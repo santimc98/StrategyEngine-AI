@@ -176,3 +176,54 @@ def test_metric_round_apply_guard_reprompts_once_when_hypothesis_not_applied(mon
     apply_guard = result.get("ml_improvement_apply_guard_report") or {}
     assert apply_guard.get("repair_attempted") is True
     assert apply_guard.get("applied") is True
+
+
+def test_metric_round_forces_editor_mode_even_on_first_iteration(monkeypatch):
+    calls = {}
+
+    def _fake_generate_code(*, editor_mode=False, previous_code=None, **kwargs):
+        calls["editor_mode"] = editor_mode
+        calls["previous_code"] = previous_code
+        return "print('optimized')"
+
+    monkeypatch.setattr("src.graph.graph.ml_engineer.generate_code", _fake_generate_code, raising=True)
+    monkeypatch.setattr(
+        "src.graph.graph.load_recent_memory",
+        lambda run_id, k=5: [],
+        raising=True,
+    )
+
+    state = {
+        "run_id": "unit_metric_round_editor_force",
+        "selected_strategy": {"title": "Strategy", "analysis_type": "predictive", "required_columns": []},
+        "feedback_history": [],
+        "data_summary": "",
+        "business_objective": "",
+        "csv_encoding": "utf-8",
+        "csv_sep": ",",
+        "csv_decimal": ".",
+        "generated_code": "print('baseline')",
+        "last_generated_code": "print('baseline')",
+        "last_gate_context": {
+            "source": "metric_improvement_optimizer",
+            "status": "OPTIMIZATION_REQUIRED",
+            "feedback": "Apply hypothesis with material edits.",
+            "failed_gates": [],
+            "required_fixes": ["Apply hypothesis."],
+        },
+        "iteration_handoff": {
+            "mode": "optimize",
+            "source": "actor_critic_metric_improvement",
+            "editor_constraints": {"must_apply_hypothesis": True, "forbid_noop": True},
+            "hypothesis_packet": {"action": "APPLY", "hypothesis": {"technique": "missing_indicators"}},
+        },
+        "ml_improvement_round_active": True,
+        "iteration_count": 0,
+        "execution_contract": {"required_outputs": ["data/metrics.json"], "canonical_columns": []},
+    }
+
+    result = run_engineer(state)
+
+    assert calls.get("editor_mode") is True
+    assert calls.get("previous_code") == "print('baseline')"
+    assert result.get("generated_code") == "print('optimized')"

@@ -258,6 +258,7 @@ def log_agent_snapshot(
     script: Optional[str] = None,
     verdicts: Optional[Any] = None,
     attempt: Optional[int] = None,
+    iteration: Optional[int] = None,
 ) -> None:
     run_dir = get_run_dir(run_id)
     if not run_dir:
@@ -284,7 +285,12 @@ def log_agent_snapshot(
         except Exception:
             pass
     base = os.path.join(run_dir, "agents", agent)
-    if attempt is not None:
+    if iteration is not None and attempt is not None:
+        base = os.path.join(base, f"iteration_{iteration}", f"attempt_{attempt}")
+    elif iteration is not None:
+        base = os.path.join(base, f"iteration_{iteration}")
+    elif attempt is not None:
+        # Backwards-compatible path layout for callers that only pass attempt.
         base = os.path.join(base, f"iteration_{attempt}")
     _ensure_dir(base)
     if prompt:

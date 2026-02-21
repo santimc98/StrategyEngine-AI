@@ -523,6 +523,7 @@ class MLEngineerAgent:
         gate_context = gate_context if isinstance(gate_context, dict) else {}
         contract_focus = raw.get("contract_focus") if isinstance(raw.get("contract_focus"), dict) else {}
         quality_focus = raw.get("quality_focus") if isinstance(raw.get("quality_focus"), dict) else {}
+        optimization_focus_raw = raw.get("optimization_focus") if isinstance(raw.get("optimization_focus"), dict) else {}
         feedback = raw.get("feedback") if isinstance(raw.get("feedback"), dict) else {}
         critic_packet = raw.get("critic_packet") if isinstance(raw.get("critic_packet"), dict) else {}
         if not critic_packet:
@@ -604,6 +605,22 @@ class MLEngineerAgent:
         if not patch_objectives:
             patch_objectives = ["Apply reviewer feedback with minimal, targeted edits to the previous script."]
 
+        optimization_focus: Dict[str, Any] = {}
+        if optimization_focus_raw:
+            optimization_focus = {
+                "round_id": optimization_focus_raw.get("round_id"),
+                "rounds_allowed": optimization_focus_raw.get("rounds_allowed"),
+                "primary_metric_name": optimization_focus_raw.get("primary_metric_name"),
+                "baseline_metric": optimization_focus_raw.get("baseline_metric"),
+                "min_delta": optimization_focus_raw.get("min_delta"),
+                "higher_is_better": optimization_focus_raw.get("higher_is_better"),
+                "feature_engineering_plan": (
+                    optimization_focus_raw.get("feature_engineering_plan")
+                    if isinstance(optimization_focus_raw.get("feature_engineering_plan"), dict)
+                    else {}
+                ),
+            }
+
         return {
             "handoff_version": raw.get("handoff_version") or "v1",
             "mode": str(raw.get("mode") or ("patch" if gate_context else "build")).lower(),
@@ -622,6 +639,7 @@ class MLEngineerAgent:
                 "hard_failures": hard_failures,
                 "evidence": evidence_focus,
             },
+            "optimization_focus": optimization_focus,
             "feedback": {
                 "reviewer": str(feedback.get("reviewer") or gate_context.get("feedback") or "").strip(),
                 "qa": str(feedback.get("qa") or "").strip(),
@@ -647,6 +665,15 @@ class MLEngineerAgent:
     ) -> str:
         gate_context = gate_context if isinstance(gate_context, dict) else {}
         handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        if self._is_metric_optimization_context(
+            gate_context=gate_context,
+            handoff_payload=handoff_payload,
+        ):
+            return self._collect_metric_optimization_feedback_text(
+                gate_context=gate_context,
+                handoff_payload=handoff_payload,
+                feedback_history=feedback_history,
+            )
         chunks: List[str] = []
         seen_chunks: set[str] = set()
 
@@ -728,6 +755,154 @@ class MLEngineerAgent:
             tail_len=1500,
         )
 
+    def _is_metric_optimization_context(
+        self,
+        gate_context: Dict[str, Any] | None,
+        handoff_payload: Dict[str, Any] | None,
+    ) -> bool:
+        gate_context = gate_context if isinstance(gate_context, dict) else {}
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        mode = str(handoff_payload.get("mode") or "").strip().lower()
+        source = str(handoff_payload.get("source") or gate_context.get("source") or "").strip().lower()
+        quality_focus = handoff_payload.get("quality_focus") if isinstance(handoff_payload.get("quality_focus"), dict) else {}
+        status = str(
+            quality_focus.get("status")
+            or gate_context.get("status")
+            or ""
+        ).strip().upper()
+        constraints = handoff_payload.get("editor_constraints") if isinstance(handoff_payload.get("editor_constraints"), dict) else {}
+        must_apply_hypothesis = bool(constraints.get("must_apply_hypothesis"))
+        if mode in {"optimize", "improve", "metric_optimize"}:
+            return True
+        if status in {"OPTIMIZATION_REQUIRED", "IMPROVEMENT_REQUIRED"}:
+            return True
+        if "metric_improvement" in source and must_apply_hypothesis:
+            return True
+        if "actor_critic" in source and must_apply_hypothesis:
+            return True
+        return False
+
+    def _collect_metric_optimization_feedback_text(
+        self,
+        gate_context: Dict[str, Any] | None,
+        handoff_payload: Dict[str, Any] | None,
+        feedback_history: List[str] | None,
+    ) -> str:
+        gate_context = gate_context if isinstance(gate_context, dict) else {}
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        chunks: List[str] = []
+        seen_chunks: set[str] = set()
+
+        def _append_chunk(value: str) -> None:
+            text = str(value or "").strip()
+            if not text or text in seen_chunks:
+                return
+            seen_chunks.add(text)
+            chunks.append(text)
+
+        optimization_focus = (
+            handoff_payload.get("optimization_focus")
+            if isinstance(handoff_payload.get("optimization_focus"), dict)
+            else {}
+        )
+        if optimization_focus:
+            _append_chunk(
+                "OPTIMIZATION_FOCUS_JSON:\n"
+                + self._serialize_json_for_prompt(
+                    optimization_focus,
+                    max_chars=2200,
+                    max_str_len=280,
+                    max_list_items=30,
+                )
+            )
+
+        critic_packet = handoff_payload.get("critic_packet")
+        if isinstance(critic_packet, dict) and critic_packet:
+            _append_chunk(
+                "CRITIQUE_PACKET_JSON:\n"
+                + self._serialize_json_for_prompt(
+                    critic_packet,
+                    max_chars=2200,
+                    max_str_len=280,
+                    max_list_items=30,
+                )
+            )
+
+        hypothesis_packet = handoff_payload.get("hypothesis_packet")
+        if isinstance(hypothesis_packet, dict) and hypothesis_packet:
+            _append_chunk(
+                "HYPOTHESIS_PACKET_JSON:\n"
+                + self._serialize_json_for_prompt(
+                    hypothesis_packet,
+                    max_chars=1800,
+                    max_str_len=260,
+                    max_list_items=25,
+                )
+            )
+
+        handoff_feedback = handoff_payload.get("feedback")
+        if isinstance(handoff_feedback, dict) and handoff_feedback:
+            _append_chunk(
+                "IMPROVEMENT_FEEDBACK_JSON:\n"
+                + self._serialize_json_for_prompt(
+                    handoff_feedback,
+                    max_chars=1600,
+                    max_str_len=260,
+                    max_list_items=20,
+                )
+            )
+
+        runtime_payload = gate_context.get("runtime_error")
+        if isinstance(runtime_payload, dict) and runtime_payload:
+            _append_chunk(
+                "RUNTIME_ERROR_JSON:\n"
+                + self._serialize_json_for_prompt(
+                    runtime_payload,
+                    max_chars=1200,
+                    max_str_len=220,
+                    max_list_items=15,
+                )
+            )
+        runtime_tail = str(
+            gate_context.get("traceback")
+            or gate_context.get("execution_output_tail")
+            or ""
+        ).strip()
+        if runtime_tail:
+            _append_chunk(
+                "RUNTIME_ERROR_TAIL:\n"
+                + self._truncate_prompt_text(
+                    runtime_tail,
+                    max_len=1200,
+                    head_len=900,
+                    tail_len=200,
+                )
+            )
+
+        if isinstance(feedback_history, list):
+            for item in feedback_history[-5:]:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                lower = text.lower()
+                if (
+                    "# improvement_round" in lower
+                    or "results_advisor_feedback" in lower
+                    or "iteration_hypothesis_packet" in lower
+                    or "steward_feedback" in lower
+                ):
+                    _append_chunk(text)
+
+        if not chunks:
+            return ""
+        merged = "\n\n".join(chunks)
+        return self._truncate_prompt_text(
+            merged,
+            max_len=4200,
+            head_len=2800,
+            tail_len=1000,
+        )
+
     def _should_use_editor_mode(
         self,
         gate_context: Dict[str, Any] | None,
@@ -769,7 +944,11 @@ class MLEngineerAgent:
             or "qa team feedback" in feedback_blob
             or "qa_code_audit" in feedback_blob
         )
-        return bool(has_runtime_signal or has_qa_signal)
+        has_optimization_signal = self._is_metric_optimization_context(
+            gate_context=gate_context,
+            handoff_payload=handoff_payload,
+        )
+        return bool(has_runtime_signal or has_qa_signal or has_optimization_signal)
 
     def _is_actor_critic_improvement_strict_enabled(self) -> bool:
         raw = str(os.getenv("ACTOR_CRITIC_IMPROVEMENT_STRICT", "1") or "").strip().lower()
@@ -785,6 +964,11 @@ class MLEngineerAgent:
         handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
         quality_focus = handoff_payload.get("quality_focus")
         quality_focus = quality_focus if isinstance(quality_focus, dict) else {}
+        if self._is_metric_optimization_context(
+            gate_context=gate_context,
+            handoff_payload=handoff_payload,
+        ):
+            return "optimization"
 
         failed_tokens: List[str] = []
         for values in (
@@ -3071,6 +3255,58 @@ $strategy_json
            Only fix persistence/serialization/artifact-writing blocks.
         """
 
+        USER_EDITOR_OPTIMIZATION_TEMPLATE = """
+        MODE: CODE_EDITOR_MODE_OPTIMIZATION
+        You are in deterministic metric-optimization editor mode.
+        Do not regenerate a new solution from zero and do not re-plan strategy.
+
+        PHASE CLASSIFICATION:
+        $phase_classification
+
+        OPTIMIZATION TARGET:
+        $optimization_target
+
+        FEATURE ENGINEERING PLAN (contract):
+        $feature_engineering_plan
+
+        OPTIMIZATION FEEDBACK:
+        $optimization_feedback
+
+        LAST RUN MEMORY (most recent attempts):
+        $last_run_memory
+
+        STRATEGY LOCK (immutable):
+        $strategy_lock
+
+        ITERATION HANDOFF:
+        $iteration_handoff_json
+
+        STRUCTURED CRITIQUE PACKET:
+        $critic_packet_json
+
+        STRUCTURED HYPOTHESIS PACKET (apply one hypothesis only):
+        $hypothesis_packet_json
+
+        PATCH OBJECTIVES:
+        $patch_objectives
+
+        MUST PRESERVE:
+        $must_preserve
+
+        EDITOR ENFORCEMENT:
+        $editor_enforcement
+
+        PREVIOUS SCRIPT:
+        $previous_code
+
+        OPTIMIZATION RULES:
+        1) Return ONLY the full updated Python script. No markdown, no explanation.
+        2) Apply the active hypothesis with material feature-engineering edits end-to-end.
+        3) Prioritize feature_engineering_plan + hypothesis_packet over legacy reviewer text.
+        4) Keep model family, CV/data-split protocol, and contract output paths stable.
+        5) Avoid unrelated refactors; edit only the regions needed for metric improvement.
+        """
+
         USER_IMPROVE_TEMPLATE = """
         MODE: IMPROVE
         Your previous code executed successfully and was approved by the reviewer.
@@ -3136,6 +3372,13 @@ $strategy_json
                 )
             )
         )
+        optimization_editor_mode = bool(
+            editor_mode_active
+            and self._is_metric_optimization_context(
+                gate_context=gate_ctx,
+                handoff_payload=handoff_payload,
+            )
+        )
         improve_mode_active = bool(
             not editor_mode_active
             and previous_code
@@ -3179,20 +3422,60 @@ $strategy_json
                 max_list_items=30,
             )
             editor_enforcement_block = self._build_editor_enforcement_block(handoff_payload)
-            user_message = render_prompt(
-                USER_EDITOR_TEMPLATE,
-                phase_classification=phase_classification,
-                error_feedback=feedback_text or "No structured feedback provided.",
-                last_run_memory=last_run_memory_block,
-                strategy_lock=strategy_lock_block,
-                iteration_handoff_json=handoff_payload_json,
-                critic_packet_json=critic_packet_block,
-                hypothesis_packet_json=hypothesis_packet_block,
-                patch_objectives=patch_objectives_block,
-                must_preserve=must_preserve_block,
-                editor_enforcement=editor_enforcement_block,
-                previous_code=previous_code_block,
-            )
+            if optimization_editor_mode:
+                optimization_focus = (
+                    handoff_payload.get("optimization_focus")
+                    if isinstance(handoff_payload.get("optimization_focus"), dict)
+                    else {}
+                )
+                optimization_target = self._serialize_json_for_prompt(
+                    optimization_focus,
+                    max_chars=2000,
+                    max_str_len=260,
+                    max_list_items=25,
+                )
+                feature_engineering_plan = (
+                    optimization_focus.get("feature_engineering_plan")
+                    if isinstance(optimization_focus.get("feature_engineering_plan"), dict)
+                    else {}
+                )
+                feature_engineering_plan_block = self._serialize_json_for_prompt(
+                    feature_engineering_plan,
+                    max_chars=2000,
+                    max_str_len=260,
+                    max_list_items=25,
+                )
+                user_message = render_prompt(
+                    USER_EDITOR_OPTIMIZATION_TEMPLATE,
+                    phase_classification=phase_classification,
+                    optimization_target=optimization_target or "{}",
+                    feature_engineering_plan=feature_engineering_plan_block or "{}",
+                    optimization_feedback=feedback_text or "No optimization feedback provided.",
+                    last_run_memory=last_run_memory_block,
+                    strategy_lock=strategy_lock_block,
+                    iteration_handoff_json=handoff_payload_json,
+                    critic_packet_json=critic_packet_block,
+                    hypothesis_packet_json=hypothesis_packet_block,
+                    patch_objectives=patch_objectives_block,
+                    must_preserve=must_preserve_block,
+                    editor_enforcement=editor_enforcement_block,
+                    previous_code=previous_code_block,
+                )
+            else:
+                user_message = render_prompt(
+                    USER_EDITOR_TEMPLATE,
+                    phase_classification=phase_classification,
+                    error_feedback=feedback_text or "No structured feedback provided.",
+                    last_run_memory=last_run_memory_block,
+                    strategy_lock=strategy_lock_block,
+                    iteration_handoff_json=handoff_payload_json,
+                    critic_packet_json=critic_packet_block,
+                    hypothesis_packet_json=hypothesis_packet_block,
+                    patch_objectives=patch_objectives_block,
+                    must_preserve=must_preserve_block,
+                    editor_enforcement=editor_enforcement_block,
+                    previous_code=previous_code_block,
+                )
         elif improve_mode_active:
             # Build improve prompt from handoff
             metric_focus = handoff_payload.get("metric_focus", {})
@@ -3311,8 +3594,11 @@ $strategy_json
         base_temp = _env_float("ML_ENGINEER_TEMPERATURE", 0.1)
         retry_temp = _env_float("ML_ENGINEER_TEMPERATURE_RETRY", 0.0)
         improve_temp = _env_float("ML_ENGINEER_TEMPERATURE_IMPROVE", 0.2)
+        optimize_editor_temp = _env_float("ML_ENGINEER_TEMPERATURE_OPTIMIZE_EDITOR", improve_temp)
         if improve_mode_active:
             current_temp = improve_temp
+        elif optimization_editor_mode:
+            current_temp = optimize_editor_temp
         elif editor_mode_active or patch_mode_active:
             current_temp = retry_temp
         else:

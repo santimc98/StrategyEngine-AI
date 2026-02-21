@@ -9294,6 +9294,7 @@ class AgentState(TypedDict):
     iteration_handoff: Dict[str, Any]
     review_reject_streak: int
     qa_reject_streak: int
+    ml_engineer_attempt: int
     data_engineer_attempt: int
     execution_attempt: int # Track runtime retries
     runtime_fix_count: int
@@ -9358,6 +9359,7 @@ class AgentState(TypedDict):
     ml_improvement_critique_packet: Dict[str, Any]
     ml_improvement_candidate_critique_packet: Dict[str, Any]
     ml_improvement_hypothesis_packet: Dict[str, Any]
+    ml_improvement_force_finalize_reason: str
     ml_improvement_round_baseline_metric: float
     ml_improvement_round_baseline_metrics: Dict[str, Any]
     ml_improvement_round_baseline_reviewer_packet: Dict[str, Any]
@@ -9832,6 +9834,7 @@ def run_steward(state: AgentState) -> AgentState:
         "iteration_handoff": None,
         "review_reject_streak": 0,
         "qa_reject_streak": 0,
+        "ml_engineer_attempt": 0,
         "metric_improvement_nodes_managed": False,
         "metric_improvement_bootstrapped": False,
         "metric_improvement_finalized": False,
@@ -9855,6 +9858,7 @@ def run_steward(state: AgentState) -> AgentState:
         "ml_improvement_critique_packet": {},
         "ml_improvement_candidate_critique_packet": {},
         "ml_improvement_hypothesis_packet": {},
+        "ml_improvement_force_finalize_reason": "",
         "ml_improvement_round_baseline_metric": 0.0,
         "ml_improvement_round_baseline_metrics": {},
         "ml_improvement_round_baseline_reviewer_packet": {},
@@ -15867,9 +15871,10 @@ def check_execution_planner_success(state: AgentState):
     return "success"
 
 def run_engineer(state: AgentState) -> AgentState:
+    next_ml_attempt = int(state.get("ml_engineer_attempt", 0) or 0) + 1
     print(
         f"--- [4] ML Engineer: Generating Code "
-        f"(Iteration {state.get('iteration_count', 0) + 1}, Attempt {int(state.get('ml_engineer_attempt', 0) or 0) + 1}) ---"
+        f"(Iteration {state.get('iteration_count', 0) + 1}, Attempt {next_ml_attempt}) ---"
     )
     abort_state = _abort_if_requested(state, "ml_engineer")
     if abort_state:
@@ -15882,14 +15887,20 @@ def run_engineer(state: AgentState) -> AgentState:
             log_run_event(run_id, "budget_exceeded", {"label": "ml_engineer", "error": err_msg})
         last_code = state.get("last_generated_code")
         last_success_output = state.get("last_successful_execution_output")
-        return {
+        result = {
             "error_message": err_msg,
             "generated_code": last_code or "# Generation Failed",
             "last_generated_code": last_code,
             "execution_output": last_success_output or err_msg,
             "execution_output_stale": bool(last_success_output),
             "budget_counters": counters,
+            "ml_engineer_attempt": next_ml_attempt,
         }
+        if bool(state.get("ml_improvement_round_active")):
+            # Ensure metric-improvement rounds close deterministically on budget exhaustion.
+            result["ml_improvement_force_finalize_reason"] = "budget_exceeded"
+            result["ml_improvement_continue"] = False
+        return result
 
     # Strategy Lock: Capture snapshot on first iteration, validate on subsequent iterations
     strategy_lock_snapshot = state.get("strategy_lock_snapshot")
@@ -15921,7 +15932,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "review_abort_reason": "strategy_lock_failed",
             }
 
-    ml_attempt = int(state.get("ml_engineer_attempt", 0) or 0) + 1
+    ml_attempt = next_ml_attempt
     if run_id:
         log_run_event(
             run_id,
@@ -16067,11 +16078,12 @@ def run_engineer(state: AgentState) -> AgentState:
     # Patch Mode Inputs
     previous_code = state.get('generated_code') or state.get('last_generated_code')
     gate_context = state.get('last_gate_context')
+    metric_round_active = bool(state.get("ml_improvement_round_active"))
     editor_mode_active = _should_use_ml_editor_mode(
         previous_code,
         gate_context,
         iteration_count=int(state.get("iteration_count", 0) or 0),
-    )
+    ) or (metric_round_active and _is_editable_ml_code(previous_code))
     iteration_handoff = state.get("iteration_handoff")
     if previous_code and gate_context and not isinstance(iteration_handoff, dict):
         iteration_handoff = _build_iteration_handoff(
@@ -16090,9 +16102,13 @@ def run_engineer(state: AgentState) -> AgentState:
         editor_mode_active = False
 
     if editor_mode_active:
-        print("ML_EDITOR_MODE: reusing previous code with iterative feedback.")
+        if metric_round_active:
+            print("ML_EDITOR_MODE_OPTIMIZATION: reusing previous code for metric improvement round.")
+        else:
+            print("ML_EDITOR_MODE: reusing previous code with iterative feedback.")
         if run_id:
-            log_run_event(run_id, "ml_editor_mode", {"attempt": ml_attempt, "iteration": iter_id})
+            payload = {"attempt": ml_attempt, "iteration": iter_id, "metric_round_active": bool(metric_round_active)}
+            log_run_event(run_id, "ml_editor_mode", payload)
 
     print(f"DEBUG: Generating code for strategy: {strategy['title']}")
 
@@ -16608,6 +16624,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 context=ctx_payload,
                 script=code,
                 attempt=ml_attempt,
+                iteration=iter_id,
             )
         try:
             iter_id = ml_attempt
@@ -16730,8 +16747,14 @@ def run_engineer(state: AgentState) -> AgentState:
             "max_ml_engineer_host_retries": max_host_retries,
         }
 
+def _is_budget_exceeded_error(message: Any) -> bool:
+    return "BUDGET_EXCEEDED" in str(message or "").upper()
+
+
 def check_engineer_success(state: AgentState):
     if state.get("error_message"):
+        if bool(state.get("ml_improvement_round_active")) and _is_budget_exceeded_error(state.get("error_message")):
+            return "finalize_metric_round"
         if bool(state.get("ml_engineer_host_crash")):
             crash_count = int(state.get("ml_engineer_host_crash_count", 0) or 0)
             max_retries = int(state.get("max_ml_engineer_host_retries", 1) or 1)
@@ -22204,14 +22227,16 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     state["feedback_history"] = history[-25:]
 
     existing_gate = state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
-    gate_feedback = str(existing_gate.get("feedback") or "")
-    merged_feedback = (gate_feedback + feedback_block).strip() if gate_feedback else feedback_block.strip()
+    # Optimization rounds should not inherit baseline rejection framing.
+    # Keep a clean optimization context for editor mode.
+    merged_feedback = feedback_block.strip()
     state["last_gate_context"] = {
         **existing_gate,
-        "source": "qa_improvement_round",
-        "status": "REJECTED",
-        "failed_gates": list(existing_gate.get("failed_gates") or []) or ["metric_improvement_round"],
-        "required_fixes": list(existing_gate.get("required_fixes") or []) or patch_objectives,
+        "source": "metric_improvement_optimizer",
+        "status": "OPTIMIZATION_REQUIRED",
+        "failed_gates": [],
+        "hard_failures": [],
+        "required_fixes": patch_objectives,
         "feedback": merged_feedback,
         "feature_engineering_plan": feature_engineering_plan,
         "advisor_critique_packet": critique_packet,
@@ -22225,7 +22250,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
 
     state["iteration_handoff"] = {
         "handoff_version": "v1",
-        "mode": "patch",
+        "mode": "optimize",
         "source": "actor_critic_metric_improvement",
         "from_iteration": int(state.get("iteration_count", 0) or 0),
         "next_iteration": int(state.get("iteration_count", 0) or 0) + 1,
@@ -22235,11 +22260,20 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             "missing_outputs": [],
         },
         "quality_focus": {
-            "status": "NEEDS_IMPROVEMENT",
-            "failed_gates": ["metric_improvement_round"],
+            "status": "OPTIMIZATION_REQUIRED",
+            "failed_gates": [],
             "required_fixes": patch_objectives,
             "hard_failures": [],
             "evidence": [],
+        },
+        "optimization_focus": {
+            "round_id": int(round_id),
+            "rounds_allowed": int(rounds),
+            "primary_metric_name": metric_name,
+            "baseline_metric": float(baseline_value),
+            "min_delta": float(min_delta),
+            "higher_is_better": bool(metric_higher_is_better),
+            "feature_engineering_plan": feature_engineering_plan,
         },
         "feedback": {
             "reviewer": feedback_block.strip(),
@@ -22404,6 +22438,8 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     output_paths = state.get("ml_improvement_output_paths") if isinstance(state.get("ml_improvement_output_paths"), list) else []
     snapshot_dir = Path(str(state.get("ml_improvement_snapshot_dir") or Path("work") / "ml_baseline_snapshot"))
     baseline_verdict = normalize_review_status(state.get("ml_improvement_baseline_review_verdict") or "APPROVED")
+    force_finalize_reason = str(state.get("ml_improvement_force_finalize_reason") or "").strip().lower()
+    force_finalize = bool(force_finalize_reason)
     current_metrics = _load_json_safe("data/metrics.json")
     if not isinstance(current_metrics, dict):
         current_metrics = {}
@@ -22533,6 +22569,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         max_generalization_gap=max_generalization_gap,
         disallow_high_variance=bool(disallow_high_variance),
     )
+    if force_finalize:
+        improved_by_metric = False
+        stability_ok = False
     improved = approved and improved_by_metric and stability_ok
     if not improved:
         _restore_ml_outputs(snapshot_dir, output_paths)
@@ -22590,6 +22629,8 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         "stability_ok": bool(stability_ok),
         "deterministic_blockers": bool(deterministic_blockers),
         "advisory_review_mode": bool(advisory_review_mode),
+        "forced_finalize": bool(force_finalize),
+        "forced_finalize_reason": force_finalize_reason if force_finalize else "",
         "kept": state.get("ml_improvement_kept"),
         "no_improve_streak": int(no_improve_streak),
         "rounds_allowed": int(rounds_allowed),
@@ -22632,7 +22673,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     rounds_done = int(state.get("ml_improvement_round_count", 0) or 0)
     has_budget = rounds_done < int(max(0, rounds_allowed))
     under_patience = int(no_improve_streak) < int(max(1, patience))
-    continue_round = bool(has_budget and under_patience)
+    continue_round = bool(has_budget and under_patience and (not force_finalize))
     state["ml_improvement_continue"] = bool(continue_round)
 
     decision_note = (
@@ -22641,6 +22682,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         f"meets_min_delta={improved_by_metric} stability_ok={stability_ok} "
         f"deterministic_blockers={deterministic_blockers} "
         f"advisory_review_mode={advisory_review_mode} "
+        f"forced_finalize={force_finalize} "
         f"kept={state.get('ml_improvement_kept')} "
         f"pareto_frontier_improved={round_record.get('pareto_frontier_improved')} "
         f"no_improve_streak={no_improve_streak} "
@@ -22726,6 +22768,8 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                         "pareto_frontier_improved": bool(round_record.get("pareto_frontier_improved")),
                         "deterministic_blockers": bool(deterministic_blockers),
                         "advisory_review_mode": bool(advisory_review_mode),
+                        "forced_finalize": bool(force_finalize),
+                        "forced_finalize_reason": force_finalize_reason if force_finalize else "",
                         "kept": state.get("ml_improvement_kept"),
                         "no_improve_streak": int(no_improve_streak),
                         "patience": int(patience),
@@ -22757,7 +22801,10 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     else:
         state["ml_improvement_attempted"] = True
         state["ml_improvement_loop_complete"] = True
+        if force_finalize:
+            state["stop_reason"] = f"IMPROVEMENT_ROUND_{force_finalize_reason.upper()}"
     state["ml_improvement_round_active"] = False
+    state["ml_improvement_force_finalize_reason"] = ""
     state["last_iteration_type"] = None
     return "approved"
 
@@ -23520,6 +23567,7 @@ workflow.add_conditional_edges(
     {
         "success": "execute_code",
         "retry_host_crash": "engineer",
+        "finalize_metric_round": "finalize_improvement_round",
         "failed": "translator"
     }
 )

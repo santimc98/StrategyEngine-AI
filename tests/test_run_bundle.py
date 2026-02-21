@@ -3,7 +3,7 @@ import os
 import time
 from pathlib import Path
 
-from src.utils.run_bundle import init_run_bundle, write_run_manifest, copy_run_artifacts
+from src.utils.run_bundle import init_run_bundle, write_run_manifest, copy_run_artifacts, log_agent_snapshot
 from src.utils.run_logger import init_run_log, log_run_event
 
 
@@ -150,3 +150,26 @@ def test_run_manifest_includes_iteration_trace_metadata(tmp_path, monkeypatch):
     assert trace.get("metric_improvement_round_count") == 1
     assert trace.get("metric_improvement_attempted") is True
     assert trace.get("metric_improvement_kept") == "baseline"
+
+
+def test_log_agent_snapshot_supports_iteration_and_attempt_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run_id = "run_snapshot_trace_01"
+    run_dir = init_run_bundle(run_id, {}, base_dir=str(tmp_path / "runs"), enable_tee=False)
+
+    log_agent_snapshot(
+        run_id,
+        "ml_engineer",
+        prompt="prompt_a",
+        response="response_a",
+        context={"k": "v"},
+        script="print('a')",
+        iteration=2,
+        attempt=5,
+    )
+
+    attempt_dir = Path(run_dir) / "agents" / "ml_engineer" / "iteration_2" / "attempt_5"
+    assert (attempt_dir / "prompt.txt").exists()
+    assert (attempt_dir / "response.txt").exists()
+    assert (attempt_dir / "context.json").exists()
+    assert (attempt_dir / "script.py").exists()

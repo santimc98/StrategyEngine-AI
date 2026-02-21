@@ -63,3 +63,11 @@ def test_check_engineer_success_fails_after_host_crash_retry_limit():
         "max_ml_engineer_host_retries": 1,
     }
     assert check_engineer_success(state) == "failed"
+
+
+def test_check_engineer_success_routes_to_metric_round_finalize_on_budget_exceeded():
+    state = {
+        "error_message": "BUDGET_EXCEEDED: ML Engineer exceeded 6/6",
+        "ml_improvement_round_active": True,
+    }
+    assert check_engineer_success(state) == "finalize_metric_round"

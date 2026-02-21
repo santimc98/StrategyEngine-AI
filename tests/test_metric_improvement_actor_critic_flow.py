@@ -114,7 +114,13 @@ def test_bootstrap_metric_improvement_round_builds_actor_critic_handoff(tmp_path
     assert activated is True
     assert state.get("ml_improvement_round_active") is True
     handoff = state.get("iteration_handoff", {})
+    assert handoff.get("mode") == "optimize"
     assert handoff.get("source") == "actor_critic_metric_improvement"
+    quality_focus = handoff.get("quality_focus") if isinstance(handoff.get("quality_focus"), dict) else {}
+    assert quality_focus.get("status") == "OPTIMIZATION_REQUIRED"
+    assert quality_focus.get("failed_gates") == []
+    optimization_focus = handoff.get("optimization_focus") if isinstance(handoff.get("optimization_focus"), dict) else {}
+    assert optimization_focus.get("primary_metric_name") == "roc_auc"
     assert isinstance(handoff.get("critic_packet"), dict)
     assert isinstance(handoff.get("hypothesis_packet"), dict)
     constraints = handoff.get("editor_constraints") if isinstance(handoff.get("editor_constraints"), dict) else {}

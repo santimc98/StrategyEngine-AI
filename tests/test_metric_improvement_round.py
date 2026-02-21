@@ -192,6 +192,44 @@ def test_finalize_round_requests_continue_when_budget_and_patience_allow(tmp_pat
     assert updates.get("ml_improvement_attempted") is False
 
 
+def test_finalize_round_forced_by_budget_exceeded_stops_loop(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("data/metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps({"roc_auc": 0.8001}), encoding="utf-8")
+    snapshot_dir = Path("work/ml_incumbent_snapshot_r1")
+    output_paths = ["data/metrics.json"]
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    state = {
+        "review_verdict": "APPROVED",
+        "execution_contract": {"iteration_policy": {"metric_improvement_rounds": 3, "metric_improvement_patience": 2}},
+        "ml_improvement_round_active": True,
+        "ml_improvement_force_finalize_reason": "budget_exceeded",
+        "ml_improvement_round_count": 1,
+        "ml_improvement_current_round_id": 1,
+        "ml_improvement_primary_metric_name": "roc_auc",
+        "ml_improvement_round_baseline_metric": 0.8000,
+        "ml_improvement_baseline_metric": 0.8000,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": True,
+        "ml_improvement_output_paths": output_paths,
+        "ml_improvement_snapshot_dir": str(snapshot_dir),
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "ml_improvement_rounds_allowed": 3,
+        "ml_improvement_patience": 2,
+        "ml_improvement_no_improve_streak": 0,
+        "feedback_history": [],
+    }
+    updates = run_metric_improvement_finalize(state)
+
+    assert updates.get("metric_improvement_nodes_managed") is True
+    assert updates.get("ml_improvement_continue") is False
+    assert updates.get("ml_improvement_attempted") is True
+    assert updates.get("ml_improvement_loop_complete") is True
+    assert updates.get("ml_improvement_force_finalize_reason") == ""
+
+
 def test_check_evaluation_bootstraps_next_round_after_continue(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
