@@ -1,9 +1,10 @@
 """
-Tests for result evaluator behavior with metric iteration DISABLED.
+Tests for result evaluator behavior with non-blocking metric feedback.
 
-With metric iteration disabled:
-- NEEDS_IMPROVEMENT for metric-only issues -> APPROVE_WITH_WARNINGS (no retry)
-- NEEDS_IMPROVEMENT for compliance issues (audit rejected, missing outputs) -> stays NEEDS_IMPROVEMENT (allows retry)
+Policy:
+- NEEDS_IMPROVEMENT for metric-only issues stays NEEDS_IMPROVEMENT in evaluator output.
+- check_evaluation then treats non-blocking metric findings as advisory-only (no retry).
+- NEEDS_IMPROVEMENT for compliance issues (audit rejected, missing outputs) keeps retry path.
 """
 import json
 import os
@@ -43,10 +44,10 @@ class _StubQARejectedNoGates:
         }
 
 
-def test_result_evaluator_metric_issue_downgrades_to_approve_with_warnings(tmp_path, monkeypatch):
+def test_result_evaluator_metric_issue_keeps_needs_improvement_and_stops_advisory(tmp_path, monkeypatch):
     """
     When NEEDS_IMPROVEMENT is for metric-only issues (iteration_type='metric'),
-    it should downgrade to APPROVE_WITH_WARNINGS since metric iteration is disabled.
+    evaluator should keep NEEDS_IMPROVEMENT and evaluation routing should stop as advisory-only.
     """
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)
@@ -66,10 +67,12 @@ def test_result_evaluator_metric_issue_downgrades_to_approve_with_warnings(tmp_p
     monkeypatch.setattr(graph_mod, "reviewer", _StubReviewerMetricIssue())
     result = graph_mod.run_result_evaluator(state)
 
-    # With metric iteration disabled, metric-only issues get downgraded
-    assert result["review_verdict"] == "APPROVE_WITH_WARNINGS"
-    # Should have the metric iteration disabled message
-    assert any("Metric iteration disabled" in item for item in result["feedback_history"])
+    assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
+    assert not any("Metric iteration disabled" in item for item in result["feedback_history"])
+
+    state.update(result)
+    assert graph_mod.check_evaluation(state) == "approved"
+    assert state.get("stop_reason") == "ADVISORY_ONLY"
 
 
 def test_result_evaluator_compliance_issue_keeps_needs_improvement(tmp_path, monkeypatch):

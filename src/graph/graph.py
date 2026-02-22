@@ -20107,26 +20107,6 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if runtime_failure_detected and status == "NEEDS_IMPROVEMENT":
         iteration_type = "compliance"
 
-    # METRIC ITERATION DISABLED: Force downgrade to APPROVE_WITH_WARNINGS for metric-only issues.
-    # This stops the metric retry loop while preserving compliance/runtime retries.
-    metric_iteration_disabled = False
-    blocking_retry = _is_blocking_retry_reason(
-        state if isinstance(state, dict) else {},
-        gate_context=gate_context,
-    )
-    if (
-        status == "NEEDS_IMPROVEMENT"
-        and iteration_type == "metric"
-        and not blocking_retry
-    ):
-        status = "APPROVE_WITH_WARNINGS"
-        metric_disable_msg = "(Metric iteration disabled: reporting limitations & next steps only.)"
-        feedback = f"{feedback}\n{metric_disable_msg}" if feedback else metric_disable_msg
-        new_history.append(metric_disable_msg)
-        iteration_type = None  # Clear iteration_type to prevent any metric loop logic
-        metric_iteration_disabled = True
-        print(f"METRIC_ITERATION_DISABLED: Downgraded to APPROVE_WITH_WARNINGS for metric-only issue.")
-
     if iteration_type:
         gate_context["iteration_type"] = iteration_type
     compliance_iterations = int(state.get("compliance_iterations", 0))
@@ -20136,7 +20116,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         if iteration_type == "compliance":
             compliance_iterations += 1
             compliance_passed = False
-        # Note: metric branch removed since iteration_type="metric" is now downgraded above
+        # metric iteration accounting/routing is handled downstream by check_evaluation
 
     review_feedback = feedback or state.get("review_feedback", "")
     qa_packet_for_state = _normalize_review_packet_for_state(
@@ -20258,16 +20238,12 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         result_state["last_successful_gate_context"] = gate_context
     if review_counters:
         result_state["budget_counters"] = review_counters
-    if metric_iteration_disabled:
-        result_state["stop_reason"] = "METRIC_ITERATION_DISABLED"
     # Preserve improvement suggestions from evaluator for the improvement loop
     if isinstance(eval_improvement_suggestions, dict):
         result_state["eval_improvement_suggestions"] = eval_improvement_suggestions
 
-    # NOTE: results_advisor.generate_ml_advice block REMOVED.
-    # Metric iteration is disabled, so this block was dead code.
-    # The condition (status=="NEEDS_IMPROVEMENT" and iteration_type=="metric") can never
-    # be true because we force downgrade to APPROVE_WITH_WARNINGS above.
+    # NOTE: results_advisor.generate_ml_advice block removed in favor of
+    # actor-critic metric improvement orchestration (bootstrap/finalize nodes).
 
     results_insights: Dict[str, Any] = {}
     try:
