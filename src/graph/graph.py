@@ -105,6 +105,7 @@ from src.utils.contract_views import (
 )
 from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
 from src.utils.cleaning_executor import execute_cleaning_plan
+from src.utils.actor_critic_schemas import normalize_target_columns
 from src.utils.run_logger import init_run_log, log_run_event, finalize_run_log
 from src.utils.run_bundle import (
     init_run_bundle,
@@ -8649,6 +8650,26 @@ def _build_iteration_handoff(
         and hypothesis_technique
         and hypothesis_technique.upper() != "NO_OP"
     )
+    optimization_context = (
+        state.get("ml_optimization_context")
+        if isinstance(state.get("ml_optimization_context"), dict)
+        else {}
+    )
+    if enforce_apply_hypothesis and not optimization_context:
+        optimization_context = {
+            "policy": {},
+            "metric_snapshot": {
+                "primary_metric_name": metric_name or state.get("ml_improvement_primary_metric_name"),
+                "baseline_metric": _coerce_float(state.get("ml_improvement_round_baseline_metric")),
+                "best_metric_so_far": _coerce_float(state.get("ml_improvement_best_metric")),
+                "higher_is_better": bool(state.get("ml_improvement_higher_is_better", True)),
+                "min_delta": _coerce_float(state.get("ml_improvement_min_delta")),
+            },
+            "contract_lock": _build_metric_round_contract_lock(contract, required_outputs, metric_name or "unknown"),
+            "active_hypothesis": compress_long_lists(hypothesis_packet or {})[0],
+            "experiment_tracker_recent": [],
+            "round_history_recent": [],
+        }
     if enforce_apply_hypothesis:
         enforce_msg = (
             "Metric-improvement round: apply active hypothesis '"
@@ -8671,10 +8692,10 @@ def _build_iteration_handoff(
 
     handoff: Dict[str, Any] = {
         "handoff_version": "v1",
-        "mode": "patch" if next_iteration > 1 else "build",
+        "mode": "optimize" if enforce_apply_hypothesis else ("patch" if next_iteration > 1 else "build"),
         "from_iteration": iteration_count,
         "next_iteration": next_iteration,
-        "source": "result_evaluator",
+        "source": "actor_critic_metric_improvement" if enforce_apply_hypothesis else "result_evaluator",
         "contract_focus": {
             "required_outputs": required_outputs[:15],
             "present_outputs": present_outputs,
@@ -8704,6 +8725,16 @@ def _build_iteration_handoff(
         },
         "must_preserve": must_preserve[:8],
         "patch_objectives": patch_objectives[:8],
+        "optimization_focus": optimization_context.get("metric_snapshot")
+        if isinstance(optimization_context.get("metric_snapshot"), dict)
+        else {},
+        "optimization_context": optimization_context if isinstance(optimization_context, dict) else {},
+        "critic_packet": (
+            state.get("ml_improvement_critique_packet")
+            if isinstance(state.get("ml_improvement_critique_packet"), dict)
+            else {}
+        ),
+        "hypothesis_packet": hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
         "editor_constraints": {
             "must_apply_hypothesis": bool(enforce_apply_hypothesis),
             "forbid_noop": bool(enforce_apply_hypothesis),
@@ -20846,6 +20877,14 @@ def run_review_board(state: AgentState) -> AgentState:
     iteration_handoff = state.get("iteration_handoff")
     if not isinstance(iteration_handoff, dict):
         iteration_handoff = {}
+    handoff_mode = str(iteration_handoff.get("mode") or "").strip().lower()
+    handoff_source = str(iteration_handoff.get("source") or "").strip().lower()
+    preserve_metric_handoff = bool(
+        bool(state.get("ml_improvement_round_active"))
+        or handoff_mode in {"optimize", "metric_optimize", "improve"}
+        or "metric_improvement" in handoff_source
+        or "actor_critic" in handoff_source
+    )
     handoff_quality = (
         dict(iteration_handoff.get("quality_focus"))
         if isinstance(iteration_handoff.get("quality_focus"), dict)
@@ -20876,7 +20915,6 @@ def run_review_board(state: AgentState) -> AgentState:
             break
     if final_status == "NEEDS_IMPROVEMENT" and not patch_objectives:
         patch_objectives = ["Apply review_board required actions with minimal edits to the previous script."]
-    iteration_handoff["source"] = "review_board"
     iteration_handoff["board_focus"] = {
         "status": board_status,
         "summary": board_summary,
@@ -20886,7 +20924,25 @@ def run_review_board(state: AgentState) -> AgentState:
         "evidence": _normalize_handoff_evidence(evidence, max_items=8),
     }
     iteration_handoff["quality_focus"] = handoff_quality
-    iteration_handoff["patch_objectives"] = patch_objectives
+    if preserve_metric_handoff:
+        if patch_objectives and (final_status == "NEEDS_IMPROVEMENT" or not iteration_handoff.get("patch_objectives")):
+            iteration_handoff["patch_objectives"] = patch_objectives
+        if not isinstance(iteration_handoff.get("critic_packet"), dict) or not iteration_handoff.get("critic_packet"):
+            critic_packet = state.get("ml_improvement_critique_packet")
+            if isinstance(critic_packet, dict) and critic_packet:
+                iteration_handoff["critic_packet"] = critic_packet
+        if not isinstance(iteration_handoff.get("hypothesis_packet"), dict) or not iteration_handoff.get("hypothesis_packet"):
+            hypothesis_packet = state.get("ml_improvement_hypothesis_packet")
+            if isinstance(hypothesis_packet, dict) and hypothesis_packet:
+                iteration_handoff["hypothesis_packet"] = hypothesis_packet
+        if not isinstance(iteration_handoff.get("optimization_context"), dict) or not iteration_handoff.get("optimization_context"):
+            optimization_context = state.get("ml_optimization_context")
+            if isinstance(optimization_context, dict) and optimization_context:
+                iteration_handoff["optimization_context"] = optimization_context
+    else:
+        iteration_handoff["source"] = "review_board"
+        iteration_handoff["mode"] = str(iteration_handoff.get("mode") or "patch").strip().lower() or "patch"
+        iteration_handoff["patch_objectives"] = patch_objectives
 
     board_payload = {
         "status": board_status,
@@ -21825,6 +21881,242 @@ def _restore_ml_outputs(snapshot_dir: Path, output_paths: List[str]) -> None:
                     pass
 
 
+def _normalize_fe_technique_entries(feature_engineering_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    plan = feature_engineering_plan if isinstance(feature_engineering_plan, dict) else {}
+    techniques_raw = plan.get("techniques")
+    if not isinstance(techniques_raw, list):
+        techniques_raw = []
+    entries: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in techniques_raw:
+        if isinstance(item, dict):
+            technique = str(item.get("technique") or item.get("name") or "").strip()
+            target_columns = item.get("columns") if isinstance(item.get("columns"), list) else []
+            params = item.get("params") if isinstance(item.get("params"), dict) else {}
+        else:
+            technique = str(item or "").strip()
+            target_columns = []
+            params = {}
+        if not technique:
+            continue
+        key = technique.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(
+            {
+                "technique": technique,
+                "target_columns": [str(col) for col in target_columns[:12] if str(col).strip()],
+                "params": params,
+            }
+        )
+    return entries
+
+
+def _technique_family_key(technique_name: Any) -> str:
+    token = str(technique_name or "").strip().lower()
+    if not token:
+        return "unknown"
+    if any(part in token for part in ("type cast", "dtype", "casting")):
+        return "dtype_casting"
+    if any(part in token for part in ("missing indicator", "missingness", "imputation")):
+        return "missingness"
+    if any(part in token for part in ("rare", "frequency encoding", "target encoding", "categorical")):
+        return "categorical_encoding"
+    if any(part in token for part in ("ratio", "interaction", "cross", "polynomial", "feature cross")):
+        return "interaction"
+    if any(part in token for part in ("binning", "bucket", "quantile")):
+        return "binning"
+    return "generic"
+
+
+def _techniques_are_compatible(left: Any, right: Any) -> bool:
+    a = str(left or "").strip()
+    b = str(right or "").strip()
+    if not a or not b:
+        return False
+    if a.lower() == b.lower():
+        return False
+    fam_a = _technique_family_key(a)
+    fam_b = _technique_family_key(b)
+    if fam_a == fam_b and fam_a not in {"interaction"}:
+        return False
+    tokens_a = {tok for tok in re.split(r"[^a-z0-9]+", a.lower()) if len(tok) >= 4}
+    tokens_b = {tok for tok in re.split(r"[^a-z0-9]+", b.lower()) if len(tok) >= 4}
+    if len(tokens_a & tokens_b) >= 2:
+        return False
+    return True
+
+
+def _resolve_metric_round_hybrid_policy(
+    *,
+    round_id: int,
+    rounds_allowed: int,
+    no_improve_streak: int,
+    patience: int,
+    min_delta: float,
+    higher_is_better: bool,
+    hypothesis_packet: Dict[str, Any],
+    feature_engineering_plan: Dict[str, Any],
+    tracker_entries: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    safe_rounds_allowed = max(1, int(rounds_allowed or 1))
+    safe_round_id = max(1, int(round_id or 1))
+    safe_patience = max(1, int(patience or 1))
+    safe_no_improve = max(0, int(no_improve_streak or 0))
+    explore_rounds = max(1, min(safe_rounds_allowed - 1 if safe_rounds_allowed > 1 else 1, 2))
+    forced_exploit = safe_no_improve >= max(1, safe_patience - 1)
+    phase = "exploit" if forced_exploit or safe_round_id > explore_rounds else "explore"
+
+    packet = dict(hypothesis_packet) if isinstance(hypothesis_packet, dict) else {}
+    hypothesis = packet.get("hypothesis") if isinstance(packet.get("hypothesis"), dict) else {}
+    action = str(packet.get("action") or "NO_OP").strip().upper()
+    current_technique = str(hypothesis.get("technique") or "").strip()
+
+    plan_entries = _normalize_fe_technique_entries(feature_engineering_plan)
+    plan_map = {str(item.get("technique")).lower(): item for item in plan_entries if str(item.get("technique") or "").strip()}
+
+    successful_ranked: List[str] = []
+    seen_success: set[str] = set()
+    for entry in tracker_entries if isinstance(tracker_entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("event") or "").strip().lower() != "candidate_evaluated":
+            continue
+        if not bool(entry.get("approved")):
+            continue
+        delta = _coerce_float(entry.get("delta"))
+        if delta is None:
+            continue
+        meets_delta = delta >= float(min_delta) if higher_is_better else delta <= -float(min_delta)
+        if not meets_delta:
+            continue
+        technique = str(entry.get("technique") or "").strip()
+        if not technique:
+            continue
+        key = technique.lower()
+        if key in seen_success:
+            continue
+        seen_success.add(key)
+        successful_ranked.append(technique)
+
+    bundle_techniques: List[str] = []
+    if action == "APPLY" and current_technique and current_technique.upper() != "NO_OP":
+        bundle_techniques.append(current_technique)
+
+    if phase == "exploit":
+        candidates: List[str] = []
+        for technique in successful_ranked:
+            if technique.lower() not in {x.lower() for x in bundle_techniques}:
+                candidates.append(technique)
+        for entry in plan_entries:
+            technique = str(entry.get("technique") or "").strip()
+            if not technique:
+                continue
+            if technique.lower() in {x.lower() for x in bundle_techniques}:
+                continue
+            if technique not in candidates:
+                candidates.append(technique)
+
+        if not bundle_techniques and candidates:
+            bundle_techniques.append(candidates[0])
+        if bundle_techniques:
+            primary = bundle_techniques[0]
+            secondary = ""
+            for candidate in candidates:
+                if _techniques_are_compatible(primary, candidate):
+                    secondary = candidate
+                    break
+            if secondary:
+                bundle_techniques.append(secondary)
+
+    if len(bundle_techniques) >= 2:
+        primary = bundle_techniques[0]
+        secondary = bundle_techniques[1]
+        primary_meta = plan_map.get(primary.lower(), {})
+        secondary_meta = plan_map.get(secondary.lower(), {})
+        target_columns = normalize_target_columns(
+            (primary_meta.get("target_columns") or [])
+            + (secondary_meta.get("target_columns") or [])
+            + (hypothesis.get("target_columns") if isinstance(hypothesis.get("target_columns"), list) else [])
+        )
+        params = hypothesis.get("params") if isinstance(hypothesis.get("params"), dict) else {}
+        params = dict(params)
+        params["bundle_techniques"] = bundle_techniques[:2]
+        params["bundle_mode"] = "compatible_pair"
+        updated_hypothesis = {
+            **hypothesis,
+            "technique": "Hybrid Bundle: " + " + ".join(bundle_techniques[:2]),
+            "target_columns": target_columns or hypothesis.get("target_columns") or ["ALL_NUMERIC"],
+            "params": params,
+        }
+        packet["action"] = "APPLY"
+        packet["hypothesis"] = updated_hypothesis
+        app_constraints = (
+            dict(packet.get("application_constraints"))
+            if isinstance(packet.get("application_constraints"), dict)
+            else {}
+        )
+        app_constraints["max_code_regions_to_change"] = max(
+            int(app_constraints.get("max_code_regions_to_change", 3) or 3),
+            5,
+        )
+        packet["application_constraints"] = app_constraints
+        signature_base = "|".join(bundle_techniques[:2]) + "|" + ",".join(target_columns[:12])
+        signature = "hyb_" + hashlib.sha1(signature_base.encode("utf-8")).hexdigest()[:12]
+        tracker_context = (
+            dict(packet.get("tracker_context"))
+            if isinstance(packet.get("tracker_context"), dict)
+            else {}
+        )
+        tracker_context["signature"] = signature
+        tracker_context["is_duplicate"] = False
+        tracker_context["duplicate_of"] = None
+        packet["tracker_context"] = tracker_context
+        packet["explanation"] = (
+            "Exploit phase: apply compatible hybrid bundle from prior signals and FE plan."
+        )[:280]
+
+    policy_meta = {
+        "policy": "explore_exploit_hybrid_v1",
+        "phase": phase,
+        "explore_rounds": int(explore_rounds),
+        "round_id": int(safe_round_id),
+        "rounds_allowed": int(safe_rounds_allowed),
+        "min_delta": float(min_delta),
+        "patience": int(safe_patience),
+        "no_improve_streak": int(safe_no_improve),
+        "bundle_size": int(len(bundle_techniques)) if bundle_techniques else 1,
+        "bundle_techniques": bundle_techniques[:3],
+        "compatibility_rule": "family_key_and_token_overlap_v1",
+    }
+    return packet, policy_meta
+
+
+def _build_metric_round_contract_lock(
+    contract: Dict[str, Any],
+    output_paths: List[str],
+    metric_name: str,
+) -> Dict[str, Any]:
+    contract = contract if isinstance(contract, dict) else {}
+    validation = contract.get("validation_requirements") if isinstance(contract.get("validation_requirements"), dict) else {}
+    allowed_sets = contract.get("allowed_feature_sets") if isinstance(contract.get("allowed_feature_sets"), dict) else {}
+    qa_gates = get_qa_gates(contract)
+    reviewer_gates = get_reviewer_gates(contract)
+    qa_gate_names = [str(item.get("name")) for item in qa_gates if isinstance(item, dict) and str(item.get("name") or "").strip()]
+    reviewer_gate_names = [str(item.get("name")) for item in reviewer_gates if isinstance(item, dict) and str(item.get("name") or "").strip()]
+    return {
+        "required_outputs": _normalize_output_path_list(output_paths)[:12],
+        "primary_metric": str(metric_name or validation.get("primary_metric") or "unknown"),
+        "split_column": str(validation.get("split_column") or ""),
+        "train_filter": str(validation.get("train_filter") or ""),
+        "forbidden_features": [str(item) for item in (allowed_sets.get("forbidden_features") or [])][:24],
+        "model_features": [str(item) for item in (allowed_sets.get("model_features") or [])][:60],
+        "qa_gates": qa_gate_names[:20],
+        "reviewer_gates": reviewer_gate_names[:20],
+    }
+
+
 def _build_metric_improvement_feedback_block(
     *,
     feature_engineering_plan: Dict[str, Any],
@@ -21857,6 +22149,9 @@ def _build_metric_improvement_patch_objectives(hypothesis_packet: Dict[str, Any]
     hypothesis = hypothesis_packet.get("hypothesis") if isinstance(hypothesis_packet.get("hypothesis"), dict) else {}
     technique = str(hypothesis.get("technique") or "NO_OP")
     target_columns = hypothesis.get("target_columns") if isinstance(hypothesis.get("target_columns"), list) else []
+    params = hypothesis.get("params") if isinstance(hypothesis.get("params"), dict) else {}
+    bundle_techniques = params.get("bundle_techniques") if isinstance(params.get("bundle_techniques"), list) else []
+    bundle_techniques = [str(item) for item in bundle_techniques[:3] if str(item).strip()]
     targets_text = ", ".join([str(item) for item in target_columns[:6]]) if target_columns else "ALL_NUMERIC"
     action = str(hypothesis_packet.get("action") or "NO_OP").upper()
 
@@ -21868,6 +22163,12 @@ def _build_metric_improvement_patch_objectives(hypothesis_packet: Dict[str, Any]
         objectives.append(
             "NO_OP is forbidden in this round. Implement the hypothesis with material feature engineering edits."
         )
+        if len(bundle_techniques) >= 2:
+            objectives.append(
+                "Exploit phase active: apply compatible hybrid bundle in sequence: "
+                + ", ".join(bundle_techniques[:2])
+                + "."
+            )
         objectives.append(
             "Keep baseline model family and CV/data-split protocol stable while injecting the hypothesis end-to-end."
         )
@@ -22167,6 +22468,17 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
     }
     hypothesis_packet = strategist.generate_iteration_hypothesis(strategist_context)
+    hypothesis_packet, hybrid_policy_meta = _resolve_metric_round_hybrid_policy(
+        round_id=int(round_id),
+        rounds_allowed=int(rounds),
+        no_improve_streak=int(no_improve_streak),
+        patience=int(patience),
+        min_delta=float(min_delta),
+        higher_is_better=bool(metric_higher_is_better),
+        hypothesis_packet=hypothesis_packet,
+        feature_engineering_plan=feature_engineering_plan,
+        tracker_entries=tracker_entries,
+    )
     hypothesis_meta = (
         strategist.last_iteration_meta
         if isinstance(getattr(strategist, "last_iteration_meta", None), dict)
@@ -22197,8 +22509,33 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         and hypothesis_technique
         and hypothesis_technique.upper() != "NO_OP"
     )
+    optimization_context = {
+        "policy": hybrid_policy_meta,
+        "metric_snapshot": {
+            "primary_metric_name": metric_name,
+            "baseline_metric": float(baseline_value),
+            "best_metric_so_far": float(best_metric_so_far if best_metric_so_far is not None else baseline_value),
+            "higher_is_better": bool(metric_higher_is_better),
+            "min_delta": float(min_delta),
+        },
+        "contract_lock": _build_metric_round_contract_lock(contract, output_paths, metric_name),
+        "active_hypothesis": compress_long_lists(hypothesis_packet or {})[0],
+        "experiment_tracker_recent": compress_long_lists((tracker_entries or [])[-5:])[0],
+        "round_history_recent": compress_long_lists((round_history or [])[-4:])[0],
+    }
+    history_policy_line = (
+        "METRIC_IMPROVEMENT_POLICY: phase="
+        + str(hybrid_policy_meta.get("phase") or "explore")
+        + " bundle_size="
+        + str(hybrid_policy_meta.get("bundle_size") or 1)
+        + " min_delta="
+        + str(hybrid_policy_meta.get("min_delta"))
+        + " patience="
+        + str(hybrid_policy_meta.get("patience"))
+    )
 
     history = list(state.get("feedback_history", []) or [])
+    history.append(history_policy_line)
     history.append(feedback_block)
     state["feedback_history"] = history[-25:]
 
@@ -22217,6 +22554,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "feature_engineering_plan": feature_engineering_plan,
         "advisor_critique_packet": critique_packet,
         "iteration_hypothesis_packet": hypothesis_packet,
+        "optimization_context": optimization_context,
         "metric_round_enforcement": {
             "must_apply_hypothesis": bool(enforce_apply_hypothesis),
             "forbid_noop": bool(enforce_apply_hypothesis),
@@ -22251,6 +22589,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             "higher_is_better": bool(metric_higher_is_better),
             "feature_engineering_plan": feature_engineering_plan,
         },
+        "optimization_context": optimization_context,
         "feedback": {
             "reviewer": feedback_block.strip(),
             "qa": "",
@@ -22280,6 +22619,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
 
     state["ml_improvement_critique_packet"] = critique_packet
     state["ml_improvement_hypothesis_packet"] = hypothesis_packet
+    state["ml_optimization_context"] = optimization_context
     state["ml_improvement_apply_guard_report"] = {}
     state["ml_improvement_round_active"] = True
     state["ml_improvement_round_count"] = int(round_id)
@@ -22344,6 +22684,8 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
                     "action": hypothesis_packet.get("action"),
                     "technique": hypothesis.get("technique"),
                     "signature": tracker_context.get("signature"),
+                    "phase": hybrid_policy_meta.get("phase"),
+                    "bundle_techniques": hybrid_policy_meta.get("bundle_techniques"),
                     "editor_mode_forced": True,
                 },
             )
@@ -22974,7 +23316,13 @@ def check_evaluation(state: AgentState):
         state["stop_reason"] = "ADVISORY_ONLY"
         return "approved"
 
-    if not metric_nodes_managed and _bootstrap_metric_improvement_round(state, contract):
+    # Legacy direct-call compatibility path (unit tests and isolated helpers):
+    # when the metric-improvement node-management key is absent, allow inline bootstrap.
+    # In compiled graph execution, this key is always present and bootstrap happens via dedicated nodes.
+    if (
+        "metric_improvement_nodes_managed" not in state
+        and _bootstrap_metric_improvement_round(state, contract)
+    ):
         rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
         round_count = int(state.get("ml_improvement_round_count", 0) or 0)
         budget_left = max(0, rounds_allowed - round_count)

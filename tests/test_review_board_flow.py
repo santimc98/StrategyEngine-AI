@@ -231,3 +231,60 @@ def test_run_review_board_drops_spurious_failed_areas_when_packets_are_clean(tmp
     with open("data/review_board_verdict.json", "r", encoding="utf-8") as f:
         payload = json.load(f)
     assert payload.get("failed_areas") == []
+
+
+def test_run_review_board_preserves_metric_optimization_handoff(tmp_path, monkeypatch):
+    class _StubBoardApproved:
+        def __init__(self):
+            self.last_prompt = None
+            self.last_response = None
+
+        def adjudicate(self, _context):
+            return {
+                "status": "APPROVED",
+                "summary": "Round approved.",
+                "failed_areas": [],
+                "required_actions": [],
+                "confidence": "high",
+                "evidence": [],
+            }
+
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardApproved())
+    state = {
+        "review_verdict": "APPROVED",
+        "review_feedback": "Round approved.",
+        "feedback_history": [],
+        "ml_improvement_round_active": True,
+        "last_gate_context": {"failed_gates": [], "required_fixes": []},
+        "ml_improvement_hypothesis_packet": {
+            "action": "APPLY",
+            "hypothesis": {"technique": "missing_indicators", "target_columns": ["ALL_NUMERIC"]},
+        },
+        "ml_improvement_critique_packet": {"analysis_summary": "baseline stable"},
+        "iteration_handoff": {
+            "mode": "optimize",
+            "source": "actor_critic_metric_improvement",
+            "optimization_context": {"policy": {"phase": "explore"}},
+            "hypothesis_packet": {
+                "action": "APPLY",
+                "hypothesis": {"technique": "missing_indicators", "target_columns": ["ALL_NUMERIC"]},
+            },
+            "critic_packet": {"analysis_summary": "baseline stable"},
+            "patch_objectives": ["Apply active hypothesis."],
+        },
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False},
+            "result_evaluator": {"status": "APPROVED"},
+            "reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "APPROVED"},
+            "results_advisor": {"status": "APPROVED"},
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+    handoff = result.get("iteration_handoff", {})
+    assert handoff.get("mode") == "optimize"
+    assert handoff.get("source") == "actor_critic_metric_improvement"
+    assert isinstance(handoff.get("hypothesis_packet"), dict) and handoff.get("hypothesis_packet")

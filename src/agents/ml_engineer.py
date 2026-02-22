@@ -524,6 +524,13 @@ class MLEngineerAgent:
         contract_focus = raw.get("contract_focus") if isinstance(raw.get("contract_focus"), dict) else {}
         quality_focus = raw.get("quality_focus") if isinstance(raw.get("quality_focus"), dict) else {}
         optimization_focus_raw = raw.get("optimization_focus") if isinstance(raw.get("optimization_focus"), dict) else {}
+        optimization_context_raw = raw.get("optimization_context") if isinstance(raw.get("optimization_context"), dict) else {}
+        if not optimization_context_raw:
+            optimization_context_raw = (
+                gate_context.get("optimization_context")
+                if isinstance(gate_context.get("optimization_context"), dict)
+                else {}
+            )
         feedback = raw.get("feedback") if isinstance(raw.get("feedback"), dict) else {}
         critic_packet = raw.get("critic_packet") if isinstance(raw.get("critic_packet"), dict) else {}
         if not critic_packet:
@@ -620,6 +627,40 @@ class MLEngineerAgent:
                     else {}
                 ),
             }
+        optimization_context: Dict[str, Any] = {}
+        if optimization_context_raw:
+            optimization_context = {
+                "policy": (
+                    optimization_context_raw.get("policy")
+                    if isinstance(optimization_context_raw.get("policy"), dict)
+                    else {}
+                ),
+                "metric_snapshot": (
+                    optimization_context_raw.get("metric_snapshot")
+                    if isinstance(optimization_context_raw.get("metric_snapshot"), dict)
+                    else {}
+                ),
+                "contract_lock": (
+                    optimization_context_raw.get("contract_lock")
+                    if isinstance(optimization_context_raw.get("contract_lock"), dict)
+                    else {}
+                ),
+                "active_hypothesis": (
+                    optimization_context_raw.get("active_hypothesis")
+                    if isinstance(optimization_context_raw.get("active_hypothesis"), dict)
+                    else {}
+                ),
+                "experiment_tracker_recent": (
+                    optimization_context_raw.get("experiment_tracker_recent")
+                    if isinstance(optimization_context_raw.get("experiment_tracker_recent"), list)
+                    else []
+                ),
+                "round_history_recent": (
+                    optimization_context_raw.get("round_history_recent")
+                    if isinstance(optimization_context_raw.get("round_history_recent"), list)
+                    else []
+                ),
+            }
 
         return {
             "handoff_version": raw.get("handoff_version") or "v1",
@@ -640,6 +681,7 @@ class MLEngineerAgent:
                 "evidence": evidence_focus,
             },
             "optimization_focus": optimization_focus,
+            "optimization_context": optimization_context,
             "feedback": {
                 "reviewer": str(feedback.get("reviewer") or gate_context.get("feedback") or "").strip(),
                 "qa": str(feedback.get("qa") or "").strip(),
@@ -811,6 +853,21 @@ class MLEngineerAgent:
                 + self._serialize_json_for_prompt(
                     optimization_focus,
                     max_chars=2200,
+                    max_str_len=280,
+                    max_list_items=30,
+                )
+            )
+        optimization_context = (
+            handoff_payload.get("optimization_context")
+            if isinstance(handoff_payload.get("optimization_context"), dict)
+            else {}
+        )
+        if optimization_context:
+            _append_chunk(
+                "OPTIMIZATION_CONTEXT_JSON:\n"
+                + self._serialize_json_for_prompt(
+                    optimization_context,
+                    max_chars=2600,
                     max_str_len=280,
                     max_list_items=30,
                 )
@@ -2941,6 +2998,38 @@ $strategy_json
         # V4.1: No spec_extraction - removed
         execution_contract_compact = self._compact_execution_contract(execution_contract_input)
         execution_contract_compact = compress_long_lists(execution_contract_compact)[0]
+        raw_handoff = iteration_handoff if isinstance(iteration_handoff, dict) else {}
+        raw_gate_context = gate_context if isinstance(gate_context, dict) else {}
+        raw_handoff_mode = str(raw_handoff.get("mode") or "").strip().lower()
+        raw_handoff_source = str(
+            raw_handoff.get("source") or raw_gate_context.get("source") or ""
+        ).strip().lower()
+        raw_editor_constraints = (
+            raw_handoff.get("editor_constraints")
+            if isinstance(raw_handoff.get("editor_constraints"), dict)
+            else {}
+        )
+        raw_status = str(
+            raw_gate_context.get("status")
+            or (raw_handoff.get("quality_focus", {}).get("status") if isinstance(raw_handoff.get("quality_focus"), dict) else "")
+            or ""
+        ).strip().upper()
+        optimization_round_hint = bool(
+            previous_code
+            and (
+                raw_handoff_mode in {"optimize", "metric_optimize", "improve"}
+                or "metric_improvement" in raw_handoff_source
+                or "actor_critic" in raw_handoff_source
+                or raw_status in {"OPTIMIZATION_REQUIRED", "IMPROVEMENT_REQUIRED"}
+                or bool(raw_editor_constraints.get("must_apply_hypothesis"))
+            )
+        )
+        canonical_columns_hint = (
+            execution_contract_compact.get("canonical_columns")
+            or execution_contract_input.get("canonical_columns")
+            or ml_view.get("canonical_columns")
+            or []
+        )
         ml_view_whitelist = {
             "required_outputs",
             "artifact_requirements",
@@ -2962,6 +3051,61 @@ $strategy_json
         ml_view_payload = {
             k: v for k, v in (ml_view or {}).items() if k in ml_view_whitelist and v not in (None, "", [], {})
         }
+        if optimization_round_hint:
+            validation_lock = (
+                ml_view_payload.get("validation_requirements")
+                if isinstance(ml_view_payload.get("validation_requirements"), dict)
+                else (
+                    execution_contract_input.get("validation_requirements")
+                    if isinstance(execution_contract_input.get("validation_requirements"), dict)
+                    else {}
+                )
+            )
+            allowed_sets_lock = (
+                ml_view_payload.get("allowed_feature_sets")
+                if isinstance(ml_view_payload.get("allowed_feature_sets"), dict)
+                else (
+                    execution_contract_input.get("allowed_feature_sets")
+                    if isinstance(execution_contract_input.get("allowed_feature_sets"), dict)
+                    else {}
+                )
+            )
+            column_roles_lock = (
+                ml_view_payload.get("column_roles")
+                if isinstance(ml_view_payload.get("column_roles"), dict)
+                else (
+                    execution_contract_input.get("column_roles")
+                    if isinstance(execution_contract_input.get("column_roles"), dict)
+                    else {}
+                )
+            )
+            ml_view_payload = {
+                "required_outputs": required_deliverables[:12],
+                "validation_requirements": {
+                    "primary_metric": validation_lock.get("primary_metric"),
+                    "method": validation_lock.get("method"),
+                    "split_column": validation_lock.get("split_column"),
+                    "params": validation_lock.get("params"),
+                },
+                "allowed_feature_sets": {
+                    "model_features": [
+                        str(item)
+                        for item in (allowed_sets_lock.get("model_features") or [])[:60]
+                        if str(item).strip()
+                    ],
+                    "forbidden_features": [
+                        str(item)
+                        for item in (allowed_sets_lock.get("forbidden_features") or [])[:24]
+                        if str(item).strip()
+                    ],
+                },
+                "column_roles": column_roles_lock,
+                "canonical_columns": [
+                    str(item) for item in (canonical_columns_hint or [])[:80] if str(item).strip()
+                ],
+                "qa_gates": ml_view_payload.get("qa_gates") or [],
+                "reviewer_gates": ml_view_payload.get("reviewer_gates") or [],
+            }
         ml_view_payload = compress_long_lists(ml_view_payload)[0]
         ml_view_json = self._serialize_json_for_prompt(
             ml_view_payload,
@@ -2990,12 +3134,7 @@ $strategy_json
             max_str_len=500,
             max_list_items=80,
         )
-        canonical_columns_source = (
-            execution_contract_compact.get("canonical_columns")
-            or execution_contract_input.get("canonical_columns")
-            or ml_view.get("canonical_columns")
-            or []
-        )
+        canonical_columns_source = canonical_columns_hint
         required_columns_payload: Any = []
         artifact_reqs = execution_contract_input.get("artifact_requirements")
         if isinstance(artifact_reqs, dict):
@@ -3038,6 +3177,19 @@ $strategy_json
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
         )
+        if optimization_round_hint and isinstance(data_sample_context, dict):
+            data_sample_context = {
+                "path": data_sample_context.get("path"),
+                "status": data_sample_context.get("status"),
+                "shape_preview": data_sample_context.get("shape_preview"),
+                "dtypes_preview": data_sample_context.get("dtypes_preview"),
+                "preview_columns": (
+                    data_sample_context.get("preview_columns")
+                    if isinstance(data_sample_context.get("preview_columns"), list)
+                    else []
+                )[:40],
+                "preview_columns_truncated": data_sample_context.get("preview_columns_truncated"),
+            }
         data_sample_context_json = self._serialize_json_for_prompt(
             data_sample_context,
             max_chars=7000,
@@ -3045,6 +3197,15 @@ $strategy_json
             max_list_items=60,
         )
         cleaned_data_summary_payload = self._compact_cleaned_data_summary_for_prompt(cleaned_data_summary_min or {})
+        if optimization_round_hint and isinstance(cleaned_data_summary_payload, dict):
+            cleaned_data_summary_payload = {
+                "row_count": cleaned_data_summary_payload.get("row_count"),
+                "column_count": cleaned_data_summary_payload.get("column_count"),
+                "missing_required_columns": cleaned_data_summary_payload.get("missing_required_columns", []),
+                "role_dtype_warnings": cleaned_data_summary_payload.get("role_dtype_warnings", []),
+                "family_aggregate": cleaned_data_summary_payload.get("family_aggregate", []),
+                "source": cleaned_data_summary_payload.get("source"),
+            }
         column_dtype_targets = ml_view.get("column_dtype_targets")
         if not isinstance(column_dtype_targets, dict) or not column_dtype_targets:
             column_dtype_targets = execution_contract_input.get("column_dtype_targets")
@@ -3072,21 +3233,22 @@ $strategy_json
             _optional_parts.append(f"- Iteration Memory: {_iter_mem}")
         if iteration_memory_block:
             _optional_parts.append(f"- Iteration Memory (compact): {iteration_memory_block}")
-        for _opt_key, _opt_label in [
-            ("decisioning_requirements", "Decisioning Requirements"),
-            ("alignment_requirements", "Alignment Requirements"),
-            ("feature_semantics", "Feature Semantics"),
-            ("business_sanity_checks", "Business Sanity Checks"),
-        ]:
-            _opt_val = execution_contract_input.get(_opt_key)
-            if _opt_val and _opt_val != {} and _opt_val != []:
+        if not optimization_round_hint:
+            for _opt_key, _opt_label in [
+                ("decisioning_requirements", "Decisioning Requirements"),
+                ("alignment_requirements", "Alignment Requirements"),
+                ("feature_semantics", "Feature Semantics"),
+                ("business_sanity_checks", "Business Sanity Checks"),
+            ]:
+                _opt_val = execution_contract_input.get(_opt_key)
+                if _opt_val and _opt_val != {} and _opt_val != []:
+                    _optional_parts.append(
+                        f"- {_opt_label}: {self._serialize_json_for_prompt(_opt_val, max_chars=3000, max_str_len=400, max_list_items=60)}"
+                    )
+            if signal_summary and signal_summary != {}:
                 _optional_parts.append(
-                    f"- {_opt_label}: {self._serialize_json_for_prompt(_opt_val, max_chars=3000, max_str_len=400, max_list_items=60)}"
+                    f"- Signal Summary: {self._serialize_json_for_prompt(signal_summary, max_chars=3000, max_str_len=400, max_list_items=60)}"
                 )
-        if signal_summary and signal_summary != {}:
-            _optional_parts.append(
-                f"- Signal Summary: {self._serialize_json_for_prompt(signal_summary, max_chars=3000, max_str_len=400, max_list_items=60)}"
-            )
         _optional_context_block = "\n        ".join(_optional_parts) if _optional_parts else ""
 
         render_kwargs = dict(
@@ -3266,6 +3428,9 @@ $strategy_json
         OPTIMIZATION TARGET:
         $optimization_target
 
+        OPTIMIZATION CONTEXT (authoritative current round):
+        $optimization_context
+
         FEATURE ENGINEERING PLAN (contract):
         $feature_engineering_plan
 
@@ -3302,9 +3467,10 @@ $strategy_json
         OPTIMIZATION RULES:
         1) Return ONLY the full updated Python script. No markdown, no explanation.
         2) Apply the active hypothesis with material feature-engineering edits end-to-end.
-        3) Prioritize feature_engineering_plan + hypothesis_packet over legacy reviewer text.
-        4) Keep model family, CV/data-split protocol, and contract output paths stable.
-        5) Avoid unrelated refactors; edit only the regions needed for metric improvement.
+        3) Prioritize optimization_context + hypothesis_packet over legacy reviewer text.
+        4) Treat contract fields as immutable lock constraints (paths/split/CV/gates), not as re-planning input.
+        5) Keep model family, CV/data-split protocol, and contract output paths stable.
+        6) Avoid unrelated refactors; edit only the regions needed for metric improvement.
         """
 
         USER_IMPROVE_TEMPLATE = """
@@ -3434,6 +3600,17 @@ $strategy_json
                     max_str_len=260,
                     max_list_items=25,
                 )
+                optimization_context = (
+                    handoff_payload.get("optimization_context")
+                    if isinstance(handoff_payload.get("optimization_context"), dict)
+                    else {}
+                )
+                optimization_context_block = self._serialize_json_for_prompt(
+                    optimization_context,
+                    max_chars=2800,
+                    max_str_len=260,
+                    max_list_items=30,
+                )
                 feature_engineering_plan = (
                     optimization_focus.get("feature_engineering_plan")
                     if isinstance(optimization_focus.get("feature_engineering_plan"), dict)
@@ -3449,6 +3626,7 @@ $strategy_json
                     USER_EDITOR_OPTIMIZATION_TEMPLATE,
                     phase_classification=phase_classification,
                     optimization_target=optimization_target or "{}",
+                    optimization_context=optimization_context_block or "{}",
                     feature_engineering_plan=feature_engineering_plan_block or "{}",
                     optimization_feedback=feedback_text or "No optimization feedback provided.",
                     last_run_memory=last_run_memory_block,

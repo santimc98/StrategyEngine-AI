@@ -3,7 +3,9 @@ from pathlib import Path
 
 from src.graph.graph import (
     check_evaluation,
+    check_metric_improvement_bootstrap_route,
     _is_improvement,
+    run_metric_improvement_bootstrap,
     run_metric_improvement_finalize,
     _should_run_metric_improvement_round,
     _snapshot_ml_outputs,
@@ -230,7 +232,7 @@ def test_finalize_round_forced_by_budget_exceeded_stops_loop(tmp_path, monkeypat
     assert updates.get("ml_improvement_force_finalize_reason") == ""
 
 
-def test_check_evaluation_bootstraps_next_round_after_continue(tmp_path, monkeypatch) -> None:
+def test_bootstrap_node_activates_next_round_after_continue(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
     (tmp_path / "data" / "metrics.json").write_text(json.dumps({"roc_auc": 0.8002}), encoding="utf-8")
@@ -335,10 +337,12 @@ def test_check_evaluation_bootstraps_next_round_after_continue(tmp_path, monkeyp
         },
         "feedback_history": [],
     }
-    route = check_evaluation(state)
+    updates = run_metric_improvement_bootstrap(state)
+    merged_state = {**state, **updates}
+    route = check_metric_improvement_bootstrap_route(merged_state)
     assert route == "retry"
-    assert state.get("ml_improvement_round_active") is True
-    assert int(state.get("ml_improvement_round_count", 0)) == 2
+    assert merged_state.get("ml_improvement_round_active") is True
+    assert int(merged_state.get("ml_improvement_round_count", 0)) == 2
 
 
 def test_metric_round_apply_guard_requires_material_edit() -> None:

@@ -135,3 +135,134 @@ def test_bootstrap_metric_improvement_round_builds_actor_critic_handoff(tmp_path
     event_types = [evt[1] for evt in events]
     assert "metric_improvement_round_start" in event_types
     assert "metric_improvement_round_activated" in event_types
+
+
+def test_bootstrap_metric_improvement_round_exploit_phase_builds_compatible_bundle(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod, "log_run_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        graph_mod,
+        "load_recent_experiment_entries",
+        lambda run_id, k=20: [
+            {
+                "event": "candidate_evaluated",
+                "approved": True,
+                "delta": 0.0012,
+                "technique": "Heart Rate Reserve Proxy",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_critique_packet",
+        lambda _ctx: {
+            "packet_type": "advisor_critique_packet",
+            "packet_version": "1.0",
+            "run_id": "run_exploit",
+            "iteration": 2,
+            "timestamp_utc": "2026-02-19T10:00:00+00:00",
+            "primary_metric_name": "roc_auc",
+            "higher_is_better": True,
+            "metric_comparison": {
+                "baseline_value": 0.90,
+                "candidate_value": 0.90,
+                "delta_abs": 0.0,
+                "delta_rel": 0.0,
+                "min_delta_required": 0.0005,
+                "meets_min_delta": False,
+            },
+            "validation_signals": {"validation_mode": "cv"},
+            "error_modes": [],
+            "risk_flags": [],
+            "active_gates_context": [],
+            "analysis_summary": "Stagnation detected.",
+            "strictly_no_code_advice": True,
+        },
+    )
+    monkeypatch.setattr(
+        graph_mod.strategist,
+        "generate_iteration_hypothesis",
+        lambda _ctx: {
+            "packet_type": "iteration_hypothesis_packet",
+            "packet_version": "1.0",
+            "run_id": "run_exploit",
+            "iteration": 3,
+            "hypothesis_id": "h_abcdef99",
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "Type Casting",
+                "objective": "Normalize dtypes",
+                "target_columns": ["ALL_NUMERIC"],
+                "feature_scope": "model_features",
+                "params": {},
+                "expected_effect": {"target_error_modes": ["metric_stagnation"], "direction": "positive"},
+            },
+            "application_constraints": {
+                "edit_mode": "incremental",
+                "max_code_regions_to_change": 3,
+                "forbid_replanning": True,
+                "forbid_model_family_switch": True,
+                "must_keep": ["data_split_logic", "cv_protocol", "output_paths_contract"],
+            },
+            "success_criteria": {
+                "primary_metric_name": "roc_auc",
+                "min_delta": 0.0005,
+                "must_pass_active_gates": True,
+            },
+            "tracker_context": {"signature": "hyp_type_casting", "is_duplicate": False, "duplicate_of": None},
+            "explanation": "Single hypothesis selected.",
+            "fallback_if_not_applicable": "NO_OP",
+        },
+    )
+    monkeypatch.setattr(graph_mod.results_advisor, "last_critique_meta", {"mode": "deterministic", "source": "deterministic", "provider": "none", "model": None})
+    monkeypatch.setattr(graph_mod.strategist, "last_iteration_meta", {"mode": "deterministic", "source": "deterministic", "model": None})
+
+    metrics_path = tmp_path / "data" / "metrics.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps({"roc_auc": 0.90}), encoding="utf-8")
+
+    contract = {
+        "iteration_policy": {"metric_improvement_rounds": 4, "metric_improvement_patience": 2, "metric_min_delta": 0.0005},
+        "feature_engineering_plan": {
+            "techniques": [
+                {"technique": "Type Casting", "columns": ["ALL_NUMERIC"]},
+                {"technique": "Heart Rate Reserve Proxy", "columns": ["max_hr", "age"]},
+            ],
+            "derived_columns": [],
+            "notes": "",
+        },
+        "artifact_requirements": {"required_files": [{"path": "data/metrics.json"}]},
+        "required_outputs": ["data/metrics.json"],
+        "column_roles": {},
+        "allowed_feature_sets": {"model_features": ["age", "max_hr"], "forbidden_features": []},
+        "validation_requirements": {"primary_metric": "roc_auc", "split_column": "is_train"},
+    }
+    state = {
+        "run_id": "run_exploit",
+        "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_attempted": False,
+        "ml_improvement_round_count": 1,
+        "ml_improvement_no_improve_streak": 1,
+        "ml_improvement_patience": 2,
+        "iteration_count": 2,
+        "generated_code": "def train():\n    pass\n",
+        "feedback_history": [],
+    }
+
+    activated = graph_mod._bootstrap_metric_improvement_round(state, contract)
+    assert activated is True
+    handoff = state.get("iteration_handoff", {})
+    optimization_context = handoff.get("optimization_context") if isinstance(handoff.get("optimization_context"), dict) else {}
+    policy = optimization_context.get("policy") if isinstance(optimization_context.get("policy"), dict) else {}
+    hypothesis = handoff.get("hypothesis_packet", {}).get("hypothesis", {})
+    bundle = hypothesis.get("params", {}).get("bundle_techniques", [])
+
+    assert policy.get("phase") == "exploit"
+    assert len(bundle) >= 2
+    assert "Type Casting" in bundle
+    assert "Heart Rate Reserve Proxy" in bundle

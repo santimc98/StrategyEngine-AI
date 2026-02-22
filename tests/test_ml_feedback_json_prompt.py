@@ -90,6 +90,11 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
                 "higher_is_better": True,
                 "feature_engineering_plan": {"techniques": [{"technique": "missing_indicators"}]},
             },
+            "optimization_context": {
+                "policy": {"phase": "explore", "bundle_size": 1},
+                "metric_snapshot": {"primary_metric_name": "roc_auc", "baseline_metric": 0.80},
+                "contract_lock": {"required_outputs": ["data/metrics.json"]},
+            },
             "editor_constraints": {
                 "must_apply_hypothesis": True,
                 "forbid_noop": True,
@@ -109,5 +114,6 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
     prompt = str(agent.last_prompt or "")
     assert "MODE: CODE_EDITOR_MODE_OPTIMIZATION" in prompt
     assert "OPTIMIZATION TARGET:" in prompt
+    assert "OPTIMIZATION CONTEXT (authoritative current round):" in prompt
     assert "FEATURE ENGINEERING PLAN (contract):" in prompt
     assert "HYPOTHESIS_PACKET_JSON" in prompt
