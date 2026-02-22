@@ -17,3 +17,10 @@ def test_minimal_contract_prompt_defines_column_roles_semantics():
     prompt = MINIMAL_CONTRACT_COMPILER_PROMPT
     assert "Role definitions (ML execution context)" in prompt
     assert "outcome MUST contain only the target" in prompt
+
+
+def test_minimal_contract_prompt_declares_phased_compilation():
+    prompt = MINIMAL_CONTRACT_COMPILER_PROMPT
+    assert "Phased contract compilation protocol" in prompt
+    assert "Phase 1 FACTS_EXTRACTOR" in prompt
+    assert "Phase 4 VALIDATOR_REPAIR" in prompt

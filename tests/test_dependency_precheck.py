@@ -48,6 +48,13 @@ def test_dependency_precheck_allows_lightgbm_on_cloudrun_without_contract_hint()
     assert "lightgbm" not in result["blocked"]
 
 
+def test_dependency_precheck_allows_catboost_on_cloudrun_without_contract_hint():
+    code = "import catboost\n"
+    result = check_dependency_precheck(code, required_dependencies=[], backend_profile="cloudrun")
+    assert "catboost" not in result["banned"]
+    assert "catboost" not in result["blocked"]
+
+
 def test_dependency_precheck_allows_joblib_on_cloudrun():
     code = "import joblib\n"
     result = check_dependency_precheck(code, required_dependencies=[], backend_profile="cloudrun")

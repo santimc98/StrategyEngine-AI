@@ -83,6 +83,25 @@ You are an Execution Contract Compiler for a multi-agent business intelligence s
 Goal:
 - Produce ONE JSON execution contract that downstream agents can execute and review.
 - Keep reasoning freedom, but obey a minimal stable interface.
+- Use phased contract compilation for robust, universal behavior across datasets/objectives.
+
+Phased contract compilation protocol (mandatory internal process):
+- Phase 1 FACTS_EXTRACTOR:
+  - Extract only grounded facts from provided inputs (strategy/objective/column inventory/profile).
+  - Resolve ambiguities conservatively; do not invent columns or artifacts.
+- Phase 2 CONTRACT_BUILDER:
+  - Fill the contract schema deterministically using required keys and scope constraints.
+  - Keep interfaces consumable by data_engineer, ml_engineer, QA, reviewers, and translator views.
+- Phase 3 GATE_COMPOSER:
+  - Compose executable gates with stable semantics (name/severity/params) and evidence-backed params.
+  - Prefer universal gate primitives; avoid one-off ad hoc gates when an equivalent primitive exists.
+- Phase 4 VALIDATOR_REPAIR:
+  - Run a strict self-check against schema/semantics and downstream-consumer compatibility.
+  - If issues exist, apply minimal edits; do not regenerate unrelated valid sections.
+
+Output discipline:
+- Return only the final contract JSON object.
+- Do not output phase traces, reasoning notes, or chain-of-thought.
 
 Return format:
 - Return ONLY valid JSON (no markdown, no code fences, no comments).
@@ -309,6 +328,41 @@ PLANNER_SEMANTIC_RESOLUTION_POLICY_V1 = {
     "dtype_semantic_guardrail": (
         "Choose dtype constraints compatible with observed value ranges; avoid narrow integer dtypes when out of range."
     ),
+}
+
+PHASED_CONTRACT_COMPILATION_PROTOCOL_V1 = {
+    "phase_1_facts_extractor": {
+        "goal": "derive grounded facts from input evidence only",
+        "rules": [
+            "no invented columns",
+            "no invented artifact paths",
+            "prefer direct evidence over inference",
+        ],
+    },
+    "phase_2_contract_builder": {
+        "goal": "populate required schema keys with scope-aware constraints",
+        "rules": [
+            "preserve downstream consumer compatibility",
+            "use stable canonical field shapes",
+            "keep required_outputs as list[str] paths",
+        ],
+    },
+    "phase_3_gate_composer": {
+        "goal": "emit executable gates with stable semantics",
+        "rules": [
+            "gate object shape: name/severity/params",
+            "prefer reusable universal gate primitives",
+            "bind gate params to evidence-backed columns/thresholds",
+        ],
+    },
+    "phase_4_validator_repair": {
+        "goal": "self-validate and patch minimally before return",
+        "rules": [
+            "fail-closed for schema/semantic violations",
+            "minimal-diff repair over full regeneration",
+            "preserve already-valid sections",
+        ],
+    },
 }
 
 
@@ -8569,6 +8623,7 @@ class ExecutionPlannerAgent:
             return (
                 "Repair the previous execution contract.\n"
                 "Return ONLY one valid JSON object (no markdown, no comments, no code fences).\n"
+                "Use phased repair: FACTS_EXTRACTOR -> CONTRACT_BUILDER -> GATE_COMPOSER -> VALIDATOR_REPAIR.\n"
                 "Patch policy: keep unchanged valid fields stable; modify ONLY fields needed to resolve listed issues.\n"
                 "Schema registry examples:\n"
                 + CONTRACT_SCHEMA_EXAMPLES_TEXT
@@ -9183,6 +9238,11 @@ class ExecutionPlannerAgent:
                 "You are Execution Contract Compiler.\n"
                 f"SECTION: {section_id}\n"
                 f"GOAL: {section_goal}\n"
+                "Use phased compilation for this SECTION:\n"
+                "- Phase 1 FACTS_EXTRACTOR: resolve facts relevant to this section only.\n"
+                "- Phase 2 CONTRACT_BUILDER: populate required section keys with canonical shapes.\n"
+                "- Phase 3 GATE_COMPOSER: if gates are in scope, emit executable {name,severity,params} objects.\n"
+                "- Phase 4 VALIDATOR_REPAIR: self-check this section and minimally fix before returning.\n"
                 "Return ONLY one JSON object.\n"
                 "Do not include markdown, comments, or explanations.\n"
                 "Schema registry examples:\n"
@@ -9333,6 +9393,11 @@ class ExecutionPlannerAgent:
                 "Repair the section output.\n"
                 f"SECTION: {section_id}\n"
                 f"GOAL: {section_goal}\n"
+                "Use phased repair for this SECTION:\n"
+                "- Phase 1 FACTS_EXTRACTOR: identify grounded constraints from ORIGINAL INPUTS.\n"
+                "- Phase 2 CONTRACT_BUILDER: preserve valid keys and patch only section-required fields.\n"
+                "- Phase 3 GATE_COMPOSER: normalize gates to executable shape and stable semantics.\n"
+                "- Phase 4 VALIDATOR_REPAIR: apply minimal edits until section checks pass.\n"
                 "Return ONLY one JSON object.\n"
                 "No markdown, no comments.\n"
                 "Patch policy: edit only fields required by this SECTION and listed issues; preserve already valid content.\n"
@@ -9660,6 +9725,7 @@ class ExecutionPlannerAgent:
                 "You are Execution Contract Compiler in progressive mode.\n"
                 "Pass 1 (deterministic scaffold) is already provided.\n"
                 "Your task is Pass 2: provide only judgment-driven updates as a JSON patch object.\n"
+                "Use phased compilation: FACTS_EXTRACTOR -> CONTRACT_BUILDER -> GATE_COMPOSER -> VALIDATOR_REPAIR.\n"
                 "Return ONLY one valid JSON object (no markdown/comments).\n"
                 "The object may contain only keys listed in ALLOWED_PATCH_FIELDS.\n"
                 "Do not remove mandatory scaffold structure. You may override scaffold fields only with evidence.\n"
@@ -9708,6 +9774,7 @@ class ExecutionPlannerAgent:
             )
             return (
                 "Repair the progressive judgment patch.\n"
+                "Use phased repair: FACTS_EXTRACTOR -> CONTRACT_BUILDER -> GATE_COMPOSER -> VALIDATOR_REPAIR.\n"
                 "Return ONLY one valid JSON object (no markdown/comments).\n"
                 "Patch policy: preserve valid updates; change only what fixes listed issues.\n"
                 "The object may contain only keys listed in ALLOWED_PATCH_FIELDS.\n"
@@ -10463,6 +10530,9 @@ evidence_policy:
 
 planner_semantic_resolution_policy:
 {json.dumps(PLANNER_SEMANTIC_RESOLUTION_POLICY_V1, indent=2)}
+
+phased_contract_compilation_protocol:
+{json.dumps(PHASED_CONTRACT_COMPILATION_PROTOCOL_V1, indent=2)}
 
 progressive_contract_construction_policy:
 {json.dumps({
