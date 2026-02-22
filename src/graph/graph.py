@@ -4072,6 +4072,7 @@ def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
     compliance_max = policy.get("compliance_bootstrap_max")
     metric_max = policy.get("metric_improvement_max")
     runtime_max = policy.get("runtime_fix_max")
+    total_max = policy.get("total_iteration_max")
     if compliance_max is None:
         for alias in ("compliance_retry_limit",):
             if policy.get(alias) is not None:
@@ -4087,6 +4088,11 @@ def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
             if policy.get(alias) is not None:
                 runtime_max = policy.get(alias)
                 break
+    if total_max is None:
+        for alias in ("max_total_iterations", "max_total_retries", "max_iterations_total", "total_retry_limit"):
+            if policy.get(alias) is not None:
+                total_max = policy.get(alias)
+                break
     plateau_window = policy.get("plateau_window")
     plateau_epsilon = policy.get("plateau_epsilon")
     out: Dict[str, Any] = {}
@@ -4094,6 +4100,7 @@ def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
         "compliance_bootstrap_max": compliance_max,
         "metric_improvement_max": metric_max,
         "runtime_fix_max": runtime_max,
+        "total_iteration_max": total_max,
         "plateau_window": plateau_window,
         "plateau_epsilon": plateau_epsilon,
     }.items():
@@ -4107,8 +4114,77 @@ def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
         except Exception:
             continue
     if out:
-        print(f"ITER_POLICY metric_improvement_max={out.get('metric_improvement_max')} runtime_fix_max={out.get('runtime_fix_max')} plateau_window={out.get('plateau_window')} epsilon={out.get('plateau_epsilon')}")
+        print(
+            "ITER_POLICY "
+            + f"metric_improvement_max={out.get('metric_improvement_max')} "
+            + f"runtime_fix_max={out.get('runtime_fix_max')} "
+            + f"total_iteration_max={out.get('total_iteration_max')} "
+            + f"plateau_window={out.get('plateau_window')} "
+            + f"epsilon={out.get('plateau_epsilon')}"
+        )
     return out or None
+
+
+def _coerce_nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        out = int(value)
+    except Exception:
+        return int(default)
+    if out < 0:
+        return int(default)
+    return out
+
+
+def _resolve_total_iteration_limit(
+    state: Dict[str, Any],
+    policy: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+) -> int:
+    """
+    Resolve a deterministic hard ceiling for global retry loops.
+    Priority:
+      1) explicit iteration_policy total cap
+      2) derived cap from per-phase budgets
+      3) legacy default fallback (6)
+    """
+    default_cap = _coerce_nonnegative_int(os.getenv("MAX_TOTAL_ITERATIONS_DEFAULT", "6"), default=6)
+    if default_cap <= 0:
+        default_cap = 6
+
+    if isinstance(policy, dict):
+        explicit = _coerce_nonnegative_int(policy.get("total_iteration_max"), default=0)
+        if explicit > 0:
+            return explicit
+
+        compliance_cap = _coerce_nonnegative_int(policy.get("compliance_bootstrap_max"), default=0)
+        metric_cap = _coerce_nonnegative_int(policy.get("metric_improvement_max"), default=0)
+        if metric_cap <= 0:
+            rounds_allowed = _coerce_nonnegative_int(
+                (state.get("ml_improvement_rounds_allowed") if isinstance(state, dict) else None),
+                default=0,
+            )
+            if rounds_allowed > 0:
+                metric_cap = rounds_allowed
+            else:
+                rounds_allowed, _, _ = _metric_improvement_policy(contract if isinstance(contract, dict) else {})
+                metric_cap = _coerce_nonnegative_int(rounds_allowed, default=0)
+        runtime_cap = _coerce_nonnegative_int(
+            policy.get("runtime_fix_max"),
+            default=_coerce_nonnegative_int(
+                state.get("max_runtime_fix_attempts") if isinstance(state, dict) else None,
+                default=0,
+            ),
+        )
+
+        derived = compliance_cap + metric_cap + runtime_cap
+        if derived > 0:
+            hard_ceiling = _coerce_nonnegative_int(os.getenv("MAX_TOTAL_ITERATIONS_HARD_CEILING", "24"), default=24)
+            if hard_ceiling <= 0:
+                hard_ceiling = 24
+            derived = min(derived, hard_ceiling)
+            return max(1, derived)
+
+    return default_cap
 
 def _classify_iteration_type(
     status: str,
@@ -23225,28 +23301,50 @@ def check_evaluation(state: AgentState):
 
     policy = _get_iteration_policy(state)
     last_iter_type = state.get("last_iteration_type")
-    metric_iters = state.get("metric_iterations", 0)
+    metric_iters = _coerce_nonnegative_int(state.get("metric_iterations", 0), default=0)
+    if metric_iters <= 0:
+        rounds_done = _coerce_nonnegative_int(state.get("ml_improvement_round_count", 0), default=0)
+        if rounds_done > 0:
+            metric_iters = rounds_done
+    if metric_iters <= 0:
+        total_iters = _coerce_nonnegative_int(state.get("iteration_count", 0), default=0)
+        compliance_iters = _coerce_nonnegative_int(state.get("compliance_iterations", 0), default=0)
+        metric_iters = max(0, total_iters - compliance_iters)
     metric_max = policy.get("metric_improvement_max") if policy else None
-    budget_left = (metric_max - metric_iters) if metric_max else "unlimited"
+    budget_left = max(0, metric_max - metric_iters) if metric_max else "unlimited"
+    total_limit = _resolve_total_iteration_limit(state, policy, contract)
+    total_iters = _coerce_nonnegative_int(state.get("iteration_count", 0), default=0)
     metric_name, metric_value, best_value = _get_metric_info()
+
+    if total_limit > 0 and total_iters >= total_limit:
+        print(
+            "WARNING: Total iteration limit reached. "
+            + f"Proceeding with current results (used={total_iters}, limit={total_limit})."
+        )
+        state["stop_reason"] = "BUDGET"
+        print(
+            f"ITER_DECISION type=total action=stop reason=BUDGET metric={metric_name}:{metric_value} "
+            + f"best={best_value} budget_left=0"
+        )
+        return "approved"
 
     if policy:
         compliance_max = policy.get("compliance_bootstrap_max")
         if last_iter_type == "compliance" and compliance_max:
             if state.get("compliance_iterations", 0) >= compliance_max:
                 print("WARNING: Compliance bootstrap limit reached. Proceeding with current results.")
+                state["stop_reason"] = "BUDGET"
                 print(f"ITER_DECISION type=compliance action=stop reason=BUDGET metric={metric_name}:{metric_value} best={best_value} budget_left=0")
                 return "approved"
         if last_iter_type != "compliance" and metric_max:
             if metric_iters >= metric_max:
                 print("WARNING: Metric-iteration limit reached. Proceeding with current results.")
+                state["stop_reason"] = "BUDGET"
                 print(f"ITER_DECISION type=metric action=stop reason=BUDGET metric={metric_name}:{metric_value} best={best_value} budget_left=0")
                 return "approved"
     else:
-        if state.get('iteration_count', 0) >= 6:
-            print("WARNING: Max iterations reached. Proceeding with current results.")
-            print(f"ITER_DECISION type=metric action=stop reason=BUDGET metric={metric_name}:{metric_value} best={best_value} budget_left=0")
-            return "approved"
+        # Legacy behavior is now covered by _resolve_total_iteration_limit().
+        pass
 
     # Adaptive stop: if case alignment degrades or stagnates, stop early.
     if last_iter_type == "compliance":
