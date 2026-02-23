@@ -59,3 +59,15 @@ if target_var == 0:
     raise ValueError("Target variance is zero; cannot train.")
 """
     _assert_guard_detected_and_not_rejected(code)
+
+
+def test_variance_guard_detects_unique_len_alias_le_one() -> None:
+    code = """
+import pandas as pd
+df = pd.read_csv("data/cleaned_data.csv")
+target_num = pd.to_numeric(df["target"], errors="coerce")
+unique_targets = target_num.dropna().unique()
+if len(unique_targets) <= 1:
+    raise ValueError("Target has no variance; cannot train.")
+"""
+    _assert_guard_detected_and_not_rejected(code)

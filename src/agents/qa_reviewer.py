@@ -1063,6 +1063,8 @@ class _StaticQAScanner(ast.NodeVisitor):
         self.has_split_fabrication = False
         self.has_variance_guard = False
         self.nunique_aliases: set[str] = set()
+        self.unique_aliases: set[str] = set()
+        self.unique_len_aliases: set[str] = set()
         self.var_aliases: set[str] = set()
         self.std_aliases: set[str] = set()
         self.has_leakage_assert = False
@@ -1204,8 +1206,21 @@ class _StaticQAScanner(ast.NodeVisitor):
 
         for name in target_names:
             self.nunique_aliases.discard(name)
+            self.unique_aliases.discard(name)
+            self.unique_len_aliases.discard(name)
             self.var_aliases.discard(name)
             self.std_aliases.discard(name)
+
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "len"
+            and value.args
+        ):
+            inner_kind = self._guard_stat_kind_from_expr(value.args[0])
+            if inner_kind in {"nunique", "unique"}:
+                self.unique_len_aliases.update(target_names)
+            return
 
         if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Attribute):
             return
@@ -1214,6 +1229,8 @@ class _StaticQAScanner(ast.NodeVisitor):
             return
         if attr == "nunique":
             self.nunique_aliases.update(target_names)
+        elif attr == "unique":
+            self.unique_aliases.update(target_names)
         elif attr == "var":
             self.var_aliases.update(target_names)
         elif attr == "std":
@@ -1222,12 +1239,25 @@ class _StaticQAScanner(ast.NodeVisitor):
     def _guard_stat_kind_from_expr(self, expr: ast.AST) -> Optional[str]:
         if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
             attr = str(expr.func.attr or "").strip()
-            if attr in {"nunique", "var", "std"}:
+            if attr in {"nunique", "unique", "var", "std"}:
                 return attr
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id == "len"
+            and expr.args
+        ):
+            inner_kind = self._guard_stat_kind_from_expr(expr.args[0])
+            if inner_kind in {"nunique", "unique"}:
+                return "nunique"
         if isinstance(expr, ast.Name):
             name = expr.id
             if name in self.nunique_aliases:
                 return "nunique"
+            if name in self.unique_len_aliases:
+                return "nunique"
+            if name in self.unique_aliases:
+                return "unique"
             if name in self.var_aliases:
                 return "var"
             if name in self.std_aliases:

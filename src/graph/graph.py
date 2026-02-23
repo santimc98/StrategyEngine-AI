@@ -23473,7 +23473,8 @@ def check_evaluation(state: AgentState):
     total_iters = _coerce_nonnegative_int(state.get("iteration_count", 0), default=0)
     metric_name, metric_value, best_value = _get_metric_info()
 
-    if total_limit > 0 and total_iters >= total_limit:
+    allow_metric_continue_over_total = bool(state.get("ml_improvement_continue"))
+    if total_limit > 0 and total_iters >= total_limit and not allow_metric_continue_over_total:
         print(
             "WARNING: Total iteration limit reached. "
             + f"Proceeding with current results (used={total_iters}, limit={total_limit})."
@@ -23571,13 +23572,18 @@ def check_evaluation(state: AgentState):
         state["stop_reason"] = "ADVISORY_ONLY"
         return "approved"
 
-    # Legacy direct-call compatibility path (unit tests and isolated helpers):
-    # when the metric-improvement node-management key is absent, allow inline bootstrap.
-    # In compiled graph execution, this key is always present and bootstrap happens via dedicated nodes.
-    if (
+    # Inline bootstrap compatibility path (unit tests and controlled continue-round fallback):
+    # - Legacy direct-call helpers may not include the node-management key.
+    # - Finalize node can set metric_improvement_nodes_managed=False with ml_improvement_continue=True.
+    #   In that case we must bootstrap the next round before routing back to engineer.
+    allow_inline_bootstrap = (
         "metric_improvement_nodes_managed" not in state
-        and _bootstrap_metric_improvement_round(state, contract)
-    ):
+        or (
+            not bool(state.get("metric_improvement_nodes_managed"))
+            and bool(state.get("ml_improvement_continue"))
+        )
+    )
+    if allow_inline_bootstrap and _bootstrap_metric_improvement_round(state, contract):
         rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
         round_count = int(state.get("ml_improvement_round_count", 0) or 0)
         budget_left = max(0, rounds_allowed - round_count)

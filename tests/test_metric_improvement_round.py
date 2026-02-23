@@ -345,6 +345,41 @@ def test_bootstrap_node_activates_next_round_after_continue(tmp_path, monkeypatc
     assert int(merged_state.get("ml_improvement_round_count", 0)) == 2
 
 
+def test_check_evaluation_bootstraps_next_round_when_continue_flag_is_set(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    def _fake_bootstrap(state, contract):
+        calls["count"] += 1
+        state["ml_improvement_round_active"] = True
+        state["ml_improvement_round_count"] = 2
+        state["ml_improvement_rounds_allowed"] = 3
+        return True
+
+    monkeypatch.setattr(graph_mod, "_bootstrap_metric_improvement_round", _fake_bootstrap)
+
+    state = {
+        "iteration_count": 3,
+        "review_verdict": "APPROVED",
+        "execution_contract": {},
+        "metric_improvement_nodes_managed": False,
+        "ml_improvement_continue": True,
+        "ml_improvement_round_active": False,
+        "ml_improvement_round_count": 1,
+        "ml_improvement_rounds_allowed": 3,
+        "primary_metric_snapshot": {
+            "primary_metric_name": "roc_auc",
+            "primary_metric_value": 0.8001,
+            "baseline_value": 0.8000,
+        },
+    }
+
+    route = check_evaluation(state)
+
+    assert route == "retry"
+    assert calls["count"] == 1
+    assert state.get("ml_improvement_round_active") is True
+
+
 def test_metric_round_apply_guard_requires_material_edit() -> None:
     state = {
         "ml_improvement_round_active": True,
