@@ -71,3 +71,13 @@ if len(unique_targets) <= 1:
     raise ValueError("Target has no variance; cannot train.")
 """
     _assert_guard_detected_and_not_rejected(code)
+
+
+def test_variance_guard_detects_assert_nunique_alias_gt_one() -> None:
+    code = """
+import pandas as pd
+df = pd.read_csv("data/cleaned_data.csv")
+n_unique = df["target"].nunique()
+assert n_unique > 1, "Target has no variance; cannot train."
+"""
+    _assert_guard_detected_and_not_rejected(code)

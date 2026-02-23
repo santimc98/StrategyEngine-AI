@@ -21107,9 +21107,18 @@ def run_review_board(state: AgentState) -> AgentState:
     handoff_source = str(iteration_handoff.get("source") or "").strip().lower()
     preserve_metric_handoff = bool(
         bool(state.get("ml_improvement_round_active"))
+        or bool(state.get("ml_improvement_continue"))
         or handoff_mode in {"optimize", "metric_optimize", "improve"}
         or "metric_improvement" in handoff_source
         or "actor_critic" in handoff_source
+        or (
+            isinstance(iteration_handoff.get("hypothesis_packet"), dict)
+            and bool(iteration_handoff.get("hypothesis_packet"))
+        )
+        or (
+            isinstance(iteration_handoff.get("critic_packet"), dict)
+            and bool(iteration_handoff.get("critic_packet"))
+        )
     )
     handoff_quality = (
         dict(iteration_handoff.get("quality_focus"))
@@ -23433,6 +23442,26 @@ def check_metric_improvement_bootstrap_route(state: AgentState) -> str:
     return check_evaluation(state)
 
 
+def check_finalize_metric_improvement_route(state: AgentState) -> str:
+    """Route finalization to bootstrap node when another metric round is requested."""
+    continue_round = bool(state.get("ml_improvement_continue"))
+    round_active = bool(state.get("ml_improvement_round_active"))
+    if continue_round and not round_active:
+        snapshot = state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {}
+        metric_name = snapshot.get("primary_metric_name", "unknown")
+        metric_value = snapshot.get("primary_metric_value", "N/A")
+        best_value = snapshot.get("baseline_value", "N/A")
+        rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
+        round_count = int(state.get("ml_improvement_round_count", 0) or 0)
+        budget_left = max(0, rounds_allowed - round_count)
+        print(
+            f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT_ROUND "
+            f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
+        )
+        return "bootstrap_improvement_round"
+    return check_evaluation(state)
+
+
 def check_evaluation(state: AgentState):
     # Helper to get metric info for logging
     def _get_metric_info():
@@ -23571,27 +23600,6 @@ def check_evaluation(state: AgentState):
         print(f"ITER_DECISION type=other action=stop reason=ADVISORY_ONLY metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         state["stop_reason"] = "ADVISORY_ONLY"
         return "approved"
-
-    # Inline bootstrap compatibility path (unit tests and controlled continue-round fallback):
-    # - Legacy direct-call helpers may not include the node-management key.
-    # - Finalize node can set metric_improvement_nodes_managed=False with ml_improvement_continue=True.
-    #   In that case we must bootstrap the next round before routing back to engineer.
-    allow_inline_bootstrap = (
-        "metric_improvement_nodes_managed" not in state
-        or (
-            not bool(state.get("metric_improvement_nodes_managed"))
-            and bool(state.get("ml_improvement_continue"))
-        )
-    )
-    if allow_inline_bootstrap and _bootstrap_metric_improvement_round(state, contract):
-        rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
-        round_count = int(state.get("ml_improvement_round_count", 0) or 0)
-        budget_left = max(0, rounds_allowed - round_count)
-        print(
-            f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT_ROUND "
-            f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
-        )
-        return "retry"
 
     print(f"ITER_DECISION type=other action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
     return "approved"
@@ -24213,8 +24221,9 @@ workflow.add_conditional_edges(
 
 workflow.add_conditional_edges(
     "finalize_improvement_round",
-    check_evaluation,
+    check_finalize_metric_improvement_route,
     {
+        "bootstrap_improvement_round": "bootstrap_improvement_round",
         "retry": "retry_handler",
         "approved": "translator"
     }

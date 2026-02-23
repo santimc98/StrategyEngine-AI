@@ -60,15 +60,7 @@ def test_check_evaluation_stops_when_total_iteration_budget_reached() -> None:
     assert state.get("stop_reason") == "BUDGET"
 
 
-def test_check_evaluation_allows_metric_round_continue_even_when_total_limit_reached(monkeypatch) -> None:
-    def _fake_bootstrap(state, contract):
-        state["ml_improvement_round_active"] = True
-        state["ml_improvement_round_count"] = 2
-        state["ml_improvement_rounds_allowed"] = 3
-        return True
-
-    monkeypatch.setattr(graph_mod, "_bootstrap_metric_improvement_round", _fake_bootstrap)
-
+def test_finalize_route_allows_metric_round_continue_even_when_total_limit_reached() -> None:
     state = {
         "iteration_count": 5,
         "review_verdict": "APPROVED",
@@ -89,5 +81,5 @@ def test_check_evaluation_allows_metric_round_continue_even_when_total_limit_rea
         },
     }
 
-    route = graph_mod.check_evaluation(state)
-    assert route == "retry"
+    route = graph_mod.check_finalize_metric_improvement_route(state)
+    assert route == "bootstrap_improvement_round"

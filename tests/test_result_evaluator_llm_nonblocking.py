@@ -261,6 +261,16 @@ def test_check_evaluation_results_advisor_improve_retry_routes_to_retry(monkeypa
     monkeypatch.setenv("IMPROVEMENT_LOOP_ENABLED", "1")
     monkeypatch.setenv("MAX_IMPROVEMENT_ATTEMPTS", "2")
     monkeypatch.setenv("IMPROVEMENT_PATIENCE", "1")
+    calls = {"count": 0}
+
+    def _fake_bootstrap(working_state, _contract):
+        calls["count"] += 1
+        working_state["ml_improvement_round_active"] = True
+        working_state["ml_improvement_round_count"] = 1
+        working_state["ml_improvement_rounds_allowed"] = 2
+        return True
+
+    monkeypatch.setattr(graph_mod, "_bootstrap_metric_improvement_round", _fake_bootstrap)
 
     state = {
         "review_verdict": "APPROVE_WITH_WARNINGS",
@@ -278,17 +288,31 @@ def test_check_evaluation_results_advisor_improve_retry_routes_to_retry(monkeypa
             "primary_metric_value": 0.71,
             "baseline_value": 0.71,
         },
+        "execution_contract": {},
     }
 
-    assert graph_mod.check_evaluation(state) == "retry"
-    assert state.get("last_iteration_type") == "metric"
-    assert state.get("improvement_attempt_count") == 0
+    assert graph_mod.check_review_board_metric_improvement_route(state) == "bootstrap_improvement_round"
+    updates = graph_mod.run_metric_improvement_bootstrap(state)
+    merged_state = {**state, **updates}
+    assert calls["count"] == 1
+    assert merged_state.get("ml_improvement_round_active") is True
+    assert graph_mod.check_metric_improvement_bootstrap_route(merged_state) == "retry"
 
 
 def test_check_evaluation_results_advisor_stop_does_not_block_improvement_round(monkeypatch):
     monkeypatch.setenv("IMPROVEMENT_LOOP_ENABLED", "1")
     monkeypatch.setenv("MAX_IMPROVEMENT_ATTEMPTS", "3")
     monkeypatch.setenv("IMPROVEMENT_PATIENCE", "2")
+    calls = {"count": 0}
+
+    def _fake_bootstrap(working_state, _contract):
+        calls["count"] += 1
+        working_state["ml_improvement_round_active"] = True
+        working_state["ml_improvement_round_count"] = 1
+        working_state["ml_improvement_rounds_allowed"] = 3
+        return True
+
+    monkeypatch.setattr(graph_mod, "_bootstrap_metric_improvement_round", _fake_bootstrap)
 
     state = {
         "review_verdict": "APPROVED",
@@ -306,7 +330,11 @@ def test_check_evaluation_results_advisor_stop_does_not_block_improvement_round(
             "primary_metric_value": 0.73,
             "baseline_value": 0.73,
         },
+        "execution_contract": {},
     }
 
-    assert graph_mod.check_evaluation(state) == "retry"
-    assert state.get("ml_improvement_round_active") is True
+    assert graph_mod.check_review_board_metric_improvement_route(state) == "bootstrap_improvement_round"
+    updates = graph_mod.run_metric_improvement_bootstrap(state)
+    merged_state = {**state, **updates}
+    assert calls["count"] == 1
+    assert merged_state.get("ml_improvement_round_active") is True

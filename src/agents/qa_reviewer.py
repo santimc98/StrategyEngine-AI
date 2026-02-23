@@ -1169,6 +1169,11 @@ class _StaticQAScanner(ast.NodeVisitor):
             self.has_variance_guard = True
         self.generic_visit(node)
 
+    def visit_Assert(self, node: ast.Assert):
+        if self._assert_checks_variance_guard(node.test):
+            self.has_variance_guard = True
+        self.generic_visit(node)
+
     def _handle_assignment(self, targets, value):
         if value is None:
             return
@@ -1285,6 +1290,30 @@ class _StaticQAScanner(ast.NodeVisitor):
                 if isinstance(op, ast.Eq) and value == 0:
                     return True
                 if isinstance(op, ast.LtE) and value <= 0:
+                    return True
+        return False
+
+    def _assert_checks_variance_guard(self, test_node: ast.AST) -> bool:
+        if not isinstance(test_node, ast.Compare):
+            return False
+        stat_kind = self._guard_stat_kind_from_expr(test_node.left)
+        if not stat_kind:
+            return False
+        for op, comp in zip(test_node.ops, test_node.comparators):
+            value = _numeric_literal_value(comp)
+            if value is None:
+                continue
+            if stat_kind == "nunique":
+                # Equivalent assert forms of "nunique must be >= 2".
+                if isinstance(op, ast.Gt) and value >= 1:
+                    return True
+                if isinstance(op, ast.GtE) and value >= 2:
+                    return True
+            if stat_kind in {"var", "std"}:
+                # Equivalent assert forms of "variance/std must be > 0".
+                if isinstance(op, ast.Gt) and value >= 0:
+                    return True
+                if isinstance(op, ast.NotEq) and value == 0:
                     return True
         return False
 
