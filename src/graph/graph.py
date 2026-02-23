@@ -587,7 +587,105 @@ def _metrics_report_has_values(report: Dict[str, Any] | None) -> bool:
     if not isinstance(report, dict):
         return False
     model_perf = report.get("model_performance")
-    return isinstance(model_perf, dict) and bool(model_perf)
+    if isinstance(model_perf, dict) and bool(model_perf):
+        return True
+    return bool(_extract_metric_like_numbers(report, max_items=80))
+
+
+def _metric_key_looks_metric_like(name: str) -> bool:
+    key = _normalize_metric_key(name)
+    if not key:
+        return False
+    if key in {"value", "score", "metric", "primarymetric", "primarymetricvalue", "cvmean", "mean"}:
+        return True
+    tokens = (
+        "metric",
+        "score",
+        "auc",
+        "gini",
+        "logloss",
+        "loss",
+        "error",
+        "rmse",
+        "mae",
+        "mape",
+        "smape",
+        "r2",
+        "accuracy",
+        "acc",
+        "precision",
+        "recall",
+        "f1",
+        "spearman",
+        "kendall",
+        "ndcg",
+        "map",
+        "mrr",
+        "ks",
+        "lift",
+    )
+    return any(token in key for token in tokens)
+
+
+def _extract_metric_like_numbers(payload: Any, max_items: int = 400) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+
+    def _coerce_numeric(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                return float(value)
+            except Exception:
+                return None
+        if isinstance(value, str):
+            token = value.strip()
+            if not token:
+                return None
+            try:
+                return float(token)
+            except Exception:
+                return None
+        return None
+
+    def _walk(node: Any, prefix: str = "", depth: int = 0) -> None:
+        if len(metrics) >= max_items or depth > 6:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_text = str(key)
+                next_prefix = f"{prefix}.{key_text}" if prefix else key_text
+                numeric = _coerce_numeric(value)
+                if numeric is not None:
+                    if _metric_key_looks_metric_like(next_prefix) or _metric_key_looks_metric_like(key_text):
+                        metrics[next_prefix] = float(numeric)
+                    continue
+                if isinstance(value, (dict, list)):
+                    _walk(value, next_prefix, depth + 1)
+            return
+        if isinstance(node, list):
+            for idx, item in enumerate(node[:80]):
+                list_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("metric")
+                    metric_value = item.get("value")
+                    if metric_value is None:
+                        metric_value = item.get("mean")
+                    numeric = _coerce_numeric(metric_value)
+                    if name and numeric is not None:
+                        metric_name = str(name).strip()
+                        merged_key = f"{prefix}.{metric_name}" if prefix else metric_name
+                        if _metric_key_looks_metric_like(merged_key):
+                            metrics[merged_key] = float(numeric)
+                    _walk(item, list_prefix, depth + 1)
+                else:
+                    numeric = _coerce_numeric(item)
+                    if numeric is not None and _metric_key_looks_metric_like(prefix):
+                        metrics[list_prefix] = float(numeric)
+            return
+
+    _walk(payload)
+    return metrics
 
 
 def _is_metrics_like_path(path: str) -> bool:
@@ -640,7 +738,8 @@ def _merge_model_performance_entry(model_perf: Dict[str, Any], metric_name: str,
 def _normalize_metrics_report_payload(payload: Dict[str, Any] | None) -> Dict[str, Any]:
     if not isinstance(payload, dict) or not payload:
         return {}
-    if _metrics_report_has_values(payload):
+    existing_model_perf = payload.get("model_performance")
+    if isinstance(existing_model_perf, dict) and bool(existing_model_perf):
         return dict(payload)
 
     model_perf: Dict[str, Any] = {}
@@ -674,6 +773,11 @@ def _normalize_metrics_report_payload(payload: Dict[str, Any] | None) -> Dict[st
             if metric_value is None:
                 metric_value = item.get("mean")
             _merge_model_performance_entry(model_perf, metric_name, metric_value)
+
+    generic_metrics = _extract_metric_like_numbers(payload)
+    if generic_metrics:
+        for metric_key, metric_value in generic_metrics.items():
+            _merge_model_performance_entry(model_perf, metric_key, metric_value)
 
     if not model_perf:
         return {}
@@ -889,6 +993,10 @@ def _extract_primary_metric_for_board(
     state: Dict[str, Any],
     metrics_report: Dict[str, Any],
 ) -> Dict[str, Any]:
+    if isinstance(metrics_report, dict):
+        normalized_metrics = _normalize_metrics_report_payload(metrics_report)
+        if isinstance(normalized_metrics, dict) and normalized_metrics:
+            metrics_report = normalized_metrics
     contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
     contract_metric = _resolve_contract_primary_metric_name(state, contract)
 
@@ -923,6 +1031,20 @@ def _extract_primary_metric_for_board(
                 "name": cand_name or contract_metric,
                 "value": float(value),
                 "source": str((metrics_report or {}).get("source") or "metrics.normalized"),
+            }
+        direct_value = _extract_primary_metric(
+            metrics_report if isinstance(metrics_report, dict) else {},
+            contract_metric,
+        )
+        if direct_value is None:
+            raw_metrics = _load_json_safe("data/metrics.json")
+            if isinstance(raw_metrics, dict):
+                direct_value = _extract_primary_metric(raw_metrics, contract_metric)
+        if direct_value is not None:
+            return {
+                "name": contract_metric,
+                "value": float(direct_value),
+                "source": str((metrics_report or {}).get("source") or "data/metrics.json.direct_scan"),
             }
         return {
             "name": contract_metric,
@@ -7576,6 +7698,10 @@ def _collect_metric_candidates(metrics_report: Dict[str, Any], weights_report: D
     if isinstance(model_perf, dict):
         for key, value in model_perf.items():
             _walk_metric_tree(str(key), value)
+    if isinstance(metrics_report, dict):
+        generic_metrics = _extract_metric_like_numbers(metrics_report)
+        for key, value in generic_metrics.items():
+            _append_candidate(str(key), value)
     if isinstance(weights_report, dict):
         for container in ("metrics", "classification", "regression", "propensity_model", "price_model", "optimization"):
             block = weights_report.get(container)
@@ -19451,6 +19577,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
 
     # Detect stale metrics file across iterations (diagnostic for ML)
     metrics_report = metrics_report if isinstance(metrics_report, dict) else {}
+    raw_metrics_payload = _load_json_safe("data/metrics.json")
+    raw_metrics_present = isinstance(raw_metrics_payload, dict) and bool(raw_metrics_payload)
     weights_report = _load_json_safe("data/weights.json")
     metrics_signature = _hash_json(metrics_report)
     weights_signature = _hash_json(weights_report)
@@ -19471,6 +19599,21 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         new_history.append(
             "METRICS_MISSING: data/metrics.json not found or empty; downstream evaluation may be using stale metrics."
         )
+        contract_metric_name = _resolve_contract_primary_metric_name(
+            state if isinstance(state, dict) else {},
+            contract if isinstance(contract, dict) else {},
+        )
+        if contract_metric_name and raw_metrics_present:
+            direct_value = _extract_primary_metric(raw_metrics_payload, contract_metric_name)
+            if direct_value is not None:
+                metrics_report = {
+                    "model_performance": {contract_metric_name: float(direct_value)},
+                    "source": "data/metrics.json.direct_scan",
+                }
+                metrics_signature = _hash_json(metrics_report)
+                new_history.append(
+                    f"METRICS_DIRECT_SCAN: recovered contract primary metric '{contract_metric_name}' from raw metrics payload."
+                )
     if not metrics_report or metrics_stale:
         synthesized = _normalize_metrics_from_weights(weights_report)
         if not synthesized:
@@ -19488,7 +19631,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             )
             try:
                 os.makedirs("data", exist_ok=True)
-                dump_json("data/metrics.json", metrics_report)
+                fallback_target = "data/metrics.json"
+                if raw_metrics_present and not metrics_stale:
+                    fallback_target = "data/metrics_fallback.json"
+                dump_json(fallback_target, metrics_report)
+                if fallback_target != "data/metrics.json":
+                    new_history.append(
+                        "METRICS_FALLBACK_PRESERVE_RAW: wrote synthesized metrics to data/metrics_fallback.json and preserved existing data/metrics.json."
+                    )
             except Exception as metrics_err:
                 print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
 
@@ -21736,6 +21886,13 @@ def _extract_primary_metric(metrics_json: Dict[str, Any], metric_name: str) -> O
     preferred_keys.extend(["primary_metric_value", "metric_value", "score", "value", "cv_mean"])
 
     flat = _flatten_numeric_metrics_for_improvement(metrics_json)
+    generic_metrics = _extract_metric_like_numbers(metrics_json)
+    if generic_metrics:
+        seen = {str(key) for key, _ in flat}
+        for key, value in generic_metrics.items():
+            if key in seen:
+                continue
+            flat.append((key, float(value)))
 
     def _norm(text: str) -> str:
         return re.sub(r"[^0-9a-zA-Z]+", "", str(text or "").lower())
