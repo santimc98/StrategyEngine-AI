@@ -22190,6 +22190,48 @@ def _techniques_are_compatible(left: Any, right: Any) -> bool:
     return True
 
 
+def _collect_metric_round_tracker_signatures(tracker_entries: Any) -> set[str]:
+    signatures: set[str] = set()
+    if not isinstance(tracker_entries, list):
+        return signatures
+    for entry in tracker_entries:
+        if not isinstance(entry, dict):
+            continue
+        direct = str(entry.get("signature") or entry.get("hypothesis_signature") or "").strip()
+        if direct:
+            signatures.add(direct)
+        tracker_ctx = entry.get("tracker_context")
+        if isinstance(tracker_ctx, dict):
+            nested = str(tracker_ctx.get("signature") or "").strip()
+            if nested:
+                signatures.add(nested)
+    return signatures
+
+
+def _build_metric_round_hypothesis_signature(
+    *,
+    technique: Any,
+    target_columns: Any,
+    params: Any,
+) -> str:
+    technique_token = str(technique or "").strip().lower() or "unknown"
+    cols: List[str] = []
+    if isinstance(target_columns, list):
+        for item in target_columns:
+            token = str(item or "").strip()
+            if token:
+                cols.append(token)
+    cols = cols[:24]
+    params_json = "{}"
+    if isinstance(params, dict):
+        try:
+            params_json = json.dumps(params, sort_keys=True, ensure_ascii=True)
+        except Exception:
+            params_json = "{}"
+    base = technique_token + "|" + ",".join(cols) + "|" + params_json
+    return "hyp_" + hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
+
+
 def _resolve_metric_round_hybrid_policy(
     *,
     round_id: int,
@@ -22217,6 +22259,9 @@ def _resolve_metric_round_hybrid_policy(
 
     plan_entries = _normalize_fe_technique_entries(feature_engineering_plan)
     plan_map = {str(item.get("technique")).lower(): item for item in plan_entries if str(item.get("technique") or "").strip()}
+    known_signatures = _collect_metric_round_tracker_signatures(tracker_entries)
+    first_round_apply_forced = False
+    first_round_force_reason = ""
 
     successful_ranked: List[str] = []
     seen_success: set[str] = set()
@@ -22243,6 +22288,74 @@ def _resolve_metric_round_hybrid_policy(
         successful_ranked.append(technique)
 
     bundle_techniques: List[str] = []
+    if safe_round_id == 1 and action != "APPLY" and plan_entries:
+        selected_entry = None
+        selected_signature = ""
+        for entry in plan_entries:
+            technique = str(entry.get("technique") or "").strip()
+            if not technique:
+                continue
+            entry_signature = _build_metric_round_hypothesis_signature(
+                technique=technique,
+                target_columns=normalize_target_columns(entry.get("target_columns")),
+                params=entry.get("params"),
+            )
+            if entry_signature not in known_signatures:
+                selected_entry = entry
+                selected_signature = entry_signature
+                break
+        if selected_entry is None:
+            selected_entry = plan_entries[0]
+            selected_signature = _build_metric_round_hypothesis_signature(
+                technique=selected_entry.get("technique"),
+                target_columns=normalize_target_columns(selected_entry.get("target_columns")),
+                params=selected_entry.get("params"),
+            )
+            first_round_force_reason = "first_round_apply_forced_plan_duplicate"
+        else:
+            first_round_force_reason = "first_round_apply_forced_plan_bootstrap"
+        selected_technique = str(selected_entry.get("technique") or "").strip()
+        selected_columns = normalize_target_columns(selected_entry.get("target_columns"))
+        selected_params = (
+            dict(selected_entry.get("params"))
+            if isinstance(selected_entry.get("params"), dict)
+            else {}
+        )
+        updated_hypothesis = {
+            **hypothesis,
+            "technique": selected_technique,
+            "objective": (
+                str(hypothesis.get("objective") or "").strip()
+                or "Apply one focused feature-engineering hypothesis from contract plan."
+            )[:220],
+            "target_columns": selected_columns or ["ALL_NUMERIC"],
+            "feature_scope": str(hypothesis.get("feature_scope") or "model_features") or "model_features",
+            "params": selected_params,
+            "expected_effect": (
+                dict(hypothesis.get("expected_effect"))
+                if isinstance(hypothesis.get("expected_effect"), dict)
+                else {"target_error_modes": ["metric_stagnation"], "direction": "positive"}
+            ),
+        }
+        packet["action"] = "APPLY"
+        packet["hypothesis"] = updated_hypothesis
+        tracker_context = (
+            dict(packet.get("tracker_context"))
+            if isinstance(packet.get("tracker_context"), dict)
+            else {}
+        )
+        tracker_context["signature"] = selected_signature
+        tracker_context["is_duplicate"] = False
+        tracker_context["duplicate_of"] = None
+        packet["tracker_context"] = tracker_context
+        packet["explanation"] = (
+            "Explore phase bootstrap: force first metric round to apply one FE hypothesis from plan."
+        )[:280]
+        action = "APPLY"
+        hypothesis = updated_hypothesis
+        current_technique = selected_technique
+        first_round_apply_forced = True
+
     if action == "APPLY" and current_technique and current_technique.upper() != "NO_OP":
         bundle_techniques.append(current_technique)
 
@@ -22331,6 +22444,8 @@ def _resolve_metric_round_hybrid_policy(
         "bundle_size": int(len(bundle_techniques)) if bundle_techniques else 1,
         "bundle_techniques": bundle_techniques[:3],
         "compatibility_rule": "family_key_and_token_overlap_v1",
+        "first_round_apply_forced": bool(first_round_apply_forced),
+        "first_round_force_reason": first_round_force_reason,
     }
     return packet, policy_meta
 
@@ -23161,6 +23276,29 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         no_improve_streak = 0
         state["ml_improvement_incumbent_metric"] = float(improved_value) if improved_value is not None else baseline_value
 
+    final_metrics_payload = _load_json_safe("data/metrics.json")
+    if not isinstance(final_metrics_payload, dict):
+        final_metrics_payload = {}
+    final_metric_value = _extract_primary_metric(final_metrics_payload, metric_name)
+    if final_metric_value is None:
+        final_metric_value = improved_value if improved else baseline_value
+    _sync_review_board_verdict_after_metric_round(
+        state,
+        metric_name=metric_name,
+        kept=str(state.get("ml_improvement_kept") or ""),
+        baseline_metric=baseline_value,
+        candidate_metric=improved_value,
+        final_metric=final_metric_value,
+        min_delta=float(min_delta),
+        approved=bool(approved),
+        improved_by_metric=bool(improved_by_metric),
+        stability_ok=bool(stability_ok),
+        deterministic_blockers=bool(deterministic_blockers),
+        advisory_review_mode=bool(advisory_review_mode),
+        force_finalize=bool(force_finalize),
+        force_finalize_reason=force_finalize_reason if force_finalize else "",
+    )
+
     def _metric_better(candidate: Optional[float], incumbent: Optional[float], hib: bool) -> bool:
         if candidate is None:
             return False
@@ -23367,6 +23505,73 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     state["ml_improvement_force_finalize_reason"] = ""
     state["last_iteration_type"] = None
     return "approved"
+
+
+def _upsert_metric_improvement_summary(summary: str, line: str) -> str:
+    base_lines = [str(item).strip() for item in str(summary or "").splitlines() if str(item).strip()]
+    filtered = [item for item in base_lines if not item.startswith("METRIC_IMPROVEMENT_FINAL:")]
+    filtered.append(line)
+    return "\n".join(filtered)
+
+
+def _sync_review_board_verdict_after_metric_round(
+    state: Dict[str, Any],
+    *,
+    metric_name: str,
+    kept: str,
+    baseline_metric: Optional[float],
+    candidate_metric: Optional[float],
+    final_metric: Optional[float],
+    min_delta: float,
+    approved: bool,
+    improved_by_metric: bool,
+    stability_ok: bool,
+    deterministic_blockers: bool,
+    advisory_review_mode: bool,
+    force_finalize: bool,
+    force_finalize_reason: str,
+) -> None:
+    board_payload = state.get("review_board_verdict")
+    if not isinstance(board_payload, dict):
+        loaded = _load_json_safe("data/review_board_verdict.json")
+        board_payload = loaded if isinstance(loaded, dict) else {}
+    if not isinstance(board_payload, dict) or not board_payload:
+        return
+
+    payload = dict(board_payload)
+    final_verdict = normalize_review_status(state.get("review_verdict") or payload.get("final_review_verdict"))
+    summary_line = (
+        "METRIC_IMPROVEMENT_FINAL: "
+        + f"kept={kept or 'unknown'} "
+        + f"metric={metric_name} "
+        + f"final={final_metric} "
+        + f"baseline={baseline_metric} "
+        + f"candidate={candidate_metric} "
+        + f"min_delta={min_delta}"
+    )
+    payload["summary"] = _upsert_metric_improvement_summary(str(payload.get("summary") or ""), summary_line)
+    payload["final_review_verdict"] = final_verdict
+    payload["metric_round_finalization"] = {
+        "metric_name": metric_name,
+        "kept": kept,
+        "baseline_metric": baseline_metric,
+        "candidate_metric": candidate_metric,
+        "final_metric": final_metric,
+        "min_delta": float(min_delta),
+        "approved": bool(approved),
+        "improved_by_metric": bool(improved_by_metric),
+        "stability_ok": bool(stability_ok),
+        "deterministic_blockers": bool(deterministic_blockers),
+        "advisory_review_mode": bool(advisory_review_mode),
+        "force_finalize": bool(force_finalize),
+        "force_finalize_reason": force_finalize_reason,
+    }
+    state["review_board_verdict"] = payload
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/review_board_verdict.json", payload)
+    except Exception:
+        pass
 
 
 def _collect_state_updates(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:

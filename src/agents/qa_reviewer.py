@@ -1062,6 +1062,7 @@ class _StaticQAScanner(ast.NodeVisitor):
         self.has_random_target_noise = False
         self.has_split_fabrication = False
         self.has_variance_guard = False
+        self.variance_guard_deferred_sinks: set[str] = set()
         self.nunique_aliases: set[str] = set()
         self.unique_aliases: set[str] = set()
         self.unique_len_aliases: set[str] = set()
@@ -1165,12 +1166,23 @@ class _StaticQAScanner(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_If(self, node: ast.If):
-        if self._condition_checks_variance_guard(node.test) and _if_has_value_error_raise(node.body):
+        has_raise = _if_has_value_error_raise(node.body)
+        is_variance_condition = self._condition_checks_variance_guard(node.test)
+        if is_variance_condition:
+            if has_raise:
+                self.has_variance_guard = True
+            else:
+                self.variance_guard_deferred_sinks.update(
+                    self._collect_variance_guard_sink_names(node.body)
+                )
+        elif has_raise and self._test_references_names(node.test, self.variance_guard_deferred_sinks):
             self.has_variance_guard = True
         self.generic_visit(node)
 
     def visit_Assert(self, node: ast.Assert):
-        if self._assert_checks_variance_guard(node.test):
+        if self._assert_checks_variance_guard(node.test) or self._test_references_names(
+            node.test, self.variance_guard_deferred_sinks
+        ):
             self.has_variance_guard = True
         self.generic_visit(node)
 
@@ -1268,6 +1280,47 @@ class _StaticQAScanner(ast.NodeVisitor):
             if name in self.std_aliases:
                 return "std"
         return None
+
+    def _call_receiver_name(self, call_node: ast.Call) -> Optional[str]:
+        if not isinstance(call_node.func, ast.Attribute):
+            return None
+        receiver = call_node.func.value
+        if not isinstance(receiver, ast.Name):
+            return None
+        method = str(call_node.func.attr or "").strip().lower()
+        if method in {"append", "extend", "add", "update", "setdefault", "insert"}:
+            return receiver.id
+        return None
+
+    def _collect_variance_guard_sink_names(self, body_nodes: List[ast.stmt]) -> set[str]:
+        sink_names: set[str] = set()
+        for stmt in body_nodes:
+            if isinstance(stmt, ast.Assign):
+                sink_names.update(self._iter_target_names(stmt.targets))
+            elif isinstance(stmt, ast.AnnAssign):
+                sink_names.update(self._iter_target_names([stmt.target]))
+            elif isinstance(stmt, ast.AugAssign):
+                sink_names.update(self._iter_target_names([stmt.target]))
+            elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                receiver = self._call_receiver_name(stmt.value)
+                if receiver:
+                    sink_names.add(receiver)
+            for child in ast.walk(stmt):
+                if isinstance(child, ast.Call):
+                    receiver = self._call_receiver_name(child)
+                    if receiver:
+                        sink_names.add(receiver)
+        return {name for name in sink_names if isinstance(name, str) and name.strip()}
+
+    def _test_references_names(self, test_node: ast.AST, names: set[str]) -> bool:
+        if not names:
+            return False
+        referenced = {
+            child.id
+            for child in ast.walk(test_node)
+            if isinstance(child, ast.Name)
+        }
+        return bool(referenced & names)
 
     def _condition_checks_variance_guard(self, test_node: ast.AST) -> bool:
         if not isinstance(test_node, ast.Compare):

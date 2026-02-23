@@ -118,3 +118,35 @@ def test_generate_iteration_hypothesis_fallback_advances_when_first_signature_se
     )
     assert second_packet.get("action") == "APPLY"
     assert second_packet.get("hypothesis", {}).get("technique") != first_packet.get("hypothesis", {}).get("technique")
+
+
+def test_generate_iteration_hypothesis_repairs_long_objective_without_noop(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("STRATEGIST_ITERATION_MODE", "deterministic")
+    strategist = StrategistAgent()
+    very_long_rationale = "Improve signal. " * 40
+    packet = strategist.generate_iteration_hypothesis(
+        {
+            "run_id": "run_test",
+            "iteration": 2,
+            "primary_metric_name": "roc_auc",
+            "min_delta": 0.0005,
+            "feature_engineering_plan": {
+                "techniques": [
+                    {
+                        "technique": "rare_category_grouping",
+                        "columns": ["ALL_CATEGORICAL"],
+                        "rationale": very_long_rationale,
+                    }
+                ]
+            },
+            "critique_packet": {"error_modes": [{"id": "minority_class_recall_low"}]},
+            "experiment_tracker": [],
+        }
+    )
+    valid, errors = validate_iteration_hypothesis_packet(packet)
+    assert valid is True, errors
+    assert packet.get("action") == "APPLY"
+    objective = str(packet.get("hypothesis", {}).get("objective") or "")
+    assert objective
+    assert len(objective) <= 220

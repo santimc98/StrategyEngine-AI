@@ -119,6 +119,53 @@ def test_check_evaluation_restores_baseline_when_improvement_is_below_delta(tmp_
     assert restored == baseline
 
 
+def test_finalize_round_syncs_review_board_verdict_with_kept_artifact(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("data/metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline = {"roc_auc": 0.8000}
+    metrics_path.write_text(json.dumps(baseline), encoding="utf-8")
+    snapshot_dir = Path("work/ml_baseline_snapshot")
+    output_paths = ["data/metrics.json"]
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    # Candidate is approved but below delta, so baseline should be restored.
+    metrics_path.write_text(json.dumps({"roc_auc": 0.8002}), encoding="utf-8")
+    board_payload = {
+        "status": "APPROVED",
+        "final_review_verdict": "APPROVED",
+        "summary": "Candidate approved by review board.",
+    }
+    Path("data/review_board_verdict.json").write_text(json.dumps(board_payload), encoding="utf-8")
+    state = {
+        "review_verdict": "APPROVED",
+        "execution_contract": {},
+        "ml_improvement_round_active": True,
+        "ml_improvement_primary_metric_name": "roc_auc",
+        "ml_improvement_baseline_metric": 0.8000,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": True,
+        "ml_improvement_output_paths": output_paths,
+        "ml_improvement_snapshot_dir": str(snapshot_dir),
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "review_board_verdict": board_payload,
+        "feedback_history": [],
+    }
+
+    route = check_evaluation(state)
+
+    assert route == "approved"
+    synced_payload = state.get("review_board_verdict") if isinstance(state.get("review_board_verdict"), dict) else {}
+    finalization = synced_payload.get("metric_round_finalization") if isinstance(synced_payload.get("metric_round_finalization"), dict) else {}
+    assert finalization.get("kept") == "baseline"
+    assert finalization.get("final_metric") == baseline["roc_auc"]
+    assert "METRIC_IMPROVEMENT_FINAL:" in str(synced_payload.get("summary") or "")
+
+    persisted = json.loads(Path("data/review_board_verdict.json").read_text(encoding="utf-8"))
+    persisted_finalization = persisted.get("metric_round_finalization") if isinstance(persisted.get("metric_round_finalization"), dict) else {}
+    assert persisted_finalization.get("kept") == "baseline"
+
+
 def test_check_evaluation_logs_metric_improvement_round_completion(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     events = []

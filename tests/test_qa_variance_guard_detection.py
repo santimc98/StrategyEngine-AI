@@ -81,3 +81,18 @@ n_unique = df["target"].nunique()
 assert n_unique > 1, "Target has no variance; cannot train."
 """
     _assert_guard_detected_and_not_rejected(code)
+
+
+def test_variance_guard_detects_deferred_raise_via_failure_container() -> None:
+    code = """
+import pandas as pd
+df = pd.read_csv("data/cleaned_data.csv")
+failures = []
+target_nunique = df["target"].nunique()
+if target_nunique <= 1:
+    failures.append("target_variance_guard")
+
+if failures:
+    raise ValueError("Validation failed before training.")
+"""
+    _assert_guard_detected_and_not_rejected(code)

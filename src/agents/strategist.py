@@ -562,6 +562,15 @@ class StrategistAgent:
         valid_packet, errors = validate_iteration_hypothesis_packet(packet)
         if valid_packet:
             return packet
+        repaired_packet = self._sanitize_iteration_hypothesis_packet(
+            packet,
+            primary_metric_name=primary_metric_name,
+            min_delta=min_delta,
+            fallback_signature=selected_signature,
+        )
+        repaired_valid, repaired_errors = validate_iteration_hypothesis_packet(repaired_packet)
+        if repaired_valid:
+            return repaired_packet
         return build_noop_iteration_hypothesis_packet(
             run_id=run_id,
             iteration=iteration,
@@ -571,9 +580,198 @@ class StrategistAgent:
             min_delta=min_delta,
             explanation=(
                 "Schema fallback to no-op hypothesis."
-                + (" Validation: " + "; ".join(errors[:2]) if errors else "")
+                + (
+                    " Validation: "
+                    + "; ".join((errors + repaired_errors)[:2])
+                    if (errors or repaired_errors)
+                    else ""
+                )
             )[:280],
         )
+
+    def _sanitize_iteration_hypothesis_packet(
+        self,
+        packet: Dict[str, Any],
+        *,
+        primary_metric_name: str,
+        min_delta: float,
+        fallback_signature: str,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = dict(packet) if isinstance(packet, dict) else {}
+        out["packet_type"] = "iteration_hypothesis_packet"
+        out["packet_version"] = "1.0"
+
+        run_id = str(out.get("run_id") or "unknown_run").strip() or "unknown_run"
+        out["run_id"] = run_id
+
+        try:
+            iteration = int(out.get("iteration") or 1)
+        except Exception:
+            iteration = 1
+        if iteration <= 0:
+            iteration = 1
+        out["iteration"] = iteration
+
+        tracker_context = out.get("tracker_context") if isinstance(out.get("tracker_context"), dict) else {}
+        signature = str(tracker_context.get("signature") or fallback_signature or "hypothesis_signature").strip()
+        if not signature:
+            signature = "hypothesis_signature"
+        if len(signature) > 512:
+            signature = signature[:512]
+        duplicate_of_raw = tracker_context.get("duplicate_of")
+        duplicate_of = str(duplicate_of_raw).strip() if duplicate_of_raw not in (None, "") else None
+        is_duplicate = bool(tracker_context.get("is_duplicate"))
+        if is_duplicate and not duplicate_of:
+            duplicate_of = signature
+
+        action = str(out.get("action") or "NO_OP").strip().upper()
+        action = action if action in {"APPLY", "NO_OP"} else "NO_OP"
+        if is_duplicate:
+            action = "NO_OP"
+        out["action"] = action
+
+        hypothesis = out.get("hypothesis") if isinstance(out.get("hypothesis"), dict) else {}
+        technique = str(hypothesis.get("technique") or "").strip()
+        if action == "NO_OP":
+            technique = "NO_OP"
+        elif not technique or technique.upper() == "NO_OP":
+            technique = "missing_indicators"
+
+        objective = str(hypothesis.get("objective") or "").strip()
+        if not objective:
+            objective = "Apply one focused feature-engineering change aligned to critique findings."
+        if len(objective) > 220:
+            objective = objective[:217].rstrip() + "..."
+
+        target_columns = normalize_target_columns(hypothesis.get("target_columns"))
+        if len(target_columns) > 200:
+            target_columns = target_columns[:200]
+
+        feature_scope = str(hypothesis.get("feature_scope") or "model_features").strip() or "model_features"
+        if feature_scope not in {
+            "model_features",
+            "segmentation_features",
+            "audit_only_features",
+            "all_features",
+        }:
+            feature_scope = "model_features"
+
+        params = hypothesis.get("params") if isinstance(hypothesis.get("params"), dict) else {}
+        expected_effect = (
+            hypothesis.get("expected_effect")
+            if isinstance(hypothesis.get("expected_effect"), dict)
+            else {}
+        )
+        target_error_modes_raw = (
+            expected_effect.get("target_error_modes")
+            if isinstance(expected_effect.get("target_error_modes"), list)
+            else []
+        )
+        target_error_modes: List[str] = []
+        for item in target_error_modes_raw:
+            token = str(item or "").strip()
+            if not token or token in target_error_modes:
+                continue
+            target_error_modes.append(token)
+            if len(target_error_modes) >= 5:
+                break
+        if not target_error_modes:
+            target_error_modes = ["metric_stagnation"]
+        direction = str(expected_effect.get("direction") or "").strip().lower()
+        if direction not in {"positive", "neutral", "negative"}:
+            direction = "neutral" if action == "NO_OP" else "positive"
+
+        out["hypothesis"] = {
+            "technique": technique,
+            "objective": objective,
+            "target_columns": target_columns,
+            "feature_scope": feature_scope,
+            "params": params,
+            "expected_effect": {
+                "target_error_modes": target_error_modes,
+                "direction": direction,
+            },
+        }
+
+        app_constraints = (
+            out.get("application_constraints")
+            if isinstance(out.get("application_constraints"), dict)
+            else {}
+        )
+        try:
+            max_regions = int(app_constraints.get("max_code_regions_to_change", 3) or 3)
+        except Exception:
+            max_regions = 3
+        max_regions = min(8, max(1, max_regions))
+        must_keep_raw = app_constraints.get("must_keep") if isinstance(app_constraints.get("must_keep"), list) else []
+        must_keep: List[str] = []
+        for item in must_keep_raw:
+            token = str(item or "").strip()
+            if not token or token in must_keep:
+                continue
+            must_keep.append(token)
+            if len(must_keep) >= 10:
+                break
+        if not must_keep:
+            must_keep = ["data_split_logic", "cv_protocol", "output_paths_contract"]
+        out["application_constraints"] = {
+            "edit_mode": "incremental",
+            "max_code_regions_to_change": max_regions,
+            "forbid_replanning": bool(app_constraints.get("forbid_replanning", True)),
+            "forbid_model_family_switch": bool(app_constraints.get("forbid_model_family_switch", True)),
+            "must_keep": must_keep,
+        }
+
+        success_criteria = (
+            out.get("success_criteria")
+            if isinstance(out.get("success_criteria"), dict)
+            else {}
+        )
+        try:
+            safe_min_delta = float(success_criteria.get("min_delta", min_delta) or min_delta)
+        except Exception:
+            safe_min_delta = float(min_delta)
+        if safe_min_delta < 0:
+            safe_min_delta = 0.0
+        out["success_criteria"] = {
+            "primary_metric_name": str(
+                success_criteria.get("primary_metric_name") or primary_metric_name or "primary_metric"
+            ).strip()
+            or "primary_metric",
+            "min_delta": safe_min_delta,
+            "must_pass_active_gates": bool(success_criteria.get("must_pass_active_gates", True)),
+        }
+
+        if action != "NO_OP":
+            is_duplicate = False
+            duplicate_of = None
+        out["tracker_context"] = {
+            "signature": signature,
+            "is_duplicate": bool(is_duplicate),
+            "duplicate_of": duplicate_of if is_duplicate else None,
+        }
+
+        hypothesis_id = str(out.get("hypothesis_id") or "").strip()
+        if not re.match(r"^h_[a-zA-Z0-9_-]{6,64}$", hypothesis_id):
+            hypothesis_id = "h_" + hashlib.sha1(signature.encode("utf-8")).hexdigest()[:8]
+        out["hypothesis_id"] = hypothesis_id
+
+        explanation = str(out.get("explanation") or "").strip()
+        if not explanation:
+            explanation = (
+                "Single hypothesis selected from feature_engineering_plan and critique packet."
+                if action == "APPLY"
+                else "No-op hypothesis because selected signature already exists in experiment tracker."
+            )
+        if len(explanation) > 280:
+            explanation = explanation[:277].rstrip() + "..."
+        out["explanation"] = explanation
+        out["fallback_if_not_applicable"] = "NO_OP"
+        timestamp = str(out.get("timestamp_utc") or "").strip()
+        if not timestamp:
+            timestamp = datetime.now(timezone.utc).isoformat()
+        out["timestamp_utc"] = timestamp
+        return out
 
     def _get_wide_schema_threshold(self) -> int:
         raw = os.getenv("STRATEGIST_WIDE_SCHEMA_THRESHOLD", "240")
