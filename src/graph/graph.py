@@ -98,7 +98,11 @@ from src.utils.contract_accessors import (
     get_reviewer_gates,
     get_decision_columns,
 )
-from src.utils.contract_validator import normalize_contract_scope
+from src.utils.contract_validator import (
+    normalize_contract_scope,
+    get_default_optimization_policy,
+    normalize_optimization_policy,
+)
 from src.utils.contract_views import (
     build_contract_views_projection,
     persist_views,
@@ -140,7 +144,11 @@ from src.utils.dataset_memory import (
     summarize_memory,
 )
 from src.utils.ml_engineer_memory import append_memory, load_recent_memory
-from src.utils.experiment_tracker import append_experiment_entry, load_recent_experiment_entries
+from src.utils.experiment_tracker import (
+    append_experiment_entry,
+    load_recent_experiment_entries,
+    append_hypothesis_memory,
+)
 from src.utils.error_hints import append_repair_hints
 from src.utils.contract_first_gates import apply_contract_first_gate_policy
 from src.utils.governance import write_governance_report, build_run_summary
@@ -206,6 +214,12 @@ from src.graph.steps.retry_policy import should_reselect_strategy_on_retry
 from src.graph.steps.handoff_utils import (
     extract_preflight_gate_failures,
     extract_preflight_gate_tail,
+)
+from src.utils.metric_eval import (
+    extract_primary_metric as metric_eval_extract_primary_metric,
+    extract_stability_signals as metric_eval_extract_stability_signals,
+    stability_ok as metric_eval_stability_ok,
+    select_incumbent as metric_eval_select_incumbent,
 )
 
 
@@ -9572,6 +9586,12 @@ class AgentState(TypedDict):
     metric_improvement_nodes_managed: bool
     metric_improvement_bootstrapped: bool
     metric_improvement_finalized: bool
+    opt_round_bootstrapped: bool
+    opt_round_plan_ready: bool
+    opt_loop_phase: str
+    opt_quick_eval_folds: int
+    opt_full_eval_folds: int
+    opt_incumbent_selection: Dict[str, Any]
     ml_improvement_round_active: bool
     ml_improvement_continue: bool
     ml_improvement_loop_complete: bool
@@ -10071,6 +10091,12 @@ def run_steward(state: AgentState) -> AgentState:
         "metric_improvement_nodes_managed": False,
         "metric_improvement_bootstrapped": False,
         "metric_improvement_finalized": False,
+        "opt_round_bootstrapped": False,
+        "opt_round_plan_ready": False,
+        "opt_loop_phase": "idle",
+        "opt_quick_eval_folds": 2,
+        "opt_full_eval_folds": 5,
+        "opt_incumbent_selection": {},
         "ml_improvement_round_active": False,
         "ml_improvement_continue": False,
         "ml_improvement_loop_complete": False,
@@ -21485,13 +21511,61 @@ def finalize_runtime_failure(state: AgentState) -> AgentState:
     return result
 
 
+def _resolve_optimization_policy(contract: Dict[str, Any] | None) -> Dict[str, Any]:
+    source_contract = contract if isinstance(contract, dict) else {}
+    optimization_policy_raw = source_contract.get("optimization_policy")
+    optimization_policy_raw_keys = set(optimization_policy_raw.keys()) if isinstance(optimization_policy_raw, dict) else set()
+    if isinstance(optimization_policy_raw, dict):
+        optimization_policy = normalize_optimization_policy(optimization_policy_raw)
+    else:
+        optimization_policy = get_default_optimization_policy()
+
+    # Backward-compatible overrides from legacy iteration_policy keys.
+    iteration_policy = source_contract.get("iteration_policy")
+    if not isinstance(iteration_policy, dict):
+        iteration_policy = {}
+
+    if "metric_improvement_rounds" in iteration_policy and "max_rounds" not in optimization_policy_raw_keys:
+        optimization_policy["max_rounds"] = iteration_policy.get("metric_improvement_rounds")
+    if "metric_min_delta" in iteration_policy and "min_delta" not in optimization_policy_raw_keys:
+        optimization_policy["min_delta"] = iteration_policy.get("metric_min_delta")
+    if "metric_improvement_patience" in iteration_policy and "patience" not in optimization_policy_raw_keys:
+        optimization_policy["patience"] = iteration_policy.get("metric_improvement_patience")
+    if "quick_eval_folds" in iteration_policy and "quick_eval_folds" not in optimization_policy_raw_keys:
+        optimization_policy["quick_eval_folds"] = iteration_policy.get("quick_eval_folds")
+    if "full_eval_folds" in iteration_policy and "full_eval_folds" not in optimization_policy_raw_keys:
+        optimization_policy["full_eval_folds"] = iteration_policy.get("full_eval_folds")
+
+    return normalize_optimization_policy(optimization_policy)
+
+
+def _resolve_opt_eval_folds(contract: Dict[str, Any] | None) -> Tuple[int, int]:
+    policy = _resolve_optimization_policy(contract)
+    quick = int(policy.get("quick_eval_folds") or 2)
+    full = int(policy.get("full_eval_folds") or 5)
+    if quick < 1:
+        quick = 1
+    if full < 1:
+        full = max(quick, 1)
+    if quick > full:
+        quick = full
+    return quick, full
+
+
 def _metric_improvement_policy(contract: Dict[str, Any] | None) -> Tuple[int, float, int]:
     policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
     if not isinstance(policy, dict):
         policy = {}
-    rounds_raw = policy.get("metric_improvement_rounds", os.getenv("METRIC_IMPROVEMENT_MAX_ROUNDS", 4))
-    min_delta_raw = policy.get("metric_min_delta", 0.0005)
-    patience_raw = policy.get("metric_improvement_patience", os.getenv("METRIC_IMPROVEMENT_PATIENCE", 2))
+    optimization_policy = _resolve_optimization_policy(contract if isinstance(contract, dict) else {})
+    rounds_raw = optimization_policy.get(
+        "max_rounds",
+        policy.get("metric_improvement_rounds", os.getenv("METRIC_IMPROVEMENT_MAX_ROUNDS", 4)),
+    )
+    min_delta_raw = optimization_policy.get("min_delta", policy.get("metric_min_delta", 0.0005))
+    patience_raw = optimization_policy.get(
+        "patience",
+        policy.get("metric_improvement_patience", os.getenv("METRIC_IMPROVEMENT_PATIENCE", 2)),
+    )
     try:
         rounds = int(rounds_raw)
     except Exception:
@@ -21878,43 +21952,31 @@ def _flatten_numeric_metrics_for_improvement(payload: Any, prefix: str = "") -> 
 
 
 def _extract_primary_metric(metrics_json: Dict[str, Any], metric_name: str) -> Optional[float]:
+    value = metric_eval_extract_primary_metric(metrics_json, metric_name)
+    if value is not None:
+        return float(value)
+
+    # Backward-compatible fallback with metric-like token scan from local helpers.
     if not isinstance(metrics_json, dict):
         return None
-    metric = str(metric_name or "").strip()
-    preferred_keys: List[str] = []
-    if metric:
-        preferred_keys.extend(
-            [
-                metric,
-                f"cv_{metric}",
-                f"{metric}_mean",
-                f"mean_{metric}",
-                f"primary_{metric}",
-            ]
-        )
-    preferred_keys.extend(["primary_metric_value", "metric_value", "score", "value", "cv_mean"])
-
-    flat = _flatten_numeric_metrics_for_improvement(metrics_json)
     generic_metrics = _extract_metric_like_numbers(metrics_json)
-    if generic_metrics:
-        seen = {str(key) for key, _ in flat}
-        for key, value in generic_metrics.items():
-            if key in seen:
-                continue
-            flat.append((key, float(value)))
-
-    def _norm(text: str) -> str:
-        return re.sub(r"[^0-9a-zA-Z]+", "", str(text or "").lower())
-
-    preferred_norm = [_norm(key) for key in preferred_keys if key]
-    for key, value in flat:
-        key_norm = _norm(key)
-        if any(token and token == key_norm for token in preferred_norm):
-            return float(value)
-    for key, value in flat:
-        key_norm = _norm(key)
-        if any(token and token in key_norm for token in preferred_norm):
-            return float(value)
+    if not isinstance(generic_metrics, dict) or not generic_metrics:
+        return None
+    metric = str(metric_name or "").strip().lower()
+    if metric:
+        for key, raw in generic_metrics.items():
+            key_text = str(key or "").lower()
+            if metric in key_text:
+                try:
+                    return float(raw)
+                except Exception:
+                    continue
+        return None
+    for raw in generic_metrics.values():
+        try:
+            return float(raw)
+        except Exception:
+            continue
     return None
 
 
@@ -21937,14 +21999,11 @@ def _extract_metric_round_tradeoff(
     metric_value: Optional[float],
     critique_packet: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
-    critique_packet = critique_packet if isinstance(critique_packet, dict) else {}
-    validation = critique_packet.get("validation_signals")
-    validation = validation if isinstance(validation, dict) else {}
-    cv_block = validation.get("cv") if isinstance(validation.get("cv"), dict) else {}
-    cv_std = _coerce_float(cv_block.get("cv_std"))
-    if cv_std is None:
-        cv_std = _coerce_float(validation.get("cv_std"))
-    gen_gap = _coerce_float(validation.get("generalization_gap"))
+    signals = metric_eval_extract_stability_signals(
+        critique_packet if isinstance(critique_packet, dict) else {}
+    )
+    cv_std = _coerce_float(signals.get("cv_std"))
+    gen_gap = _coerce_float(signals.get("generalization_gap_abs"))
     return {
         "metric_value": metric_value,
         "cv_std": cv_std,
@@ -22015,36 +22074,12 @@ def _metric_round_stability_ok(
     max_generalization_gap: Optional[float] = 0.02,
     disallow_high_variance: bool = True,
 ) -> bool:
-    if not isinstance(critique_packet, dict):
-        return True
-    error_modes = critique_packet.get("error_modes") if isinstance(critique_packet.get("error_modes"), list) else []
-    error_mode_ids = {
-        str(item.get("id") or "").strip().lower()
-        for item in error_modes
-        if isinstance(item, dict) and str(item.get("id") or "").strip()
-    }
-    if "fold_instability" in error_mode_ids or "generalization_gap_high" in error_mode_ids:
-        return False
-
-    validation = (
-        critique_packet.get("validation_signals")
-        if isinstance(critique_packet.get("validation_signals"), dict)
-        else {}
+    return metric_eval_stability_ok(
+        critique_packet if isinstance(critique_packet, dict) else {},
+        max_cv_std=max_cv_std,
+        max_generalization_gap=max_generalization_gap,
+        disallow_high_variance=disallow_high_variance,
     )
-    cv_block = validation.get("cv") if isinstance(validation.get("cv"), dict) else {}
-    variance_level = str(cv_block.get("variance_level") or "").strip().lower()
-    if disallow_high_variance and variance_level == "high":
-        return False
-
-    cv_std = _coerce_float(cv_block.get("cv_std"))
-    if max_cv_std is not None and cv_std is not None and cv_std > float(max_cv_std):
-        return False
-
-    gap = _coerce_float(validation.get("generalization_gap"))
-    if max_generalization_gap is not None and gap is not None:
-        if abs(float(gap)) > float(max_generalization_gap):
-            return False
-    return True
 
 
 def _resolve_ml_outputs_for_metric_round(contract: Dict[str, Any], state: Dict[str, Any]) -> List[str]:
@@ -23068,6 +23103,29 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
                 "baseline_metric": float(baseline_value),
             },
         )
+        hypothesis_payload = hypothesis_packet.get("hypothesis") if isinstance(hypothesis_packet.get("hypothesis"), dict) else {}
+        append_hypothesis_memory(
+            run_id,
+            round_id=int(round_id),
+            technique=str(hypothesis_payload.get("technique") or ""),
+            target_columns=normalize_target_columns(hypothesis_payload.get("target_columns")),
+            feature_scope=str(hypothesis_payload.get("feature_scope") or "model_features"),
+            params=hypothesis_payload.get("params") if isinstance(hypothesis_payload.get("params"), dict) else {},
+            metric_name=metric_name,
+            metric_value=baseline_value,
+            delta=0.0,
+            stability_ok=True,
+            cost=float(round_id if round_id > 0 else 1),
+            status="proposed",
+            phase=str(hybrid_policy_meta.get("phase") or "explore"),
+            extra={
+                "signature": tracker_context.get("signature"),
+                "is_duplicate": bool(tracker_context.get("is_duplicate")),
+                "duplicate_of": tracker_context.get("duplicate_of"),
+                "action": hypothesis_packet.get("action"),
+                "event": "hypothesis_proposed",
+            },
+        )
     return True
 
 
@@ -23247,7 +23305,38 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     if force_finalize:
         improved_by_metric = False
         stability_ok = False
-    improved = approved and improved_by_metric and stability_ok
+    baseline_tradeoff = _extract_metric_round_tradeoff(baseline_value, {})
+    candidate_tradeoff = _extract_metric_round_tradeoff(improved_value, critique_packet)
+    incumbent_selection = metric_eval_select_incumbent(
+        [
+            {
+                "label": "baseline",
+                "metric_value": baseline_value,
+                "stability_ok": True,
+                "cv_std": baseline_tradeoff.get("cv_std"),
+                "generalization_gap_abs": baseline_tradeoff.get("generalization_gap_abs"),
+                "cost": 0.0,
+            },
+            {
+                "label": "candidate",
+                "metric_value": improved_value,
+                "stability_ok": bool(approved and stability_ok),
+                "cv_std": candidate_tradeoff.get("cv_std"),
+                "generalization_gap_abs": candidate_tradeoff.get("generalization_gap_abs"),
+                "cost": float(round_id if round_id > 0 else 1),
+            },
+        ],
+        higher_is_better=bool(higher_is_better),
+        min_delta=float(min_delta),
+    )
+    selected_label = str(incumbent_selection.get("selected_label") or "").strip().lower()
+    improved = bool(
+        selected_label == "candidate"
+        and bool(approved)
+        and bool(improved_by_metric)
+        and bool(stability_ok)
+    )
+    state["opt_incumbent_selection"] = incumbent_selection
     if not improved:
         _restore_ml_outputs(snapshot_dir, output_paths)
         state["ml_improvement_kept"] = "baseline"
@@ -23330,6 +23419,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         "forced_finalize": bool(force_finalize),
         "forced_finalize_reason": force_finalize_reason if force_finalize else "",
         "kept": state.get("ml_improvement_kept"),
+        "incumbent_selection": incumbent_selection,
         "no_improve_streak": int(no_improve_streak),
         "rounds_allowed": int(rounds_allowed),
         "patience": int(patience),
@@ -23426,6 +23516,41 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                     if isinstance(round_record.get("apply_guard"), dict)
                     else None
                 ),
+            },
+        )
+        hypothesis_payload = hypothesis_packet.get("hypothesis") if isinstance(hypothesis_packet.get("hypothesis"), dict) else {}
+        delta_value_for_memory = None
+        if baseline_value is not None and improved_value is not None:
+            delta_value_for_memory = float(improved_value - baseline_value)
+        append_hypothesis_memory(
+            run_id,
+            round_id=int(round_id or 0),
+            technique=str(hypothesis_payload.get("technique") or ""),
+            target_columns=normalize_target_columns(hypothesis_payload.get("target_columns")),
+            feature_scope=str(hypothesis_payload.get("feature_scope") or "model_features"),
+            params=hypothesis_payload.get("params") if isinstance(hypothesis_payload.get("params"), dict) else {},
+            metric_name=metric_name,
+            metric_value=improved_value,
+            delta=delta_value_for_memory,
+            stability_ok=bool(stability_ok),
+            cost=float(round_id if round_id > 0 else 1),
+            status=str(state.get("ml_improvement_kept") or ""),
+            phase=str(
+                (
+                    state.get("ml_optimization_context", {}).get("policy", {}).get("phase")
+                    if isinstance(state.get("ml_optimization_context"), dict)
+                    else ""
+                )
+                or "full_eval"
+            ),
+            extra={
+                "signature": tracker_context.get("signature"),
+                "action": hypothesis_packet.get("action"),
+                "approved": bool(approved),
+                "improved_by_metric": bool(improved_by_metric),
+                "deterministic_blockers": bool(deterministic_blockers),
+                "event": "candidate_evaluated",
+                "kept": state.get("ml_improvement_kept"),
             },
         )
         try:
@@ -23624,47 +23749,146 @@ def run_metric_improvement_finalize(state: AgentState) -> AgentState:
     return updates
 
 
-def check_review_board_metric_improvement_route(state: AgentState) -> str:
+def _log_metric_round_retry_decision(state: AgentState, reason: str) -> None:
+    snapshot = state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {}
+    metric_name = snapshot.get("primary_metric_name", "unknown")
+    metric_value = snapshot.get("primary_metric_value", "N/A")
+    best_value = snapshot.get("baseline_value", "N/A")
+    rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
+    round_count = int(state.get("ml_improvement_round_count", 0) or 0)
+    budget_left = max(0, rounds_allowed - round_count)
+    print(
+        f"ITER_DECISION type=metric action=retry reason={reason} "
+        f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
+    )
+
+
+def _should_continue_opt_loop(state: AgentState) -> bool:
+    continue_round = bool(state.get("ml_improvement_continue"))
+    if not continue_round or bool(state.get("ml_improvement_round_active")):
+        return False
+    rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
+    round_count = int(state.get("ml_improvement_round_count", 0) or 0)
+    if rounds_allowed > 0 and round_count >= rounds_allowed:
+        return False
+    patience = int(state.get("ml_improvement_patience", 1) or 1)
+    no_improve_streak = int(state.get("ml_improvement_no_improve_streak", 0) or 0)
+    if no_improve_streak >= max(1, patience):
+        return False
+    return True
+
+
+def run_bootstrap_opt_round(state: AgentState) -> AgentState:
+    updates = run_metric_improvement_bootstrap(state)
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    quick_folds, full_folds = _resolve_opt_eval_folds(contract)
+    updates["opt_round_bootstrapped"] = bool(updates.get("metric_improvement_bootstrapped"))
+    updates["opt_round_plan_ready"] = False
+    updates["opt_quick_eval_folds"] = int(quick_folds)
+    updates["opt_full_eval_folds"] = int(full_folds)
+    updates["opt_loop_phase"] = "bootstrap" if updates.get("opt_round_bootstrapped") else "idle"
+    return updates
+
+
+def run_plan_opt_hypothesis(state: AgentState) -> AgentState:
+    hypothesis_packet = (
+        state.get("ml_improvement_hypothesis_packet")
+        if isinstance(state.get("ml_improvement_hypothesis_packet"), dict)
+        else {}
+    )
+    critique_packet = (
+        state.get("ml_improvement_critique_packet")
+        if isinstance(state.get("ml_improvement_critique_packet"), dict)
+        else {}
+    )
+    optimization_context = (
+        state.get("ml_optimization_context")
+        if isinstance(state.get("ml_optimization_context"), dict)
+        else {}
+    )
+    plan_ready = bool(state.get("metric_improvement_bootstrapped")) and bool(hypothesis_packet) and bool(critique_packet)
+    if not plan_ready:
+        # Allow deterministic fallback rounds where packets are intentionally sparse.
+        plan_ready = bool(state.get("metric_improvement_bootstrapped")) and bool(optimization_context)
+    return {
+        "opt_round_plan_ready": bool(plan_ready),
+        "opt_loop_phase": "plan" if plan_ready else "idle",
+    }
+
+
+def run_quick_eval(state: AgentState) -> AgentState:
+    updates: Dict[str, Any] = {"opt_loop_phase": "quick_eval"}
+    if bool(state.get("opt_round_plan_ready")) and bool(state.get("metric_improvement_bootstrapped")):
+        updates["last_iteration_type"] = "metric"
+    return updates
+
+
+def run_full_eval(state: AgentState) -> AgentState:
+    updates = run_metric_improvement_finalize(state)
+    updates["opt_loop_phase"] = "full_eval"
+    return updates
+
+
+def run_select_incumbent(state: AgentState) -> AgentState:
+    selection = state.get("opt_incumbent_selection")
+    if not isinstance(selection, dict) or not selection:
+        round_history = state.get("ml_improvement_round_history") if isinstance(state.get("ml_improvement_round_history"), list) else []
+        if round_history and isinstance(round_history[-1], dict):
+            candidate = round_history[-1].get("incumbent_selection")
+            if isinstance(candidate, dict):
+                selection = candidate
+    if not isinstance(selection, dict):
+        selection = {}
+    return {
+        "opt_incumbent_selection": selection,
+        "opt_loop_phase": "select_incumbent",
+    }
+
+
+def run_finalize_opt_loop(state: AgentState) -> AgentState:
+    continue_round = _should_continue_opt_loop(state)
+    return {
+        "opt_loop_phase": "finalize",
+        "metric_improvement_nodes_managed": False if continue_round else True,
+    }
+
+
+def check_review_board_opt_route(state: AgentState) -> str:
     if bool(state.get("ml_improvement_round_active")):
+        return "run_full_eval"
+    return "bootstrap_opt_round"
+
+
+def check_run_quick_eval_route(state: AgentState) -> str:
+    if bool(state.get("metric_improvement_bootstrapped")):
+        _log_metric_round_retry_decision(state, "METRIC_IMPROVEMENT_ROUND")
+        return "retry"
+    return check_evaluation(state)
+
+
+def check_finalize_opt_loop_route(state: AgentState) -> str:
+    if _should_continue_opt_loop(state):
+        _log_metric_round_retry_decision(state, "METRIC_IMPROVEMENT_ROUND")
+        return "bootstrap_opt_round"
+    return check_evaluation(state)
+
+
+def check_review_board_metric_improvement_route(state: AgentState) -> str:
+    route = check_review_board_opt_route(state)
+    if route == "run_full_eval":
         return "finalize_improvement_round"
     return "bootstrap_improvement_round"
 
 
 def check_metric_improvement_bootstrap_route(state: AgentState) -> str:
-    if bool(state.get("metric_improvement_bootstrapped")):
-        snapshot = state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {}
-        metric_name = snapshot.get("primary_metric_name", "unknown")
-        metric_value = snapshot.get("primary_metric_value", "N/A")
-        best_value = snapshot.get("baseline_value", "N/A")
-        rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
-        round_count = int(state.get("ml_improvement_round_count", 0) or 0)
-        budget_left = max(0, rounds_allowed - round_count)
-        print(
-            f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT_ROUND "
-            f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
-        )
-        return "retry"
-    return check_evaluation(state)
+    return check_run_quick_eval_route(state)
 
 
 def check_finalize_metric_improvement_route(state: AgentState) -> str:
-    """Route finalization to bootstrap node when another metric round is requested."""
-    continue_round = bool(state.get("ml_improvement_continue"))
-    round_active = bool(state.get("ml_improvement_round_active"))
-    if continue_round and not round_active:
-        snapshot = state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {}
-        metric_name = snapshot.get("primary_metric_name", "unknown")
-        metric_value = snapshot.get("primary_metric_value", "N/A")
-        best_value = snapshot.get("baseline_value", "N/A")
-        rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
-        round_count = int(state.get("ml_improvement_round_count", 0) or 0)
-        budget_left = max(0, rounds_allowed - round_count)
-        print(
-            f"ITER_DECISION type=metric action=retry reason=METRIC_IMPROVEMENT_ROUND "
-            f"metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}"
-        )
+    route = check_finalize_opt_loop_route(state)
+    if route == "bootstrap_opt_round":
         return "bootstrap_improvement_round"
-    return check_evaluation(state)
+    return route
 
 
 def check_evaluation(state: AgentState):
@@ -24326,6 +24550,13 @@ workflow.add_node("final_runtime_fix", finalize_runtime_failure)
 workflow.add_node("execute_code", execute_code)
 workflow.add_node("evaluate_results", run_result_evaluator) # New Node
 workflow.add_node("review_board", run_review_board)
+workflow.add_node("bootstrap_opt_round", run_bootstrap_opt_round)
+workflow.add_node("plan_opt_hypothesis", run_plan_opt_hypothesis)
+workflow.add_node("run_quick_eval", run_quick_eval)
+workflow.add_node("run_full_eval", run_full_eval)
+workflow.add_node("select_incumbent", run_select_incumbent)
+workflow.add_node("finalize_opt_loop", run_finalize_opt_loop)
+# Legacy compatibility nodes (kept for tests/backward routes)
 workflow.add_node("bootstrap_improvement_round", run_metric_improvement_bootstrap)
 workflow.add_node("finalize_improvement_round", run_metric_improvement_finalize)
 workflow.add_node("retry_handler", retry_handler)
@@ -24408,17 +24639,43 @@ workflow.add_edge("evaluate_results", "review_board")
 # Conditional Edge for Review Board Decision
 workflow.add_conditional_edges(
     "review_board",
-    check_review_board_metric_improvement_route,
+    check_review_board_opt_route,
     {
-        "bootstrap_improvement_round": "bootstrap_improvement_round",
-        "finalize_improvement_round": "finalize_improvement_round",
+        "bootstrap_opt_round": "bootstrap_opt_round",
+        "run_full_eval": "run_full_eval",
     }
 )
 
+workflow.add_edge("bootstrap_opt_round", "plan_opt_hypothesis")
+workflow.add_edge("plan_opt_hypothesis", "run_quick_eval")
+
+workflow.add_conditional_edges(
+    "run_quick_eval",
+    check_run_quick_eval_route,
+    {
+        "retry": "retry_handler",
+        "approved": "translator"
+    }
+)
+
+# Legacy compatibility routes (reachable from historical branches).
 workflow.add_conditional_edges(
     "bootstrap_improvement_round",
     check_metric_improvement_bootstrap_route,
     {
+        "retry": "retry_handler",
+        "approved": "translator"
+    }
+)
+
+workflow.add_edge("run_full_eval", "select_incumbent")
+workflow.add_edge("select_incumbent", "finalize_opt_loop")
+
+workflow.add_conditional_edges(
+    "finalize_opt_loop",
+    check_finalize_opt_loop_route,
+    {
+        "bootstrap_opt_round": "bootstrap_opt_round",
         "retry": "retry_handler",
         "approved": "translator"
     }
