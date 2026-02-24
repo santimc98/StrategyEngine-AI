@@ -120,10 +120,6 @@ _ACTION_FAMILY_GUIDANCE: Dict[str, List[str]] = {
 }
 
 
-def get_action_families() -> List[str]:
-    return list(ACTION_FAMILIES)
-
-
 def normalize_action_family(value: Any) -> str:
     token = str(value or "").strip().lower()
     return token if token in ACTION_FAMILIES else "feature_engineering"
@@ -174,4 +170,3 @@ def get_action_family_guidance(action_family: str) -> List[str]:
     normalized = normalize_action_family(action_family)
     guidance = _ACTION_FAMILY_GUIDANCE.get(normalized, _ACTION_FAMILY_GUIDANCE["feature_engineering"])
     return [str(item) for item in guidance]
-

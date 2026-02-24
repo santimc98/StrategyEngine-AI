@@ -1848,25 +1848,6 @@ class ResultsAdvisorAgent:
             "primary_metric": metric_name,
         }
 
-    def _suggest_next_changes(self, review_feedback: str) -> List[str]:
-        text = str(review_feedback or "").lower()
-        suggestions: List[str] = []
-        if "baseline" in text or "dummy" in text:
-            suggestions.append("Add baseline metrics to quantify lift over trivial models.")
-        if "validation" in text or "cross_validation" in text or "split" in text:
-            suggestions.append("Align validation strategy with contract (CV/holdout/time split).")
-        if self._feedback_indicates_leakage_risk(text):
-            suggestions.append("Remove post-outcome features and rerun leakage checks.")
-        if "imputer" in text or "missing" in text:
-            suggestions.append("Add preprocessing with imputation for missing values.")
-        if "metrics" in text:
-            suggestions.append("Recompute and persist metrics.json for the current outputs.")
-        if "alignment" in text:
-            suggestions.append("Address alignment_check issues before further tuning.")
-        if not suggestions:
-            suggestions.append("Simplify the model, validate splits, and report metrics with confidence intervals.")
-        return suggestions[:4]
-
     def _feedback_indicates_leakage_risk(self, text: str) -> bool:
         lowered = str(text or "").lower()
         if "leak" not in lowered:
@@ -1943,25 +1924,6 @@ class ResultsAdvisorAgent:
             if corr is not None and threshold is not None and abs(corr) >= abs(threshold):
                 return True
         return False
-
-    def _detect_plateau(self, metric_history: List[Dict[str, Any]], window: int, epsilon: float) -> bool:
-        if not metric_history or len(metric_history) < window:
-            return False
-        recent = metric_history[-window:]
-        lifts = [item.get("lift") for item in recent if isinstance(item, dict)]
-        if len(lifts) == window and all(isinstance(val, (int, float)) for val in lifts):
-            return all(val < epsilon for val in lifts)
-        values = [item.get("primary_metric_value") for item in recent if isinstance(item, dict)]
-        if len(values) == window and all(isinstance(val, (int, float)) for val in values):
-            deltas = [abs(values[idx] - values[idx - 1]) for idx in range(1, len(values))]
-            return all(delta <= epsilon for delta in deltas)
-        return False
-
-    def _build_iteration_recommendation(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        # Deprecated by PR4 governance: ResultsAdvisor no longer issues loop actions.
-        # Keep the method for compatibility with older call-sites.
-        _ = context
-        return {}
 
     def _flatten_numeric_metrics(self, metrics: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
         if not isinstance(metrics, dict):

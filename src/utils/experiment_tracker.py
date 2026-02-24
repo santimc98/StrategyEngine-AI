@@ -165,20 +165,6 @@ def append_hypothesis_memory(
     return append_experiment_entry(run_id, payload, base_dir=base_dir)
 
 
-def load_hypothesis_memory(run_id: str, k: int = 20, base_dir: str = "runs") -> List[Dict[str, Any]]:
-    rows = load_recent_experiment_entries(run_id, k=max(1, int(k or 20)) * 3, base_dir=base_dir)
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        normalized = normalize_experiment_entry(row if isinstance(row, dict) else {})
-        if not isinstance(normalized.get("signature"), str) or not str(normalized.get("signature")).strip():
-            continue
-        out.append(normalized)
-    limit = int(k or 0)
-    if limit <= 0:
-        return []
-    return out[-limit:]
-
-
 def append_experiment_entry(run_id: str, entry_dict: Dict[str, Any], base_dir: str = "runs") -> str | None:
     if not run_id or not isinstance(entry_dict, dict):
         return None

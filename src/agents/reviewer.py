@@ -19,40 +19,6 @@ from src.utils.contract_first_gates import apply_contract_first_gate_policy
 load_dotenv()
 
 
-def _extract_json_object(text: str) -> str | None:
-    if not text:
-        return None
-    start = None
-    depth = 0
-    in_str = False
-    escape = False
-    for i, ch in enumerate(text):
-        if start is None:
-            if ch == "{":
-                start = i
-                depth = 1
-                in_str = False
-                escape = False
-            continue
-        if in_str:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == "\"":
-                in_str = False
-            continue
-        if ch == "\"":
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
-    return None
-
-
 def _coerce_llm_response_text(response: Any) -> str:
     if isinstance(response, str):
         return response
@@ -887,11 +853,6 @@ class ReviewerAgent:
                 "warnings": precheck_warnings,
                 "evidence": [{"claim": "Reviewer API call failed.", "source": "missing"}],
             }
-
-    def _clean_json(self, text: str) -> str:
-        text = re.sub(r'```json', '', text)
-        text = re.sub(r'```', '', text)
-        return text.strip()
 
     def _parse_json_payload(self, text: str) -> Dict[str, Any]:
         try:
