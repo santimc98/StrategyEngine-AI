@@ -141,6 +141,28 @@ def test_validate_contract_minimal_readonly_allows_missing_iteration_policy_with
     assert "contract.iteration_policy" in rules
 
 
+def test_validate_contract_minimal_readonly_allows_missing_optimization_policy_with_warning():
+    contract = _base_full_pipeline_contract()
+    contract.pop("optimization_policy", None)
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is True
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.optimization_policy_missing" in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_invalid_optimization_policy_type():
+    contract = _base_full_pipeline_contract()
+    contract["optimization_policy"] = "enabled=true"
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.optimization_policy_type" in rules
+
+
 def test_validate_contract_minimal_readonly_rejects_missing_evaluation_spec_for_ml_scope():
     contract = _base_full_pipeline_contract()
     contract.pop("evaluation_spec", None)

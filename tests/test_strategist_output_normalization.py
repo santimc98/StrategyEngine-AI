@@ -161,6 +161,44 @@ class TestStrategistNormalization:
         assert output["column_validation"]["invalid_count"] == 0
         assert output["strategies"][0]["required_columns"] == ["ps_car_01_cat", "target"]
 
+    def test_generate_prompt_excludes_feature_engineering_step(self):
+        payload = {
+            "strategies": [
+                {
+                    "title": "Baseline Churn",
+                    "objective_type": "predictive",
+                    "objective_reasoning": "Predict churn probability for retention actions.",
+                    "success_metric": "roc_auc",
+                    "recommended_evaluation_metrics": ["roc_auc"],
+                    "validation_strategy": "stratified_cv",
+                    "validation_rationale": "Class balance should be preserved.",
+                    "analysis_type": "Churn Prediction",
+                    "hypothesis": "Core behavioral variables are predictive.",
+                    "required_columns": ["target", "feature_a"],
+                    "feature_families": [],
+                    "techniques": ["gradient_boosting", "logistic_regression"],
+                    "feasibility_analysis": {
+                        "statistical_power": "adequate",
+                        "signal_quality": "moderate",
+                        "compute_value_tradeoff": "acceptable",
+                    },
+                    "fallback_chain": ["gradient_boosting", "logistic_regression"],
+                    "expected_lift": "3-5% over naive baseline",
+                    "estimated_difficulty": "Medium",
+                    "reasoning": "Balanced baseline strategy with robust fallback.",
+                }
+            ]
+        }
+        self.agent.model.generate_content = MagicMock(return_value=_mock_llm_response(payload))
+        self.agent.generate_strategies(
+            data_summary="summary",
+            user_request="predict churn",
+            column_inventory=["target", "feature_a"],
+        )
+        prompt = self.agent.last_prompt or ""
+        assert "FEATURE ENGINEERING REASONING" not in prompt
+        assert '"feature_engineering_strategy"' not in prompt
+
 
 class TestGraphStrategistIntegration:
     

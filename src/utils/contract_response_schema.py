@@ -3,6 +3,7 @@ Execution Planner structured-output schemas.
 """
 
 from typing import Any, Dict
+import copy
 
 
 EXECUTION_CONTRACT_V41_MIN_SCHEMA: Dict[str, Any] = {
@@ -96,4 +97,47 @@ EXECUTION_CONTRACT_V41_MIN_SCHEMA: Dict[str, Any] = {
     },
     "additionalProperties": True,
 }
+
+
+OPTIMIZATION_POLICY_MIN_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "enabled",
+        "max_rounds",
+        "quick_eval_folds",
+        "full_eval_folds",
+        "min_delta",
+        "patience",
+        "allow_model_switch",
+        "allow_ensemble",
+        "allow_hpo",
+        "allow_feature_engineering",
+        "allow_calibration",
+    ],
+    "properties": {
+        "enabled": {"type": "boolean"},
+        "max_rounds": {"type": "integer", "minimum": 1},
+        "quick_eval_folds": {"type": "integer", "minimum": 1},
+        "full_eval_folds": {"type": "integer", "minimum": 1},
+        "min_delta": {"type": "number", "minimum": 0},
+        "patience": {"type": "integer", "minimum": 0},
+        "allow_model_switch": {"type": "boolean"},
+        "allow_ensemble": {"type": "boolean"},
+        "allow_hpo": {"type": "boolean"},
+        "allow_feature_engineering": {"type": "boolean"},
+        "allow_calibration": {"type": "boolean"},
+    },
+    "additionalProperties": True,
+}
+
+
+EXECUTION_CONTRACT_V42_MIN_SCHEMA: Dict[str, Any] = copy.deepcopy(EXECUTION_CONTRACT_V41_MIN_SCHEMA)
+EXECUTION_CONTRACT_V42_MIN_SCHEMA["properties"] = dict(EXECUTION_CONTRACT_V42_MIN_SCHEMA.get("properties") or {})
+EXECUTION_CONTRACT_V42_MIN_SCHEMA["properties"]["contract_version"] = {
+    "type": "string",
+    "enum": ["4.1", "4.2"],
+}
+EXECUTION_CONTRACT_V42_MIN_SCHEMA["properties"]["optimization_policy"] = copy.deepcopy(
+    OPTIMIZATION_POLICY_MIN_SCHEMA
+)
 

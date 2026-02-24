@@ -26,7 +26,4 @@ def test_ensure_feature_engineering_plan_from_strategy_maps_object_payload() -> 
 
 def test_ensure_feature_engineering_plan_from_strategy_backfills_empty_structure() -> None:
     out = _ensure_feature_engineering_plan_from_strategy({}, {})
-    fep = out.get("feature_engineering_plan", {})
-    assert fep.get("techniques") == []
-    assert fep.get("derived_columns") == []
-    assert fep.get("notes") == ""
+    assert "feature_engineering_plan" not in out

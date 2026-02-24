@@ -349,6 +349,128 @@ ITERATION_HYPOTHESIS_PACKET_V1_SCHEMA: Dict[str, Any] = {
 }
 
 
+EXPERIMENT_HYPOTHESIS_PACKET_V2_SCHEMA: Dict[str, Any] = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://multiagent-bi/schemas/experiment_hypothesis_packet-2.0.schema.json",
+    "title": "Experiment Hypothesis Packet V2",
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "packet_type",
+        "packet_version",
+        "run_id",
+        "round",
+        "hypothesis_id",
+        "action",
+        "technique",
+        "objective",
+        "target_columns",
+        "params",
+        "success_criteria",
+    ],
+    "definitions": {
+        "targetColumnMacro": {
+            "type": "string",
+            "enum": sorted(TARGET_COLUMN_MACROS),
+        }
+    },
+    "properties": {
+        "packet_type": {"const": "experiment_hypothesis_packet"},
+        "packet_version": {"const": "2.0"},
+        "run_id": {"type": "string", "minLength": 1},
+        "round": {"type": "integer", "minimum": 1},
+        "hypothesis_id": {"type": "string", "pattern": "^h_[a-zA-Z0-9_-]{6,64}$"},
+        "action": {"type": "string", "enum": ["APPLY", "NO_OP"]},
+        "technique": {"type": "string", "minLength": 1},
+        "objective": {"type": "string", "minLength": 1, "maxLength": 280},
+        "target_columns": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 200,
+            "uniqueItems": True,
+            "items": {
+                "anyOf": [
+                    {"$ref": "#/definitions/targetColumnMacro"},
+                    {"type": "string", "minLength": 1, "maxLength": 128},
+                ]
+            },
+        },
+        "params": {"type": "object", "additionalProperties": True},
+        "success_criteria": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["primary_metric_name", "min_delta", "must_pass_active_gates"],
+            "properties": {
+                "primary_metric_name": {"type": "string", "minLength": 1},
+                "min_delta": {"type": "number", "minimum": 0},
+                "must_pass_active_gates": {"type": "boolean"},
+            },
+        },
+        "constraints": {"type": "object", "additionalProperties": True},
+        "timestamp_utc": {"type": "string", "format": "date-time"},
+    },
+}
+
+
+EXPERIMENT_RESULT_PACKET_V2_SCHEMA: Dict[str, Any] = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://multiagent-bi/schemas/experiment_result_packet-2.0.schema.json",
+    "title": "Experiment Result Packet V2",
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "packet_type",
+        "packet_version",
+        "run_id",
+        "round",
+        "hypothesis_id",
+        "status",
+        "primary_metric_name",
+        "baseline_metric",
+        "candidate_metric",
+        "delta_abs",
+        "meets_min_delta",
+        "gates_passed",
+    ],
+    "properties": {
+        "packet_type": {"const": "experiment_result_packet"},
+        "packet_version": {"const": "2.0"},
+        "run_id": {"type": "string", "minLength": 1},
+        "round": {"type": "integer", "minimum": 1},
+        "hypothesis_id": {"type": "string", "pattern": "^h_[a-zA-Z0-9_-]{6,64}$"},
+        "status": {"type": "string", "enum": ["SUCCESS", "FAILED", "REJECTED"]},
+        "primary_metric_name": {"type": "string", "minLength": 1},
+        "baseline_metric": {"type": "number"},
+        "candidate_metric": {"type": "number"},
+        "delta_abs": {"type": "number"},
+        "meets_min_delta": {"type": "boolean"},
+        "gates_passed": {"type": "boolean"},
+        "failed_gates": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 30,
+            "uniqueItems": True,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "hard_failures": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 30,
+            "uniqueItems": True,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "artifacts_present": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 200,
+            "items": {"type": "string", "minLength": 1},
+        },
+        "analysis_summary": {"type": "string", "minLength": 1, "maxLength": 500},
+        "timestamp_utc": {"type": "string", "format": "date-time"},
+    },
+}
+
+
 def _iter_jsonschema_errors(packet: Dict[str, Any], schema: Dict[str, Any]) -> List[str]:
     if Draft7Validator is None:
         return []
@@ -514,3 +636,51 @@ def validate_iteration_hypothesis_packet(packet: Any) -> Tuple[bool, List[str]]:
     errors.extend(_iter_jsonschema_errors(packet, ITERATION_HYPOTHESIS_PACKET_V1_SCHEMA))
     return len(errors) == 0, errors
 
+
+def validate_experiment_hypothesis_packet_v2(packet: Any) -> Tuple[bool, List[str]]:
+    errors: List[str] = []
+    if not isinstance(packet, dict):
+        return False, ["packet must be an object"]
+    if packet.get("packet_type") != "experiment_hypothesis_packet":
+        errors.append("packet_type must be experiment_hypothesis_packet")
+    if packet.get("packet_version") != "2.0":
+        errors.append("packet_version must be 2.0")
+    action = str(packet.get("action") or "")
+    if action not in {"APPLY", "NO_OP"}:
+        errors.append("action must be APPLY or NO_OP")
+    technique = str(packet.get("technique") or "").strip()
+    if action == "NO_OP" and technique != "NO_OP":
+        errors.append("NO_OP action requires technique=NO_OP")
+    target_columns = packet.get("target_columns")
+    if not isinstance(target_columns, list) or not target_columns:
+        errors.append("target_columns must be a non-empty array")
+    else:
+        normalized = normalize_target_columns(target_columns)
+        if len(normalized) != len(target_columns):
+            errors.append("target_columns contain invalid/empty values")
+    errors.extend(_iter_jsonschema_errors(packet, EXPERIMENT_HYPOTHESIS_PACKET_V2_SCHEMA))
+    return len(errors) == 0, errors
+
+
+def validate_experiment_result_packet_v2(packet: Any) -> Tuple[bool, List[str]]:
+    errors: List[str] = []
+    if not isinstance(packet, dict):
+        return False, ["packet must be an object"]
+    if packet.get("packet_type") != "experiment_result_packet":
+        errors.append("packet_type must be experiment_result_packet")
+    if packet.get("packet_version") != "2.0":
+        errors.append("packet_version must be 2.0")
+    status = str(packet.get("status") or "")
+    if status not in {"SUCCESS", "FAILED", "REJECTED"}:
+        errors.append("status must be SUCCESS|FAILED|REJECTED")
+    if packet.get("gates_passed") is True and status == "REJECTED":
+        errors.append("REJECTED status cannot have gates_passed=true")
+    if packet.get("meets_min_delta") is True:
+        try:
+            delta = float(packet.get("delta_abs"))
+            if delta < 0:
+                errors.append("delta_abs must be >= 0 when meets_min_delta=true")
+        except Exception:
+            errors.append("delta_abs must be numeric")
+    errors.extend(_iter_jsonschema_errors(packet, EXPERIMENT_RESULT_PACKET_V2_SCHEMA))
+    return len(errors) == 0, errors

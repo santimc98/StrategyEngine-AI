@@ -40,13 +40,15 @@ from src.utils.contract_validator import (
     is_probably_path,
     is_file_path,
     _normalize_selector_entry,
+    get_default_optimization_policy,
+    normalize_optimization_policy,
 )
 from src.utils.contract_schema_registry import (
     build_contract_schema_examples_text,
     get_contract_schema_repair_action,
     apply_contract_schema_registry_repairs,
 )
-from src.utils.contract_response_schema import EXECUTION_CONTRACT_V41_MIN_SCHEMA
+from src.utils.contract_response_schema import EXECUTION_CONTRACT_V42_MIN_SCHEMA
 
 load_dotenv()
 
@@ -135,18 +137,19 @@ Minimal contract interface:
   Each value MUST be an object with key "target_dtype" (NOT "type").
 - artifact_requirements: object
 - iteration_policy: object with practical retry/iteration limits (small, numeric, and actionable)
+- optimization_policy (recommended for v4.2, backward-compatible): object with:
+  - enabled, max_rounds, quick_eval_folds, full_eval_folds, min_delta, patience,
+    allow_model_switch, allow_ensemble, allow_hpo, allow_feature_engineering, allow_calibration
 - outlier_policy (optional): object for robust outlier handling when strategy/data justify it.
   - recommended fields: enabled(bool), apply_stage("data_engineer"|"ml_engineer"|"both"),
     target_columns(list[str]), methods/treatment(object|list), report_path(file path), strict(bool).
   - recommended fields: enabled(bool), apply_stage("data_engineer"|"ml_engineer"|"both"),
     target_columns(list[str]), methods/treatment(object|list), report_path(file path), strict(bool).
-- feature_engineering_tasks: list of objects representing transformations.
-  - items should have: "technique", "input_columns", "output_column_name" (or prefix), "rationale".
-  - REQUIRED if strategy.feature_engineering_strategy is present.
-  - You MUST map strategy.feature_engineering_strategy items to this list.
-  - Use this to formalize the Strategist's feature engineering request.
+- feature_engineering_plan / feature_engineering_tasks (legacy optional):
+  - preserve if explicitly provided by upstream context.
+  - do not require or invent FE plans at planner stage.
 - derived_columns: list[str] OR object mapping new_column_name -> definition/source.
-  - REQUIRED if feature_engineering_tasks imply creation of new columns.
+  - REQUIRED only when the contract explicitly declares derived columns.
   - Use to declare columns that do not exist in the raw data but will be created.
   - Downstream normalization may convert this field to a list of derived column names.
 
@@ -587,10 +590,23 @@ def _ensure_feature_engineering_plan_from_strategy(
 
     normalized_fe = _normalize_strategy_feature_engineering_payload(strategy)
     existing = contract.get("feature_engineering_plan")
+    existing_present = "feature_engineering_plan" in contract
     if not isinstance(existing, dict):
         existing = {}
 
     techniques = normalized_fe.get("techniques") if isinstance(normalized_fe.get("techniques"), list) else []
+    notes_from_strategy = str(normalized_fe.get("notes") or "").strip()
+    raw_constraints = strategy.get("feature_engineering_constraints") if isinstance(strategy, dict) else None
+    constraints_from_strategy = raw_constraints if isinstance(raw_constraints, dict) and raw_constraints else {}
+    if (
+        not existing_present
+        and not techniques
+        and not notes_from_strategy
+        and not constraints_from_strategy
+    ):
+        # Legacy field is optional: keep absent unless strategy/contracts explicitly provide FE content.
+        return contract
+
     existing_derived_raw = existing.get("derived_columns")
     existing_entries: List[Any] = list(existing_derived_raw) if isinstance(existing_derived_raw, list) else []
     existing_names = _extract_derived_column_names(existing_entries)
@@ -609,14 +625,12 @@ def _ensure_feature_engineering_plan_from_strategy(
     if not merged_derived_entries:
         merged_derived_entries = []
 
-    notes = str(existing.get("notes") or normalized_fe.get("notes") or "").strip()
+    notes = str(existing.get("notes") or notes_from_strategy or "").strip()
     constraints = existing.get("constraints")
     if not isinstance(constraints, dict):
         constraints = {}
-    if isinstance(strategy, dict):
-        raw_constraints = strategy.get("feature_engineering_constraints")
-        if isinstance(raw_constraints, dict) and raw_constraints:
-            constraints = dict(raw_constraints)
+    if constraints_from_strategy:
+        constraints = dict(constraints_from_strategy)
 
     contract["feature_engineering_plan"] = {
         "techniques": techniques,
@@ -624,6 +638,13 @@ def _ensure_feature_engineering_plan_from_strategy(
         "constraints": constraints,
         "notes": notes,
     }
+    return contract
+
+
+def _ensure_optimization_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+    contract["optimization_policy"] = normalize_optimization_policy(contract.get("optimization_policy"))
     return contract
 
 
@@ -2147,6 +2168,7 @@ def _create_v41_skeleton(
             "max_iterations": 3,
             "early_stop_on_success": True
         },
+        "optimization_policy": get_default_optimization_policy(),
         
         "unknowns": [
             {
@@ -4045,6 +4067,7 @@ def build_contract_min(
             "max_training_retries": 2,
             "max_total_attempts": 4,
         }
+    optimization_policy = normalize_optimization_policy(contract.get("optimization_policy"))
 
     scope = normalize_contract_scope(contract.get("scope"))
     if scope not in {"cleaning_only", "ml_only", "full_pipeline"}:
@@ -4096,6 +4119,7 @@ def build_contract_min(
         "objective_analysis": objective_analysis,
         "evaluation_spec": evaluation_spec,
         "iteration_policy": iteration_policy,
+        "optimization_policy": optimization_policy,
     }
     if prep_reqs_min:
         contract_min["preprocessing_requirements"] = prep_reqs_min
@@ -4131,14 +4155,14 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
         "contract_version", "strategy_title", "business_objective",
         "missing_columns_handling", "execution_constraints",
         "objective_analysis", "data_analysis", "column_roles",
-        "preprocessing_requirements", "feature_engineering_plan",
+        "preprocessing_requirements",
         "validation_requirements", "leakage_execution_plan",
         "optimization_specification", "segmentation_constraints",
         "data_limited_mode", "allowed_feature_sets",
         "artifact_requirements", "qa_gates", "cleaning_gates", "reviewer_gates",
         "data_engineer_runbook", "ml_engineer_runbook",
         "available_columns", "canonical_columns", "derived_columns",
-        "required_outputs", "iteration_policy", "column_dtype_targets", "unknowns",
+        "required_outputs", "iteration_policy", "optimization_policy", "column_dtype_targets", "unknowns",
         "assumptions", "notes_for_engineers"
     ]
 
@@ -4152,6 +4176,8 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
             # Fill with safe default
             if key == "contract_version":
                 contract[key] = CONTRACT_VERSION_V41
+            elif key == "optimization_policy":
+                contract[key] = get_default_optimization_policy()
             elif key in ("optimization_specification", "segmentation_constraints"):
                 contract[key] = None
             elif key in ("unknowns", "assumptions", "notes_for_engineers", "available_columns",
@@ -4195,6 +4221,13 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
             "mitigation": "Review LLM output quality",
             "requires_verification": False
         })
+
+    # Legacy optional field: if present, keep dict shape.
+    if "feature_engineering_plan" in contract and not isinstance(contract.get("feature_engineering_plan"), dict):
+        contract["feature_engineering_plan"] = {}
+
+    # v4.2-compatible policy defaults.
+    contract["optimization_policy"] = normalize_optimization_policy(contract.get("optimization_policy"))
 
     return contract
 
@@ -5227,7 +5260,7 @@ class ExecutionPlannerAgent:
         config = dict(self._generation_config)
         config["max_output_tokens"] = int(budgeted_max)
         if self._use_response_schema:
-            config["response_schema"] = copy.deepcopy(EXECUTION_CONTRACT_V41_MIN_SCHEMA)
+            config["response_schema"] = copy.deepcopy(EXECUTION_CONTRACT_V42_MIN_SCHEMA)
         return config
 
     @staticmethod
@@ -7709,6 +7742,7 @@ class ExecutionPlannerAgent:
                 contract["compliance_checklist"] = []
             if not isinstance(contract.get("iteration_policy"), dict):
                 contract["iteration_policy"] = {}
+            contract["optimization_policy"] = normalize_optimization_policy(contract.get("optimization_policy"))
             return contract
 
         def _attach_reporting_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -10176,6 +10210,7 @@ class ExecutionPlannerAgent:
                     contract,
                     strategy if isinstance(strategy, dict) else {},
                 )
+                contract = _ensure_optimization_policy(contract)
                 # Apply deliverables canonicalization + auto-sync
                 contract = _apply_deliverables(contract)
                 # Lint deliverable invariants

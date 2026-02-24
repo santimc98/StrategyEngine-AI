@@ -29,7 +29,7 @@ def test_fallback_contains_all_v41_keys():
         "cleaning_gates",
         "data_engineer_runbook", "ml_engineer_runbook",
         "available_columns", "canonical_columns", "derived_columns",
-        "required_outputs", "iteration_policy", "unknowns",
+        "required_outputs", "iteration_policy", "optimization_policy", "unknowns",
         "assumptions", "notes_for_engineers"
     ]
     

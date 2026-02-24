@@ -1,6 +1,8 @@
 from src.utils.actor_critic_schemas import (
     normalize_target_columns,
     validate_advisor_critique_packet,
+    validate_experiment_hypothesis_packet_v2,
+    validate_experiment_result_packet_v2,
     validate_iteration_hypothesis_packet,
 )
 
@@ -135,3 +137,44 @@ def test_validate_iteration_hypothesis_packet_rejects_duplicate_apply() -> None:
     assert valid is False
     assert any("action=NO_OP" in msg or "NO_OP" in msg for msg in errors)
 
+
+def test_validate_experiment_hypothesis_packet_v2_accepts_macro_targets() -> None:
+    packet = {
+        "packet_type": "experiment_hypothesis_packet",
+        "packet_version": "2.0",
+        "run_id": "run_x",
+        "round": 2,
+        "hypothesis_id": "h_abcdef12",
+        "action": "APPLY",
+        "technique": "missing_indicators",
+        "objective": "Stabilize folds under missingness.",
+        "target_columns": ["ALL_NUMERIC"],
+        "params": {"suffix": "_is_missing"},
+        "success_criteria": {
+            "primary_metric_name": "roc_auc",
+            "min_delta": 0.0005,
+            "must_pass_active_gates": True,
+        },
+    }
+    valid, errors = validate_experiment_hypothesis_packet_v2(packet)
+    assert valid is True, errors
+
+
+def test_validate_experiment_result_packet_v2_rejects_inconsistent_status() -> None:
+    packet = {
+        "packet_type": "experiment_result_packet",
+        "packet_version": "2.0",
+        "run_id": "run_x",
+        "round": 2,
+        "hypothesis_id": "h_abcdef12",
+        "status": "REJECTED",
+        "primary_metric_name": "roc_auc",
+        "baseline_metric": 0.81,
+        "candidate_metric": 0.812,
+        "delta_abs": 0.002,
+        "meets_min_delta": True,
+        "gates_passed": True,
+    }
+    valid, errors = validate_experiment_result_packet_v2(packet)
+    assert valid is False
+    assert any("REJECTED status cannot have gates_passed=true" in err for err in errors)

@@ -1464,31 +1464,7 @@ $payload_json
            - Simple holdout (70/15/15) is often sufficient
            - Consider computational cost of cross-validation
 
-        *** STEP 5: FEATURE ENGINEERING REASONING (THE "SECRET SAUCE") ***
-        A Senior Data Scientist doesn't just use raw columns. They CREATE signal.
-        Reason through the data semantics to propose HIGH-VALUE transformations:
-
-        1. **INTERACTIONS**: Do two columns multiply or divide to create meaning?
-           - e.g. Price * Quantity = Revenue
-           - e.g. Weight / Height^2 = BMI
-           - e.g. Debt / Income = DTI Ratio
-
-        2. **TEMPORAL EXTRACTION**: Do dates hide cycles?
-           - e.g. DayOfWeek (weekend vs weekday behavior)
-           - e.g. HourOfDay (morning vs night patterns)
-           - e.g. DaysSinceLastEvent (recency)
-
-        3. **DISTRIBUTIONAL TRANSFORMS**: Do distributions hurt the model?
-           - High Skew -> Log Transform
-           - Heavy Tails -> Winsorization / Clipping
-           - Cardinality > 50 -> Target Encoding / Count Encoding / Embedding
-
-        4. **DOMAIN SPECIFIC**:
-           - Medical: Age groups, Risk scores
-           - Finance: Moving averages, Volatility
-           - E-commerce: Cart abandonment rate, Session duration
-
-        *** STEP 6: EVALUATE APPROPRIATE METRICS ***
+        *** STEP 5: EVALUATE APPROPRIATE METRICS ***
         Based on your objective_type, reason through what metrics best measure success.
         DO NOT use pre-defined metric lists. Instead, think:
         - What does the business care about? (revenue, accuracy, interpretability, coverage)
@@ -1520,17 +1496,6 @@ $payload_json
             "required_columns": ["exact", "column", "names", "from", "summary"],
             "feature_families": [{"family": "optional", "rationale": "optional", "selector_hint": "optional"}],
             "techniques": ["list", "of", "data science techniques"],
-            "feature_engineering_strategy": {
-              "techniques": [
-                {
-                  "technique": "Name of technique (e.g. Interaction, Log Transform, Target Encoding)",
-                  "columns": ["List", "of", "involved", "columns"],
-                  "rationale": "WHY this transformation creates value/signal for this specific objective"
-                }
-              ],
-              "notes": "",
-              "risk_level": "low|med|high"
-            },
             "feasibility_analysis": {
               "statistical_power": "Assessment of n/p ratio and sample adequacy",
               "signal_quality": "Assessment of data quality for proposed method",

@@ -46,6 +46,7 @@ def test_execution_planner_generation_config_includes_response_schema_when_enabl
     schema = cfg.get("response_schema") or {}
     assert schema.get("type") == "object"
     assert "required_outputs" in ((schema.get("properties") or {}).keys())
+    assert "optimization_policy" in ((schema.get("properties") or {}).keys())
 
 
 def test_execution_planner_generate_content_retries_without_response_schema(monkeypatch):

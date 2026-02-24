@@ -78,6 +78,38 @@ ITERATION_POLICY_LIMIT_ALIASES = (
     "max_runtime_retries",
 )
 
+OPTIMIZATION_POLICY_DEFAULTS: Dict[str, Any] = {
+    "enabled": True,
+    "max_rounds": 8,
+    "quick_eval_folds": 2,
+    "full_eval_folds": 5,
+    "min_delta": 0.0005,
+    "patience": 3,
+    "allow_model_switch": True,
+    "allow_ensemble": True,
+    "allow_hpo": True,
+    "allow_feature_engineering": True,
+    "allow_calibration": True,
+}
+
+OPTIMIZATION_POLICY_BOOL_KEYS = (
+    "enabled",
+    "allow_model_switch",
+    "allow_ensemble",
+    "allow_hpo",
+    "allow_feature_engineering",
+    "allow_calibration",
+)
+OPTIMIZATION_POLICY_INT_KEYS = (
+    "max_rounds",
+    "quick_eval_folds",
+    "full_eval_folds",
+    "patience",
+)
+OPTIMIZATION_POLICY_FLOAT_KEYS = (
+    "min_delta",
+)
+
 # Role synonym mapping for normalization
 ROLE_SYNONYM_MAP = {
     "target": "outcome",
@@ -88,6 +120,63 @@ ROLE_SYNONYM_MAP = {
     "excluded": "forbidden",
     "protected_attribute": "protected",
 }
+
+
+def get_default_optimization_policy() -> Dict[str, Any]:
+    return dict(OPTIMIZATION_POLICY_DEFAULTS)
+
+
+def _coerce_bool_value(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+        if token in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _coerce_int_value(value: Any, default: int, minimum: int) -> int:
+    try:
+        candidate = int(float(value))
+    except Exception:
+        candidate = default
+    if candidate < minimum:
+        return default
+    return candidate
+
+
+def _coerce_float_value(value: Any, default: float, minimum: float) -> float:
+    try:
+        candidate = float(value)
+    except Exception:
+        candidate = default
+    if candidate < minimum:
+        return default
+    return candidate
+
+
+def normalize_optimization_policy(policy: Any) -> Dict[str, Any]:
+    defaults = get_default_optimization_policy()
+    if not isinstance(policy, dict):
+        return defaults
+    normalized = dict(defaults)
+    for key in OPTIMIZATION_POLICY_BOOL_KEYS:
+        normalized[key] = _coerce_bool_value(policy.get(key), defaults[key])
+    for key in OPTIMIZATION_POLICY_INT_KEYS:
+        minimum = 1 if key != "patience" else 0
+        normalized[key] = _coerce_int_value(policy.get(key), defaults[key], minimum)
+    for key in OPTIMIZATION_POLICY_FLOAT_KEYS:
+        normalized[key] = _coerce_float_value(policy.get(key), defaults[key], 0.0)
+    for key, value in policy.items():
+        if key in normalized:
+            continue
+        normalized[key] = value
+    return normalized
 
 
 def _normalize_metric_name(name: str) -> str:
@@ -2211,6 +2300,82 @@ def validate_contract_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
 
+    optimization_policy = contract.get("optimization_policy")
+    if optimization_policy is None:
+        issues.append(
+            _strict_issue(
+                "contract.optimization_policy_missing",
+                "warning",
+                "optimization_policy missing; runtime will use safe optimization defaults.",
+                get_default_optimization_policy(),
+            )
+        )
+    elif not isinstance(optimization_policy, dict):
+        issues.append(
+            _strict_issue(
+                "contract.optimization_policy_type",
+                "error",
+                "optimization_policy must be an object when present.",
+                type(optimization_policy).__name__,
+            )
+        )
+    else:
+        missing_keys = [key for key in OPTIMIZATION_POLICY_DEFAULTS.keys() if key not in optimization_policy]
+        if missing_keys:
+            issues.append(
+                _strict_issue(
+                    "contract.optimization_policy_missing_keys",
+                    "warning",
+                    "optimization_policy missing keys; runtime will fill defaults.",
+                    missing_keys,
+                )
+            )
+        for key in OPTIMIZATION_POLICY_BOOL_KEYS:
+            if key not in optimization_policy:
+                continue
+            value = optimization_policy.get(key)
+            if not isinstance(value, (bool, int, float, str)):
+                issues.append(
+                    _strict_issue(
+                        "contract.optimization_policy_value",
+                        "error",
+                        f"optimization_policy.{key} must be boolean-like.",
+                        value,
+                    )
+                )
+        for key in OPTIMIZATION_POLICY_INT_KEYS:
+            if key not in optimization_policy:
+                continue
+            value = optimization_policy.get(key)
+            min_value = 0 if key == "patience" else 1
+            try:
+                numeric = int(float(value))
+                if numeric < min_value:
+                    raise ValueError("below minimum")
+            except Exception:
+                issues.append(
+                    _strict_issue(
+                        "contract.optimization_policy_value",
+                        "error",
+                        f"optimization_policy.{key} must be an integer >= {min_value}.",
+                        value,
+                    )
+                )
+        if "min_delta" in optimization_policy:
+            try:
+                min_delta = float(optimization_policy.get("min_delta"))
+                if min_delta < 0:
+                    raise ValueError("below minimum")
+            except Exception:
+                issues.append(
+                    _strict_issue(
+                        "contract.optimization_policy_value",
+                        "error",
+                        "optimization_policy.min_delta must be a number >= 0.",
+                        optimization_policy.get("min_delta"),
+                    )
+                )
+
     gate_keys = ("qa_gates", "cleaning_gates", "reviewer_gates")
     for gate_key in gate_keys:
         gates = contract.get(gate_key)
@@ -4067,6 +4232,68 @@ def validate_contract_minimal_readonly(
                     [key for key in ITERATION_POLICY_LIMIT_ALIASES if key in iteration_policy],
                 )
             )
+
+    optimization_policy = contract.get("optimization_policy")
+    if optimization_policy is None:
+        issues.append(
+            _strict_issue(
+                "contract.optimization_policy_missing",
+                "warning",
+                "optimization_policy missing; runtime will use safe optimization defaults.",
+                get_default_optimization_policy(),
+            )
+        )
+    elif not isinstance(optimization_policy, dict):
+        issues.append(
+            _strict_issue(
+                "contract.optimization_policy_type",
+                "error",
+                "optimization_policy must be an object when present.",
+                type(optimization_policy).__name__,
+            )
+        )
+    else:
+        missing_opt_keys = [key for key in OPTIMIZATION_POLICY_DEFAULTS.keys() if key not in optimization_policy]
+        if missing_opt_keys:
+            issues.append(
+                _strict_issue(
+                    "contract.optimization_policy_missing_keys",
+                    "warning",
+                    "optimization_policy missing keys; runtime will fill defaults.",
+                    missing_opt_keys,
+                )
+            )
+        for key in OPTIMIZATION_POLICY_INT_KEYS:
+            if key not in optimization_policy:
+                continue
+            min_value = 0 if key == "patience" else 1
+            try:
+                numeric = int(float(optimization_policy.get(key)))
+                if numeric < min_value:
+                    raise ValueError("below minimum")
+            except Exception:
+                issues.append(
+                    _strict_issue(
+                        "contract.optimization_policy_value",
+                        "error",
+                        f"optimization_policy.{key} must be an integer >= {min_value}.",
+                        optimization_policy.get(key),
+                    )
+                )
+        if "min_delta" in optimization_policy:
+            try:
+                min_delta = float(optimization_policy.get("min_delta"))
+                if min_delta < 0:
+                    raise ValueError("below minimum")
+            except Exception:
+                issues.append(
+                    _strict_issue(
+                        "contract.optimization_policy_value",
+                        "error",
+                        "optimization_policy.min_delta must be a number >= 0.",
+                        optimization_policy.get("min_delta"),
+                    )
+                )
 
     status = _status_from_issues(issues)
     error_count = sum(1 for issue in issues if str(issue.get("severity", "")).lower() in {"error", "fail"})
