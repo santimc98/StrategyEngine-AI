@@ -8925,13 +8925,32 @@ def _append_ml_iteration_journal(
     stage = entry.get("stage") or "unknown"
     if iter_id is None:
         return written_ids or []
+
+    def _entry_key(payload: Dict[str, Any], default_stage: str) -> str:
+        stage_value = str(payload.get("stage") or default_stage or "unknown")
+        iter_value = payload.get("iteration_id")
+        try:
+            iter_token = str(int(iter_value))
+        except Exception:
+            iter_token = str(iter_value or "")
+        metric_round = payload.get("metric_round")
+        round_id = 0
+        if isinstance(metric_round, dict):
+            try:
+                round_id = int(metric_round.get("round_id") or 0)
+            except Exception:
+                round_id = 0
+        if round_id > 0:
+            return iter_token + ":" + stage_value + ":r" + str(round_id)
+        return iter_token + ":" + stage_value
+
     known: set[str] = set()
     for item in written_ids or []:
         if isinstance(item, str):
             known.add(item)
         elif isinstance(item, int) or str(item).isdigit():
             known.add(f"{int(item)}:unknown")
-    entry_key = f"{int(iter_id)}:{stage}"
+    entry_key = _entry_key(entry, stage)
     if entry_key in known:
         return sorted(known)
     path = _ml_iteration_journal_path(run_id, base_dir=base_dir)
@@ -8963,6 +8982,81 @@ def _append_ml_iteration_journal(
     except Exception:
         pass
     return sorted(known)
+
+
+def _refresh_ml_iteration_trace_summary(
+    run_id: str,
+    state: Dict[str, Any] | None = None,
+    *,
+    base_dir: str = "runs",
+) -> None:
+    if not run_id:
+        return
+    entries = _load_ml_iteration_journal(run_id, base_dir=base_dir)
+    if not isinstance(entries, list):
+        entries = []
+
+    observed_round_ids: set[int] = set()
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        metric_round = item.get("metric_round")
+        if not isinstance(metric_round, dict):
+            continue
+        try:
+            round_id = int(metric_round.get("round_id") or 0)
+        except Exception:
+            round_id = 0
+        if round_id > 0:
+            observed_round_ids.add(round_id)
+
+    state_payload = state if isinstance(state, dict) else {}
+    round_history = (
+        state_payload.get("ml_improvement_round_history")
+        if isinstance(state_payload.get("ml_improvement_round_history"), list)
+        else []
+    )
+    iteration_id = int(state_payload.get("iteration_count", 0) or 0) + 1
+    reviewer_verdict = str(state_payload.get("review_verdict") or "UNKNOWN")
+    qa_packet = (
+        state_payload.get("qa_last_result")
+        if isinstance(state_payload.get("qa_last_result"), dict)
+        else {}
+    )
+    qa_verdict = str(qa_packet.get("status") or "UNKNOWN")
+
+    for record in round_history:
+        if not isinstance(record, dict):
+            continue
+        try:
+            round_id = int(record.get("round_id") or 0)
+        except Exception:
+            round_id = 0
+        if round_id <= 0 or round_id in observed_round_ids:
+            continue
+        hypothesis = record.get("hypothesis") if isinstance(record.get("hypothesis"), dict) else {}
+        entries.append(
+            {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "iteration_id": int(iteration_id),
+                "stage": "review_complete",
+                "reviewer_verdict": reviewer_verdict,
+                "qa_verdict": qa_verdict,
+                "outputs_missing": [],
+                "metric_round": {
+                    "round_id": int(round_id),
+                    "action": str(hypothesis.get("action") or "").strip(),
+                    "technique": str(hypothesis.get("technique") or "").strip(),
+                    "signature": str(hypothesis.get("signature") or "").strip(),
+                    "delta": record.get("delta"),
+                    "kept": str(record.get("kept") or "").strip(),
+                    "reason": str(record.get("reason") or "").strip(),
+                },
+            }
+        )
+        observed_round_ids.add(round_id)
+
+    _persist_ml_iteration_trace_summary(run_id, entries, base_dir=base_dir)
 
 def _load_ml_iteration_journal(run_id: str, base_dir: str = "runs") -> List[Dict[str, Any]]:
     if not run_id:
@@ -21281,6 +21375,16 @@ def _resolve_metric_round_hypothesis_packet(
     return {}
 
 
+def _is_duplicate_noop_hypothesis(packet: Dict[str, Any] | None) -> bool:
+    payload = packet if isinstance(packet, dict) else {}
+    action = str(payload.get("action") or "").strip().upper()
+    hypothesis = payload.get("hypothesis") if isinstance(payload.get("hypothesis"), dict) else {}
+    technique = str(hypothesis.get("technique") or payload.get("technique") or "").strip().upper()
+    tracker_context = payload.get("tracker_context") if isinstance(payload.get("tracker_context"), dict) else {}
+    is_duplicate = bool(tracker_context.get("is_duplicate")) or bool(str(tracker_context.get("duplicate_of") or "").strip())
+    return bool(action == "NO_OP" and (technique in {"", "NO_OP"}) and is_duplicate)
+
+
 def _resolve_metric_round_augmentation_requested(
     state: Dict[str, Any],
     contract: Dict[str, Any] | None = None,
@@ -21815,6 +21919,52 @@ def _collect_metric_round_tracker_signatures(tracker_entries: Any) -> set[str]:
     return signatures
 
 
+def _extract_metric_round_tracker_technique(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    direct = str(entry.get("technique") or "").strip()
+    if direct:
+        return direct
+    hypothesis = entry.get("hypothesis")
+    if isinstance(hypothesis, dict):
+        nested = str(hypothesis.get("technique") or hypothesis.get("name") or "").strip()
+        if nested:
+            return nested
+    return ""
+
+
+def _collect_metric_round_negative_streak(
+    tracker_entries: Any,
+    *,
+    higher_is_better: bool,
+) -> Tuple[int, List[str]]:
+    rows: List[Tuple[float, str]] = []
+    if isinstance(tracker_entries, list):
+        for entry in tracker_entries:
+            if not isinstance(entry, dict):
+                continue
+            event = str(entry.get("event") or "").strip().lower()
+            if event not in {"candidate_evaluated", "hypothesis_memory"}:
+                continue
+            delta = _coerce_float(entry.get("delta"))
+            if delta is None:
+                continue
+            rows.append((float(delta), _extract_metric_round_tracker_technique(entry)))
+    streak = 0
+    techniques: List[str] = []
+    seen: set[str] = set()
+    for delta_value, technique in reversed(rows):
+        is_negative = delta_value < 0.0 if higher_is_better else delta_value > 0.0
+        if not is_negative:
+            break
+        streak += 1
+        technique_key = str(technique or "").strip().lower()
+        if technique_key and technique_key not in seen:
+            techniques.append(str(technique).strip())
+            seen.add(technique_key)
+    return streak, techniques
+
+
 def _build_metric_round_hypothesis_signature(
     *,
     technique: Any,
@@ -21867,8 +22017,15 @@ def _resolve_metric_round_hybrid_policy(
     plan_entries = _normalize_fe_technique_entries(feature_engineering_plan)
     plan_map = {str(item.get("technique")).lower(): item for item in plan_entries if str(item.get("technique") or "").strip()}
     known_signatures = _collect_metric_round_tracker_signatures(tracker_entries)
+    negative_delta_streak, recent_negative_techniques = _collect_metric_round_negative_streak(
+        tracker_entries,
+        higher_is_better=bool(higher_is_better),
+    )
     first_round_apply_forced = False
     first_round_force_reason = ""
+    diversity_recovery_applied = False
+    diversity_recovery_reason = ""
+    diversity_alternate = ""
 
     successful_ranked: List[str] = []
     seen_success: set[str] = set()
@@ -21885,7 +22042,7 @@ def _resolve_metric_round_hybrid_policy(
         meets_delta = delta >= float(min_delta) if higher_is_better else delta <= -float(min_delta)
         if not meets_delta:
             continue
-        technique = str(entry.get("technique") or "").strip()
+        technique = _extract_metric_round_tracker_technique(entry)
         if not technique:
             continue
         key = technique.lower()
@@ -21962,6 +22119,111 @@ def _resolve_metric_round_hybrid_policy(
         hypothesis = updated_hypothesis
         current_technique = selected_technique
         first_round_apply_forced = True
+
+    tracker_context_current = (
+        dict(packet.get("tracker_context"))
+        if isinstance(packet.get("tracker_context"), dict)
+        else {}
+    )
+    is_duplicate_packet = bool(tracker_context_current.get("is_duplicate")) or bool(
+        str(tracker_context_current.get("duplicate_of") or "").strip()
+    )
+    recent_negative_keys = {str(item).strip().lower() for item in recent_negative_techniques if str(item).strip()}
+
+    def _pick_diversity_alternative(prefer_unseen: bool) -> Tuple[Dict[str, Any], str]:
+        candidates: List[Tuple[Dict[str, Any], str]] = []
+        fallback: List[Tuple[Dict[str, Any], str]] = []
+        for entry in plan_entries:
+            technique = str(entry.get("technique") or "").strip()
+            if not technique:
+                continue
+            if current_technique and technique.lower() == current_technique.lower():
+                continue
+            signature = _build_metric_round_hypothesis_signature(
+                technique=technique,
+                target_columns=normalize_target_columns(entry.get("target_columns")),
+                params=entry.get("params"),
+            )
+            item = (entry, signature)
+            if prefer_unseen and signature in known_signatures:
+                fallback.append(item)
+                continue
+            candidates.append(item)
+        if not candidates:
+            candidates = fallback
+        if not candidates:
+            return {}, ""
+        if recent_negative_keys:
+            for entry, signature in candidates:
+                technique = str(entry.get("technique") or "").strip().lower()
+                if technique and technique not in recent_negative_keys:
+                    return entry, signature
+        return candidates[0]
+
+    should_recover_diversity = (
+        safe_round_id > 1
+        and (
+            action != "APPLY"
+            or not current_technique
+            or current_technique.upper() == "NO_OP"
+            or is_duplicate_packet
+            or (
+                negative_delta_streak >= 2
+                and current_technique
+                and current_technique.lower() in recent_negative_keys
+            )
+        )
+    )
+    if should_recover_diversity and plan_entries:
+        selected_entry, selected_signature = _pick_diversity_alternative(prefer_unseen=True)
+        selected_technique = str(selected_entry.get("technique") or "").strip()
+        if selected_technique:
+            selected_params = (
+                dict(selected_entry.get("params"))
+                if isinstance(selected_entry.get("params"), dict)
+                else {}
+            )
+            selected_columns = normalize_target_columns(selected_entry.get("target_columns"))
+            updated_hypothesis = {
+                **hypothesis,
+                "technique": selected_technique,
+                "objective": (
+                    str(hypothesis.get("objective") or "").strip()
+                    or "Apply one focused optimization hypothesis with measurable metric impact."
+                )[:220],
+                "target_columns": selected_columns or normalize_target_columns(hypothesis.get("target_columns")) or ["ALL_NUMERIC"],
+                "feature_scope": str(hypothesis.get("feature_scope") or "model_features") or "model_features",
+                "params": selected_params,
+                "expected_effect": (
+                    dict(hypothesis.get("expected_effect"))
+                    if isinstance(hypothesis.get("expected_effect"), dict)
+                    else {"target_error_modes": ["metric_stagnation"], "direction": "positive"}
+                ),
+            }
+            packet["action"] = "APPLY"
+            packet["hypothesis"] = updated_hypothesis
+            tracker_context = (
+                dict(packet.get("tracker_context"))
+                if isinstance(packet.get("tracker_context"), dict)
+                else {}
+            )
+            tracker_context["signature"] = selected_signature
+            tracker_context["is_duplicate"] = False
+            tracker_context["duplicate_of"] = None
+            packet["tracker_context"] = tracker_context
+            diversity_recovery_applied = True
+            diversity_alternate = selected_technique
+            diversity_recovery_reason = (
+                "negative_delta_diversity_recovery"
+                if negative_delta_streak >= 2
+                else "duplicate_or_noop_recovery"
+            )
+            packet["explanation"] = (
+                "Diversity recovery: switched to an alternative hypothesis after duplicate/no-op or negative-delta streak."
+            )[:280]
+            action = "APPLY"
+            hypothesis = updated_hypothesis
+            current_technique = selected_technique
 
     if action == "APPLY" and current_technique and current_technique.upper() != "NO_OP":
         bundle_techniques.append(current_technique)
@@ -22053,6 +22315,11 @@ def _resolve_metric_round_hybrid_policy(
         "compatibility_rule": "family_key_and_token_overlap_v1",
         "first_round_apply_forced": bool(first_round_apply_forced),
         "first_round_force_reason": first_round_force_reason,
+        "negative_delta_streak": int(negative_delta_streak),
+        "recent_negative_techniques": recent_negative_techniques[:6],
+        "diversity_recovery_applied": bool(diversity_recovery_applied),
+        "diversity_recovery_reason": diversity_recovery_reason,
+        "diversity_alternate_technique": diversity_alternate,
     }
     return packet, policy_meta
 
@@ -22443,6 +22710,64 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         feature_engineering_plan=feature_engineering_plan,
         tracker_entries=tracker_entries,
     )
+    if _is_duplicate_noop_hypothesis(hypothesis_packet):
+        state["ml_improvement_round_active"] = False
+        state["ml_improvement_continue"] = False
+        state["ml_improvement_attempted"] = True
+        state["ml_improvement_loop_complete"] = True
+        state["ml_improvement_kept"] = "baseline"
+        state["ml_improvement_force_finalize_reason"] = "duplicate_noop_hypothesis"
+        state["stop_reason"] = "IMPROVEMENT_ROUND_DUPLICATE_NOOP"
+        state["last_iteration_type"] = None
+        _append_feedback_history(
+            state,
+            (
+                "METRIC_IMPROVEMENT_LOOP_STOP: duplicate NO_OP hypothesis detected; "
+                "terminating loop to avoid token waste."
+            ),
+        )
+        if run_id:
+            tracker_context = (
+                hypothesis_packet.get("tracker_context")
+                if isinstance(hypothesis_packet.get("tracker_context"), dict)
+                else {}
+            )
+            hypothesis = (
+                hypothesis_packet.get("hypothesis")
+                if isinstance(hypothesis_packet.get("hypothesis"), dict)
+                else {}
+            )
+            try:
+                log_run_event(
+                    run_id,
+                    "metric_improvement_round_terminated",
+                    {
+                        "reason": "duplicate_noop_hypothesis",
+                        "round_id": int(round_id),
+                        "round_count_current": int(round_index_before),
+                        "rounds_allowed": int(rounds),
+                        "action": str(hypothesis_packet.get("action") or ""),
+                        "technique": str(hypothesis.get("technique") or ""),
+                        "signature": str(tracker_context.get("signature") or ""),
+                        "duplicate_of": str(tracker_context.get("duplicate_of") or ""),
+                    },
+                )
+            except Exception:
+                pass
+            append_experiment_entry(
+                run_id,
+                {
+                    "iter": int(state.get("iteration_count", 0) or 0),
+                    "event": "hypothesis_terminated",
+                    "phase": "metric_improvement_round",
+                    "round_id": int(round_id),
+                    "action": str(hypothesis_packet.get("action") or ""),
+                    "signature": str(tracker_context.get("signature") or ""),
+                    "duplicate_of": str(tracker_context.get("duplicate_of") or ""),
+                    "reason": "duplicate_noop_hypothesis",
+                },
+            )
+        return False
     hypothesis_meta = (
         strategist.last_iteration_meta
         if isinstance(getattr(strategist, "last_iteration_meta", None), dict)
@@ -23240,6 +23565,11 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     state["ml_improvement_round_active"] = False
     state["ml_improvement_force_finalize_reason"] = ""
     state["last_iteration_type"] = None
+    if run_id:
+        try:
+            _refresh_ml_iteration_trace_summary(run_id, state)
+        except Exception:
+            pass
     return "approved"
 
 
