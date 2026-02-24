@@ -26,6 +26,10 @@ from src.utils.sandbox_deps import (
     BANNED_ALWAYS_ALLOWLIST,
     check_dependency_precheck,
 )
+from src.utils.action_families import (
+    classify_action_family,
+    get_action_family_guidance,
+)
 
 # NOTE: scan_code_safety referenced by tests as a required safety mechanism.
 # ML code executes in sandbox; keep the reference for integration checks.
@@ -1111,6 +1115,69 @@ class MLEngineerAgent:
             f"- Patch intensity: {patch_intensity}.",
         ]
         return "\n".join(lines)
+
+    def _resolve_optimization_mode_inputs(
+        self,
+        handoff_payload: Dict[str, Any] | None,
+        last_run_memory: List[Dict[str, Any]] | None,
+    ) -> Dict[str, Any]:
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        optimization_context = (
+            handoff_payload.get("optimization_context")
+            if isinstance(handoff_payload.get("optimization_context"), dict)
+            else {}
+        )
+        hypothesis_packet = (
+            handoff_payload.get("hypothesis_packet")
+            if isinstance(handoff_payload.get("hypothesis_packet"), dict)
+            else {}
+        )
+        invariants_lock = (
+            optimization_context.get("contract_lock")
+            if isinstance(optimization_context.get("contract_lock"), dict)
+            else {}
+        )
+        recent_tracker = (
+            optimization_context.get("experiment_tracker_recent")
+            if isinstance(optimization_context.get("experiment_tracker_recent"), list)
+            else []
+        )
+        if not recent_tracker:
+            recent_tracker = (
+                optimization_context.get("round_history_recent")
+                if isinstance(optimization_context.get("round_history_recent"), list)
+                else []
+            )
+        if not recent_tracker and isinstance(last_run_memory, list):
+            recent_tracker = [
+                {
+                    "iter": item.get("iter"),
+                    "attempt": item.get("attempt"),
+                    "event": item.get("event"),
+                    "phase": item.get("phase"),
+                    "error_signature": item.get("error_signature"),
+                    "changes_summary": item.get("changes_summary"),
+                }
+                for item in last_run_memory[-5:]
+                if isinstance(item, dict)
+            ]
+        missing_inputs: List[str] = []
+        if not isinstance(hypothesis_packet, dict) or not hypothesis_packet:
+            missing_inputs.append("hypothesis_packet")
+        if not isinstance(invariants_lock, dict) or not invariants_lock:
+            missing_inputs.append("invariants_lock")
+        if not isinstance(recent_tracker, list) or not recent_tracker:
+            missing_inputs.append("recent_tracker")
+        action_family = classify_action_family(hypothesis_packet)
+        action_family_guidelines = get_action_family_guidance(action_family)
+        return {
+            "hypothesis_packet": hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
+            "invariants_lock": invariants_lock if isinstance(invariants_lock, dict) else {},
+            "recent_tracker": recent_tracker if isinstance(recent_tracker, list) else [],
+            "missing_inputs": missing_inputs,
+            "action_family": action_family,
+            "action_family_guidelines": action_family_guidelines,
+        }
 
     def _extract_decisioning_context(
         self,
@@ -3418,8 +3485,9 @@ $strategy_json
         """
 
         USER_EDITOR_OPTIMIZATION_TEMPLATE = """
+        MODE: OPTIMIZATION_MODE
         MODE: CODE_EDITOR_MODE_OPTIMIZATION
-        You are in deterministic metric-optimization editor mode.
+        You are in deterministic action-driven optimization editor mode.
         Do not regenerate a new solution from zero and do not re-plan strategy.
 
         PHASE CLASSIFICATION:
@@ -3433,6 +3501,21 @@ $strategy_json
 
         FEATURE ENGINEERING PLAN (contract):
         $feature_engineering_plan
+
+        ACTIVE ACTION FAMILY:
+        $action_family
+
+        ACTION FAMILY GUIDELINES:
+        $action_family_guidelines
+
+        INVARIANTS_LOCK (mandatory, immutable):
+        $invariants_lock
+
+        RECENT_TRACKER (mandatory evidence for this round):
+        $recent_tracker
+
+        MISSING OPTIMIZATION INPUTS (must be resolved conservatively if non-empty):
+        $missing_optimization_inputs
 
         OPTIMIZATION FEEDBACK:
         $optimization_feedback
@@ -3466,11 +3549,12 @@ $strategy_json
 
         OPTIMIZATION RULES:
         1) Return ONLY the full updated Python script. No markdown, no explanation.
-        2) Apply the active hypothesis with material feature-engineering edits end-to-end.
+        2) Apply the active hypothesis with a material code patch end-to-end.
         3) Prioritize optimization_context + hypothesis_packet over legacy reviewer text.
         4) Treat contract fields as immutable lock constraints (paths/split/CV/gates), not as re-planning input.
         5) Keep model family, CV/data-split protocol, and contract output paths stable.
         6) Avoid unrelated refactors; edit only the regions needed for metric improvement.
+        7) Keep patch scope minimal for the selected action family.
         """
 
         USER_IMPROVE_TEMPLATE = """
@@ -3605,6 +3689,33 @@ $strategy_json
                     if isinstance(handoff_payload.get("optimization_context"), dict)
                     else {}
                 )
+                optimization_inputs = self._resolve_optimization_mode_inputs(
+                    handoff_payload=handoff_payload,
+                    last_run_memory=last_run_memory,
+                )
+                invariants_lock_block = self._serialize_json_for_prompt(
+                    optimization_inputs.get("invariants_lock"),
+                    max_chars=2200,
+                    max_str_len=260,
+                    max_list_items=30,
+                )
+                recent_tracker_block = self._serialize_json_for_prompt(
+                    optimization_inputs.get("recent_tracker"),
+                    max_chars=2200,
+                    max_str_len=260,
+                    max_list_items=20,
+                )
+                missing_inputs_block = self._serialize_json_for_prompt(
+                    optimization_inputs.get("missing_inputs"),
+                    max_chars=400,
+                    max_str_len=120,
+                    max_list_items=8,
+                )
+                action_family = str(optimization_inputs.get("action_family") or "feature_engineering")
+                action_family_guidelines = optimization_inputs.get("action_family_guidelines") or []
+                action_family_guidelines_block = "\n".join(
+                    [f"- {str(item)}" for item in action_family_guidelines if str(item).strip()]
+                ) or "- Keep targeted edits with contract invariants preserved."
                 optimization_context_block = self._serialize_json_for_prompt(
                     optimization_context,
                     max_chars=2800,
@@ -3628,6 +3739,11 @@ $strategy_json
                     optimization_target=optimization_target or "{}",
                     optimization_context=optimization_context_block or "{}",
                     feature_engineering_plan=feature_engineering_plan_block or "{}",
+                    action_family=action_family,
+                    action_family_guidelines=action_family_guidelines_block,
+                    invariants_lock=invariants_lock_block or "{}",
+                    recent_tracker=recent_tracker_block or "[]",
+                    missing_optimization_inputs=missing_inputs_block or "[]",
                     optimization_feedback=feedback_text or "No optimization feedback provided.",
                     last_run_memory=last_run_memory_block,
                     strategy_lock=strategy_lock_block,
