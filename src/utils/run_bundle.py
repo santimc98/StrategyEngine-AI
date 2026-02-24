@@ -127,6 +127,59 @@ def _normalize_required_outputs(contract: Dict[str, Any]) -> List[str]:
     return get_required_outputs(contract)
 
 
+def _compact_metric_round_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(entry, dict):
+        return None
+    try:
+        round_id = int(entry.get("round_id"))
+    except Exception:
+        round_id = 0
+    if round_id <= 0:
+        return None
+    hypothesis = entry.get("hypothesis") if isinstance(entry.get("hypothesis"), dict) else {}
+    return {
+        "round_id": round_id,
+        "delta": entry.get("delta"),
+        "kept": entry.get("kept"),
+        "reason": entry.get("reason") or entry.get("forced_finalize_reason") or "",
+        "hypothesis": {
+            "action": hypothesis.get("action") if isinstance(hypothesis, dict) else "",
+            "technique": hypothesis.get("technique") if isinstance(hypothesis, dict) else "",
+            "signature": hypothesis.get("signature") if isinstance(hypothesis, dict) else "",
+        },
+    }
+
+
+def _compact_metric_rounds(state: Dict[str, Any], trace_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rounds: List[Dict[str, Any]] = []
+    round_history = state.get("ml_improvement_round_history")
+    if isinstance(round_history, list):
+        for item in round_history:
+            compact = _compact_metric_round_entry(item)
+            if compact:
+                rounds.append(compact)
+    if rounds:
+        return rounds[-24:]
+    summary_rounds = trace_summary.get("metric_rounds") if isinstance(trace_summary, dict) else []
+    if isinstance(summary_rounds, list):
+        for item in summary_rounds:
+            if isinstance(item, dict):
+                rounds.append(
+                    {
+                        "round_id": item.get("round_id"),
+                        "delta": item.get("delta"),
+                        "kept": item.get("kept"),
+                        "reason": item.get("reason"),
+                        "hypothesis": {
+                            "action": item.get("action"),
+                            "technique": item.get("technique"),
+                            "signature": item.get("signature"),
+                        },
+                    }
+                )
+    return rounds[-24:]
+
+
 def _scan_run_outputs(run_dir: str) -> List[str]:
     produced: List[str] = []
     if not run_dir:
@@ -535,6 +588,7 @@ def write_run_manifest(
         entries_count = int(entries_count)
     except Exception:
         entries_count = _count_jsonl_rows(trace_journal_path)
+    metric_rounds = _compact_metric_rounds(state, trace_summary)
     iteration_trace = {
         "journal_exists": os.path.exists(trace_journal_path),
         "journal_relative_path": "report/governance/ml_iteration_journal.jsonl",
@@ -546,6 +600,9 @@ def write_run_manifest(
         "metric_improvement_round_count": int(state.get("ml_improvement_round_count", 0) or 0),
         "metric_improvement_attempted": bool(state.get("ml_improvement_attempted")),
         "metric_improvement_kept": state.get("ml_improvement_kept"),
+        "metric_rounds_count": len(metric_rounds),
+        "metric_rounds": metric_rounds,
+        "metric_round_last": metric_rounds[-1] if metric_rounds else {},
     }
 
     manifest_path = os.path.join(run_dir, "run_manifest.json")

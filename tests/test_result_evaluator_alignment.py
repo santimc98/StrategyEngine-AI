@@ -76,6 +76,15 @@ def test_build_ml_iteration_journal_entry_includes_handoff_and_parse_repair_flag
     state = {
         "iteration_count": 1,
         "generated_code": "print('ok')",
+        "ml_improvement_round_count": 1,
+        "ml_improvement_hypothesis_packet": {
+            "action": "APPLY",
+            "tracker_context": {"signature": "hyp_test"},
+            "hypothesis": {"technique": "missing_indicators"},
+        },
+        "ml_improvement_round_history": [
+            {"round_id": 1, "delta": 0.0012, "kept": "improved", "reason": "candidate_selected"}
+        ],
         "iteration_handoff": {
             "source": "result_evaluator",
             "mode": "patch",
@@ -104,3 +113,6 @@ def test_build_ml_iteration_journal_entry_includes_handoff_and_parse_repair_flag
     assert entry.get("handoff_meta", {}).get("next_iteration") == 2
     assert entry.get("reviewer_json_repair_used") is True
     assert entry.get("qa_json_repair_used") is False
+    assert entry.get("metric_round", {}).get("round_id") == 1
+    assert entry.get("metric_round", {}).get("technique") == "missing_indicators"
+    assert entry.get("metric_round", {}).get("kept") == "improved"

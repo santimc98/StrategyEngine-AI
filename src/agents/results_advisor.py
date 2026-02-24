@@ -1345,7 +1345,8 @@ class ResultsAdvisorAgent:
         elif objective_type == "ranking":
             recommendations.append("Validate ordering metrics and consider pairwise loss if rankings are unstable.")
 
-        iteration_recommendation = self._build_iteration_recommendation(context)
+        # PR4: ResultsAdvisor is a pure critic; loop control belongs to graph policy.
+        iteration_recommendation: Dict[str, Any] = {}
 
         artifacts_used = []
         for path in (metrics_artifacts + predictions_artifacts + error_artifacts + importances_artifacts):
@@ -1957,74 +1958,10 @@ class ResultsAdvisorAgent:
         return False
 
     def _build_iteration_recommendation(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        data_adequacy = context.get("data_adequacy_report") or {}
-        review_feedback = str(context.get("review_feedback") or "")
-        review_verdict = str(context.get("review_verdict") or "").upper()
-        metric_history = context.get("metric_history") or []
-        policy = context.get("iteration_policy") or {}
-        window = int(policy.get("plateau_window", 2) or 2)
-        epsilon = float(policy.get("plateau_epsilon", 0.01) or 0.01)
-
-        if isinstance(data_adequacy, dict):
-            reasons = data_adequacy.get("reasons", []) if isinstance(data_adequacy.get("reasons"), list) else []
-            threshold_reached = bool(data_adequacy.get("threshold_reached"))
-            infra_reasons = [r for r in reasons if "cleaned_data_read_failed" in str(r) or "required_outputs_missing" in str(r)]
-            if infra_reasons:
-                return {
-                    "action": "RETRY",
-                    "reason": "Infrastructure or artifact issues detected in data adequacy.",
-                    "next_changes": ["Fix pipeline IO/artifacts before further iterations."],
-                }
-            if threshold_reached or "signal_ceiling_reached" in reasons:
-                return {
-                    "action": "STOP",
-                    "reason": "Data adequacy indicates signal ceiling reached.",
-                    "next_changes": [],
-                }
-            status = data_adequacy.get("status")
-            if review_verdict in {"APPROVED", "APPROVE_WITH_WARNINGS"} and status not in {"data_limited", "insufficient_signal", "unknown"}:
-                # Check for pending feature engineering to upgrade baseline
-                execution_contract = context.get("execution_contract")
-                fe_tasks = execution_contract.get("feature_engineering_tasks") if isinstance(execution_contract, dict) else []
-                # metric_history already includes the current run snapshot in graph flow.
-                # First successful baseline run is usually history size 1 (or 0 in edge cases).
-                # Only trigger feature engineering ONCE, after the baseline.
-                if fe_tasks and len(metric_history) <= 1:
-                    return {
-                        "action": "RETRY",
-                        "reason": "Baseline approved. Proceeding to implement planned feature engineering tasks.",
-                        "next_changes": ["Implement feature_engineering_tasks from contract."],
-                        "review_verdict": review_verdict,
-                        "mode": "improve"
-                    }
-
-                next_changes = self._suggest_next_changes(review_feedback) if review_feedback else []
-                return {
-                    "action": "STOP",
-                    "reason": "Review approved; iterate only if explicit improvements are requested.",
-                    "next_changes": next_changes,
-                    "review_verdict": review_verdict,
-                }
-        if isinstance(metric_history, list) and self._detect_plateau(metric_history, window, epsilon):
-            return {
-                "action": "STOP",
-                "reason": "Metrics plateau across recent iterations.",
-                "next_changes": [],
-            }
-        if isinstance(data_adequacy, dict):
-            status = data_adequacy.get("status")
-            if status in {"data_limited", "insufficient_signal", "unknown"}:
-                return {
-                    "action": "RETRY",
-                    "reason": "Data adequacy inconclusive; address missing signal before stopping.",
-                    "next_changes": self._suggest_next_changes(review_feedback),
-                }
-        return {
-            "action": "RETRY",
-            "reason": "Continue iteration to improve metrics with targeted changes.",
-            "next_changes": self._suggest_next_changes(review_feedback),
-            "review_verdict": review_verdict if review_verdict else None,
-        }
+        # Deprecated by PR4 governance: ResultsAdvisor no longer issues loop actions.
+        # Keep the method for compatibility with older call-sites.
+        _ = context
+        return {}
 
     def _flatten_numeric_metrics(self, metrics: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
         if not isinstance(metrics, dict):

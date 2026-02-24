@@ -71,7 +71,7 @@ def test_results_advisor_primary_metric_prefers_explicit_metric_field(tmp_path, 
     assert str(insights.get("primary_metric") or "").lower() == "rmsle"
 
 
-def test_results_advisor_triggers_improve_mode_after_first_baseline():
+def test_results_advisor_is_pure_critic_and_does_not_emit_iteration_decisions():
     advisor = ResultsAdvisorAgent(api_key="")
     insights = advisor.generate_insights(
         {
@@ -86,6 +86,4 @@ def test_results_advisor_triggers_improve_mode_after_first_baseline():
             "metric_history": [{"primary_metric_name": "roc_auc", "primary_metric_value": 0.71}],
         }
     )
-    recommendation = insights.get("iteration_recommendation") or {}
-    assert recommendation.get("action") == "RETRY"
-    assert recommendation.get("mode") == "improve"
+    assert insights.get("iteration_recommendation") == {}

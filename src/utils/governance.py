@@ -63,6 +63,33 @@ def _metric_higher_is_better(name: str) -> bool:
     return True
 
 
+def _normalize_metric_token(name: Any) -> str:
+    return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+
+
+def _extract_metric_value_by_name(metric_pool: Dict[str, float], metric_name: Any) -> Any:
+    if not isinstance(metric_pool, dict):
+        return None
+    target = _normalize_metric_token(metric_name)
+    if not target:
+        return None
+    exact_key = None
+    fuzzy_key = None
+    for key in metric_pool.keys():
+        normalized = _normalize_metric_token(key)
+        if not normalized:
+            continue
+        if normalized == target:
+            exact_key = key
+            break
+        if target in normalized and fuzzy_key is None:
+            fuzzy_key = key
+    selected = exact_key or fuzzy_key
+    if selected is None:
+        return None
+    return metric_pool.get(selected)
+
+
 def _extract_baseline_vs_model(metric_pool: Dict[str, float]) -> Dict[str, Any]:
     baseline_vs_model = []
     baseline_keys = [k for k in metric_pool.keys() if any(tok in k.lower() for tok in ["baseline", "dummy", "naive", "null"])]
@@ -412,6 +439,29 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     ):
         run_outcome = "NO_GO"
 
+    review_board_payload = state.get("review_board_verdict")
+    if not isinstance(review_board_payload, dict):
+        loaded_board = _safe_load_json("data/review_board_verdict.json")
+        review_board_payload = loaded_board if isinstance(loaded_board, dict) else {}
+    metric_round_finalization = (
+        review_board_payload.get("metric_round_finalization")
+        if isinstance(review_board_payload, dict)
+        and isinstance(review_board_payload.get("metric_round_finalization"), dict)
+        else {}
+    )
+    metric_improvement_summary: Dict[str, Any] = {}
+    if metric_round_finalization:
+        metric_name = metric_round_finalization.get("metric_name")
+        metric_improvement_summary = {
+            "kept": metric_round_finalization.get("kept") or state.get("ml_improvement_kept"),
+            "metric_name": metric_name,
+            "baseline_metric": metric_round_finalization.get("baseline_metric"),
+            "candidate_metric": metric_round_finalization.get("candidate_metric"),
+            "final_metric_reported": metric_round_finalization.get("final_metric"),
+            "final_metric_artifact": _extract_metric_value_by_name(metric_pool, metric_name),
+            "reason": metric_round_finalization.get("force_finalize_reason") or "",
+        }
+
     return {
         "run_id": state.get("run_id"),
         "status": status,
@@ -438,4 +488,5 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         "overall_status_global": overall_status_global,
         "hard_failures": reducer_hard_failures,
         "governance_reasons": reducer_reasons,
+        "metric_improvement": metric_improvement_summary,
     }

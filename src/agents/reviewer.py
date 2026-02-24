@@ -14,6 +14,7 @@ from src.utils.reviewer_response_schema import (
     build_reviewer_response_schema,
 )
 from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
+from src.utils.contract_first_gates import apply_contract_first_gate_policy
 
 load_dotenv()
 
@@ -87,29 +88,31 @@ def _normalize_reviewer_gate_name(item: Any) -> str:
     return str(item).strip()
 
 
+_REVIEWER_INVARIANT_GATES: List[str] = [
+    "reviewer_syntax_validity",
+    "runtime_failure",
+    "llm_review_unavailable",
+    "contract_required_artifacts_missing",
+    "insufficient_deterministic_evidence",
+]
+
+
 def apply_reviewer_gate_filter(result: Dict[str, Any], reviewer_gates: List[Any]) -> Dict[str, Any]:
     if not isinstance(result, dict):
         return {}
-    allowed = {
-        name.lower()
+    active_gate_names: List[str] = [
+        name
         for name in (_normalize_reviewer_gate_name(g) for g in (reviewer_gates or []))
         if name
-    }
-    if allowed:
-        filtered = []
-        for g in result.get("failed_gates", []):
-            gate_name = _normalize_reviewer_gate_name(g)
-            if gate_name.lower() in allowed:
-                filtered.append(gate_name)
-        result["failed_gates"] = filtered
-        hard_failures = result.get("hard_failures")
-        has_hard_failures = isinstance(hard_failures, list) and any(
-            str(item).strip() for item in hard_failures
-        )
-        if result.get("status") == "REJECTED" and not result.get("failed_gates") and not has_hard_failures:
-            result["status"] = "APPROVE_WITH_WARNINGS"
-            result["feedback"] = "Spec-driven gating: no reviewer gates failed; downgraded to warnings."
-    return result
+    ]
+    for invariant_gate in _REVIEWER_INVARIANT_GATES:
+        if invariant_gate not in active_gate_names:
+            active_gate_names.append(invariant_gate)
+    return apply_contract_first_gate_policy(
+        dict(result),
+        active_gate_names,
+        actor="reviewer",
+    )
 
 
 def _collect_string_literals(tree: ast.AST | None) -> set[str]:
@@ -1088,6 +1091,7 @@ class ReviewerAgent:
             result["evidence"] = _normalize_evidence_items(result.get("evidence"), max_items=8)
             if parse_trace:
                 result["json_parse_trace"] = parse_trace
+            result = apply_reviewer_gate_filter(result, eval_reviewer_gates)
             
             return result
             

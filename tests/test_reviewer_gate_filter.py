@@ -24,6 +24,7 @@ def test_reviewer_gate_filter_downgrades_when_no_allowed_gate_fails() -> None:
         "status": "REJECTED",
         "feedback": "only unknown gate",
         "failed_gates": ["not_in_contract"],
+        "hard_failures": ["not_in_contract"],
         "required_fixes": [],
     }
     reviewer_gates = [
@@ -34,4 +35,5 @@ def test_reviewer_gate_filter_downgrades_when_no_allowed_gate_fails() -> None:
 
     assert filtered["status"] == "APPROVE_WITH_WARNINGS"
     assert filtered["failed_gates"] == []
-    assert "Spec-driven gating" in filtered["feedback"]
+    assert filtered["hard_failures"] == []
+    assert "NON_ACTIVE_GATE_WARNINGS" in str(filtered["feedback"])

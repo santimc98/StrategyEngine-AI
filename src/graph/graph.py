@@ -9022,6 +9022,7 @@ def _persist_ml_iteration_trace_summary(
 
     stage_counts: Dict[str, int] = {}
     iterations: set[int] = set()
+    metric_round_map: Dict[int, Dict[str, Any]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -9031,10 +9032,27 @@ def _persist_ml_iteration_trace_summary(
             iterations.add(int(entry.get("iteration_id")))
         except Exception:
             pass
+        metric_round = entry.get("metric_round")
+        if isinstance(metric_round, dict):
+            try:
+                round_id = int(metric_round.get("round_id"))
+            except Exception:
+                round_id = 0
+            if round_id > 0:
+                metric_round_map[round_id] = {
+                    "round_id": round_id,
+                    "action": str(metric_round.get("action") or "").strip(),
+                    "technique": str(metric_round.get("technique") or "").strip(),
+                    "signature": str(metric_round.get("signature") or "").strip(),
+                    "delta": metric_round.get("delta"),
+                    "kept": str(metric_round.get("kept") or "").strip(),
+                    "reason": str(metric_round.get("reason") or "").strip(),
+                }
 
     last_entry = entries[-1] if entries else {}
     outputs_missing = last_entry.get("outputs_missing") if isinstance(last_entry, dict) else []
     outputs_missing = outputs_missing if isinstance(outputs_missing, list) else []
+    metric_rounds = [metric_round_map[key] for key in sorted(metric_round_map.keys())]
     summary = {
         "run_id": run_id,
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -9042,6 +9060,8 @@ def _persist_ml_iteration_trace_summary(
         "entries_count": len(entries),
         "stages_count": stage_counts,
         "iterations_observed": sorted(iterations),
+        "metric_rounds_count": len(metric_rounds),
+        "metric_rounds": metric_rounds[-24:],
         "last_entry": {
             "iteration_id": last_entry.get("iteration_id") if isinstance(last_entry, dict) else None,
             "stage": last_entry.get("stage") if isinstance(last_entry, dict) else None,
@@ -9241,6 +9261,13 @@ def _build_ml_iteration_journal_entry(
             return int(value)
         except Exception:
             return 0
+    def _safe_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
 
     handoff_meta = {
         "source": str(handoff_obj.get("source") or ""),
@@ -9250,6 +9277,59 @@ def _build_ml_iteration_journal_entry(
     }
     reviewer_trace = reviewer_packet.get("json_parse_trace") if isinstance(reviewer_packet, dict) else {}
     qa_trace = qa_packet.get("json_parse_trace") if isinstance(qa_packet, dict) else {}
+    metric_round_info: Dict[str, Any] = {}
+    round_history = state.get("ml_improvement_round_history")
+    latest_round = round_history[-1] if isinstance(round_history, list) and round_history and isinstance(round_history[-1], dict) else {}
+    hypothesis_packet = (
+        state.get("ml_improvement_hypothesis_packet")
+        if isinstance(state.get("ml_improvement_hypothesis_packet"), dict)
+        else {}
+    )
+    hypothesis_payload = (
+        hypothesis_packet.get("hypothesis")
+        if isinstance(hypothesis_packet.get("hypothesis"), dict)
+        else {}
+    )
+    latest_hypothesis = latest_round.get("hypothesis") if isinstance(latest_round.get("hypothesis"), dict) else {}
+    tracker_context = (
+        hypothesis_packet.get("tracker_context")
+        if isinstance(hypothesis_packet.get("tracker_context"), dict)
+        else {}
+    )
+    round_id = (
+        _safe_int(latest_round.get("round_id"))
+        or _safe_int(state.get("ml_improvement_current_round_id"))
+        or _safe_int(state.get("ml_improvement_round_count"))
+    )
+    if round_id > 0 or bool(state.get("ml_improvement_round_active")):
+        reason = str(
+            latest_round.get("reason")
+            or latest_round.get("forced_finalize_reason")
+            or state.get("ml_improvement_force_finalize_reason")
+            or state.get("stop_reason")
+            or ""
+        ).strip()
+        metric_round_info = {
+            "round_id": round_id,
+            "action": str(
+                latest_hypothesis.get("action")
+                or hypothesis_packet.get("action")
+                or ""
+            ).strip(),
+            "technique": str(
+                latest_hypothesis.get("technique")
+                or hypothesis_payload.get("technique")
+                or ""
+            ).strip(),
+            "signature": str(
+                latest_hypothesis.get("signature")
+                or tracker_context.get("signature")
+                or ""
+            ).strip(),
+            "delta": _safe_float(latest_round.get("delta")),
+            "kept": str(latest_round.get("kept") or state.get("ml_improvement_kept") or "").strip(),
+            "reason": reason,
+        }
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "iteration_id": iter_id,
@@ -9270,6 +9350,7 @@ def _build_ml_iteration_journal_entry(
         "qa_packet_status": str(qa_packet.get("status") or ""),
         "reviewer_json_repair_used": bool(reviewer_trace.get("used_repair")) if isinstance(reviewer_trace, dict) else False,
         "qa_json_repair_used": bool(qa_trace.get("used_repair")) if isinstance(qa_trace, dict) else False,
+        "metric_round": metric_round_info,
     }
 
 def _build_iteration_memory(
@@ -23403,6 +23484,37 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             state["ml_improvement_best_metric"] = float(best_metric_value)
             state["ml_improvement_best_round"] = int(round_id or 0)
 
+    hypothesis_packet_for_round = (
+        state.get("ml_improvement_hypothesis_packet")
+        if isinstance(state.get("ml_improvement_hypothesis_packet"), dict)
+        else {}
+    )
+    hypothesis_payload_for_round = (
+        hypothesis_packet_for_round.get("hypothesis")
+        if isinstance(hypothesis_packet_for_round.get("hypothesis"), dict)
+        else {}
+    )
+    tracker_context_for_round = (
+        hypothesis_packet_for_round.get("tracker_context")
+        if isinstance(hypothesis_packet_for_round.get("tracker_context"), dict)
+        else {}
+    )
+    round_reason_parts: List[str] = []
+    if force_finalize:
+        round_reason_parts.append("force_finalize")
+    if deterministic_blockers:
+        round_reason_parts.append("deterministic_blockers")
+    if not approved:
+        round_reason_parts.append("review_not_approved")
+    if not improved_by_metric:
+        round_reason_parts.append("delta_below_threshold")
+    if not stability_ok:
+        round_reason_parts.append("stability_guard")
+    round_reason_parts.append("candidate_selected" if improved else "baseline_restored")
+    if force_finalize_reason:
+        round_reason_parts.append("force_reason=" + str(force_finalize_reason))
+    round_reason = " | ".join([part for part in round_reason_parts if part])
+
     round_record = {
         "round_id": int(round_id or 0),
         "metric_name": metric_name,
@@ -23419,6 +23531,12 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         "forced_finalize": bool(force_finalize),
         "forced_finalize_reason": force_finalize_reason if force_finalize else "",
         "kept": state.get("ml_improvement_kept"),
+        "reason": round_reason,
+        "hypothesis": {
+            "action": str(hypothesis_packet_for_round.get("action") or "").strip(),
+            "technique": str(hypothesis_payload_for_round.get("technique") or "").strip(),
+            "signature": str(tracker_context_for_round.get("signature") or "").strip(),
+        },
         "incumbent_selection": incumbent_selection,
         "no_improve_streak": int(no_improve_streak),
         "rounds_allowed": int(rounds_allowed),
@@ -23594,6 +23712,8 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                         "forced_finalize": bool(force_finalize),
                         "forced_finalize_reason": force_finalize_reason if force_finalize else "",
                         "kept": state.get("ml_improvement_kept"),
+                        "reason": round_reason,
+                        "hypothesis": round_record.get("hypothesis"),
                         "no_improve_streak": int(no_improve_streak),
                         "patience": int(patience),
                         "continue_round": bool(continue_round),

@@ -152,6 +152,46 @@ def test_run_manifest_includes_iteration_trace_metadata(tmp_path, monkeypatch):
     assert trace.get("metric_improvement_kept") == "baseline"
 
 
+def test_run_manifest_includes_metric_round_records(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run_id = "run_trace_rounds_01"
+    state = {
+        "run_id": run_id,
+        "run_start_ts": "2026-02-20T00:00:00",
+        "ml_improvement_round_count": 2,
+        "ml_improvement_attempted": True,
+        "ml_improvement_kept": "improved",
+        "ml_improvement_round_history": [
+            {
+                "round_id": 1,
+                "delta": 0.0002,
+                "kept": "baseline",
+                "reason": "delta_below_threshold | baseline_restored",
+                "hypothesis": {"action": "APPLY", "technique": "missing_indicators", "signature": "hyp_a"},
+            },
+            {
+                "round_id": 2,
+                "delta": 0.0011,
+                "kept": "improved",
+                "reason": "candidate_selected",
+                "hypothesis": {"action": "APPLY", "technique": "rare_grouping", "signature": "hyp_b"},
+            },
+        ],
+    }
+    run_dir = init_run_bundle(run_id, state, base_dir=str(tmp_path / "runs"), enable_tee=False)
+    Path(run_dir, "contracts").mkdir(parents=True, exist_ok=True)
+
+    manifest_path = write_run_manifest(run_id, state)
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    trace = manifest.get("iteration_trace", {})
+    rounds = trace.get("metric_rounds") or []
+
+    assert trace.get("metric_rounds_count") == 2
+    assert len(rounds) == 2
+    assert rounds[-1].get("kept") == "improved"
+    assert rounds[-1].get("hypothesis", {}).get("technique") == "rare_grouping"
+
+
 def test_log_agent_snapshot_supports_iteration_and_attempt_paths(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     run_id = "run_snapshot_trace_01"
