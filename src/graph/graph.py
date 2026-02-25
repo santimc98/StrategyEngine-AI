@@ -50,6 +50,7 @@ from src.agents.execution_planner import (
 )
 from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
+from src.agents.model_analyst import ModelAnalystAgent
 from src.utils.pdf_generator import convert_report_to_pdf
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.dialect_guardrails import (
@@ -22736,6 +22737,33 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         print(critique_line)
 
     tracker_entries = load_recent_experiment_entries(run_id, k=20) if run_id else []
+
+    # --- Model Analyst: deep baseline analysis (runs once on first round) ---
+    optimization_blueprint = state.get("optimization_blueprint")
+    if not isinstance(optimization_blueprint, dict) and int(round_id) <= 1:
+        try:
+            baseline_script = state.get("ml_code_current") or ""
+            analyst = ModelAnalystAgent()
+            analyst_context = {
+                "script_code": baseline_script,
+                "metrics": state.get("results_advisor_metrics") if isinstance(state.get("results_advisor_metrics"), dict) else {},
+                "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
+                "contract": contract,
+                "primary_metric": metric_name,
+                "models_used": (state.get("results_advisor_metrics") or {}).get("models_used", []),
+            }
+            optimization_blueprint = analyst.analyze_baseline(analyst_context)
+            state["optimization_blueprint"] = optimization_blueprint
+            if run_id:
+                blueprint_dir = os.path.join("runs", run_id, "agents", "model_analyst")
+                os.makedirs(blueprint_dir, exist_ok=True)
+                with open(os.path.join(blueprint_dir, "optimization_blueprint.json"), "w") as f:
+                    json.dump(optimization_blueprint, f, indent=2, default=str)
+                print(f"MODEL_ANALYST: blueprint generated with {len(optimization_blueprint.get('improvement_actions', []))} actions")
+        except Exception as exc:
+            print(f"MODEL_ANALYST_ERROR: {exc}")
+            optimization_blueprint = None
+
     strategist_context = {
         "run_id": run_id,
         "iteration": int(state.get("iteration_count", 0) or 0) + 1,
@@ -22751,6 +22779,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "round_history": round_history[-8:],
         "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
         "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
+        "optimization_blueprint": optimization_blueprint if isinstance(optimization_blueprint, dict) else {},
     }
     hypothesis_packet = strategist.generate_iteration_hypothesis(strategist_context)
     hypothesis_packet, hybrid_policy_meta = _resolve_metric_round_hybrid_policy(

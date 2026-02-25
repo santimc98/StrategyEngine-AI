@@ -573,7 +573,36 @@ class StrategistAgent:
         known_signatures = self._collect_tracker_signatures(tracker_entries)
 
         dataset_profile = context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
+
+        # --- Extract optimization blueprint candidates (from ModelAnalyst) ---
+        optimization_blueprint = context.get("optimization_blueprint")
+        if not isinstance(optimization_blueprint, dict):
+            optimization_blueprint = {}
+        blueprint_actions = optimization_blueprint.get("improvement_actions")
+        if not isinstance(blueprint_actions, list):
+            blueprint_actions = []
+        blueprint_candidates = []
+        for bp_action in blueprint_actions:
+            if not isinstance(bp_action, dict):
+                continue
+            technique = str(bp_action.get("technique") or "").strip()
+            if not technique:
+                continue
+            blueprint_candidates.append({
+                "technique": technique,
+                "target_columns": bp_action.get("target_columns", ["ALL_NUMERIC"]),
+                "feature_scope": "model_features",
+                "params": bp_action.get("concrete_params") if isinstance(bp_action.get("concrete_params"), dict) else {},
+                "objective": str(bp_action.get("code_change_hint") or f"Apply {technique} from model analysis blueprint"),
+                "_source": "model_analyst_blueprint",
+                "_priority": int(bp_action.get("priority", 5)) if isinstance(bp_action.get("priority"), int) else 5,
+            })
+        blueprint_candidates.sort(key=lambda x: x.get("_priority", 5))
+
         candidates = self._candidate_techniques_from_plan(feature_engineering_plan, dataset_profile=dataset_profile)
+        if blueprint_candidates:
+            bp_techniques = {bc.get("technique") for bc in blueprint_candidates}
+            candidates = blueprint_candidates + [c for c in candidates if c.get("technique") not in bp_techniques]
         if not candidates:
             candidates = self._fallback_candidates_from_critique(critique_packet, context=context)
 
@@ -673,6 +702,12 @@ class StrategistAgent:
             "fallback_if_not_applicable": "NO_OP",
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
+        # Enrich with blueprint-specific context if candidate came from ModelAnalyst
+        if selected_candidate and selected_candidate.get("_source") == "model_analyst_blueprint":
+            packet["hypothesis"]["blueprint_params"] = selected_candidate.get("params", {})
+            packet["hypothesis"]["code_change_hint"] = selected_candidate.get("objective", "")
+            packet["explanation"] = f"Blueprint-driven: {selected_candidate.get('objective', '')}"[:280]
+
         valid_packet, errors = validate_iteration_hypothesis_packet(packet)
         if valid_packet:
             return packet
