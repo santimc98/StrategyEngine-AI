@@ -21965,6 +21965,60 @@ def _collect_metric_round_negative_streak(
     return streak, techniques
 
 
+def _detect_monotonic_degradation(
+    tracker_entries: Any,
+    *,
+    higher_is_better: bool,
+    min_streak_for_warning: int = 3,
+    cumulative_threshold: float = 0.05,
+) -> Dict[str, Any]:
+    """
+    Detect monotonically decreasing metric trend across optimization rounds.
+    Universal: works with any metric direction and threshold.
+    """
+    values: List[Tuple[float, float]] = []
+    if isinstance(tracker_entries, list):
+        for entry in tracker_entries:
+            if not isinstance(entry, dict):
+                continue
+            event = str(entry.get("event") or "").strip().lower()
+            if event not in {"candidate_evaluated", "hypothesis_memory"}:
+                continue
+            metric_val = _coerce_float(entry.get("metric_value"))
+            delta = _coerce_float(entry.get("delta"))
+            if metric_val is not None and delta is not None:
+                values.append((float(metric_val), float(delta)))
+
+    if len(values) < min_streak_for_warning:
+        return {
+            "monotonic_degradation": False,
+            "streak_length": 0,
+            "cumulative_delta": 0.0,
+            "should_early_stop": False,
+            "metric_values": [v[0] for v in values],
+        }
+
+    streak = 0
+    cumulative = 0.0
+    for metric_val, delta in reversed(values):
+        is_degrading = delta < 0.0 if higher_is_better else delta > 0.0
+        if not is_degrading:
+            break
+        streak += 1
+        cumulative += abs(delta)
+
+    is_monotonic = streak >= min_streak_for_warning
+    should_stop = is_monotonic and cumulative >= cumulative_threshold
+
+    return {
+        "monotonic_degradation": is_monotonic,
+        "streak_length": streak,
+        "cumulative_delta": round(cumulative, 6),
+        "should_early_stop": should_stop,
+        "metric_values": [v[0] for v in values[-8:]],
+    }
+
+
 def _build_metric_round_hypothesis_signature(
     *,
     technique: Any,
@@ -22710,6 +22764,58 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         feature_engineering_plan=feature_engineering_plan,
         tracker_entries=tracker_entries,
     )
+    # --- Monotonic degradation detection ---
+    degradation_threshold = float(os.environ.get("OPT_DEGRADATION_THRESHOLD", "0.05"))
+    degradation_info = _detect_monotonic_degradation(
+        tracker_entries,
+        higher_is_better=bool(metric_higher_is_better),
+        min_streak_for_warning=3,
+        cumulative_threshold=degradation_threshold,
+    )
+    state["ml_improvement_degradation_info"] = degradation_info
+    if degradation_info.get("monotonic_degradation") and run_id:
+        try:
+            log_run_event(
+                run_id,
+                "monotonic_metric_degradation_warning",
+                {
+                    "round_id": int(round_id),
+                    "streak_length": degradation_info["streak_length"],
+                    "cumulative_delta": degradation_info["cumulative_delta"],
+                    "should_early_stop": degradation_info["should_early_stop"],
+                    "recent_metric_values": degradation_info["metric_values"],
+                    "metric_name": metric_name,
+                    "higher_is_better": bool(metric_higher_is_better),
+                },
+            )
+        except Exception:
+            pass
+    if degradation_info.get("should_early_stop"):
+        state["ml_improvement_round_active"] = False
+        state["ml_improvement_continue"] = False
+        state["ml_improvement_attempted"] = True
+        state["ml_improvement_loop_complete"] = True
+        state["ml_improvement_kept"] = str(state.get("ml_improvement_best_label") or "incumbent")
+        state["ml_improvement_force_finalize_reason"] = "monotonic_metric_degradation"
+        state["stop_reason"] = "IMPROVEMENT_ROUND_MONOTONIC_DEGRADATION"
+        state["last_iteration_type"] = None
+        _append_feedback_history(
+            state,
+            (
+                "METRIC_IMPROVEMENT_LOOP_STOP: monotonic metric degradation detected "
+                f"(streak={degradation_info['streak_length']}, "
+                f"cumulative_delta={degradation_info['cumulative_delta']}); "
+                "reverting to best incumbent."
+            ),
+        )
+        print(
+            f"OPT_LOOP_EARLY_STOP: monotonic_degradation "
+            f"streak={degradation_info['streak_length']} "
+            f"cumulative_delta={degradation_info['cumulative_delta']} "
+            f"metric={metric_name}"
+        )
+        return state
+
     if _is_duplicate_noop_hypothesis(hypothesis_packet):
         state["ml_improvement_round_active"] = False
         state["ml_improvement_continue"] = False
@@ -23716,6 +23822,9 @@ def _should_continue_opt_loop(state: AgentState) -> bool:
     no_improve_streak = int(state.get("ml_improvement_no_improve_streak", 0) or 0)
     if no_improve_streak >= max(1, patience):
         return False
+    degradation_info = state.get("ml_improvement_degradation_info")
+    if isinstance(degradation_info, dict) and degradation_info.get("should_early_stop"):
+        return False
     return True
 
 
@@ -23780,6 +23889,14 @@ def run_select_incumbent(state: AgentState) -> AgentState:
                 selection = candidate
     if not isinstance(selection, dict):
         selection = {}
+
+    degradation_info = state.get("ml_improvement_degradation_info")
+    if isinstance(degradation_info, dict) and degradation_info.get("should_early_stop"):
+        selection["forced_revert"] = True
+        selection["revert_reason"] = "monotonic_metric_degradation"
+        best_label = state.get("ml_improvement_best_label") or "incumbent"
+        selection["selected_label"] = str(best_label)
+
     return {
         "opt_incumbent_selection": selection,
         "opt_loop_phase": "select_incumbent",

@@ -380,6 +380,85 @@ class MLEngineerAgent:
 
         return compact
 
+    def _render_artifact_schema_block(
+        self,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+    ) -> str:
+        """
+        Render an explicit, human-readable artifact schema block from
+        artifact_requirements for prompt injection.  Universal: does not
+        assume dataset-specific column names or file paths.
+        """
+        contract = execution_contract if isinstance(execution_contract, dict) else {}
+        view = ml_view if isinstance(ml_view, dict) else {}
+
+        artifact_reqs = contract.get("artifact_requirements")
+        if not isinstance(artifact_reqs, dict):
+            artifact_reqs = view.get("artifact_requirements")
+        if not isinstance(artifact_reqs, dict) or not artifact_reqs:
+            return ""
+
+        lines = ["=== REQUIRED OUTPUT ARTIFACTS SCHEMA ==="]
+
+        # --- scored_rows_schema ---
+        scored_schema = artifact_reqs.get("scored_rows_schema")
+        if isinstance(scored_schema, dict):
+            lines.append("\nARTIFACT: data/scored_rows.csv")
+            req_cols = scored_schema.get("required_columns")
+            if isinstance(req_cols, list) and req_cols:
+                lines.append(f"  REQUIRED_COLUMNS (must ALL be present): {req_cols}")
+            any_of = scored_schema.get("required_any_of_groups")
+            severities = scored_schema.get("required_any_of_group_severity")
+            if isinstance(any_of, list):
+                for idx, group in enumerate(any_of):
+                    if not isinstance(group, list) or not group:
+                        continue
+                    severity = "fail"
+                    if isinstance(severities, list) and idx < len(severities):
+                        severity = str(severities[idx] or "fail")
+                    lines.append(
+                        f"  ANY_OF_GROUP (severity={severity}): include >= 1 of {group}"
+                    )
+
+        # --- file_schemas (generic fallback for other artifact types) ---
+        file_schemas = artifact_reqs.get("file_schemas")
+        if isinstance(file_schemas, dict):
+            for file_path, schema_def in file_schemas.items():
+                if not isinstance(schema_def, dict):
+                    continue
+                lines.append(f"\nARTIFACT: {file_path}")
+                req_cols = schema_def.get("required_columns")
+                if isinstance(req_cols, list) and req_cols:
+                    lines.append(f"  REQUIRED_COLUMNS: {req_cols}")
+                any_of = schema_def.get("any_of_groups")
+                if isinstance(any_of, list):
+                    for group in any_of:
+                        if isinstance(group, dict):
+                            group_name = group.get("name", "unnamed")
+                            columns = group.get("columns", [])
+                            min_present = group.get("min_present", 1)
+                            lines.append(
+                                f"  ANY_OF_GROUP '{group_name}': include >= {min_present} of {columns}"
+                            )
+                output_path = schema_def.get("path") or file_path
+                lines.append(f"  OUTPUT_PATH: {output_path}")
+
+        # --- clean_dataset required columns ---
+        clean_ds = artifact_reqs.get("clean_dataset")
+        if isinstance(clean_ds, dict):
+            output_path = clean_ds.get("output_path")
+            if output_path:
+                req_cols = clean_ds.get("required_columns")
+                if isinstance(req_cols, list) and req_cols:
+                    lines.append(f"\nARTIFACT: {output_path}")
+                    lines.append(f"  REQUIRED_COLUMNS: {req_cols[:30]}{'...' if len(req_cols) > 30 else ''}")
+
+        if len(lines) <= 1:
+            return ""
+
+        return "\n".join(lines)
+
     def _resolve_allowed_columns_for_prompt(self, contract: Dict[str, Any] | None) -> List[str]:
         """Build prompt-safe column universe from executable input columns first, then canonical/derived."""
         if not isinstance(contract, dict):
@@ -1459,6 +1538,7 @@ class MLEngineerAgent:
             ("alignment_requirements_json", 2000),
             ("execution_contract_context", 9000),
             ("ml_view_context", 8000),
+            ("artifact_schema_block", 2500),
         ]
         for key, budget in shrink_plan:
             if key not in kwargs:
@@ -3006,6 +3086,8 @@ $strategy_json
         - ML_VIEW_CONTEXT: $ml_view_context
         - Evaluation Spec: $evaluation_spec_json
         - Required Outputs: $deliverables_json
+        - Artifact Schema (authoritative output column format):
+        $artifact_schema_block
         - Canonical Columns: $canonical_columns
         - Required Features: $required_columns
         - Column Dtype Targets: $column_dtype_targets_json
@@ -3051,7 +3133,12 @@ $strategy_json
             max_str_len=400,
             max_list_items=80,
         )
-        
+
+        artifact_schema_block = self._render_artifact_schema_block(
+            execution_contract=execution_contract_input,
+            ml_view=ml_view,
+        )
+
         # V4.1: Use ml_engineer_runbook directly, no legacy role_runbooks
         ml_runbook_source = execution_contract_input.get("ml_engineer_runbook")
         if not isinstance(ml_runbook_source, dict):
@@ -3357,6 +3444,7 @@ $strategy_json
             data_sample_context_json=data_sample_context_json,
             execution_profile_json=execution_profile_json,
             dataset_scale=dataset_scale,
+            artifact_schema_block=artifact_schema_block,
         )
         # Safe Rendering for System Prompt
         system_prompt, render_kwargs, prompt_budget_meta = self._build_system_prompt_with_budget(

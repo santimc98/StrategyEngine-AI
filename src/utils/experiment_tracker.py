@@ -210,3 +210,32 @@ def load_recent_experiment_entries(run_id: str, k: int = 20, base_dir: str = "ru
     if limit <= 0:
         return []
     return entries[-limit:]
+
+
+def extract_metric_trend(
+    entries: List[Dict[str, Any]],
+    *,
+    metric_name: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Extract ordered metric values from experiment tracker entries.
+    Returns list of {round, metric_value, delta, technique} for trazability.
+    """
+    trend: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        event = str(entry.get("event") or "").strip().lower()
+        if event not in {"candidate_evaluated", "hypothesis_memory"}:
+            continue
+        metric_value = _as_float(entry.get("metric_value"))
+        delta = _as_float(entry.get("delta"))
+        if metric_value is None:
+            continue
+        trend.append({
+            "round": entry.get("round_id") or entry.get("round"),
+            "metric_value": metric_value,
+            "delta": delta,
+            "technique": str(entry.get("technique") or "").strip(),
+        })
+    return trend

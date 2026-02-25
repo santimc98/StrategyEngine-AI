@@ -434,6 +434,71 @@ class QAReviewerAgent:
             trace["repair_error"] = f"{type(exc).__name__}: {exc}"[:240]
             return None, trace
 
+    def _retry_with_simplified_prompt(
+        self,
+        failed_response_preview: str,
+        *,
+        qa_gate_names: List[str],
+    ) -> Dict[str, Any] | None:
+        """
+        Last-resort retry: re-prompt the LLM with a simplified instruction
+        asking for ONLY valid JSON.  Returns parsed dict or None.
+        """
+        if not self.client or self.provider == "none":
+            return None
+
+        simplified_prompt = (
+            "Your previous response was not valid JSON and could not be parsed.\n"
+            "You MUST respond with ONLY a valid JSON object, no other text.\n"
+            "Use this exact structure:\n"
+            '{\n'
+            '  "status": "APPROVED" or "APPROVE_WITH_WARNINGS" or "REJECTED",\n'
+            '  "feedback": "your assessment here",\n'
+            '  "failed_gates": [],\n'
+            '  "required_fixes": []\n'
+            '}\n\n'
+            f"Valid gate names: {json.dumps(qa_gate_names)}\n\n"
+            "Your previous (malformed) response started with:\n"
+            f"{str(failed_response_preview or '')[:3000]}\n\n"
+            "Now return ONLY the corrected JSON."
+        )
+
+        try:
+            if self.provider == "gemini":
+                config = dict(self._generation_config)
+                config["temperature"] = 0.0
+                content, _ = self._generate_gemini_json(
+                    simplified_prompt,
+                    generation_config=config,
+                )
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": "Return only valid JSON."},
+                        {"role": "user", "content": simplified_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+                content = _coerce_llm_response_text(
+                    response.choices[0].message.content
+                )
+
+            parsed, _trace = _parse_json_payload_with_trace(content)
+            print(
+                "QA_JSON_RETRY_PASS: "
+                f"success=True provider={self.provider} model={self.model_name}"
+            )
+            return parsed
+        except Exception as exc:
+            print(
+                "QA_JSON_RETRY_PASS: "
+                f"success=False error={type(exc).__name__} "
+                f"provider={self.provider} model={self.model_name}"
+            )
+            return None
+
     def _parse_json_with_llm_repair(
         self,
         text: str,
@@ -707,31 +772,48 @@ class QAReviewerAgent:
 
             if result is None:
                 err_msg = f"QA JSON parse failed: {parse_error}"
-                print(f"{err_msg}. Raw response: {content}")
-                fallback = {
-                    "status": "APPROVE_WITH_WARNINGS",
-                    "feedback": f"QA Error: Failed to parse JSON response; defaulting to warnings. {parse_error}",
-                    "failed_gates": [],
-                    "required_fixes": [],
-                }
-                warnings = []
-                if gate_warnings:
-                    warnings.extend(gate_warnings)
-                static_warnings = static_result.get("warnings", []) if static_result else []
-                if static_warnings:
-                    warnings.extend(static_warnings)
-                if warnings:
-                    warning_text = "\n".join([f"- {w}" for w in warnings])
-                    feedback = fallback.get("feedback") or "QA Passed with warnings."
-                    fallback["feedback"] = f"{feedback}\nWarnings:\n{warning_text}"
-                fallback["qa_gates_evaluated"] = qa_gate_names
-                fallback["hard_failures"] = []
-                fallback["soft_failures"] = []
-                fallback["contract_source_used"] = contract_source_used
-                fallback["warnings"] = warnings
-                if parse_trace:
-                    fallback["json_parse_trace"] = parse_trace
-                return fallback
+                print(f"{err_msg}. Attempting simplified retry...")
+
+                retry_result = self._retry_with_simplified_prompt(
+                    str(content or ""),
+                    qa_gate_names=qa_gate_names,
+                )
+
+                if isinstance(retry_result, dict):
+                    result = retry_result
+                    result["_json_retry_used"] = True
+                else:
+                    print(f"{err_msg}. Retry also failed. Defaulting to REJECTED.")
+                    fallback = {
+                        "status": "REJECTED",
+                        "feedback": (
+                            "QA Error: Failed to parse JSON response after retry. "
+                            "Rejecting to maintain governance integrity. "
+                            f"Parse error: {parse_error}"
+                        ),
+                        "failed_gates": ["qa_json_parse_failure"],
+                        "required_fixes": [
+                            "Re-run QA review. If persistent, check LLM response format."
+                        ],
+                    }
+                    warnings = []
+                    if gate_warnings:
+                        warnings.extend(gate_warnings)
+                    static_warnings = static_result.get("warnings", []) if static_result else []
+                    if static_warnings:
+                        warnings.extend(static_warnings)
+                    if warnings:
+                        warning_text = "\n".join([f"- {w}" for w in warnings])
+                        feedback = fallback.get("feedback") or "QA rejected."
+                        fallback["feedback"] = f"{feedback}\nWarnings:\n{warning_text}"
+                    fallback["qa_gates_evaluated"] = qa_gate_names
+                    fallback["hard_failures"] = ["qa_json_parse_failure"]
+                    fallback["soft_failures"] = []
+                    fallback["contract_source_used"] = contract_source_used
+                    fallback["warnings"] = warnings
+                    if parse_trace:
+                        fallback["json_parse_trace"] = parse_trace
+                    return fallback
 
             # Fallback normalization
             if result['status'] not in ['APPROVED', 'APPROVE_WITH_WARNINGS', 'REJECTED']:

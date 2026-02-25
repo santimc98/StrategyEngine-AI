@@ -253,6 +253,90 @@ class StrategistAgent:
                     continue
         return False
 
+    def _dataset_has_categorical_signal(self, dataset_profile: Dict[str, Any]) -> bool:
+        """Check if dataset has any categorical columns (universal)."""
+        if not isinstance(dataset_profile, dict):
+            return False
+        col_types = dataset_profile.get("column_types")
+        if isinstance(col_types, dict):
+            for type_key in ("categorical", "low_cardinality", "object", "string"):
+                cols = col_types.get(type_key)
+                if isinstance(cols, list) and len(cols) > 0:
+                    return True
+        dtypes = dataset_profile.get("dtypes") or dataset_profile.get("dtype_distribution")
+        if isinstance(dtypes, dict):
+            for dtype_name, count in dtypes.items():
+                if "object" in str(dtype_name).lower() or "categ" in str(dtype_name).lower():
+                    try:
+                        if int(count) > 0:
+                            return True
+                    except Exception:
+                        pass
+        cardinality = dataset_profile.get("cardinality")
+        if isinstance(cardinality, dict) and len(cardinality) > 0:
+            return True
+        return False
+
+    def _dataset_has_numeric_signal(self, dataset_profile: Dict[str, Any]) -> bool:
+        """Check if dataset has numeric columns (universal)."""
+        if not isinstance(dataset_profile, dict):
+            return True  # assume numeric exists unless proven otherwise
+        col_types = dataset_profile.get("column_types")
+        if isinstance(col_types, dict):
+            for type_key in ("numeric", "float", "int", "continuous"):
+                cols = col_types.get(type_key)
+                if isinstance(cols, list) and len(cols) > 0:
+                    return True
+        dtypes = dataset_profile.get("dtypes") or dataset_profile.get("dtype_distribution")
+        if isinstance(dtypes, dict):
+            for dtype_name, count in dtypes.items():
+                if any(t in str(dtype_name).lower() for t in ("float", "int", "numeric")):
+                    try:
+                        if int(count) > 0:
+                            return True
+                    except Exception:
+                        pass
+        return True  # default True: assume numeric exists
+
+    def _filter_candidates_by_feasibility(
+        self,
+        candidates: List[Dict[str, Any]],
+        dataset_profile: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter out candidates whose technique is infeasible given the dataset
+        profile. Universal: does not hardcode dataset-specific logic.
+        """
+        if not isinstance(dataset_profile, dict) or not dataset_profile:
+            return candidates
+
+        has_missing = self._dataset_has_missingness_signal(dataset_profile)
+        has_categorical = self._dataset_has_categorical_signal(dataset_profile)
+        has_high_card = self._dataset_has_high_cardinality_signal(dataset_profile)
+        has_numeric = self._dataset_has_numeric_signal(dataset_profile)
+
+        feasibility_map = {
+            "missing_indicators": has_missing,
+            "rare_category_grouping": has_high_card,
+            "frequency_encoding": has_categorical,
+            "quantile_binning": has_numeric,
+        }
+
+        filtered: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            technique = str(candidate.get("technique") or "").strip().lower()
+            is_feasible = feasibility_map.get(technique)
+            if is_feasible is False:
+                print(
+                    f"STRATEGIST_FEASIBILITY_FILTER: "
+                    f"technique={technique} filtered_out=True "
+                    f"reason=infeasible_for_dataset"
+                )
+                continue
+            filtered.append(candidate)
+
+        return filtered
+
     def _dataset_has_high_cardinality_signal(self, dataset_profile: Dict[str, Any]) -> bool:
         if not isinstance(dataset_profile, dict):
             return False
@@ -279,7 +363,11 @@ class StrategistAgent:
                 return True
         return False
 
-    def _candidate_techniques_from_plan(self, feature_engineering_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _candidate_techniques_from_plan(
+        self,
+        feature_engineering_plan: Dict[str, Any],
+        dataset_profile: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
         techniques_raw = feature_engineering_plan.get("techniques")
         if not isinstance(techniques_raw, list):
             techniques_raw = []
@@ -311,7 +399,10 @@ class StrategistAgent:
                     "objective": "",
                 }
             )
-        return self._dedupe_candidates(candidates)
+        candidates = self._dedupe_candidates(candidates)
+        if isinstance(dataset_profile, dict) and dataset_profile:
+            candidates = self._filter_candidates_by_feasibility(candidates, dataset_profile)
+        return candidates
 
     def _fallback_candidates_from_critique(
         self,
@@ -328,7 +419,7 @@ class StrategistAgent:
         has_high_card_signal = self._dataset_has_high_cardinality_signal(dataset_profile)
 
         out: List[Dict[str, Any]] = []
-        if "fold_instability" in ids or has_missing_signal:
+        if "fold_instability" in ids and has_missing_signal:
             out.append(
                 {
                     "technique": "missing_indicators",
@@ -336,6 +427,26 @@ class StrategistAgent:
                     "feature_scope": "model_features",
                     "params": {"indicator_suffix": "_is_missing"},
                     "objective": "Inject missingness indicators to stabilize fold behavior with low-risk edits.",
+                }
+            )
+        elif "fold_instability" in ids:
+            out.append(
+                {
+                    "technique": "regularization_tuning",
+                    "target_columns": ["ALL"],
+                    "feature_scope": "model_features",
+                    "params": {},
+                    "objective": "Stabilize fold behavior via regularization tuning.",
+                }
+            )
+        if has_missing_signal and "fold_instability" not in ids:
+            out.append(
+                {
+                    "technique": "missing_indicators",
+                    "target_columns": ["ALL_NUMERIC"],
+                    "feature_scope": "model_features",
+                    "params": {"indicator_suffix": "_is_missing"},
+                    "objective": "Inject missingness indicators for features with missing values.",
                 }
             )
         if "minority_class_recall_low" in ids or has_high_card_signal:
@@ -368,14 +479,16 @@ class StrategistAgent:
                     "objective": "Apply bounded quantile bins to reduce over-sensitive continuous splits.",
                 }
             )
+        # Apply feasibility filter against dataset profile
+        out = self._filter_candidates_by_feasibility(out, dataset_profile)
         if not out:
             out.append(
                 {
-                    "technique": "missing_indicators",
-                    "target_columns": ["ALL_NUMERIC"],
+                    "technique": "hyperparameter_tuning",
+                    "target_columns": ["ALL"],
                     "feature_scope": "model_features",
-                    "params": {"indicator_suffix": "_is_missing"},
-                    "objective": "Low-cost baseline feature engineering refinement.",
+                    "params": {},
+                    "objective": "Safe universal fallback: tune model hyperparameters.",
                 }
             )
         return self._dedupe_candidates(out)
@@ -459,7 +572,8 @@ class StrategistAgent:
             tracker_entries = []
         known_signatures = self._collect_tracker_signatures(tracker_entries)
 
-        candidates = self._candidate_techniques_from_plan(feature_engineering_plan)
+        dataset_profile = context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
+        candidates = self._candidate_techniques_from_plan(feature_engineering_plan, dataset_profile=dataset_profile)
         if not candidates:
             candidates = self._fallback_candidates_from_critique(critique_packet, context=context)
 
