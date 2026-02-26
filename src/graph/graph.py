@@ -22742,15 +22742,15 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     optimization_blueprint = state.get("optimization_blueprint")
     if not isinstance(optimization_blueprint, dict) and int(round_id) <= 1:
         try:
-            baseline_script = state.get("ml_code_current") or ""
+            baseline_script = str(state.get("generated_code") or state.get("last_generated_code") or "")
             analyst = ModelAnalystAgent()
             analyst_context = {
                 "script_code": baseline_script,
-                "metrics": state.get("results_advisor_metrics") if isinstance(state.get("results_advisor_metrics"), dict) else {},
+                "metrics": baseline_metrics if isinstance(baseline_metrics, dict) else {},
                 "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
                 "contract": contract,
                 "primary_metric": metric_name,
-                "models_used": (state.get("results_advisor_metrics") or {}).get("models_used", []),
+                "models_used": (baseline_metrics or {}).get("models_used", []),
             }
             optimization_blueprint = analyst.analyze_baseline(analyst_context)
             state["optimization_blueprint"] = optimization_blueprint
