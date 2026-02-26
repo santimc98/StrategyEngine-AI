@@ -638,6 +638,11 @@ class QAReviewerAgent:
 
         7. CONTRACT COLUMNS (only if gate enabled):
            - The code MUST reference canonical contract columns explicitly.
+
+        8. OUTPUT ROW COUNT CONSISTENCY (only if gate enabled):
+           - For CSV artifacts with artifact_requirements.file_schemas.<path>.expected_row_count, verify code writes
+             the correct row subset (e.g., test-only vs all rows) before to_csv.
+           - Reject if a subset-sized artifact is built from full-frame columns without filtering/guard.
            
         INPUT CONTEXT:
         - Business Objective: "$business_objective"
@@ -1517,6 +1522,491 @@ def _code_mentions_columns(code: str, columns: List[str], tree: ast.AST | None =
     return any(col.lower() in lowered for col in col_set)
 
 
+def _coerce_positive_row_count(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    if isinstance(value, str):
+        token = value.strip()
+        if not token:
+            return None
+        try:
+            parsed = int(float(token))
+        except Exception:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _normalize_artifact_path_for_match(path_like: Any) -> str:
+    text = str(path_like or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _extract_row_count_hints_for_qa(evaluation_spec: Dict[str, Any] | None) -> Dict[str, int]:
+    hints: Dict[str, int] = {}
+    if not isinstance(evaluation_spec, dict):
+        return hints
+
+    train_keys = ("n_train_rows", "train_rows", "n_train", "rows_train")
+    test_keys = ("n_test_rows", "test_rows", "n_test", "rows_test")
+    total_keys = ("n_total_rows", "total_rows", "n_rows", "row_count", "rows")
+
+    def _scan(source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        if "n_train" not in hints:
+            for key in train_keys:
+                parsed = _coerce_positive_row_count(source.get(key))
+                if parsed is not None:
+                    hints["n_train"] = parsed
+                    break
+        if "n_test" not in hints:
+            for key in test_keys:
+                parsed = _coerce_positive_row_count(source.get(key))
+                if parsed is not None:
+                    hints["n_test"] = parsed
+                    break
+        if "n_total" not in hints:
+            for key in total_keys:
+                parsed = _coerce_positive_row_count(source.get(key))
+                if parsed is not None:
+                    hints["n_total"] = parsed
+                    break
+        basic_stats = source.get("basic_stats")
+        if isinstance(basic_stats, dict):
+            if "n_total" not in hints:
+                parsed = _coerce_positive_row_count(
+                    basic_stats.get("n_rows") or basic_stats.get("rows") or basic_stats.get("row_count")
+                )
+                if parsed is not None:
+                    hints["n_total"] = parsed
+            if "n_train" not in hints:
+                parsed = _coerce_positive_row_count(
+                    basic_stats.get("n_train_rows") or basic_stats.get("train_rows")
+                )
+                if parsed is not None:
+                    hints["n_train"] = parsed
+            if "n_test" not in hints:
+                parsed = _coerce_positive_row_count(
+                    basic_stats.get("n_test_rows") or basic_stats.get("test_rows")
+                )
+                if parsed is not None:
+                    hints["n_test"] = parsed
+
+    nested_eval = evaluation_spec.get("evaluation_spec") if isinstance(evaluation_spec.get("evaluation_spec"), dict) else {}
+    artifact_reqs = (
+        evaluation_spec.get("artifact_requirements")
+        if isinstance(evaluation_spec.get("artifact_requirements"), dict)
+        else {}
+    )
+    nested_dataset_profile = (
+        evaluation_spec.get("dataset_profile")
+        if isinstance(evaluation_spec.get("dataset_profile"), dict)
+        else {}
+    )
+    data_profile = evaluation_spec.get("data_profile") if isinstance(evaluation_spec.get("data_profile"), dict) else {}
+    for source in (
+        evaluation_spec,
+        nested_eval,
+        artifact_reqs,
+        nested_dataset_profile,
+        data_profile,
+    ):
+        _scan(source)
+
+    n_train = hints.get("n_train")
+    n_test = hints.get("n_test")
+    n_total = hints.get("n_total")
+    if n_total is None and n_train is not None and n_test is not None:
+        hints["n_total"] = int(n_train + n_test)
+    if n_test is None and n_total is not None and n_train is not None and n_total >= n_train:
+        hints["n_test"] = int(n_total - n_train)
+    if n_train is None and n_total is not None and n_test is not None and n_total >= n_test:
+        hints["n_train"] = int(n_total - n_test)
+    return hints
+
+
+def _resolve_expected_csv_row_counts_for_qa(
+    evaluation_spec: Dict[str, Any] | None,
+    row_hints: Dict[str, int],
+) -> Dict[str, int]:
+    expected: Dict[str, int] = {}
+    if not isinstance(evaluation_spec, dict):
+        return expected
+
+    artifact_reqs = (
+        evaluation_spec.get("artifact_requirements")
+        if isinstance(evaluation_spec.get("artifact_requirements"), dict)
+        else {}
+    )
+    nested_eval = evaluation_spec.get("evaluation_spec") if isinstance(evaluation_spec.get("evaluation_spec"), dict) else {}
+    if not artifact_reqs and isinstance(nested_eval.get("artifact_requirements"), dict):
+        artifact_reqs = nested_eval.get("artifact_requirements")
+    file_schemas = artifact_reqs.get("file_schemas") if isinstance(artifact_reqs, dict) else None
+    if not isinstance(file_schemas, dict):
+        return expected
+
+    alias_map = {
+        "n_train": row_hints.get("n_train"),
+        "n_train_rows": row_hints.get("n_train"),
+        "train_rows": row_hints.get("n_train"),
+        "n_test": row_hints.get("n_test"),
+        "n_test_rows": row_hints.get("n_test"),
+        "test_rows": row_hints.get("n_test"),
+        "n_total": row_hints.get("n_total"),
+        "n_total_rows": row_hints.get("n_total"),
+        "total_rows": row_hints.get("n_total"),
+        "n_rows": row_hints.get("n_total"),
+        "row_count": row_hints.get("n_total"),
+    }
+    for raw_path, schema in file_schemas.items():
+        path = _normalize_artifact_path_for_match(raw_path)
+        if not path or not path.lower().endswith(".csv") or not isinstance(schema, dict):
+            continue
+        resolved = _coerce_positive_row_count(schema.get("expected_row_count"))
+        if resolved is None and isinstance(schema.get("expected_row_count"), str):
+            token = re.sub(r"[^a-z0-9]+", "_", schema.get("expected_row_count", "").lower()).strip("_")
+            candidate = alias_map.get(token)
+            resolved = int(candidate) if isinstance(candidate, int) and candidate > 0 else None
+        if resolved is not None:
+            expected[path] = int(resolved)
+    return expected
+
+
+def _literal_str_from_ast(node: ast.AST | None) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return str(node.value)
+    if isinstance(node, ast.JoinedStr):
+        chunks: List[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                chunks.append(str(value.value))
+            else:
+                return ""
+        return "".join(chunks)
+    return ""
+
+
+def _resolve_to_csv_target_path(call_node: ast.Call) -> str:
+    path_node: ast.AST | None = None
+    if call_node.args:
+        path_node = call_node.args[0]
+    else:
+        for kw in call_node.keywords:
+            if isinstance(kw, ast.keyword) and kw.arg == "path_or_buf":
+                path_node = kw.value
+                break
+    return _normalize_artifact_path_for_match(_literal_str_from_ast(path_node))
+
+
+def _looks_like_read_csv_call(call_node: ast.AST) -> bool:
+    if not isinstance(call_node, ast.Call):
+        return False
+    return "read_csv" in _call_name(call_node)
+
+
+def _extract_assignment_targets(targets: List[ast.AST]) -> List[str]:
+    names: List[str] = []
+    for target in targets:
+        if isinstance(target, ast.Name):
+            names.append(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for child in target.elts:
+                if isinstance(child, ast.Name):
+                    names.append(child.id)
+    return names
+
+
+def _collect_assignment_map(tree: ast.AST) -> Dict[str, ast.AST]:
+    mapping: Dict[str, tuple[int, ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = _extract_assignment_targets(node.targets)
+            for name in targets:
+                previous = mapping.get(name)
+                if previous is None or node.lineno >= previous[0]:
+                    mapping[name] = (node.lineno, node.value)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name = node.target.id
+            previous = mapping.get(name)
+            if previous is None or node.lineno >= previous[0]:
+                mapping[name] = (node.lineno, node.value)
+    return {name: payload[1] for name, payload in mapping.items() if payload[1] is not None}
+
+
+def _expr_references_alias(expr: ast.AST, aliases: set[str]) -> bool:
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Name) and node.id in aliases:
+            return True
+    return False
+
+
+def _expr_has_subset_signal(expr: ast.AST, aliases: set[str], subset_vars: set[str]) -> bool:
+    def _is_full_row_slice(slice_node: ast.AST) -> bool:
+        if isinstance(slice_node, ast.Slice):
+            return slice_node.lower is None and slice_node.upper is None and slice_node.step is None
+        return False
+
+    def _is_column_only_projection(slice_node: ast.AST) -> bool:
+        if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+            return True
+        if isinstance(slice_node, ast.List):
+            return all(
+                isinstance(item, ast.Constant) and isinstance(item.value, str)
+                for item in slice_node.elts
+            )
+        return False
+
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Name) and node.id in subset_vars:
+            return True
+        if not isinstance(node, ast.Subscript):
+            continue
+        value = node.value
+        if isinstance(value, ast.Attribute) and value.attr in {"loc", "iloc"} and isinstance(value.value, ast.Name):
+            if value.value.id in aliases:
+                if isinstance(node.slice, ast.Tuple) and node.slice.elts:
+                    row_selector = node.slice.elts[0]
+                    if _is_full_row_slice(row_selector):
+                        continue
+                return True
+        if isinstance(value, ast.Name) and value.id in aliases:
+            # df["col"] / df[["a","b"]] are column projections (not row subsets).
+            if _is_column_only_projection(node.slice):
+                continue
+            # Non-column selectors are treated as row subsets.
+            if not _is_full_row_slice(node.slice):
+                return True
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {"query", "sample", "head", "tail", "dropna", "drop_duplicates"}:
+                if isinstance(node.func.value, ast.Name) and (
+                    node.func.value.id in aliases or node.func.value.id in subset_vars
+                ):
+                    return True
+    return False
+
+
+def _collect_dataframe_lineage(
+    assignment_map: Dict[str, ast.AST],
+) -> tuple[set[str], set[str]]:
+    full_aliases: set[str] = set()
+    subset_vars: set[str] = set()
+    for var_name, expr in assignment_map.items():
+        if _looks_like_read_csv_call(expr):
+            full_aliases.add(var_name)
+    changed = True
+    while changed:
+        changed = False
+        for var_name, expr in assignment_map.items():
+            if var_name in full_aliases or var_name in subset_vars:
+                continue
+            if isinstance(expr, ast.Name):
+                if expr.id in full_aliases:
+                    full_aliases.add(var_name)
+                    changed = True
+                    continue
+                if expr.id in subset_vars:
+                    subset_vars.add(var_name)
+                    changed = True
+                    continue
+            has_subset_signal = _expr_has_subset_signal(expr, full_aliases, subset_vars)
+            has_full_reference = _expr_references_alias(expr, full_aliases)
+
+            if has_full_reference and has_subset_signal:
+                # Mixed expressions default to full-risk unless the expression is
+                # a direct subset extractor from the base frame.
+                if isinstance(expr, ast.Subscript):
+                    subset_vars.add(var_name)
+                elif isinstance(expr, ast.Call) and _call_name(expr).endswith("DataFrame"):
+                    full_component = False
+                    subset_component = False
+                    candidate_exprs: List[ast.AST] = []
+                    if expr.args:
+                        candidate_exprs.append(expr.args[0])
+                    for kw in expr.keywords:
+                        if isinstance(kw, ast.keyword) and kw.arg == "data":
+                            candidate_exprs.append(kw.value)
+                    expanded: List[ast.AST] = []
+                    for candidate in candidate_exprs:
+                        if isinstance(candidate, ast.Dict):
+                            expanded.extend([item for item in candidate.values if item is not None])
+                        else:
+                            expanded.append(candidate)
+                    for candidate in expanded:
+                        cand_has_subset = _expr_has_subset_signal(candidate, full_aliases, subset_vars)
+                        cand_has_full = _expr_references_alias(candidate, full_aliases)
+                        if cand_has_full and not cand_has_subset:
+                            full_component = True
+                        elif cand_has_subset:
+                            subset_component = True
+                    if full_component:
+                        full_aliases.add(var_name)
+                    elif subset_component:
+                        subset_vars.add(var_name)
+                    else:
+                        full_aliases.add(var_name)
+                else:
+                    full_aliases.add(var_name)
+                changed = True
+                continue
+            if has_subset_signal:
+                subset_vars.add(var_name)
+                changed = True
+                continue
+            if has_full_reference:
+                full_aliases.add(var_name)
+                changed = True
+    return full_aliases, subset_vars
+
+
+def _classify_row_scope(
+    expr: ast.AST,
+    assignment_map: Dict[str, ast.AST],
+    full_aliases: set[str],
+    subset_vars: set[str],
+    depth: int = 0,
+) -> str:
+    if depth > 5:
+        return "unknown"
+    if isinstance(expr, ast.Name):
+        if expr.id in subset_vars:
+            return "subset"
+        if expr.id in full_aliases:
+            return "full"
+        next_expr = assignment_map.get(expr.id)
+        if next_expr is not None:
+            return _classify_row_scope(
+                next_expr,
+                assignment_map,
+                full_aliases,
+                subset_vars,
+                depth=depth + 1,
+            )
+        return "unknown"
+    if isinstance(expr, ast.Dict):
+        verdicts = [
+            _classify_row_scope(item, assignment_map, full_aliases, subset_vars, depth=depth + 1)
+            for item in expr.values
+            if item is not None
+        ]
+        if "full" in verdicts:
+            return "full"
+        if "subset" in verdicts:
+            return "subset"
+        return "unknown"
+    if isinstance(expr, ast.Call):
+        call_name = _call_name(expr)
+        if call_name.endswith("DataFrame"):
+            candidate_exprs: List[ast.AST] = []
+            if expr.args:
+                candidate_exprs.append(expr.args[0])
+            for kw in expr.keywords:
+                if isinstance(kw, ast.keyword) and kw.arg == "data":
+                    candidate_exprs.append(kw.value)
+            verdicts = [
+                _classify_row_scope(item, assignment_map, full_aliases, subset_vars, depth=depth + 1)
+                for item in candidate_exprs
+            ]
+            if "full" in verdicts:
+                return "full"
+            if "subset" in verdicts:
+                return "subset"
+            return "unknown"
+    has_subset = _expr_has_subset_signal(expr, full_aliases, subset_vars)
+    has_full = _expr_references_alias(expr, full_aliases)
+    if has_subset and not has_full:
+        return "subset"
+    if has_subset and has_full:
+        if isinstance(expr, ast.Subscript):
+            return "subset"
+        # Mixed full/subset signals in one expression are treated as risky.
+        return "full"
+    if has_full:
+        return "full"
+    return "unknown"
+
+
+def _match_expected_artifact_path(path: str, expected_paths: Dict[str, int]) -> str:
+    normalized = _normalize_artifact_path_for_match(path)
+    if not normalized:
+        return ""
+    if normalized in expected_paths:
+        return normalized
+    if normalized.lower() in {p.lower(): p for p in expected_paths}.keys():
+        for key in expected_paths:
+            if key.lower() == normalized.lower():
+                return key
+    basename = os.path.basename(normalized).lower()
+    candidates = [key for key in expected_paths if os.path.basename(key).lower() == basename]
+    if len(candidates) == 1:
+        return candidates[0]
+    return ""
+
+
+def _analyze_output_row_count_consistency(
+    tree: ast.AST,
+    evaluation_spec: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    row_hints = _extract_row_count_hints_for_qa(evaluation_spec)
+    expected_paths = _resolve_expected_csv_row_counts_for_qa(evaluation_spec, row_hints)
+    if not expected_paths:
+        return {
+            "active": False,
+            "row_count_hints": row_hints,
+            "expected_csv_row_counts": {},
+            "issues": [],
+        }
+
+    assignment_map = _collect_assignment_map(tree)
+    full_aliases, subset_vars = _collect_dataframe_lineage(assignment_map)
+    n_total = row_hints.get("n_total")
+    n_test = row_hints.get("n_test")
+
+    issues: List[Dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "to_csv":
+            continue
+        raw_path = _resolve_to_csv_target_path(node)
+        matched = _match_expected_artifact_path(raw_path, expected_paths)
+        if not matched:
+            continue
+        expected = expected_paths.get(matched)
+        if not isinstance(expected, int):
+            continue
+        requires_subset = False
+        if isinstance(n_total, int) and n_total > 0 and expected < n_total:
+            requires_subset = True
+        elif isinstance(n_test, int) and n_test > 0 and expected == n_test:
+            requires_subset = True
+        if not requires_subset:
+            continue
+        scope = _classify_row_scope(node.func.value, assignment_map, full_aliases, subset_vars)
+        if scope == "full":
+            issues.append(
+                {
+                    "path": matched,
+                    "expected_row_count": expected,
+                    "lineno": getattr(node, "lineno", None),
+                    "reason": "output_expected_subset_but_code_writes_full_dataframe",
+                }
+            )
+
+    return {
+        "active": True,
+        "row_count_hints": row_hints,
+        "expected_csv_row_counts": expected_paths,
+        "issues": issues,
+    }
+
+
 def run_static_qa_checks(
     code: str,
     evaluation_spec: Dict[str, Any] | None = None,
@@ -1605,6 +2095,7 @@ def run_static_qa_checks(
     elif "train_eval_separation" in qa_gate_set:
         train_eval_gate = "train_eval_separation"
     require_train_eval = train_eval_gate is not None
+    require_output_row_count_consistency = "output_row_count_consistency" in qa_gate_set
 
     allow_resampling_random = False
     allow_synthetic_augmentation = False
@@ -1761,6 +2252,33 @@ def run_static_qa_checks(
         )
 
     # SENIOR REASONING: Plan ↔ Code coherence validation
+    row_count_consistency = _analyze_output_row_count_consistency(tree, evaluation_spec)
+    row_count_issues = row_count_consistency.get("issues") if isinstance(row_count_consistency, dict) else []
+    if row_count_issues:
+        first_issue = row_count_issues[0] if isinstance(row_count_issues[0], dict) else {}
+        issue_path = first_issue.get("path") if isinstance(first_issue, dict) else "unknown.csv"
+        issue_expected = first_issue.get("expected_row_count") if isinstance(first_issue, dict) else "unknown"
+        issue_line = first_issue.get("lineno") if isinstance(first_issue, dict) else None
+        issue_context = (
+            f"{issue_path} (expected_rows={issue_expected}, line={issue_line})"
+            if issue_line is not None
+            else f"{issue_path} (expected_rows={issue_expected})"
+        )
+        if require_output_row_count_consistency:
+            _flag(
+                "output_row_count_consistency",
+                "Output CSV row-count consistency risk detected: "
+                f"artifact expected subset-sized rows but code writes full-frame data at {issue_context}.",
+                "Build output CSVs from the correct subset and add an explicit row-count guard before to_csv.",
+            )
+        else:
+            warnings.append(
+                "OUTPUT_ROW_COUNT_CONSISTENCY: artifact expected subset-sized rows but code appears to write "
+                f"full-frame data at {issue_context}."
+            )
+    elif not isinstance(row_count_consistency, dict):
+        row_count_consistency = {"active": False, "issues": []}
+
     require_plan_coherence = "plan_code_coherence" in qa_gate_set
     ml_plan = (evaluation_spec or {}).get("ml_plan")
     data_profile = (evaluation_spec or {}).get("data_profile")
@@ -1798,6 +2316,7 @@ def run_static_qa_checks(
     facts_payload["hard_failures"] = hard_failures
     facts_payload["soft_failures"] = soft_failures
     facts_payload["contract_source_used"] = contract_source_used
+    facts_payload["output_row_count_consistency"] = row_count_consistency
     if coherence_result:
         facts_payload["plan_code_coherence"] = coherence_result
     if gate_warnings:

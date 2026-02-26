@@ -137,3 +137,52 @@ def test_static_qa_missing_gates_triggers_fallback_warning():
     assert result.get("contract_source_used") == "fallback"
     warnings = result.get("warnings") or []
     assert any("CONTRACT_BROKEN_FALLBACK" in w for w in warnings)
+
+
+def test_static_qa_blocks_output_row_count_full_frame_submission():
+    code = """
+import pandas as pd
+df = pd.read_csv('data/cleaned_data.csv')
+train_mask = df['is_train'] == 1
+preds = model.predict_proba(df.loc[~train_mask, ['feature_a']])[:, 1]
+submission = pd.DataFrame({'id': df['id'], 'score': preds})
+submission.to_csv('data/submission.csv', index=False)
+"""
+    evaluation_spec = {
+        "qa_gates": [{"name": "output_row_count_consistency", "severity": "HARD", "params": {}}],
+        "n_total_rows": 900000,
+        "n_test_rows": 270000,
+        "artifact_requirements": {
+            "file_schemas": {
+                "data/submission.csv": {"expected_row_count": 270000},
+            }
+        },
+    }
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
+    assert result is not None
+    assert result["status"] == "REJECTED"
+    assert "output_row_count_consistency" in result.get("failed_gates", [])
+
+
+def test_static_qa_allows_output_row_count_subset_submission():
+    code = """
+import pandas as pd
+df = pd.read_csv('data/cleaned_data.csv')
+train_mask = df['is_train'] == 1
+preds = model.predict_proba(df.loc[~train_mask, ['feature_a']])[:, 1]
+submission = pd.DataFrame({'id': df.loc[~train_mask, 'id'], 'score': preds})
+submission.to_csv('data/submission.csv', index=False)
+"""
+    evaluation_spec = {
+        "qa_gates": [{"name": "output_row_count_consistency", "severity": "HARD", "params": {}}],
+        "n_total_rows": 900000,
+        "n_test_rows": 270000,
+        "artifact_requirements": {
+            "file_schemas": {
+                "data/submission.csv": {"expected_row_count": 270000},
+            }
+        },
+    }
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
+    assert result is not None
+    assert result["status"] in {"PASS", "WARN"}

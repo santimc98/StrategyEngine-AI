@@ -133,6 +133,9 @@ class QAView(TypedDict, total=False):
     canonical_columns: List[str]
     objective_summary: Dict[str, str]
     reporting_policy: Dict[str, Any]
+    n_train_rows: int
+    n_test_rows: int
+    n_total_rows: int
 
 
 _PRESERVE_KEYS = {
@@ -217,6 +220,105 @@ def _first_value(*values: Any) -> Any:
             continue
         return value
     return None
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    if isinstance(value, str):
+        token = value.strip()
+        if not token:
+            return None
+        try:
+            parsed = int(float(token))
+        except Exception:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _resolve_row_count_hints(
+    contract_full: Dict[str, Any],
+    contract_min: Dict[str, Any],
+) -> Dict[str, int]:
+    hints: Dict[str, int] = {}
+    train_keys = ("n_train_rows", "train_rows", "n_train", "rows_train")
+    test_keys = ("n_test_rows", "test_rows", "n_test", "rows_test")
+    total_keys = ("n_total_rows", "total_rows", "n_rows", "row_count", "rows")
+
+    def _scan(source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        if "n_train_rows" not in hints:
+            for key in train_keys:
+                parsed = _coerce_positive_int(source.get(key))
+                if parsed is not None:
+                    hints["n_train_rows"] = parsed
+                    break
+        if "n_test_rows" not in hints:
+            for key in test_keys:
+                parsed = _coerce_positive_int(source.get(key))
+                if parsed is not None:
+                    hints["n_test_rows"] = parsed
+                    break
+        if "n_total_rows" not in hints:
+            for key in total_keys:
+                parsed = _coerce_positive_int(source.get(key))
+                if parsed is not None:
+                    hints["n_total_rows"] = parsed
+                    break
+        basic_stats = source.get("basic_stats")
+        if isinstance(basic_stats, dict):
+            if "n_total_rows" not in hints:
+                parsed = _coerce_positive_int(
+                    basic_stats.get("n_rows") or basic_stats.get("rows") or basic_stats.get("row_count")
+                )
+                if parsed is not None:
+                    hints["n_total_rows"] = parsed
+            if "n_train_rows" not in hints:
+                parsed = _coerce_positive_int(
+                    basic_stats.get("n_train_rows") or basic_stats.get("train_rows")
+                )
+                if parsed is not None:
+                    hints["n_train_rows"] = parsed
+            if "n_test_rows" not in hints:
+                parsed = _coerce_positive_int(
+                    basic_stats.get("n_test_rows") or basic_stats.get("test_rows")
+                )
+                if parsed is not None:
+                    hints["n_test_rows"] = parsed
+
+    for source in (contract_min, contract_full):
+        _scan(source)
+        if isinstance(source, dict):
+            _scan(source.get("dataset_profile"))
+            _scan(source.get("data_profile"))
+            _scan(source.get("evaluation_spec"))
+            _scan(source.get("execution_constraints"))
+    if (
+        "n_total_rows" not in hints
+        and "n_train_rows" in hints
+        and "n_test_rows" in hints
+    ):
+        hints["n_total_rows"] = int(hints["n_train_rows"] + hints["n_test_rows"])
+    if (
+        "n_test_rows" not in hints
+        and "n_total_rows" in hints
+        and "n_train_rows" in hints
+        and hints["n_total_rows"] >= hints["n_train_rows"]
+    ):
+        hints["n_test_rows"] = int(hints["n_total_rows"] - hints["n_train_rows"])
+    if (
+        "n_train_rows" not in hints
+        and "n_total_rows" in hints
+        and "n_test_rows" in hints
+        and hints["n_total_rows"] >= hints["n_test_rows"]
+    ):
+        hints["n_train_rows"] = int(hints["n_total_rows"] - hints["n_test_rows"])
+    return hints
 
 
 def is_identifier_column(col_name: str) -> bool:
@@ -1461,6 +1563,11 @@ def build_qa_view(
         "canonical_columns": canonical_columns,
         "objective_summary": objective_summary,
     }
+    row_count_hints = _resolve_row_count_hints(contract_full, {})
+    if row_count_hints:
+        for key in ("n_train_rows", "n_test_rows", "n_total_rows"):
+            if key in row_count_hints:
+                view[key] = row_count_hints[key]
     if isinstance(reporting_policy, dict) and reporting_policy:
         view["reporting_policy"] = reporting_policy
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
@@ -1967,6 +2074,11 @@ def build_contract_views_projection(
         },
         "decisioning_requirements": decisioning_requirements,
     }
+    row_count_hints = _resolve_row_count_hints(contract_full, {})
+    if row_count_hints:
+        for key in ("n_train_rows", "n_test_rows", "n_total_rows"):
+            if key in row_count_hints:
+                qa_view[key] = row_count_hints[key]
     if reporting_policy:
         qa_view["reporting_policy"] = reporting_policy
 

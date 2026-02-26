@@ -286,3 +286,46 @@ def test_artifact_requirements_ok_with_any_of_groups(tmp_path: Path):
     assert report["status"] == "ok"
     assert report["scored_rows_report"]["missing_any_of_groups"] == []
     assert report["scored_rows_report"]["missing_any_of_groups_with_severity"] == []
+
+
+def test_artifact_requirements_row_count_mismatch_errors(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    submission_path = data_dir / "submission.csv"
+    submission_path.write_text("id,score\n1,0.1\n2,0.2\n3,0.3\n", encoding="utf-8")
+
+    artifact_requirements = {
+        "required_files": [{"path": "data/submission.csv", "description": ""}],
+        "file_schemas": {
+            "data/submission.csv": {"expected_row_count": 2},
+        },
+    }
+
+    report = check_artifact_requirements(artifact_requirements, work_dir=str(tmp_path))
+
+    assert report["status"] == "error"
+    row_report = report.get("row_count_report", {})
+    assert len(row_report.get("mismatches", [])) == 1
+    mismatch = row_report["mismatches"][0]
+    assert mismatch["expected_row_count"] == 2
+    assert mismatch["actual_row_count"] == 3
+
+
+def test_artifact_requirements_row_count_match_ok(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    submission_path = data_dir / "submission.csv"
+    submission_path.write_text("id,score\n1,0.1\n2,0.2\n", encoding="utf-8")
+
+    artifact_requirements = {
+        "required_files": [{"path": "data/submission.csv", "description": ""}],
+        "file_schemas": {
+            "data/submission.csv": {"expected_row_count": 2},
+        },
+    }
+
+    report = check_artifact_requirements(artifact_requirements, work_dir=str(tmp_path))
+
+    assert report["status"] == "ok"
+    row_report = report.get("row_count_report", {})
+    assert row_report.get("mismatches", []) == []

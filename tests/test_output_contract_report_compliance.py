@@ -155,6 +155,24 @@ class TestCheckArtifactRequirements:
         assert result["status"] == "error"
         assert "explanation" in result["scored_rows_report"]["missing_columns"]
 
+    def test_row_count_mismatch_status_error(self, tmp_path):
+        """Row count mismatch in file_schemas.expected_row_count -> status=error."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "submission.csv").write_text("id,score\n1,0.5\n2,0.6\n3,0.7\n")
+
+        artifact_reqs = {
+            "required_files": [{"path": "data/submission.csv"}],
+            "file_schemas": {
+                "data/submission.csv": {"expected_row_count": 2},
+            },
+        }
+
+        result = check_artifact_requirements(artifact_reqs, work_dir=str(tmp_path))
+
+        assert result["status"] == "error"
+        assert len(result.get("row_count_report", {}).get("mismatches", [])) == 1
+
 
 class TestBuildOutputContractReport:
     """Test build_output_contract_report unified helper."""

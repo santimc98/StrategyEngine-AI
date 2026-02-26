@@ -1685,6 +1685,7 @@ def _build_default_qa_gates(
         {"name": "must_read_input_csv", "severity": "HARD", "params": {}},
         {"name": "must_reference_contract_columns", "severity": "HARD", "params": {}},
         {"name": "no_synthetic_data", "severity": "HARD", "params": {"allow_resampling_random": allow_resampling}},
+        {"name": "output_row_count_consistency", "severity": "HARD", "params": {}},
         {"name": "dialect_mismatch_handling", "severity": "SOFT", "params": {}},
         {"name": "group_split_required", "severity": "SOFT", "params": {}},
     ]
@@ -1717,6 +1718,12 @@ def _apply_qa_gate_policy(
                 params = {}
             params.setdefault("allow_resampling_random", allow_resampling)
             gate["params"] = params
+    if not any(
+        _normalize_gate_name(gate.get("name")) == "output_row_count_consistency"
+        for gate in gates
+        if isinstance(gate, dict)
+    ):
+        gates.append({"name": "output_row_count_consistency", "severity": "HARD", "params": {}})
     return gates
 
 
@@ -3853,6 +3860,239 @@ def build_contract_min(
             continue
         required_files.append({"path": str(path), "description": ""})
 
+    def _coerce_positive_count(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+            return parsed if parsed > 0 else None
+        if isinstance(value, str):
+            token = value.strip()
+            if not token:
+                return None
+            try:
+                parsed = int(float(token))
+            except Exception:
+                return None
+            return parsed if parsed > 0 else None
+        return None
+
+    def _extract_row_count_hints(
+        contract_payload: Dict[str, Any],
+        profile_payload: Dict[str, Any] | None,
+    ) -> Dict[str, int]:
+        hints: Dict[str, int] = {}
+        train_keys = (
+            "n_train_rows",
+            "train_rows",
+            "n_train",
+            "rows_train",
+            "train_count",
+        )
+        test_keys = (
+            "n_test_rows",
+            "test_rows",
+            "n_test",
+            "rows_test",
+            "test_count",
+        )
+        total_keys = (
+            "n_total_rows",
+            "total_rows",
+            "n_rows",
+            "row_count",
+            "rows",
+        )
+
+        def _scan(source: Any) -> None:
+            if not isinstance(source, dict):
+                return
+            if "n_train" not in hints:
+                for key in train_keys:
+                    parsed = _coerce_positive_count(source.get(key))
+                    if parsed is not None:
+                        hints["n_train"] = parsed
+                        break
+            if "n_test" not in hints:
+                for key in test_keys:
+                    parsed = _coerce_positive_count(source.get(key))
+                    if parsed is not None:
+                        hints["n_test"] = parsed
+                        break
+            if "n_total" not in hints:
+                for key in total_keys:
+                    parsed = _coerce_positive_count(source.get(key))
+                    if parsed is not None:
+                        hints["n_total"] = parsed
+                        break
+            basic_stats = source.get("basic_stats")
+            if isinstance(basic_stats, dict):
+                if "n_total" not in hints:
+                    parsed = _coerce_positive_count(
+                        basic_stats.get("n_rows")
+                        or basic_stats.get("rows")
+                        or basic_stats.get("row_count")
+                    )
+                    if parsed is not None:
+                        hints["n_total"] = parsed
+                if "n_train" not in hints:
+                    parsed = _coerce_positive_count(
+                        basic_stats.get("n_train_rows")
+                        or basic_stats.get("train_rows")
+                        or basic_stats.get("n_train")
+                    )
+                    if parsed is not None:
+                        hints["n_train"] = parsed
+                if "n_test" not in hints:
+                    parsed = _coerce_positive_count(
+                        basic_stats.get("n_test_rows")
+                        or basic_stats.get("test_rows")
+                        or basic_stats.get("n_test")
+                    )
+                    if parsed is not None:
+                        hints["n_test"] = parsed
+
+        profile_dict = profile_payload if isinstance(profile_payload, dict) else {}
+        dataset_profile = contract_payload.get("dataset_profile") if isinstance(contract_payload.get("dataset_profile"), dict) else {}
+        contract_data_profile = contract_payload.get("data_profile") if isinstance(contract_payload.get("data_profile"), dict) else {}
+        evaluation_spec = contract_payload.get("evaluation_spec") if isinstance(contract_payload.get("evaluation_spec"), dict) else {}
+        execution_constraints = (
+            contract_payload.get("execution_constraints")
+            if isinstance(contract_payload.get("execution_constraints"), dict)
+            else {}
+        )
+        for source in (
+            contract_payload,
+            dataset_profile,
+            contract_data_profile,
+            evaluation_spec,
+            execution_constraints,
+            profile_dict,
+        ):
+            _scan(source)
+
+        n_train = hints.get("n_train")
+        n_test = hints.get("n_test")
+        n_total = hints.get("n_total")
+        if n_total is None and n_train is not None and n_test is not None:
+            hints["n_total"] = int(n_train + n_test)
+        if n_test is None and n_total is not None and n_train is not None and n_total >= n_train:
+            hints["n_test"] = int(n_total - n_train)
+        if n_train is None and n_total is not None and n_test is not None and n_total >= n_test:
+            hints["n_train"] = int(n_total - n_test)
+        return hints
+
+    def _normalize_artifact_path(path_like: Any) -> str:
+        text = str(path_like or "").strip().replace("\\", "/")
+        while text.startswith("./"):
+            text = text[2:]
+        return text
+
+    def _collect_artifact_kind_map(contract_payload: Dict[str, Any]) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+
+        def _ingest(items: Any) -> None:
+            if not isinstance(items, list):
+                return
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                path = _normalize_artifact_path(
+                    entry.get("path") or entry.get("output") or entry.get("artifact")
+                )
+                kind = str(entry.get("kind") or "").strip()
+                if path and kind and path.lower() not in mapping:
+                    mapping[path.lower()] = kind
+
+        _ingest(contract_payload.get("required_output_artifacts"))
+        spec = contract_payload.get("spec_extraction")
+        if isinstance(spec, dict):
+            _ingest(spec.get("deliverables"))
+        return mapping
+
+    row_count_hints = _extract_row_count_hints(contract, data_profile)
+    artifact_kind_map = _collect_artifact_kind_map(contract)
+
+    def _resolve_expected_row_count(value: Any) -> Optional[int]:
+        parsed = _coerce_positive_count(value)
+        if parsed is not None:
+            return parsed
+        if not isinstance(value, str):
+            return None
+        token = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+        if not token:
+            return None
+        alias_map = {
+            "n_train": row_count_hints.get("n_train"),
+            "n_train_rows": row_count_hints.get("n_train"),
+            "train_rows": row_count_hints.get("n_train"),
+            "n_test": row_count_hints.get("n_test"),
+            "n_test_rows": row_count_hints.get("n_test"),
+            "test_rows": row_count_hints.get("n_test"),
+            "n_total": row_count_hints.get("n_total"),
+            "n_total_rows": row_count_hints.get("n_total"),
+            "total_rows": row_count_hints.get("n_total"),
+            "n_rows": row_count_hints.get("n_total"),
+            "row_count": row_count_hints.get("n_total"),
+        }
+        candidate = alias_map.get(token)
+        return int(candidate) if isinstance(candidate, int) and candidate > 0 else None
+
+    def _infer_expected_row_count(path: str, kind: str) -> Optional[int]:
+        lowered_path = path.lower()
+        if not lowered_path.endswith(".csv"):
+            return None
+        normalized_kind = re.sub(r"[^a-z0-9]+", "_", str(kind or "").lower()).strip("_")
+        n_total = row_count_hints.get("n_total")
+        n_test = row_count_hints.get("n_test")
+        if "scored_rows" in lowered_path or normalized_kind in {"scored_rows", "scored"}:
+            return n_total
+        if normalized_kind == "submission":
+            return n_test
+        if normalized_kind in {"prediction", "predictions", "forecast", "ranking_scores", "ranking", "recommendations"}:
+            if isinstance(n_test, int) and isinstance(n_total, int) and n_test < n_total:
+                return n_test
+        return None
+
+    raw_file_schemas = full_artifact_requirements.get("file_schemas", {})
+    file_schemas: Dict[str, Any] = (
+        copy.deepcopy(raw_file_schemas) if isinstance(raw_file_schemas, dict) else {}
+    )
+    normalized_file_schemas: Dict[str, Any] = {}
+    for raw_path, raw_schema in file_schemas.items():
+        schema_path = _normalize_artifact_path(raw_path)
+        if not schema_path:
+            continue
+        schema_obj = dict(raw_schema) if isinstance(raw_schema, dict) else {}
+        resolved_expected = _resolve_expected_row_count(schema_obj.get("expected_row_count"))
+        if resolved_expected is None:
+            resolved_expected = _infer_expected_row_count(
+                schema_path,
+                artifact_kind_map.get(schema_path.lower(), ""),
+            )
+        if resolved_expected is not None:
+            schema_obj["expected_row_count"] = int(resolved_expected)
+        normalized_file_schemas[schema_path] = schema_obj
+
+    for entry in required_files:
+        if not isinstance(entry, dict):
+            continue
+        schema_path = _normalize_artifact_path(entry.get("path"))
+        if not schema_path or not schema_path.lower().endswith(".csv"):
+            continue
+        schema_obj = normalized_file_schemas.get(schema_path)
+        if not isinstance(schema_obj, dict):
+            schema_obj = {}
+        if _resolve_expected_row_count(schema_obj.get("expected_row_count")) is None:
+            inferred_expected = _infer_expected_row_count(
+                schema_path,
+                artifact_kind_map.get(schema_path.lower(), ""),
+            )
+            if inferred_expected is not None:
+                schema_obj["expected_row_count"] = int(inferred_expected)
+        if schema_obj:
+            normalized_file_schemas[schema_path] = schema_obj
+
     # SYNC FIX: Filter out constant columns from clean_dataset.required_columns
     # Constant columns provide no information and should be excluded from the final schema
     constant_columns_set: set[str] = set()
@@ -3902,7 +4142,7 @@ def build_contract_min(
         # P1.1: Formal file vs column separation
         "required_files": required_files,
         "scored_rows_schema": scored_rows_schema,
-        "file_schemas": full_artifact_requirements.get("file_schemas", {}) if isinstance(full_artifact_requirements.get("file_schemas"), dict) else {},
+        "file_schemas": normalized_file_schemas,
         "schema_binding": {
             "required_columns": clean_dataset_required_columns,
             "optional_passthrough_columns": [],

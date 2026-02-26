@@ -272,6 +272,113 @@ def check_scored_rows_schema(
         }
 
 
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    if isinstance(value, str):
+        token = value.strip()
+        if not token:
+            return None
+        try:
+            parsed = int(float(token))
+        except Exception:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _count_csv_rows(
+    csv_path: str,
+    dialect: Optional[Dict[str, str]] = None,
+) -> int:
+    import pandas as pd
+
+    sep = dialect.get("sep", ",") if isinstance(dialect, dict) else ","
+    encoding = dialect.get("encoding", "utf-8") if isinstance(dialect, dict) else "utf-8"
+    total = 0
+    # Chunked read keeps memory bounded for large artifacts.
+    for chunk in pd.read_csv(csv_path, sep=sep, encoding=encoding, chunksize=200_000):
+        total += int(len(chunk))
+    return int(total)
+
+
+def check_csv_row_counts(
+    file_schemas: Dict[str, Any],
+    work_dir: str = ".",
+    dialect: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Validate optional expected_row_count for CSV artifacts declared in file_schemas.
+
+    Args:
+        file_schemas: artifact_requirements.file_schemas mapping
+        work_dir: Base directory for relative artifact paths
+        dialect: Optional CSV dialect settings
+
+    Returns:
+        {
+            "checked": [...],
+            "mismatches": [...],
+            "errors": [...],
+            "summary": str
+        }
+    """
+    checked: List[Dict[str, Any]] = []
+    mismatches: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    if not isinstance(file_schemas, dict):
+        return {
+            "checked": checked,
+            "mismatches": mismatches,
+            "errors": errors,
+            "summary": "Row count checks skipped: invalid file_schemas",
+        }
+
+    for raw_path, schema in file_schemas.items():
+        path = str(raw_path or "").strip()
+        if not path or not path.lower().endswith(".csv"):
+            continue
+        if not isinstance(schema, dict):
+            continue
+        expected = _coerce_positive_int(schema.get("expected_row_count"))
+        if expected is None:
+            continue
+
+        artifact_path = os.path.join(work_dir, path)
+        if not os.path.exists(artifact_path):
+            # Missing files are already surfaced by required_files checks.
+            continue
+
+        try:
+            actual = _count_csv_rows(artifact_path, dialect=dialect)
+            payload = {
+                "path": path,
+                "expected_row_count": expected,
+                "actual_row_count": actual,
+                "matches": bool(actual == expected),
+            }
+            checked.append(payload)
+            if actual != expected:
+                mismatches.append(payload)
+        except Exception as err:
+            errors.append({"path": path, "expected_row_count": expected, "error": str(err)})
+
+    summary = (
+        f"Row counts checked: {len(checked)}; "
+        f"Mismatches: {len(mismatches)}; Errors: {len(errors)}"
+    )
+    return {
+        "checked": checked,
+        "mismatches": mismatches,
+        "errors": errors,
+        "summary": summary,
+    }
+
+
 def check_artifact_requirements(
     artifact_requirements: Dict[str, Any],
     work_dir: str = ".",
@@ -296,6 +403,7 @@ def check_artifact_requirements(
             "status": "error",
             "files_report": {},
             "scored_rows_report": {},
+            "row_count_report": {},
             "summary": "Invalid artifact_requirements",
         }
 
@@ -311,6 +419,9 @@ def check_artifact_requirements(
             file_paths.append(os.path.join(work_dir, path))
 
     files_report = check_required_outputs(file_paths)
+    file_schemas = artifact_requirements.get("file_schemas", {})
+    dialect = get_csv_dialect(work_dir)
+    row_count_report = check_csv_row_counts(file_schemas, work_dir=work_dir, dialect=dialect)
 
     # Check scored_rows schema
     scored_schema = artifact_requirements.get("scored_rows_schema", {})
@@ -327,8 +438,6 @@ def check_artifact_requirements(
             break
 
     if scored_rows_path:
-        # Use dialect from cleaning_manifest if available
-        dialect = get_csv_dialect(work_dir)
         scored_rows_report = check_scored_rows_schema(
             scored_rows_path,
             required_columns,
@@ -350,6 +459,8 @@ def check_artifact_requirements(
     # Determine overall status
     if files_report.get("missing"):
         status = "error"
+    elif row_count_report.get("mismatches") or row_count_report.get("errors"):
+        status = "error"
     elif scored_rows_report.get("missing_columns"):
         status = "error"
     else:
@@ -363,11 +474,16 @@ def check_artifact_requirements(
         else:
             status = "ok"
 
-    summary = f"Files: {files_report.get('summary', 'N/A')}; Scored rows: {scored_rows_report.get('summary', 'N/A')}"
+    summary = (
+        f"Files: {files_report.get('summary', 'N/A')}; "
+        f"Rows: {row_count_report.get('summary', 'N/A')}; "
+        f"Scored rows: {scored_rows_report.get('summary', 'N/A')}"
+    )
 
     return {
         "status": status,
         "files_report": files_report,
+        "row_count_report": row_count_report,
         "scored_rows_report": scored_rows_report,
         "summary": summary,
     }

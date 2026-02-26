@@ -22,3 +22,10 @@ def test_default_qa_gates_allow_resampling_for_validation_method():
     gate = _find_gate(gates, "no_synthetic_data")
     assert gate is not None
     assert gate.get("params", {}).get("allow_resampling_random") is True
+
+
+def test_default_qa_gates_include_output_row_count_consistency():
+    gates = _build_default_qa_gates({}, "", {})
+    gate = _find_gate(gates, "output_row_count_consistency")
+    assert gate is not None
+    assert gate.get("severity") == "HARD"

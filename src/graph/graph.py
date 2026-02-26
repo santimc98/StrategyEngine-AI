@@ -4154,6 +4154,25 @@ def _extract_contract_artifact_issues(oc_report: Dict[str, Any] | None) -> Dict[
         if isinstance(files_report, dict):
             for path in files_report.get("missing", []) or []:
                 _add_missing(path)
+        row_count_report = artifact_report.get("row_count_report")
+        if isinstance(row_count_report, dict):
+            for mismatch in row_count_report.get("mismatches", []) or []:
+                if not isinstance(mismatch, dict):
+                    continue
+                path = str(mismatch.get("path") or "unknown.csv")
+                expected = mismatch.get("expected_row_count")
+                actual = mismatch.get("actual_row_count")
+                schema_issues.append(
+                    f"{path} row count mismatch: expected {expected}, got {actual}"
+                )
+            for issue in row_count_report.get("errors", []) or []:
+                if not isinstance(issue, dict):
+                    continue
+                path = str(issue.get("path") or "unknown.csv")
+                detail = str(issue.get("error") or "unknown_error")
+                schema_issues.append(
+                    f"{path} row count check error: {detail}"
+                )
 
         scored_rows_report = artifact_report.get("scored_rows_report")
         if isinstance(scored_rows_report, dict):

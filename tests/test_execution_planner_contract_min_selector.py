@@ -232,3 +232,56 @@ def test_contract_min_aligns_decisioning_explanation_name() -> None:
         isinstance(entry, dict) and entry.get("name") == "explanation"
         for entry in required_cols
     )
+
+
+def test_contract_min_infers_expected_row_count_from_profile_hints() -> None:
+    inventory = ["id", "is_train", "feature_a"]
+    strategy = {"required_columns": ["id", "is_train", "feature_a"]}
+    row_hints = {"n_train_rows": 630000, "n_test_rows": 270000}
+    full_contract = {
+        "required_output_artifacts": [
+            {"path": "data/scored_rows.csv", "kind": "predictions", "required": True},
+            {"path": "data/submission.csv", "kind": "submission", "required": True},
+        ],
+        "artifact_requirements": {
+            "required_files": [
+                {"path": "data/scored_rows.csv"},
+                {"path": "data/submission.csv"},
+            ],
+        },
+        "dataset_profile": row_hints,
+    }
+
+    contract_min = build_contract_min(
+        full_contract,
+        strategy,
+        inventory,
+        inventory,
+        data_profile=row_hints,
+    )
+    file_schemas = contract_min.get("artifact_requirements", {}).get("file_schemas", {})
+    assert file_schemas.get("data/submission.csv", {}).get("expected_row_count") == 270000
+    assert file_schemas.get("data/scored_rows.csv", {}).get("expected_row_count") == 900000
+
+
+def test_contract_min_resolves_expected_row_count_alias_tokens() -> None:
+    inventory = ["id", "is_train", "feature_a"]
+    strategy = {"required_columns": ["id", "is_train", "feature_a"]}
+    row_hints = {"n_train_rows": 10, "n_test_rows": 4}
+    full_contract = {
+        "artifact_requirements": {
+            "required_files": [{"path": "data/submission.csv"}],
+            "file_schemas": {"data/submission.csv": {"expected_row_count": "n_test"}},
+        },
+        "dataset_profile": row_hints,
+    }
+
+    contract_min = build_contract_min(
+        full_contract,
+        strategy,
+        inventory,
+        inventory,
+        data_profile=row_hints,
+    )
+    file_schemas = contract_min.get("artifact_requirements", {}).get("file_schemas", {})
+    assert file_schemas.get("data/submission.csv", {}).get("expected_row_count") == 4

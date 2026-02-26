@@ -543,6 +543,19 @@ def test_qa_view_contains_gates_and_requirements():
     assert qa_view.get("allowed_feature_sets")
 
 
+def test_qa_view_carries_row_count_hints_when_available():
+    contract_full = _load_fixture("contract_full_small.json")
+    contract_min = _load_fixture("contract_min_small.json")
+    contract_full["dataset_profile"] = {
+        "n_train_rows": 100,
+        "n_test_rows": 40,
+    }
+    qa_view = build_qa_view(contract_full, contract_min, artifact_index=[])
+    assert qa_view.get("n_train_rows") == 100
+    assert qa_view.get("n_test_rows") == 40
+    assert qa_view.get("n_total_rows") == 140
+
+
 def test_translator_view_contains_policy_and_inventory():
     contract_full = _load_fixture("contract_full_small.json")
     contract_min = _load_fixture("contract_min_small.json")
