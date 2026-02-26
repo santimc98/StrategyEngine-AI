@@ -8808,6 +8808,11 @@ def _build_iteration_handoff(
             else {}
         ),
         "hypothesis_packet": hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
+        "optimization_blueprint": (
+            state.get("optimization_blueprint")
+            if isinstance(state.get("optimization_blueprint"), dict)
+            else {}
+        ),
         "editor_constraints": {
             "must_apply_hypothesis": bool(enforce_apply_hypothesis),
             "forbid_noop": bool(enforce_apply_hypothesis),
@@ -22782,6 +22787,29 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         except Exception as exc:
             print(f"MODEL_ANALYST_ERROR: {exc}")
             optimization_blueprint = None
+
+    # Adjust patience dynamically: if the blueprint provides N improvement
+    # actions, allow at least N-1 consecutive non-improvements before stopping.
+    # This ensures every blueprint technique gets a chance to be tried rather
+    # than being cut short by a low default patience (e.g. 2).
+    blueprint_actions_count = 0
+    if isinstance(optimization_blueprint, dict):
+        bp_actions = optimization_blueprint.get("improvement_actions")
+        if isinstance(bp_actions, list):
+            blueprint_actions_count = len(bp_actions)
+    if blueprint_actions_count > 0:
+        blueprint_patience = max(patience, blueprint_actions_count - 1)
+        # Also ensure rounds budget accommodates the blueprint actions
+        blueprint_rounds = max(rounds, blueprint_actions_count)
+        if blueprint_patience != patience or blueprint_rounds != rounds:
+            print(
+                f"DYNAMIC_PATIENCE: adjusted patience {patience}->{blueprint_patience}, "
+                f"rounds {rounds}->{blueprint_rounds} (blueprint has {blueprint_actions_count} actions)"
+            )
+            patience = blueprint_patience
+            rounds = blueprint_rounds
+            state["ml_improvement_patience"] = int(patience)
+            state["ml_improvement_rounds_allowed"] = int(rounds)
 
     strategist_context = {
         "run_id": run_id,

@@ -3623,6 +3623,9 @@ $strategy_json
         STRUCTURED HYPOTHESIS PACKET (apply one hypothesis only):
         $hypothesis_packet_json
 
+        OPTIMIZATION BLUEPRINT (full analysis from ModelAnalyst — use as reference for concrete params):
+        $optimization_blueprint
+
         PATCH OBJECTIVES:
         $patch_objectives
 
@@ -3639,6 +3642,7 @@ $strategy_json
         1) Return ONLY the full updated Python script. No markdown, no explanation.
         2) Apply the active hypothesis with a material code patch end-to-end.
         3) Prioritize optimization_context + hypothesis_packet over legacy reviewer text.
+        4) If hypothesis_packet.params is empty, consult the optimization_blueprint for concrete_params matching the technique or action_family.
         4) Treat contract fields as immutable lock constraints (paths/split/CV/gates), not as re-planning input.
         5) Keep model family, CV/data-split protocol, and contract output paths stable.
         6) Avoid unrelated refactors; edit only the regions needed for metric improvement.
@@ -3821,6 +3825,22 @@ $strategy_json
                     max_str_len=260,
                     max_list_items=25,
                 )
+                # Optimization blueprint from ModelAnalyst — provides concrete
+                # params and code_change_hints even when the hypothesis_packet
+                # has generic/empty params (fallback techniques).
+                optimization_blueprint_raw = (
+                    handoff_payload.get("optimization_blueprint")
+                    if isinstance(handoff_payload.get("optimization_blueprint"), dict)
+                    else {}
+                )
+                optimization_blueprint_block = self._serialize_json_for_prompt(
+                    optimization_blueprint_raw.get("improvement_actions", [])[:6]
+                    if isinstance(optimization_blueprint_raw.get("improvement_actions"), list)
+                    else optimization_blueprint_raw,
+                    max_chars=3000,
+                    max_str_len=300,
+                    max_list_items=6,
+                )
                 user_message = render_prompt(
                     USER_EDITOR_OPTIMIZATION_TEMPLATE,
                     phase_classification=phase_classification,
@@ -3838,6 +3858,7 @@ $strategy_json
                     iteration_handoff_json=handoff_payload_json,
                     critic_packet_json=critic_packet_block,
                     hypothesis_packet_json=hypothesis_packet_block,
+                    optimization_blueprint=optimization_blueprint_block or "[]",
                     patch_objectives=patch_objectives_block,
                     must_preserve=must_preserve_block,
                     editor_enforcement=editor_enforcement_block,
