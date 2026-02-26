@@ -23313,6 +23313,12 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         state,
         include_review_signals=not advisory_review_mode,
     )
+    # Distinguish runtime failure (timeout/crash) from technique inefficacy
+    runtime_failed = bool(
+        _has_runtime_failure_marker(state.get("execution_output"))
+        or state.get("runtime_fix_terminal")
+        or state.get("sandbox_failed")
+    )
     approved = (
         (not deterministic_blockers)
         if advisory_review_mode
@@ -23390,7 +23396,11 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             state["qa_last_result"] = dict(baseline_qa_packet)
         if baseline_value is not None:
             state["ml_improvement_incumbent_metric"] = float(baseline_value)
-        no_improve_streak = int(no_improve_streak) + 1
+        # Runtime failures (timeout/crash) should not count toward no-improve streak
+        # because the technique was never actually evaluated — only true metric
+        # stagnation (technique ran but didn't improve) should inflate the streak.
+        if not runtime_failed:
+            no_improve_streak = int(no_improve_streak) + 1
     else:
         state["ml_improvement_kept"] = "improved"
         state["stop_reason"] = "IMPROVEMENT_ROUND_KEPT_IMPROVED"
@@ -23575,6 +23585,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 "signature": tracker_context.get("signature"),
                 "action": hypothesis_packet.get("action"),
                 "deterministic_blockers": bool(deterministic_blockers),
+                "runtime_failed": bool(runtime_failed),
                 "advisor_meets_min_delta": bool(improved_by_metric),
                 "stability_ok": bool(stability_ok),
                 "pareto_frontier_improved": bool(round_record.get("pareto_frontier_improved")),
@@ -23618,6 +23629,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 "approved": bool(approved),
                 "improved_by_metric": bool(improved_by_metric),
                 "deterministic_blockers": bool(deterministic_blockers),
+                "runtime_failed": bool(runtime_failed),
                 "event": "candidate_evaluated",
                 "kept": state.get("ml_improvement_kept"),
             },
@@ -23659,6 +23671,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                         "stability_ok": bool(stability_ok),
                         "pareto_frontier_improved": bool(round_record.get("pareto_frontier_improved")),
                         "deterministic_blockers": bool(deterministic_blockers),
+                        "runtime_failed": bool(runtime_failed),
                         "advisory_review_mode": bool(advisory_review_mode),
                         "forced_finalize": bool(force_finalize),
                         "forced_finalize_reason": force_finalize_reason if force_finalize else "",

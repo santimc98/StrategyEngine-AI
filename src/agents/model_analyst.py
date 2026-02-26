@@ -88,6 +88,10 @@ IMPORTANT:
 - priority 1 = highest impact, 5 = lowest
 - concrete_params must contain real values the engineer can use directly
 - expected_delta should be conservative (do not overestimate)
+- For HPO: scale n_trials to dataset size. Large datasets (>500K rows) need fewer trials
+  (10-15) with strict timeout. Small datasets (<10K) can afford 50+ trials.
+  Always include timeout_seconds in concrete_params to prevent sandbox timeouts.
+- The execution sandbox has a hard timeout of ~7200s. All optimization must complete within this budget.
 
 Respond ONLY with valid JSON matching this schema:
 {{
@@ -269,12 +273,12 @@ class ModelAnalystAgent:
             for kw in ["optuna", "hyperopt", "gridsearchcv", "randomizedsearchcv", "bayesian"]
         )
         if not has_hpo and script.strip():
-            params = self._hpo_params(framework, metrics)
+            params = self._hpo_params(framework, metrics, dataset_profile)
             actions.append({
                 "technique": "optuna_hpo",
                 "action_family": "hyperparameter_search",
                 "concrete_params": params,
-                "code_change_hint": "Add Optuna-based hyperparameter optimization with cross-validation",
+                "code_change_hint": f"Add Optuna HPO with n_trials={params['n_trials']}, timeout={params['timeout_seconds']}s. Use early stopping inside each trial to stay within time budget",
                 "expected_delta": 0.002,
                 "priority": 1,
             })
@@ -537,8 +541,42 @@ class ModelAnalystAgent:
             return {"patience": 10, "min_delta": 0.0001, "restore_best_weights": True}
         return {"early_stopping_rounds": 50}
 
-    def _hpo_params(self, framework: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
-        base = {"n_trials": 50, "timeout_seconds": 600}
+    def _hpo_params(self, framework: str, metrics: Dict[str, Any], dataset_profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        n_rows = 0
+        if isinstance(dataset_profile, dict):
+            for key in ("n_train_rows", "n_rows", "n_samples"):
+                val = dataset_profile.get(key)
+                if val is not None:
+                    try:
+                        n_rows = int(val)
+                    except (ValueError, TypeError):
+                        pass
+                    if n_rows > 0:
+                        break
+        if n_rows <= 0 and isinstance(metrics, dict):
+            for key in ("n_train_rows", "n_rows"):
+                val = metrics.get(key)
+                if val is not None:
+                    try:
+                        n_rows = int(val)
+                    except (ValueError, TypeError):
+                        pass
+                    if n_rows > 0:
+                        break
+
+        if n_rows > 500_000:
+            n_trials = 10
+            timeout = 3600
+        elif n_rows > 100_000:
+            n_trials = 20
+            timeout = 1800
+        elif n_rows > 10_000:
+            n_trials = 30
+            timeout = 900
+        else:
+            n_trials = 50
+            timeout = 600
+        base: Dict[str, Any] = {"n_trials": n_trials, "timeout_seconds": timeout}
         if framework == "catboost":
             base["param_space"] = {
                 "learning_rate": [0.01, 0.1],

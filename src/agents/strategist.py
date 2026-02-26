@@ -204,11 +204,24 @@ class StrategistAgent:
         return {}
 
     def _collect_tracker_signatures(self, tracker_entries: Any) -> set[str]:
+        """Collect hypothesis signatures from tracker entries.
+
+        Entries where the technique suffered a runtime failure (timeout, crash,
+        sandbox error) are excluded so that the technique is not considered
+        "already tried" and can be retried with different parameters.
+        """
         signatures: set[str] = set()
         if not isinstance(tracker_entries, list):
             return signatures
         for entry in tracker_entries:
             if not isinstance(entry, dict):
+                continue
+            # Skip runtime-failed entries — the technique was never truly
+            # evaluated so it should remain eligible for retry.
+            if entry.get("runtime_failed"):
+                continue
+            extra = entry.get("extra") if isinstance(entry.get("extra"), dict) else {}
+            if extra.get("runtime_failed"):
                 continue
             direct = str(entry.get("signature") or entry.get("hypothesis_signature") or "").strip()
             if direct:
@@ -506,33 +519,50 @@ class StrategistAgent:
         if not isinstance(tracker_entries, list):
             tracker_entries = []
 
+        optimization_blueprint = context.get("optimization_blueprint")
+        if not isinstance(optimization_blueprint, dict):
+            optimization_blueprint = {}
+        blueprint_actions = optimization_blueprint.get("improvement_actions")
+        if not isinstance(blueprint_actions, list):
+            blueprint_actions = []
+
+        llm_context = {
+            "run_id": context.get("run_id"),
+            "iteration": context.get("iteration"),
+            "primary_metric_name": context.get("primary_metric_name"),
+            "min_delta": context.get("min_delta"),
+            "critique_packet": critique_packet,
+            "feature_engineering_plan": feature_engineering_plan,
+            "experiment_tracker": tracker_entries[-10:],
+            "dataset_profile_signals": {
+                "has_missing_signal": self._dataset_has_missingness_signal(
+                    context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
+                ),
+                "has_high_cardinality_signal": self._dataset_has_high_cardinality_signal(
+                    context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
+                ),
+            },
+        }
+        if blueprint_actions:
+            llm_context["optimization_blueprint_actions"] = blueprint_actions[:6]
+
+        blueprint_instruction = ""
+        if blueprint_actions:
+            blueprint_instruction = (
+                "PRIORITY: An optimization blueprint is provided in 'optimization_blueprint_actions'. "
+                "Pick the NEXT unused technique from the blueprint (skip those already in experiment_tracker). "
+                "Use the concrete_params and code_change_hint from the blueprint action. "
+            )
+
         llm_prompt = (
             "Return ONLY JSON for one iteration_hypothesis_packet. "
             "No markdown. No extra text.\n"
             "Rules: exactly one hypothesis; action APPLY or NO_OP; "
             "if duplicate signature then action must be NO_OP.\n"
             "Allowed target macros: ALL_NUMERIC, ALL_CATEGORICAL, ALL_TEXT, ALL_DATETIME, ALL_BOOLEAN.\n"
-            "Use this context:\n"
-            + json.dumps(
-                {
-                    "run_id": context.get("run_id"),
-                    "iteration": context.get("iteration"),
-                    "primary_metric_name": context.get("primary_metric_name"),
-                    "min_delta": context.get("min_delta"),
-                    "critique_packet": critique_packet,
-                    "feature_engineering_plan": feature_engineering_plan,
-                    "experiment_tracker": tracker_entries[-10:],
-                    "dataset_profile_signals": {
-                        "has_missing_signal": self._dataset_has_missingness_signal(
-                            context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
-                        ),
-                        "has_high_cardinality_signal": self._dataset_has_high_cardinality_signal(
-                            context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
-                        ),
-                    },
-                },
-                ensure_ascii=False,
-            )
+            + blueprint_instruction
+            + "Use this context:\n"
+            + json.dumps(llm_context, ensure_ascii=False)
         )
         try:
             content = self._call_model(
