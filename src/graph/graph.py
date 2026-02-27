@@ -22842,6 +22842,19 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
 
     # --- Model Analyst: deep baseline analysis (runs once on first round) ---
     optimization_blueprint = state.get("optimization_blueprint")
+    # Fallback: recover blueprint from persisted file if state lost it between
+    # rounds (LangGraph state serialization may not preserve large dicts).
+    if (not isinstance(optimization_blueprint, dict) or not optimization_blueprint) and run_id:
+        try:
+            _bp_path = os.path.join("runs", run_id, "agents", "model_analyst", "optimization_blueprint.json")
+            if os.path.isfile(_bp_path):
+                with open(_bp_path) as _bp_f:
+                    _bp_recovered = json.load(_bp_f)
+                if isinstance(_bp_recovered, dict) and _bp_recovered:
+                    optimization_blueprint = _bp_recovered
+                    state["optimization_blueprint"] = optimization_blueprint
+        except Exception:
+            pass
     if not isinstance(optimization_blueprint, dict) and int(round_id) <= 1:
         try:
             baseline_script = str(state.get("generated_code") or state.get("last_generated_code") or "")
@@ -22971,63 +22984,123 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         return state
 
     if _is_duplicate_noop_hypothesis(hypothesis_packet):
-        state["ml_improvement_round_active"] = False
-        state["ml_improvement_continue"] = False
-        state["ml_improvement_attempted"] = True
-        state["ml_improvement_loop_complete"] = True
-        state["ml_improvement_kept"] = "baseline"
-        state["ml_improvement_force_finalize_reason"] = "duplicate_noop_hypothesis"
-        state["stop_reason"] = "IMPROVEMENT_ROUND_DUPLICATE_NOOP"
-        state["last_iteration_type"] = None
-        _append_feedback_history(
-            state,
-            (
-                "METRIC_IMPROVEMENT_LOOP_STOP: duplicate NO_OP hypothesis detected; "
-                "terminating loop to avoid token waste."
-            ),
-        )
-        if run_id:
-            tracker_context = (
-                hypothesis_packet.get("tracker_context")
-                if isinstance(hypothesis_packet.get("tracker_context"), dict)
-                else {}
+        # Before terminating, attempt blueprint fallback recovery: if the
+        # optimization_blueprint still has untried actions, synthesize a
+        # hypothesis directly from the next blueprint action.  This is
+        # universal — it works for any blueprint regardless of task type.
+        _bp_recovery_done = False
+        if isinstance(optimization_blueprint, dict) and optimization_blueprint:
+            _bp_actions = optimization_blueprint.get("improvement_actions")
+            if isinstance(_bp_actions, list) and _bp_actions:
+                # Collect all signatures already tried from the experiment tracker
+                _tried_sigs: set = set()
+                if isinstance(tracker_entries, list):
+                    for _te in tracker_entries:
+                        if not isinstance(_te, dict):
+                            continue
+                        _s = str(_te.get("signature") or "").strip()
+                        if _s:
+                            _tried_sigs.add(_s)
+                        _extra = _te.get("extra") if isinstance(_te.get("extra"), dict) else {}
+                        _s2 = str(_extra.get("signature") or "").strip()
+                        if _s2:
+                            _tried_sigs.add(_s2)
+                        _tc = _te.get("tracker_context") if isinstance(_te.get("tracker_context"), dict) else {}
+                        _s3 = str(_tc.get("signature") or "").strip()
+                        if _s3:
+                            _tried_sigs.add(_s3)
+                for _bp_action in _bp_actions:
+                    if not isinstance(_bp_action, dict):
+                        continue
+                    _bp_sig = str(_bp_action.get("signature") or "").strip()
+                    _bp_technique = str(
+                        _bp_action.get("action_type")
+                        or _bp_action.get("technique")
+                        or ""
+                    ).strip()
+                    if _bp_sig and _bp_sig in _tried_sigs:
+                        continue
+                    if _bp_technique and _bp_technique in _tried_sigs:
+                        continue
+                    # Found an untried blueprint action — synthesize hypothesis
+                    _recovery_sig = _bp_sig or f"bp_recovery_{int(round_id)}_{_bp_technique[:20]}"
+                    hypothesis_packet = {
+                        "action": "APPLY",
+                        "hypothesis": {
+                            "technique": _bp_technique or "blueprint_action",
+                            "rationale": str(_bp_action.get("rationale") or _bp_action.get("description") or ""),
+                            "params": _bp_action.get("concrete_params") or _bp_action.get("params") or {},
+                        },
+                        "tracker_context": {
+                            "signature": _recovery_sig,
+                            "_source": "blueprint_fallback_recovery",
+                        },
+                    }
+                    print(
+                        f"BLUEPRINT_RECOVERY: recovered from NO_OP with blueprint action: "
+                        f"{_bp_technique} (sig={_recovery_sig})"
+                    )
+                    _bp_recovery_done = True
+                    break
+
+        if not _bp_recovery_done:
+            state["ml_improvement_round_active"] = False
+            state["ml_improvement_continue"] = False
+            state["ml_improvement_attempted"] = True
+            state["ml_improvement_loop_complete"] = True
+            state["ml_improvement_kept"] = "baseline"
+            state["ml_improvement_force_finalize_reason"] = "duplicate_noop_hypothesis"
+            state["stop_reason"] = "IMPROVEMENT_ROUND_DUPLICATE_NOOP"
+            state["last_iteration_type"] = None
+            _append_feedback_history(
+                state,
+                (
+                    "METRIC_IMPROVEMENT_LOOP_STOP: duplicate NO_OP hypothesis detected; "
+                    "terminating loop to avoid token waste."
+                ),
             )
-            hypothesis = (
-                hypothesis_packet.get("hypothesis")
-                if isinstance(hypothesis_packet.get("hypothesis"), dict)
-                else {}
-            )
-            try:
-                log_run_event(
+            if run_id:
+                tracker_context = (
+                    hypothesis_packet.get("tracker_context")
+                    if isinstance(hypothesis_packet.get("tracker_context"), dict)
+                    else {}
+                )
+                hypothesis = (
+                    hypothesis_packet.get("hypothesis")
+                    if isinstance(hypothesis_packet.get("hypothesis"), dict)
+                    else {}
+                )
+                try:
+                    log_run_event(
+                        run_id,
+                        "metric_improvement_round_terminated",
+                        {
+                            "reason": "duplicate_noop_hypothesis",
+                            "round_id": int(round_id),
+                            "round_count_current": int(round_index_before),
+                            "rounds_allowed": int(rounds),
+                            "action": str(hypothesis_packet.get("action") or ""),
+                            "technique": str(hypothesis.get("technique") or ""),
+                            "signature": str(tracker_context.get("signature") or ""),
+                            "duplicate_of": str(tracker_context.get("duplicate_of") or ""),
+                        },
+                    )
+                except Exception:
+                    pass
+                append_experiment_entry(
                     run_id,
-                    "metric_improvement_round_terminated",
                     {
-                        "reason": "duplicate_noop_hypothesis",
+                        "iter": int(state.get("iteration_count", 0) or 0),
+                        "event": "hypothesis_terminated",
+                        "phase": "metric_improvement_round",
                         "round_id": int(round_id),
-                        "round_count_current": int(round_index_before),
-                        "rounds_allowed": int(rounds),
                         "action": str(hypothesis_packet.get("action") or ""),
-                        "technique": str(hypothesis.get("technique") or ""),
                         "signature": str(tracker_context.get("signature") or ""),
                         "duplicate_of": str(tracker_context.get("duplicate_of") or ""),
+                        "reason": "duplicate_noop_hypothesis",
                     },
                 )
-            except Exception:
-                pass
-            append_experiment_entry(
-                run_id,
-                {
-                    "iter": int(state.get("iteration_count", 0) or 0),
-                    "event": "hypothesis_terminated",
-                    "phase": "metric_improvement_round",
-                    "round_id": int(round_id),
-                    "action": str(hypothesis_packet.get("action") or ""),
-                    "signature": str(tracker_context.get("signature") or ""),
-                    "duplicate_of": str(tracker_context.get("duplicate_of") or ""),
-                    "reason": "duplicate_noop_hypothesis",
-                },
-            )
-        return False
+            return False
     hypothesis_meta = (
         strategist.last_iteration_meta
         if isinstance(getattr(strategist, "last_iteration_meta", None), dict)
@@ -23165,8 +23238,8 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "critic_packet": critique_packet,
         "hypothesis_packet": hypothesis_packet,
         "optimization_blueprint": (
-            state.get("optimization_blueprint")
-            if isinstance(state.get("optimization_blueprint"), dict)
+            optimization_blueprint
+            if isinstance(optimization_blueprint, dict)
             else {}
         ),
     }

@@ -1833,6 +1833,50 @@ class MLEngineerAgent:
         artifact_reqs = contract.get("artifact_requirements")
         if not isinstance(artifact_reqs, dict):
             artifact_reqs = view.get("artifact_requirements")
+        # Scan row_count_hints persisted by the execution planner (universal)
+        stored_hints = (
+            artifact_reqs.get("row_count_hints")
+            if isinstance(artifact_reqs, dict)
+            else None
+        )
+        if isinstance(stored_hints, dict):
+            _scan_counts(stored_hints)
+            # Re-derive after scanning new source
+            n_train = row_hints.get("n_train")
+            n_test = row_hints.get("n_test")
+            n_total = row_hints.get("n_total")
+            if n_total is None and n_train is not None and n_test is not None:
+                n_total = int(n_train + n_test)
+                row_hints["n_total"] = n_total
+            if n_test is None and n_total is not None and n_train is not None and n_total >= n_train:
+                n_test = int(n_total - n_train)
+                row_hints["n_test"] = n_test
+            if n_train is None and n_total is not None and n_test is not None and n_total >= n_test:
+                n_train = int(n_total - n_test)
+                row_hints["n_train"] = n_train
+
+        # Universal fallback: derive n_train from target column non_null_count
+        # (works when test rows have null targets, a common universal pattern)
+        if n_train is None and n_total is not None:
+            for src in sources:
+                if not isinstance(src, dict):
+                    continue
+                outcome = src.get("outcome_analysis")
+                if not isinstance(outcome, dict):
+                    continue
+                for _col_info in outcome.values():
+                    if not isinstance(_col_info, dict):
+                        continue
+                    nnc = _coerce_positive_int(_col_info.get("non_null_count"))
+                    if nnc is not None and 0 < nnc < n_total:
+                        n_train = nnc
+                        n_test = n_total - n_train
+                        row_hints["n_train"] = n_train
+                        row_hints["n_test"] = n_test
+                        break
+                if n_train is not None:
+                    break
+
         file_schemas = artifact_reqs.get("file_schemas") if isinstance(artifact_reqs, dict) else {}
 
         artifact_row_expectations: List[Dict[str, Any]] = []
@@ -1877,7 +1921,17 @@ class MLEngineerAgent:
             return ""
 
         training_policy = str(plan_context.get("training_rows_policy") or "unspecified")
-        split_column = str(plan_context.get("split_column") or "").strip()
+        # Handle split_column as dict (from split_candidates) or plain string
+        split_column_raw = plan_context.get("split_column")
+        if isinstance(split_column_raw, dict):
+            split_column = str(
+                split_column_raw.get("column")
+                or split_column_raw.get("name")
+                or split_column_raw.get("split_column")
+                or ""
+            ).strip()
+        else:
+            split_column = str(split_column_raw or "").strip()
         train_filter = plan_context.get("train_filter")
         train_filter_rule = self._describe_train_filter(
             train_filter if isinstance(train_filter, dict) else None,

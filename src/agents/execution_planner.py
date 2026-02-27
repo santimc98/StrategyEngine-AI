@@ -4223,6 +4223,21 @@ def build_contract_min(
         if schema_obj:
             normalized_file_schemas[schema_path] = schema_obj
 
+    # Pass 3: Create file_schema entries from artifact_kind_map for CSV paths
+    # not already present.  This ensures artifacts like submission.csv get
+    # expected_row_count even when the LLM-generated file_schemas is empty.
+    # Universal: derives kind from naming conventions (submission, scored_rows,
+    # prediction, forecast, ranking), not from any specific competition or dataset.
+    for kind_path_lower, kind_value in artifact_kind_map.items():
+        norm_path = _normalize_artifact_path(kind_path_lower)
+        if not norm_path or not norm_path.lower().endswith(".csv"):
+            continue
+        if norm_path in normalized_file_schemas:
+            continue
+        inferred = _infer_expected_row_count(norm_path, kind_value)
+        if inferred is not None:
+            normalized_file_schemas[norm_path] = {"expected_row_count": int(inferred)}
+
     # SYNC FIX: Filter out constant columns from clean_dataset.required_columns
     # Constant columns provide no information and should be excluded from the final schema
     constant_columns_set: set[str] = set()
@@ -4273,6 +4288,10 @@ def build_contract_min(
         "required_files": required_files,
         "scored_rows_schema": scored_rows_schema,
         "file_schemas": normalized_file_schemas,
+        "row_count_hints": {
+            k: v for k, v in row_count_hints.items()
+            if isinstance(v, int) and v > 0
+        },
         "schema_binding": {
             "required_columns": clean_dataset_required_columns,
             "optional_passthrough_columns": [],
