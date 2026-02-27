@@ -363,6 +363,10 @@ class MLEngineerAgent:
             "derived_columns",
             "iteration_policy",
             "feature_engineering_tasks",
+            "split_spec",
+            "n_train_rows",
+            "n_test_rows",
+            "n_total_rows",
         ]
 
         compact: Dict[str, Any] = {}
@@ -1626,13 +1630,32 @@ class MLEngineerAgent:
         if outcome_columns:
             target_column = str(outcome_columns[0])
 
-        training_rows_rule = contract.get("training_rows_rule") or view.get("training_rows_rule")
-        scoring_rows_rule = contract.get("scoring_rows_rule") or view.get("scoring_rows_rule")
+        split_spec = contract.get("split_spec")
+        if not isinstance(split_spec, dict):
+            split_spec = view.get("split_spec") if isinstance(view.get("split_spec"), dict) else {}
+
+        training_rows_rule = (
+            contract.get("training_rows_rule")
+            or view.get("training_rows_rule")
+            or split_spec.get("training_rows_rule")
+        )
+        scoring_rows_rule = (
+            contract.get("scoring_rows_rule")
+            or view.get("scoring_rows_rule")
+            or split_spec.get("scoring_rows_rule")
+        )
         secondary_scoring_subset = contract.get("secondary_scoring_subset") or view.get("secondary_scoring_subset")
 
         training_rows_policy = plan.get("training_rows_policy")
+        if not isinstance(training_rows_policy, str) or not training_rows_policy.strip():
+            if isinstance(split_spec.get("training_rows_policy"), str):
+                training_rows_policy = split_spec.get("training_rows_policy")
         split_column = plan.get("split_column")
+        if not isinstance(split_column, str) or not split_column.strip():
+            split_column = split_spec.get("split_column")
         train_filter = plan.get("train_filter") if isinstance(plan.get("train_filter"), dict) else None
+        if train_filter is None and isinstance(split_spec.get("train_filter"), dict):
+            train_filter = split_spec.get("train_filter")
 
         canonical_cols = contract.get("canonical_columns")
         if not isinstance(canonical_cols, list):
@@ -1706,6 +1729,9 @@ class MLEngineerAgent:
         contract = execution_contract if isinstance(execution_contract, dict) else {}
         view = ml_view if isinstance(ml_view, dict) else {}
         plan_context = self._extract_training_context(contract, view, ml_plan)
+        split_spec = contract.get("split_spec")
+        if not isinstance(split_spec, dict):
+            split_spec = view.get("split_spec") if isinstance(view.get("split_spec"), dict) else {}
 
         def _coerce_positive_int(value: Any) -> int | None:
             if isinstance(value, bool):
@@ -1835,7 +1861,18 @@ class MLEngineerAgent:
                     }
                 )
 
-        has_row_context = any(isinstance(v, int) and v > 0 for v in row_hints.values()) or bool(artifact_row_expectations)
+        has_partition_rules = bool(
+            plan_context.get("training_rows_rule")
+            or plan_context.get("scoring_rows_rule")
+            or plan_context.get("split_column")
+            or plan_context.get("train_filter")
+        )
+        has_row_context = (
+            any(isinstance(v, int) and v > 0 for v in row_hints.values())
+            or bool(artifact_row_expectations)
+            or has_partition_rules
+            or bool(split_spec)
+        )
         if not has_row_context:
             return ""
 
@@ -1862,6 +1899,13 @@ class MLEngineerAgent:
         lines.append(f"Training row selection policy: {training_policy}")
         if split_column:
             lines.append(f"Split column: {split_column}")
+        split_status = str(split_spec.get("status") or "").strip()
+        if split_status:
+            lines.append(f"Split resolution status: {split_status}")
+        if bool(split_spec.get("requires_test_only_outputs")) and split_status.lower() in {"unknown", "unresolved", "ambiguous"}:
+            lines.append(
+                "FAIL-CLOSED NOTE: contract expects test-only outputs but split resolution is unresolved; infer and apply explicit subset filters before writing outputs."
+            )
         lines.append(f"Train filter rule: {train_filter_rule}")
 
         if artifact_row_expectations:
@@ -3414,6 +3458,10 @@ $strategy_json
             "plot_spec",
             "ml_engineer_runbook",
             "iteration_policy",
+            "split_spec",
+            "n_train_rows",
+            "n_test_rows",
+            "n_total_rows",
         }
         ml_view_payload = {
             k: v for k, v in (ml_view or {}).items() if k in ml_view_whitelist and v not in (None, "", [], {})
@@ -3470,6 +3518,15 @@ $strategy_json
                 "canonical_columns": [
                     str(item) for item in (canonical_columns_hint or [])[:80] if str(item).strip()
                 ],
+                "split_spec": (
+                    ml_view.get("split_spec")
+                    if isinstance(ml_view.get("split_spec"), dict)
+                    else (
+                        execution_contract_input.get("split_spec")
+                        if isinstance(execution_contract_input.get("split_spec"), dict)
+                        else {}
+                    )
+                ),
                 "qa_gates": ml_view_payload.get("qa_gates") or [],
                 "reviewer_gates": ml_view_payload.get("reviewer_gates") or [],
             }

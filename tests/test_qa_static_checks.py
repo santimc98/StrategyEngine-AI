@@ -186,3 +186,25 @@ submission.to_csv('data/submission.csv', index=False)
     result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
     assert result is not None
     assert result["status"] in {"PASS", "WARN"}
+
+
+def test_static_qa_infers_expected_rows_from_required_outputs_when_file_schema_missing():
+    code = """
+import pandas as pd
+df = pd.read_csv('data/cleaned_data.csv')
+preds = model.predict_proba(df[['feature_a']])[:, 1]
+submission = pd.DataFrame({'id': df['id'], 'score': preds})
+submission.to_csv('data/submission.csv', index=False)
+"""
+    evaluation_spec = {
+        "qa_gates": [{"name": "output_row_count_consistency", "severity": "HARD", "params": {}}],
+        "n_total_rows": 900000,
+        "n_test_rows": 270000,
+        "artifact_requirements": {
+            "required_outputs": ["data/submission.csv"],
+        },
+    }
+    result = run_static_qa_checks(code, evaluation_spec=evaluation_spec)
+    assert result is not None
+    assert result["status"] == "REJECTED"
+    assert "output_row_count_consistency" in result.get("failed_gates", [])

@@ -556,6 +556,56 @@ def test_qa_view_carries_row_count_hints_when_available():
     assert qa_view.get("n_total_rows") == 140
 
 
+def test_ml_and_qa_views_propagate_split_spec_and_file_schemas():
+    contract_full = {
+        "canonical_columns": ["id", "feature_a", "target", "is_train"],
+        "column_roles": {"pre_decision": ["id", "feature_a", "is_train"], "outcome": ["target"]},
+        "required_outputs": ["data/submission.csv", "data/scored_rows.csv"],
+        "artifact_requirements": {
+            "required_files": [{"path": "data/submission.csv"}, {"path": "data/scored_rows.csv"}],
+            "file_schemas": {
+                "data/submission.csv": {"expected_row_count": 270000},
+                "data/scored_rows.csv": {"expected_row_count": 900000},
+            },
+        },
+        "split_spec": {
+            "status": "resolved",
+            "split_column": "is_train",
+            "training_rows_policy": "only_rows_with_label",
+            "n_train_rows": 630000,
+            "n_test_rows": 270000,
+            "n_total_rows": 900000,
+        },
+        "data_profile": {
+            "outcome_analysis": {
+                "target": {"non_null_count": 630000, "total_count": 900000},
+            }
+        },
+    }
+    contract_min = {
+        "canonical_columns": ["id", "feature_a", "target", "is_train"],
+        "column_roles": {"pre_decision": ["id", "feature_a", "is_train"], "outcome": ["target"]},
+        "allowed_feature_sets": {
+            "model_features": ["feature_a"],
+            "segmentation_features": ["feature_a"],
+            "forbidden_features": ["target"],
+        },
+        "artifact_requirements": contract_full["artifact_requirements"],
+        "required_outputs": ["data/submission.csv", "data/scored_rows.csv"],
+    }
+
+    ml_view = build_ml_view(contract_full, contract_min, [])
+    qa_view = build_qa_view(contract_full, contract_min, [])
+
+    ml_artifacts = ml_view.get("artifact_requirements") or {}
+    assert (ml_artifacts.get("file_schemas") or {}).get("data/submission.csv", {}).get("expected_row_count") == 270000
+    assert (qa_view.get("artifact_requirements") or {}).get("file_schemas", {}).get("data/scored_rows.csv", {}).get("expected_row_count") == 900000
+    assert (ml_view.get("split_spec") or {}).get("status") == "resolved"
+    assert (qa_view.get("split_spec") or {}).get("split_column") == "is_train"
+    assert ml_view.get("n_train_rows") == 630000
+    assert qa_view.get("n_test_rows") == 270000
+
+
 def test_translator_view_contains_policy_and_inventory():
     contract_full = _load_fixture("contract_full_small.json")
     contract_min = _load_fixture("contract_min_small.json")

@@ -79,6 +79,10 @@ class MLView(TypedDict, total=False):
     plot_spec: Dict[str, Any]
     artifact_requirements: Dict[str, Any]
     outlier_policy: Dict[str, Any]
+    split_spec: Dict[str, Any]
+    n_train_rows: int
+    n_test_rows: int
+    n_total_rows: int
 
 
 class ReviewerView(TypedDict, total=False):
@@ -136,6 +140,7 @@ class QAView(TypedDict, total=False):
     n_train_rows: int
     n_test_rows: int
     n_total_rows: int
+    split_spec: Dict[str, Any]
 
 
 _PRESERVE_KEYS = {
@@ -162,6 +167,10 @@ _PRESERVE_KEYS = {
     "plot_spec",
     "plots",
     "outlier_policy",
+    "split_spec",
+    "n_train_rows",
+    "n_test_rows",
+    "n_total_rows",
 }
 
 _IDENTIFIER_TOKENS = {
@@ -291,13 +300,92 @@ def _resolve_row_count_hints(
                 if parsed is not None:
                     hints["n_test_rows"] = parsed
 
+    def _coerce_ratio(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            ratio = float(value)
+        elif isinstance(value, str):
+            token = value.strip()
+            if not token:
+                return None
+            try:
+                ratio = float(token)
+            except Exception:
+                return None
+        else:
+            return None
+        if ratio < 0.0 or ratio > 1.0:
+            return None
+        return ratio
+
+    def _scan_outcome_counts(source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        if (
+            "n_train_rows" in hints
+            and "n_total_rows" in hints
+            and "n_test_rows" in hints
+        ):
+            return
+        outcome_analysis = source.get("outcome_analysis")
+        if not isinstance(outcome_analysis, dict):
+            return
+        for entry in outcome_analysis.values():
+            if not isinstance(entry, dict):
+                continue
+            total = _coerce_positive_int(
+                entry.get("total_count")
+                or entry.get("n_total_rows")
+                or entry.get("n_rows")
+                or entry.get("row_count")
+                or entry.get("rows")
+            )
+            non_null = _coerce_positive_int(
+                entry.get("non_null_count")
+                or entry.get("n_non_null")
+                or entry.get("non_null_rows")
+                or entry.get("labeled_rows")
+                or entry.get("train_rows")
+            )
+            if non_null is None and isinstance(total, int):
+                null_frac = _coerce_ratio(entry.get("null_frac"))
+                if null_frac is not None:
+                    inferred_non_null = int(round(total * (1.0 - null_frac)))
+                    if inferred_non_null > 0 and inferred_non_null <= total:
+                        non_null = inferred_non_null
+            if "n_total_rows" not in hints and isinstance(total, int):
+                hints["n_total_rows"] = total
+            if "n_train_rows" not in hints and isinstance(non_null, int):
+                hints["n_train_rows"] = non_null
+            if (
+                "n_test_rows" not in hints
+                and isinstance(total, int)
+                and isinstance(non_null, int)
+                and total >= non_null
+            ):
+                inferred_test = total - non_null
+                if inferred_test > 0:
+                    hints["n_test_rows"] = inferred_test
+            if (
+                "n_train_rows" in hints
+                and "n_total_rows" in hints
+                and "n_test_rows" in hints
+            ):
+                return
+
     for source in (contract_min, contract_full):
         _scan(source)
+        _scan_outcome_counts(source)
         if isinstance(source, dict):
             _scan(source.get("dataset_profile"))
             _scan(source.get("data_profile"))
             _scan(source.get("evaluation_spec"))
             _scan(source.get("execution_constraints"))
+            _scan(source.get("split_spec"))
+            _scan_outcome_counts(source.get("dataset_profile"))
+            _scan_outcome_counts(source.get("data_profile"))
+            _scan_outcome_counts(source.get("evaluation_spec"))
     if (
         "n_total_rows" not in hints
         and "n_train_rows" in hints
@@ -1423,6 +1511,9 @@ def build_ml_view(
         artifact_payload["required_files"] = required_files_payload
     if scored_rows_schema:
         artifact_payload["scored_rows_schema"] = scored_rows_schema
+    file_schemas = artifact_reqs.get("file_schemas")
+    if isinstance(file_schemas, dict) and file_schemas:
+        artifact_payload["file_schemas"] = file_schemas
 
     view: MLView = {
         "role": "ml_engineer",
@@ -1440,6 +1531,16 @@ def build_ml_view(
         "required_outputs": ml_required_outputs,
         "validation_requirements": validation,
     }
+    row_count_hints = _resolve_row_count_hints(contract_full, contract_min)
+    if row_count_hints:
+        for key in ("n_train_rows", "n_test_rows", "n_total_rows"):
+            if key in row_count_hints:
+                view[key] = row_count_hints[key]
+    split_spec = contract_min.get("split_spec")
+    if not isinstance(split_spec, dict) or not split_spec:
+        split_spec = contract_full.get("split_spec")
+    if isinstance(split_spec, dict) and split_spec:
+        view["split_spec"] = split_spec
     column_sets_summary = contract_min.get("column_sets_summary") or contract_full.get("column_sets_summary")
     if column_sets_summary:
         view["column_sets_summary"] = column_sets_summary
@@ -1563,11 +1664,16 @@ def build_qa_view(
         "canonical_columns": canonical_columns,
         "objective_summary": objective_summary,
     }
-    row_count_hints = _resolve_row_count_hints(contract_full, {})
+    row_count_hints = _resolve_row_count_hints(contract_full, contract_min)
     if row_count_hints:
         for key in ("n_train_rows", "n_test_rows", "n_total_rows"):
             if key in row_count_hints:
                 view[key] = row_count_hints[key]
+    split_spec = contract_min.get("split_spec")
+    if not isinstance(split_spec, dict) or not split_spec:
+        split_spec = contract_full.get("split_spec")
+    if isinstance(split_spec, dict) and split_spec:
+        view["split_spec"] = split_spec
     if isinstance(reporting_policy, dict) and reporting_policy:
         view["reporting_policy"] = reporting_policy
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
@@ -1932,6 +2038,9 @@ def build_contract_views_projection(
         artifact_payload["required_files"] = required_files
     if scored_rows_schema:
         artifact_payload["scored_rows_schema"] = scored_rows_schema
+    file_schemas = artifact_reqs.get("file_schemas")
+    if isinstance(file_schemas, dict) and file_schemas:
+        artifact_payload["file_schemas"] = file_schemas
 
     column_dtype_targets = _resolve_column_dtype_targets({}, contract_full)
 
@@ -2030,6 +2139,9 @@ def build_contract_views_projection(
         ml_view["outlier_policy"] = outlier_policy
     if plot_spec is not None:
         ml_view["plot_spec"] = plot_spec
+    split_spec = contract_full.get("split_spec")
+    if isinstance(split_spec, dict) and split_spec:
+        ml_view["split_spec"] = split_spec
     case_rules = contract_full.get("case_rules")
     if case_rules is not None:
         ml_view["case_rules"] = case_rules
@@ -2037,6 +2149,11 @@ def build_contract_views_projection(
         value = contract_full.get(opt_key)
         if value:
             ml_view[opt_key] = value
+    row_count_hints = _resolve_row_count_hints(contract_full, {})
+    if row_count_hints:
+        for key in ("n_train_rows", "n_test_rows", "n_total_rows"):
+            if key in row_count_hints:
+                ml_view[key] = row_count_hints[key]
 
     reviewer_summary_parts = [strategy_title.strip(), objective_type.strip()]
     reviewer_summary = " | ".join([part for part in reviewer_summary_parts if part]) or "contract_based_review"
@@ -2074,11 +2191,12 @@ def build_contract_views_projection(
         },
         "decisioning_requirements": decisioning_requirements,
     }
-    row_count_hints = _resolve_row_count_hints(contract_full, {})
     if row_count_hints:
         for key in ("n_train_rows", "n_test_rows", "n_total_rows"):
             if key in row_count_hints:
                 qa_view[key] = row_count_hints[key]
+    if isinstance(split_spec, dict) and split_spec:
+        qa_view["split_spec"] = split_spec
     if reporting_policy:
         qa_view["reporting_policy"] = reporting_policy
 

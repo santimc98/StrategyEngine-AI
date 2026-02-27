@@ -3903,6 +3903,7 @@ def build_contract_min(
             "row_count",
             "rows",
         )
+        candidate_targets = [str(col) for col in (outcome_cols or []) if str(col).strip()]
 
         def _scan(source: Any) -> None:
             if not isinstance(source, dict):
@@ -3952,6 +3953,82 @@ def build_contract_min(
                     if parsed is not None:
                         hints["n_test"] = parsed
 
+        def _coerce_ratio(value: Any) -> float | None:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                ratio = float(value)
+            elif isinstance(value, str):
+                token = value.strip()
+                if not token:
+                    return None
+                try:
+                    ratio = float(token)
+                except Exception:
+                    return None
+            else:
+                return None
+            if ratio < 0.0 or ratio > 1.0:
+                return None
+            return ratio
+
+        def _resolve_outcome_entry(source: Dict[str, Any]) -> Dict[str, Any] | None:
+            outcome_analysis = source.get("outcome_analysis")
+            if not isinstance(outcome_analysis, dict) or not outcome_analysis:
+                return None
+            for target in candidate_targets:
+                entry = outcome_analysis.get(target)
+                if isinstance(entry, dict):
+                    return entry
+            for entry in outcome_analysis.values():
+                if isinstance(entry, dict):
+                    return entry
+            return None
+
+        def _scan_outcome_counts(source: Any) -> None:
+            if not isinstance(source, dict):
+                return
+            if "n_train" in hints and "n_total" in hints:
+                return
+            outcome_entry = _resolve_outcome_entry(source)
+            if not isinstance(outcome_entry, dict):
+                return
+
+            total = _coerce_positive_count(
+                outcome_entry.get("total_count")
+                or outcome_entry.get("n_total_rows")
+                or outcome_entry.get("n_rows")
+                or outcome_entry.get("row_count")
+                or outcome_entry.get("rows")
+            )
+            non_null = _coerce_positive_count(
+                outcome_entry.get("non_null_count")
+                or outcome_entry.get("n_non_null")
+                or outcome_entry.get("non_null_rows")
+                or outcome_entry.get("labeled_rows")
+                or outcome_entry.get("train_rows")
+            )
+            if non_null is None and isinstance(total, int):
+                null_frac = _coerce_ratio(outcome_entry.get("null_frac"))
+                if null_frac is not None:
+                    inferred_non_null = int(round(total * (1.0 - null_frac)))
+                    if inferred_non_null > 0 and inferred_non_null <= total:
+                        non_null = inferred_non_null
+            if isinstance(total, int) and total > 0 and "n_total" not in hints:
+                hints["n_total"] = total
+            if isinstance(non_null, int) and non_null > 0 and "n_train" not in hints:
+                hints["n_train"] = non_null
+            if (
+                isinstance(total, int)
+                and total > 0
+                and isinstance(non_null, int)
+                and non_null >= 0
+                and total >= non_null
+            ):
+                inferred_test = total - non_null
+                if inferred_test > 0 and "n_test" not in hints:
+                    hints["n_test"] = inferred_test
+
         profile_dict = profile_payload if isinstance(profile_payload, dict) else {}
         dataset_profile = contract_payload.get("dataset_profile") if isinstance(contract_payload.get("dataset_profile"), dict) else {}
         contract_data_profile = contract_payload.get("data_profile") if isinstance(contract_payload.get("data_profile"), dict) else {}
@@ -3970,6 +4047,11 @@ def build_contract_min(
             profile_dict,
         ):
             _scan(source)
+            _scan_outcome_counts(source)
+            if isinstance(source, dict):
+                _scan_outcome_counts(source.get("dataset_profile"))
+                _scan_outcome_counts(source.get("data_profile"))
+                _scan_outcome_counts(source.get("evaluation_spec"))
 
         n_train = hints.get("n_train")
         n_test = hints.get("n_test")
@@ -4011,12 +4093,17 @@ def build_contract_min(
             if not isinstance(items, list):
                 return
             for entry in items:
-                if not isinstance(entry, dict):
+                path = ""
+                kind = ""
+                if isinstance(entry, dict):
+                    path = _normalize_artifact_path(
+                        entry.get("path") or entry.get("output") or entry.get("artifact")
+                    )
+                    kind = str(entry.get("kind") or "").strip()
+                elif isinstance(entry, str):
+                    path = _normalize_artifact_path(entry)
+                else:
                     continue
-                path = _normalize_artifact_path(
-                    entry.get("path") or entry.get("output") or entry.get("artifact")
-                )
-                kind = str(entry.get("kind") or "").strip()
                 if not kind and path:
                     inferred_kind = _infer_kind_from_path(path)
                     if inferred_kind:
@@ -4025,9 +4112,20 @@ def build_contract_min(
                     mapping[path.lower()] = kind
 
         _ingest(contract_payload.get("required_output_artifacts"))
+        _ingest(contract_payload.get("required_outputs"))
         spec = contract_payload.get("spec_extraction")
         if isinstance(spec, dict):
             _ingest(spec.get("deliverables"))
+        artifact_reqs = contract_payload.get("artifact_requirements")
+        if isinstance(artifact_reqs, dict):
+            _ingest(artifact_reqs.get("required_files"))
+            file_schemas = artifact_reqs.get("file_schemas")
+            if isinstance(file_schemas, dict):
+                for raw_path in file_schemas.keys():
+                    path = _normalize_artifact_path(raw_path)
+                    inferred_kind = _infer_kind_from_path(path) if path else None
+                    if path and inferred_kind and path.lower() not in mapping:
+                        mapping[path.lower()] = inferred_kind
         return mapping
 
     row_count_hints = _extract_row_count_hints(contract, data_profile)
@@ -4063,6 +4161,18 @@ def build_contract_min(
         if not lowered_path.endswith(".csv"):
             return None
         normalized_kind = re.sub(r"[^a-z0-9]+", "_", str(kind or "").lower()).strip("_")
+        basename = lowered_path.rsplit("/", 1)[-1]
+        if not normalized_kind:
+            if "submission" in basename:
+                normalized_kind = "submission"
+            elif "scored_rows" in basename or "scored-rows" in basename:
+                normalized_kind = "scored_rows"
+            elif "prediction" in basename or "predictions" in basename:
+                normalized_kind = "prediction"
+            elif "forecast" in basename:
+                normalized_kind = "forecast"
+            elif "ranking" in basename:
+                normalized_kind = "ranking"
         n_total = row_count_hints.get("n_total")
         n_test = row_count_hints.get("n_test")
         if "scored_rows" in lowered_path or normalized_kind in {"scored_rows", "scored"}:
@@ -4267,6 +4377,267 @@ def build_contract_min(
     if not isinstance(data_partitioning_notes, list):
         data_partitioning_notes = []
 
+    def _coerce_ratio(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            ratio = float(value)
+        elif isinstance(value, str):
+            token = value.strip()
+            if not token:
+                return None
+            try:
+                ratio = float(token)
+            except Exception:
+                return None
+        else:
+            return None
+        if ratio < 0.0 or ratio > 1.0:
+            return None
+        return ratio
+
+    def _resolve_split_column() -> str | None:
+        candidates: List[str] = []
+        for col in steward_split_cols:
+            if isinstance(col, str) and col.strip():
+                candidates.append(col.strip())
+        split_fields = (
+            contract.get("split_column"),
+            contract.get("split_columns"),
+        )
+        for value in split_fields:
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item.strip():
+                        candidates.append(item.strip())
+        eval_spec_local = contract.get("evaluation_spec")
+        if isinstance(eval_spec_local, dict):
+            value = eval_spec_local.get("split_column")
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+            values = eval_spec_local.get("split_columns")
+            if isinstance(values, list):
+                for item in values:
+                    if isinstance(item, str) and item.strip():
+                        candidates.append(item.strip())
+
+        for cand in candidates:
+            if cand in canonical_columns:
+                return cand
+            norm = _normalize_column_identifier(cand)
+            resolved = inventory_norms.get(norm)
+            if resolved:
+                return resolved
+        return candidates[0] if candidates else None
+
+    def _resolve_target_for_partitioning() -> str | None:
+        for source in (
+            outcome_cols,
+            contract.get("outcome_columns"),
+            contract.get("target_column"),
+            contract.get("target_columns"),
+        ):
+            values = _coerce_list(source)
+            for raw in values:
+                if not raw:
+                    continue
+                token = str(raw).strip()
+                if not token:
+                    continue
+                if token in canonical_columns:
+                    return token
+                norm = _normalize_column_identifier(token)
+                resolved = inventory_norms.get(norm)
+                if resolved:
+                    return resolved
+        return None
+
+    def _target_has_partial_labels(target_col: str | None) -> bool:
+        if not isinstance(target_col, str) or not target_col.strip():
+            return False
+        target = target_col.strip()
+        profile_candidates: List[Dict[str, Any]] = []
+        for source in (
+            data_profile,
+            contract.get("data_profile"),
+            contract.get("dataset_profile"),
+            contract,
+        ):
+            if isinstance(source, dict):
+                profile_candidates.append(source)
+                nested = source.get("dataset_profile")
+                if isinstance(nested, dict):
+                    profile_candidates.append(nested)
+                nested = source.get("data_profile")
+                if isinstance(nested, dict):
+                    profile_candidates.append(nested)
+
+        for profile in profile_candidates:
+            outcome_analysis = profile.get("outcome_analysis")
+            if not isinstance(outcome_analysis, dict):
+                continue
+            entry = outcome_analysis.get(target)
+            if not isinstance(entry, dict):
+                continue
+            total = _coerce_positive_count(
+                entry.get("total_count")
+                or entry.get("n_total_rows")
+                or entry.get("n_rows")
+                or entry.get("row_count")
+                or entry.get("rows")
+            )
+            non_null = _coerce_positive_count(
+                entry.get("non_null_count")
+                or entry.get("n_non_null")
+                or entry.get("non_null_rows")
+                or entry.get("labeled_rows")
+            )
+            if non_null is None and isinstance(total, int):
+                null_frac = _coerce_ratio(entry.get("null_frac"))
+                if null_frac is not None:
+                    inferred_non_null = int(round(total * (1.0 - null_frac)))
+                    if inferred_non_null > 0 and inferred_non_null <= total:
+                        non_null = inferred_non_null
+            if isinstance(total, int) and isinstance(non_null, int) and total > non_null:
+                return True
+            null_frac = _coerce_ratio(entry.get("null_frac"))
+            if null_frac is not None and null_frac > 0.0:
+                return True
+        n_train = row_count_hints.get("n_train")
+        n_total = row_count_hints.get("n_total")
+        return bool(
+            isinstance(n_train, int)
+            and isinstance(n_total, int)
+            and n_total > n_train
+        )
+
+    split_column = _resolve_split_column()
+    target_for_partitioning = _resolve_target_for_partitioning()
+    partial_labels_detected = _target_has_partial_labels(target_for_partitioning)
+
+    if not isinstance(training_rows_rule, str) or not training_rows_rule.strip():
+        if partial_labels_detected and target_for_partitioning:
+            training_rows_rule = f"rows where {target_for_partitioning} is not missing"
+            data_partitioning_notes.append(
+                "Training rows inferred from target missingness (target not null)."
+            )
+        elif split_column:
+            training_rows_rule = f"rows where {split_column} indicates training split"
+            data_partitioning_notes.append(
+                f"Training rows inferred from split column '{split_column}'."
+            )
+
+    if not isinstance(scoring_rows_rule, str) or not scoring_rows_rule.strip():
+        if partial_labels_detected and target_for_partitioning:
+            scoring_rows_rule = f"rows where {target_for_partitioning} is missing"
+            data_partitioning_notes.append(
+                "Scoring rows inferred as rows without target labels."
+            )
+        elif split_column:
+            scoring_rows_rule = f"rows where {split_column} indicates scoring/test split"
+            data_partitioning_notes.append(
+                f"Scoring rows inferred from split column '{split_column}'."
+            )
+
+    partitioning_notes_dedup: List[str] = []
+    for note in data_partitioning_notes:
+        text = str(note or "").strip()
+        if text and text not in partitioning_notes_dedup:
+            partitioning_notes_dedup.append(text)
+    data_partitioning_notes = partitioning_notes_dedup
+
+    n_train_rows = row_count_hints.get("n_train")
+    n_test_rows = row_count_hints.get("n_test")
+    n_total_rows = row_count_hints.get("n_total")
+    has_subset_row_target = bool(
+        isinstance(n_test_rows, int)
+        and isinstance(n_total_rows, int)
+        and n_test_rows > 0
+        and n_total_rows > n_test_rows
+    )
+
+    def _is_subset_output_kind(kind: str) -> bool:
+        normalized_kind = re.sub(r"[^a-z0-9]+", "_", str(kind or "").lower()).strip("_")
+        return normalized_kind in {
+            "submission",
+            "prediction",
+            "predictions",
+            "forecast",
+            "ranking",
+            "ranking_scores",
+            "recommendations",
+        }
+
+    requires_subset_outputs = False
+    if has_subset_row_target:
+        for path, kind in artifact_kind_map.items():
+            if _is_subset_output_kind(kind):
+                requires_subset_outputs = True
+                break
+            if "submission" in path:
+                requires_subset_outputs = True
+                break
+        if not requires_subset_outputs:
+            for schema in normalized_file_schemas.values():
+                if not isinstance(schema, dict):
+                    continue
+                expected_rows = _resolve_expected_row_count(schema.get("expected_row_count"))
+                if isinstance(expected_rows, int) and isinstance(n_total_rows, int) and expected_rows < n_total_rows:
+                    requires_subset_outputs = True
+                    break
+
+    train_filter = contract.get("train_filter")
+    if not isinstance(train_filter, dict):
+        if partial_labels_detected and target_for_partitioning:
+            train_filter = {
+                "type": "label_not_null",
+                "column": target_for_partitioning,
+                "value": None,
+                "rule": training_rows_rule,
+            }
+        elif split_column:
+            train_filter = {
+                "type": "split_equals",
+                "column": split_column,
+                "value": "train",
+                "rule": training_rows_rule,
+            }
+        else:
+            train_filter = {}
+
+    split_status = "unknown"
+    if isinstance(train_filter, dict) and train_filter:
+        split_status = "resolved"
+    elif split_column or training_rows_rule or scoring_rows_rule:
+        split_status = "partial"
+    if requires_subset_outputs and split_status == "unknown":
+        data_partitioning_notes.append(
+            "FAIL_CLOSED: subset output artifacts are required but split resolution is unresolved."
+        )
+
+    split_spec: Dict[str, Any] = {
+        "status": split_status,
+        "target_column": target_for_partitioning,
+        "split_column": split_column,
+        "training_rows_rule": training_rows_rule,
+        "scoring_rows_rule": scoring_rows_rule,
+        "training_rows_policy": (
+            "only_rows_with_label"
+            if partial_labels_detected and target_for_partitioning
+            else ("use_split_column" if split_column else "use_all_rows")
+        ),
+        "train_filter": train_filter,
+        "requires_test_only_outputs": requires_subset_outputs,
+    }
+    if isinstance(n_train_rows, int) and n_train_rows > 0:
+        split_spec["n_train_rows"] = n_train_rows
+    if isinstance(n_test_rows, int) and n_test_rows > 0:
+        split_spec["n_test_rows"] = n_test_rows
+    if isinstance(n_total_rows, int) and n_total_rows > 0:
+        split_spec["n_total_rows"] = n_total_rows
+
     validation_requirements = contract.get("validation_requirements")
     if not isinstance(validation_requirements, dict) or not validation_requirements:
         # Build from strategy instead of hardcoding holdout/accuracy
@@ -4380,7 +4751,14 @@ def build_contract_min(
         "evaluation_spec": evaluation_spec,
         "iteration_policy": iteration_policy,
         "optimization_policy": optimization_policy,
+        "split_spec": split_spec,
     }
+    if isinstance(n_train_rows, int) and n_train_rows > 0:
+        contract_min["n_train_rows"] = n_train_rows
+    if isinstance(n_test_rows, int) and n_test_rows > 0:
+        contract_min["n_test_rows"] = n_test_rows
+    if isinstance(n_total_rows, int) and n_total_rows > 0:
+        contract_min["n_total_rows"] = n_total_rows
     if prep_reqs_min:
         contract_min["preprocessing_requirements"] = prep_reqs_min
     if training_rows_rule:

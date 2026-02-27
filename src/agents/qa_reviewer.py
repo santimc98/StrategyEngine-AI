@@ -1599,12 +1599,77 @@ def _extract_row_count_hints_for_qa(evaluation_spec: Dict[str, Any] | None) -> D
                 if parsed is not None:
                     hints["n_test"] = parsed
 
+    def _coerce_ratio(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            ratio = float(value)
+        elif isinstance(value, str):
+            token = value.strip()
+            if not token:
+                return None
+            try:
+                ratio = float(token)
+            except Exception:
+                return None
+        else:
+            return None
+        if ratio < 0.0 or ratio > 1.0:
+            return None
+        return ratio
+
+    def _scan_outcome_counts(source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        outcome_analysis = source.get("outcome_analysis")
+        if not isinstance(outcome_analysis, dict):
+            return
+        for entry in outcome_analysis.values():
+            if not isinstance(entry, dict):
+                continue
+            total = _coerce_positive_row_count(
+                entry.get("total_count")
+                or entry.get("n_total_rows")
+                or entry.get("n_rows")
+                or entry.get("row_count")
+                or entry.get("rows")
+            )
+            non_null = _coerce_positive_row_count(
+                entry.get("non_null_count")
+                or entry.get("n_non_null")
+                or entry.get("non_null_rows")
+                or entry.get("labeled_rows")
+                or entry.get("train_rows")
+            )
+            if non_null is None and isinstance(total, int):
+                null_frac = _coerce_ratio(entry.get("null_frac"))
+                if null_frac is not None:
+                    inferred_non_null = int(round(total * (1.0 - null_frac)))
+                    if inferred_non_null > 0 and inferred_non_null <= total:
+                        non_null = inferred_non_null
+            if "n_total" not in hints and isinstance(total, int):
+                hints["n_total"] = total
+            if "n_train" not in hints and isinstance(non_null, int):
+                hints["n_train"] = non_null
+            if (
+                "n_test" not in hints
+                and isinstance(total, int)
+                and isinstance(non_null, int)
+                and total >= non_null
+            ):
+                inferred_test = total - non_null
+                if inferred_test > 0:
+                    hints["n_test"] = inferred_test
+            if "n_train" in hints and "n_test" in hints and "n_total" in hints:
+                return
+
     nested_eval = evaluation_spec.get("evaluation_spec") if isinstance(evaluation_spec.get("evaluation_spec"), dict) else {}
     artifact_reqs = (
         evaluation_spec.get("artifact_requirements")
         if isinstance(evaluation_spec.get("artifact_requirements"), dict)
         else {}
     )
+    split_spec = evaluation_spec.get("split_spec") if isinstance(evaluation_spec.get("split_spec"), dict) else {}
     nested_dataset_profile = (
         evaluation_spec.get("dataset_profile")
         if isinstance(evaluation_spec.get("dataset_profile"), dict)
@@ -1615,10 +1680,12 @@ def _extract_row_count_hints_for_qa(evaluation_spec: Dict[str, Any] | None) -> D
         evaluation_spec,
         nested_eval,
         artifact_reqs,
+        split_spec,
         nested_dataset_profile,
         data_profile,
     ):
         _scan(source)
+        _scan_outcome_counts(source)
 
     n_train = hints.get("n_train")
     n_test = hints.get("n_test")
@@ -1649,8 +1716,6 @@ def _resolve_expected_csv_row_counts_for_qa(
     if not artifact_reqs and isinstance(nested_eval.get("artifact_requirements"), dict):
         artifact_reqs = nested_eval.get("artifact_requirements")
     file_schemas = artifact_reqs.get("file_schemas") if isinstance(artifact_reqs, dict) else None
-    if not isinstance(file_schemas, dict):
-        return expected
 
     alias_map = {
         "n_train": row_hints.get("n_train"),
@@ -1665,17 +1730,58 @@ def _resolve_expected_csv_row_counts_for_qa(
         "n_rows": row_hints.get("n_total"),
         "row_count": row_hints.get("n_total"),
     }
-    for raw_path, schema in file_schemas.items():
-        path = _normalize_artifact_path_for_match(raw_path)
-        if not path or not path.lower().endswith(".csv") or not isinstance(schema, dict):
-            continue
-        resolved = _coerce_positive_row_count(schema.get("expected_row_count"))
-        if resolved is None and isinstance(schema.get("expected_row_count"), str):
-            token = re.sub(r"[^a-z0-9]+", "_", schema.get("expected_row_count", "").lower()).strip("_")
-            candidate = alias_map.get(token)
-            resolved = int(candidate) if isinstance(candidate, int) and candidate > 0 else None
-        if resolved is not None:
-            expected[path] = int(resolved)
+    if isinstance(file_schemas, dict):
+        for raw_path, schema in file_schemas.items():
+            path = _normalize_artifact_path_for_match(raw_path)
+            if not path or not path.lower().endswith(".csv") or not isinstance(schema, dict):
+                continue
+            resolved = _coerce_positive_row_count(schema.get("expected_row_count"))
+            if resolved is None and isinstance(schema.get("expected_row_count"), str):
+                token = re.sub(r"[^a-z0-9]+", "_", schema.get("expected_row_count", "").lower()).strip("_")
+                candidate = alias_map.get(token)
+                resolved = int(candidate) if isinstance(candidate, int) and candidate > 0 else None
+            if resolved is not None:
+                expected[path] = int(resolved)
+
+    n_total = row_hints.get("n_total")
+    n_test = row_hints.get("n_test")
+    if not (isinstance(n_total, int) and isinstance(n_test, int) and n_total > 0 and n_test > 0 and n_test < n_total):
+        return expected
+
+    def _infer_kind_from_path(path_value: str) -> str:
+        base = os.path.basename(path_value).lower()
+        if "submission" in base:
+            return "submission"
+        if "scored_rows" in base or "scored-rows" in base:
+            return "scored_rows"
+        if "prediction" in base or "predictions" in base:
+            return "prediction"
+        if "forecast" in base:
+            return "forecast"
+        if "ranking" in base:
+            return "ranking"
+        return ""
+
+    def _ingest_paths(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if isinstance(item, dict):
+                raw_path = item.get("path") or item.get("output") or item.get("artifact")
+            else:
+                raw_path = item
+            path = _normalize_artifact_path_for_match(raw_path)
+            if not path or not path.lower().endswith(".csv") or path in expected:
+                continue
+            kind = _infer_kind_from_path(path)
+            if kind == "scored_rows":
+                expected[path] = int(n_total)
+            elif kind in {"submission", "prediction", "forecast", "ranking"}:
+                expected[path] = int(n_test)
+
+    _ingest_paths(artifact_reqs.get("required_outputs"))
+    _ingest_paths(artifact_reqs.get("optional_outputs"))
+    _ingest_paths(artifact_reqs.get("required_files"))
     return expected
 
 

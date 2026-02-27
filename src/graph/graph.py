@@ -12439,6 +12439,15 @@ def _finalize_heavy_execution(
                 f"but contract requires {mm.get('expected_row_count')} rows. "
                 "Filter to the correct row subset before .to_csv()."
             )
+    split_spec = contract.get("split_spec") if isinstance(contract, dict) else None
+    if isinstance(split_spec, dict):
+        split_status = str(split_spec.get("status") or "").strip().lower()
+        requires_subset_outputs = bool(split_spec.get("requires_test_only_outputs"))
+        if requires_subset_outputs and split_status in {"unknown", "unresolved", "ambiguous"}:
+            content_issues.append(
+                "SPLIT_SPEC_UNRESOLVED: contract requires subset-sized output artifacts but split resolution is unresolved. "
+                "Set an explicit train/test rule (split_column or label-not-null filter) before writing CSV outputs."
+            )
 
     artifact_paths: List[str] = []
     if isinstance(oc_report, dict):
@@ -18687,6 +18696,15 @@ def execute_code(state: AgentState) -> AgentState:
                 f"OUTPUT_ROW_COUNT_MISMATCH: {mm.get('path')} has {mm.get('actual_row_count')} rows "
                 f"but contract requires {mm.get('expected_row_count')} rows. "
                 "Filter to the correct row subset before .to_csv()."
+            )
+    split_spec = contract.get("split_spec") if isinstance(contract, dict) else None
+    if isinstance(split_spec, dict):
+        split_status = str(split_spec.get("status") or "").strip().lower()
+        requires_subset_outputs = bool(split_spec.get("requires_test_only_outputs"))
+        if requires_subset_outputs and split_status in {"unknown", "unresolved", "ambiguous"}:
+            content_issues.append(
+                "SPLIT_SPEC_UNRESOLVED: contract requires subset-sized output artifacts but split resolution is unresolved. "
+                "Set an explicit train/test rule (split_column or label-not-null filter) before writing CSV outputs."
             )
 
     if run_id:

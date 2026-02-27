@@ -118,6 +118,10 @@ ALLOWED_TOP_LEVEL_KEYS_V41: Set[str] = {
     "scoring_rows_rule",
     "secondary_scoring_subset",
     "data_partitioning_notes",
+    "split_spec",
+    "n_train_rows",
+    "n_test_rows",
+    "n_total_rows",
     # Metadata
     "iteration_policy",
     "unknowns",

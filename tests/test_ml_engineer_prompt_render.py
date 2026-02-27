@@ -71,3 +71,21 @@ def test_ml_engineer_partitioning_context_renders_expected_row_hints():
     assert "Test/scoring rows: 270,000" in context
     assert "data/submission.csv: MUST contain TEST/SCORING rows only (270,000 rows)" in context
     assert "Train filter rule: (is_train == 1) & (target.notnull())" in context
+
+
+def test_ml_engineer_partitioning_context_renders_rules_without_row_counts():
+    agent = MLEngineerAgent.__new__(MLEngineerAgent)
+    contract = {
+        "split_spec": {
+            "status": "resolved",
+            "split_column": "is_train",
+            "training_rows_rule": "rows where target is not missing",
+            "scoring_rows_rule": "rows where target is missing",
+            "training_rows_policy": "only_rows_with_label",
+            "train_filter": {"type": "label_not_null", "column": "target"},
+        }
+    }
+    context = agent._build_data_partitioning_context(contract, {}, {})
+    assert "DATA PARTITIONING CONTEXT" in context
+    assert "Split resolution status: resolved" in context
+    assert "Train filter rule: Filter training rows where 'target' is not null." in context

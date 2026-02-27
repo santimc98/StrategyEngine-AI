@@ -321,3 +321,61 @@ def test_contract_min_infers_expected_row_count_when_deliverable_kind_is_missing
     file_schemas = contract_min.get("artifact_requirements", {}).get("file_schemas", {})
     assert file_schemas.get("data/submission.csv", {}).get("expected_row_count") == 270000
     assert file_schemas.get("data/scored_rows.csv", {}).get("expected_row_count") == 900000
+
+
+def test_contract_min_infers_row_hints_from_outcome_analysis_counts() -> None:
+    inventory = ["id", "feature_a", "target", "is_train"]
+    strategy = {"required_columns": ["id", "feature_a", "target", "is_train"]}
+    data_profile = {
+        "basic_stats": {"n_rows": 900000},
+        "outcome_analysis": {
+            "target": {
+                "non_null_count": 630000,
+                "total_count": 900000,
+                "null_frac": 0.3,
+            }
+        },
+        "split_candidates": [{"column": "is_train", "unique_values_sample": ["1", "0"]}],
+    }
+    full_contract = {
+        "outcome_columns": ["target"],
+        "required_outputs": ["data/submission.csv", "data/scored_rows.csv"],
+        "artifact_requirements": {"required_files": [{"path": "data/submission.csv"}, {"path": "data/scored_rows.csv"}]},
+    }
+
+    contract_min = build_contract_min(
+        full_contract,
+        strategy,
+        inventory,
+        inventory,
+        data_profile=data_profile,
+    )
+    file_schemas = contract_min.get("artifact_requirements", {}).get("file_schemas", {})
+    split_spec = contract_min.get("split_spec", {})
+
+    assert file_schemas.get("data/submission.csv", {}).get("expected_row_count") == 270000
+    assert file_schemas.get("data/scored_rows.csv", {}).get("expected_row_count") == 900000
+    assert split_spec.get("n_train_rows") == 630000
+    assert split_spec.get("n_test_rows") == 270000
+    assert split_spec.get("training_rows_policy") == "only_rows_with_label"
+
+
+def test_contract_min_infers_expected_rows_from_required_outputs_paths_only() -> None:
+    inventory = ["id", "feature_a", "target"]
+    strategy = {"required_columns": ["id", "feature_a", "target"]}
+    full_contract = {
+        "required_outputs": ["data/submission.csv", "data/scored_rows.csv"],
+        "artifact_requirements": {"required_files": [{"path": "data/submission.csv"}, {"path": "data/scored_rows.csv"}]},
+        "dataset_profile": {"n_train_rows": 630000, "n_test_rows": 270000},
+    }
+
+    contract_min = build_contract_min(
+        full_contract,
+        strategy,
+        inventory,
+        inventory,
+        data_profile={"n_train_rows": 630000, "n_test_rows": 270000},
+    )
+    file_schemas = contract_min.get("artifact_requirements", {}).get("file_schemas", {})
+    assert file_schemas.get("data/submission.csv", {}).get("expected_row_count") == 270000
+    assert file_schemas.get("data/scored_rows.csv", {}).get("expected_row_count") == 900000
