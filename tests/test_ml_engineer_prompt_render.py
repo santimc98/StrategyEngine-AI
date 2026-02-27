@@ -26,3 +26,48 @@ def test_ml_engineer_prompt_renders_decisioning_and_visual_context():
     assert "VISUAL REQUIREMENTS" in prompt
     assert "priority_rank" in prompt
     assert "dist" in prompt
+
+
+def test_ml_engineer_artifact_schema_block_includes_expected_row_count():
+    agent = MLEngineerAgent.__new__(MLEngineerAgent)
+    contract = {
+        "artifact_requirements": {
+            "file_schemas": {
+                "data/submission.csv": {
+                    "required_columns": ["id", "prediction"],
+                    "expected_row_count": 270000,
+                }
+            }
+        }
+    }
+    block = agent._render_artifact_schema_block(contract, {})
+    assert "ARTIFACT: data/submission.csv" in block
+    assert "EXPECTED_ROW_COUNT: 270,000 rows" in block
+
+
+def test_ml_engineer_partitioning_context_renders_expected_row_hints():
+    agent = MLEngineerAgent.__new__(MLEngineerAgent)
+    contract = {
+        "evaluation_spec": {"n_train_rows": 630000, "n_test_rows": 270000},
+        "artifact_requirements": {
+            "file_schemas": {
+                "data/submission.csv": {"expected_row_count": 270000},
+                "data/scored_rows.csv": {"expected_row_count": 900000},
+            }
+        },
+    }
+    ml_plan = {
+        "training_rows_policy": "custom",
+        "split_column": "is_train",
+        "train_filter": {
+            "type": "custom_rule",
+            "rule": "(is_train == 1) & (target.notnull())",
+        },
+    }
+    context = agent._build_data_partitioning_context(contract, {}, ml_plan)
+    assert "DATA PARTITIONING CONTEXT" in context
+    assert "Total rows in cleaned dataset: 900,000" in context
+    assert "Training rows: 630,000" in context
+    assert "Test/scoring rows: 270,000" in context
+    assert "data/submission.csv: MUST contain TEST/SCORING rows only (270,000 rows)" in context
+    assert "Train filter rule: (is_train == 1) & (target.notnull())" in context

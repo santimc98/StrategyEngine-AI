@@ -285,3 +285,39 @@ def test_contract_min_resolves_expected_row_count_alias_tokens() -> None:
     )
     file_schemas = contract_min.get("artifact_requirements", {}).get("file_schemas", {})
     assert file_schemas.get("data/submission.csv", {}).get("expected_row_count") == 4
+
+
+def test_contract_min_infers_expected_row_count_when_deliverable_kind_is_missing() -> None:
+    inventory = ["id", "is_train", "feature_a"]
+    strategy = {"required_columns": ["id", "is_train", "feature_a"]}
+    row_hints = {"n_train_rows": 630000, "n_test_rows": 270000}
+    full_contract = {
+        "required_output_artifacts": [
+            {"path": "data/submission.csv", "required": True},
+            {"path": "data/scored_rows.csv", "required": True},
+        ],
+        "spec_extraction": {
+            "deliverables": [
+                {"path": "data/submission.csv", "required": True},
+                {"path": "data/scored_rows.csv", "required": True},
+            ]
+        },
+        "artifact_requirements": {
+            "required_files": [
+                {"path": "data/submission.csv"},
+                {"path": "data/scored_rows.csv"},
+            ]
+        },
+        "dataset_profile": row_hints,
+    }
+
+    contract_min = build_contract_min(
+        full_contract,
+        strategy,
+        inventory,
+        inventory,
+        data_profile=row_hints,
+    )
+    file_schemas = contract_min.get("artifact_requirements", {}).get("file_schemas", {})
+    assert file_schemas.get("data/submission.csv", {}).get("expected_row_count") == 270000
+    assert file_schemas.get("data/scored_rows.csv", {}).get("expected_row_count") == 900000

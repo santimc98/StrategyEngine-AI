@@ -3991,6 +3991,22 @@ def build_contract_min(
     def _collect_artifact_kind_map(contract_payload: Dict[str, Any]) -> Dict[str, str]:
         mapping: Dict[str, str] = {}
 
+        def _infer_kind_from_path(normalized_path: str) -> str | None:
+            basename = normalized_path.lower().rsplit("/", 1)[-1]
+            if not basename:
+                return None
+            if "submission" in basename:
+                return "submission"
+            if "scored_rows" in basename or "scored-rows" in basename:
+                return "scored_rows"
+            if "prediction" in basename or "predictions" in basename:
+                return "prediction"
+            if "forecast" in basename:
+                return "forecast"
+            if "ranking" in basename:
+                return "ranking"
+            return None
+
         def _ingest(items: Any) -> None:
             if not isinstance(items, list):
                 return
@@ -4001,6 +4017,10 @@ def build_contract_min(
                     entry.get("path") or entry.get("output") or entry.get("artifact")
                 )
                 kind = str(entry.get("kind") or "").strip()
+                if not kind and path:
+                    inferred_kind = _infer_kind_from_path(path)
+                    if inferred_kind:
+                        kind = inferred_kind
                 if path and kind and path.lower() not in mapping:
                     mapping[path.lower()] = kind
 

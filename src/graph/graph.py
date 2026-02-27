@@ -12410,14 +12410,35 @@ def _finalize_heavy_execution(
             content_issues=content_issues,
         )
 
-    # Validate only ML engineer's outputs in post-ML finalization
-    from src.utils.output_contract import check_required_outputs_for_owner
-    oc_report = check_required_outputs_for_owner(output_contract, "ml_engineer")
+    # Validate only ML engineer's outputs in post-ML finalization.
+    # Prefer full contract validation when artifact_requirements are available.
+    if isinstance(contract, dict) and isinstance(contract.get("artifact_requirements"), dict):
+        from src.utils.output_contract import build_output_contract_report
+        oc_report = build_output_contract_report(contract, work_dir=".")
+    else:
+        from src.utils.output_contract import check_required_outputs_for_owner
+        oc_report = check_required_outputs_for_owner(output_contract, "ml_engineer")
     try:
         os.makedirs("data", exist_ok=True)
         dump_json("data/output_contract_report.json", oc_report)
     except Exception as oc_err:
         print(f"Warning: failed to persist output_contract_report.json: {oc_err}")
+
+    row_mismatches: List[Dict[str, Any]] = []
+    artifact_report = oc_report.get("artifact_requirements_report") if isinstance(oc_report, dict) else None
+    if isinstance(artifact_report, dict):
+        rc_report = artifact_report.get("row_count_report")
+        if isinstance(rc_report, dict):
+            raw_mismatches = rc_report.get("mismatches") or []
+            if isinstance(raw_mismatches, list):
+                row_mismatches = [mm for mm in raw_mismatches if isinstance(mm, dict)]
+    if row_mismatches:
+        for mm in row_mismatches:
+            content_issues.append(
+                f"OUTPUT_ROW_COUNT_MISMATCH: {mm.get('path')} has {mm.get('actual_row_count')} rows "
+                f"but contract requires {mm.get('expected_row_count')} rows. "
+                "Filter to the correct row subset before .to_csv()."
+            )
 
     artifact_paths: List[str] = []
     if isinstance(oc_report, dict):
@@ -12450,7 +12471,12 @@ def _finalize_heavy_execution(
         print(f"Warning: failed to persist produced_artifact_index.json: {idx_err}")
 
     attempt_score = _score_attempt(outputs_valid, oc_report, content_issues, artifact_paths)
-    attempt_valid = bool(outputs_valid and not oc_report.get("missing") and not content_issues)
+    attempt_valid = bool(
+        outputs_valid
+        and not oc_report.get("missing")
+        and not content_issues
+        and not row_mismatches
+    )
 
     result = {
         "execution_output": output,
@@ -18632,16 +18658,36 @@ def execute_code(state: AgentState) -> AgentState:
     else:
         has_partial_visuals = len(plots_local) > 0
 
-    # Validate required outputs early
+    # Validate required outputs early. Prefer full contract validation when possible.
     contract = state.get("execution_contract", {}) or {}
     deliverables = _resolve_contract_deliverables(contract)
     output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
-    oc_report = check_required_outputs(output_contract)
+    if isinstance(contract, dict) and isinstance(contract.get("artifact_requirements"), dict):
+        from src.utils.output_contract import build_output_contract_report
+        oc_report = build_output_contract_report(contract, work_dir=".")
+    else:
+        oc_report = check_required_outputs(output_contract)
     try:
         os.makedirs("data", exist_ok=True)
         dump_json("data/output_contract_report.json", oc_report)
     except Exception as oc_err:
         print(f"Warning: failed to persist output_contract_report.json: {oc_err}")
+
+    row_mismatches: List[Dict[str, Any]] = []
+    artifact_report = oc_report.get("artifact_requirements_report") if isinstance(oc_report, dict) else None
+    if isinstance(artifact_report, dict):
+        rc_report = artifact_report.get("row_count_report")
+        if isinstance(rc_report, dict):
+            raw_mismatches = rc_report.get("mismatches") or []
+            if isinstance(raw_mismatches, list):
+                row_mismatches = [mm for mm in raw_mismatches if isinstance(mm, dict)]
+    if row_mismatches:
+        for mm in row_mismatches:
+            content_issues.append(
+                f"OUTPUT_ROW_COUNT_MISMATCH: {mm.get('path')} has {mm.get('actual_row_count')} rows "
+                f"but contract requires {mm.get('expected_row_count')} rows. "
+                "Filter to the correct row subset before .to_csv()."
+            )
 
     if run_id:
         log_run_event(
@@ -18683,7 +18729,12 @@ def execute_code(state: AgentState) -> AgentState:
         print(f"Warning: failed to persist produced_artifact_index.json: {idx_err}")
 
     attempt_score = _score_attempt(outputs_valid, oc_report, content_issues, artifact_paths)
-    attempt_valid = bool(outputs_valid and not oc_report.get("missing") and not content_issues)
+    attempt_valid = bool(
+        outputs_valid
+        and not oc_report.get("missing")
+        and not content_issues
+        and not row_mismatches
+    )
 
     result = {
         "execution_output": output,

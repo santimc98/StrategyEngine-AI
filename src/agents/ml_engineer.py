@@ -443,6 +443,16 @@ class MLEngineerAgent:
                             )
                 output_path = schema_def.get("path") or file_path
                 lines.append(f"  OUTPUT_PATH: {output_path}")
+                expected_rc = schema_def.get("expected_row_count")
+                if expected_rc is not None:
+                    try:
+                        expected_rc_int = int(expected_rc)
+                        if expected_rc_int > 0:
+                            lines.append(
+                                f"  EXPECTED_ROW_COUNT: {expected_rc_int:,} rows (MUST match exactly - contract enforced)"
+                            )
+                    except (TypeError, ValueError):
+                        pass
 
         # --- clean_dataset required columns ---
         clean_ds = artifact_reqs.get("clean_dataset")
@@ -1539,6 +1549,7 @@ class MLEngineerAgent:
             ("execution_contract_context", 9000),
             ("ml_view_context", 8000),
             ("artifact_schema_block", 2500),
+            ("data_partitioning_context", 2500),
         ]
         for key, budget in shrink_plan:
             if key not in kwargs:
@@ -1685,6 +1696,200 @@ class MLEngineerAgent:
             "split_column": split_column,
             "train_filter": train_filter,
         }
+
+    def _build_data_partitioning_context(
+        self,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+        ml_plan: Dict[str, Any] | None,
+    ) -> str:
+        contract = execution_contract if isinstance(execution_contract, dict) else {}
+        view = ml_view if isinstance(ml_view, dict) else {}
+        plan_context = self._extract_training_context(contract, view, ml_plan)
+
+        def _coerce_positive_int(value: Any) -> int | None:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return int(value) if value > 0 else None
+            if isinstance(value, float):
+                if value.is_integer() and value > 0:
+                    return int(value)
+                return None
+            if isinstance(value, str):
+                token = value.strip().replace(",", "")
+                if not token:
+                    return None
+                if token.isdigit():
+                    parsed = int(token)
+                    return parsed if parsed > 0 else None
+            return None
+
+        row_hints: Dict[str, int | None] = {"n_train": None, "n_test": None, "n_total": None}
+        train_aliases = {
+            "n_train",
+            "n_train_rows",
+            "train_rows",
+            "train_row_count",
+            "train_count",
+            "train_size",
+        }
+        test_aliases = {
+            "n_test",
+            "n_test_rows",
+            "test_rows",
+            "test_row_count",
+            "test_count",
+            "scoring_rows",
+            "n_scoring_rows",
+            "score_rows",
+        }
+        total_aliases = {
+            "n_total",
+            "n_total_rows",
+            "n_rows",
+            "total_rows",
+            "row_count",
+            "rows",
+        }
+
+        def _scan_counts(node: Any, depth: int = 0) -> None:
+            if depth > 5:
+                return
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    key_norm = re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_")
+                    parsed = _coerce_positive_int(value)
+                    if key_norm in train_aliases and row_hints["n_train"] is None and parsed is not None:
+                        row_hints["n_train"] = int(parsed)
+                    elif key_norm in test_aliases and row_hints["n_test"] is None and parsed is not None:
+                        row_hints["n_test"] = int(parsed)
+                    elif key_norm in total_aliases and row_hints["n_total"] is None and parsed is not None:
+                        row_hints["n_total"] = int(parsed)
+
+                    if isinstance(value, (dict, list, tuple)):
+                        _scan_counts(value, depth + 1)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    if isinstance(item, (dict, list, tuple)):
+                        _scan_counts(item, depth + 1)
+
+        contract_data_profile = contract.get("data_profile") if isinstance(contract.get("data_profile"), dict) else {}
+        view_data_profile = view.get("data_profile") if isinstance(view.get("data_profile"), dict) else {}
+        sources = [
+            contract,
+            view,
+            contract.get("evaluation_spec"),
+            view.get("evaluation_spec"),
+            contract.get("execution_constraints"),
+            view.get("execution_constraints"),
+            contract_data_profile,
+            view_data_profile,
+            contract_data_profile.get("basic_stats"),
+            view_data_profile.get("basic_stats"),
+        ]
+        for source in sources:
+            _scan_counts(source)
+
+        n_train = row_hints.get("n_train")
+        n_test = row_hints.get("n_test")
+        n_total = row_hints.get("n_total")
+        if n_total is None and n_train is not None and n_test is not None:
+            n_total = int(n_train + n_test)
+            row_hints["n_total"] = n_total
+        if n_test is None and n_total is not None and n_train is not None and n_total >= n_train:
+            n_test = int(n_total - n_train)
+            row_hints["n_test"] = n_test
+        if n_train is None and n_total is not None and n_test is not None and n_total >= n_test:
+            n_train = int(n_total - n_test)
+            row_hints["n_train"] = n_train
+
+        artifact_reqs = contract.get("artifact_requirements")
+        if not isinstance(artifact_reqs, dict):
+            artifact_reqs = view.get("artifact_requirements")
+        file_schemas = artifact_reqs.get("file_schemas") if isinstance(artifact_reqs, dict) else {}
+
+        artifact_row_expectations: List[Dict[str, Any]] = []
+        if isinstance(file_schemas, dict):
+            for raw_path, schema_def in file_schemas.items():
+                if not isinstance(schema_def, dict):
+                    continue
+                expected_count = _coerce_positive_int(schema_def.get("expected_row_count"))
+                if expected_count is None:
+                    continue
+                path = str(schema_def.get("path") or raw_path or "").strip()
+                if not path:
+                    continue
+                expectation = "exact row subset"
+                if n_test is not None and expected_count == n_test:
+                    expectation = "TEST/SCORING rows only"
+                elif n_train is not None and expected_count == n_train:
+                    expectation = "TRAINING rows only"
+                elif n_total is not None and expected_count == n_total:
+                    expectation = "ALL rows"
+                artifact_row_expectations.append(
+                    {
+                        "path": path,
+                        "expected_row_count": expected_count,
+                        "expectation": expectation,
+                    }
+                )
+
+        has_row_context = any(isinstance(v, int) and v > 0 for v in row_hints.values()) or bool(artifact_row_expectations)
+        if not has_row_context:
+            return ""
+
+        training_policy = str(plan_context.get("training_rows_policy") or "unspecified")
+        split_column = str(plan_context.get("split_column") or "").strip()
+        train_filter = plan_context.get("train_filter")
+        train_filter_rule = self._describe_train_filter(
+            train_filter if isinstance(train_filter, dict) else None,
+            plan_context.get("target_column"),
+            plan_context.get("split_column"),
+        )
+        if isinstance(train_filter, dict):
+            custom_rule = train_filter.get("rule")
+            if isinstance(custom_rule, str) and custom_rule.strip():
+                train_filter_rule = custom_rule.strip()
+
+        lines = ["=== DATA PARTITIONING CONTEXT (CRITICAL - READ BEFORE WRITING ANY CSV) ==="]
+        if n_total is not None:
+            lines.append(f"Total rows in cleaned dataset: {n_total:,}")
+        if n_train is not None:
+            lines.append(f"Training rows: {n_train:,} (apply train_filter below before model.fit)")
+        if n_test is not None:
+            lines.append(f"Test/scoring rows: {n_test:,} (rows NOT used for training)")
+        lines.append(f"Training row selection policy: {training_policy}")
+        if split_column:
+            lines.append(f"Split column: {split_column}")
+        lines.append(f"Train filter rule: {train_filter_rule}")
+
+        if artifact_row_expectations:
+            lines.append("")
+            lines.append("REQUIRED OUTPUT ARTIFACT ROW COUNTS (contract-enforced):")
+            for item in artifact_row_expectations:
+                lines.append(
+                    "  - {path}: MUST contain {expectation} ({rows:,} rows)".format(
+                        path=item["path"],
+                        expectation=item["expectation"],
+                        rows=int(item["expected_row_count"]),
+                    )
+                )
+
+        lines.append("")
+        lines.append("CRITICAL RULES:")
+        if n_test is not None:
+            lines.append(
+                f"  - Any artifact with expected_row_count={n_test:,} MUST contain TEST/SCORING rows only. NEVER write the full dataframe."
+            )
+        if n_total is not None:
+            lines.append(
+                f"  - Any artifact with expected_row_count={n_total:,} MUST contain ALL rows."
+            )
+        lines.append(
+            "  - Always filter to the correct subset BEFORE calling .to_csv(). Add an explicit len() assertion after writing each artifact."
+        )
+        return "\n".join(lines)
 
     def _code_mentions_label_filter(self, code: str, target: str | None) -> bool:
         """
@@ -3077,6 +3282,9 @@ $strategy_json
         - Bound CV/search complexity to fit budget and avoid uncontrolled loops.
         - Use chunked scoring for large outputs when needed.
 
+        DATA PARTITIONING CONTEXT
+        $data_partitioning_context
+
         AUTHORITATIVE CONTEXT
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title ($analysis_type)
@@ -3137,6 +3345,11 @@ $strategy_json
         artifact_schema_block = self._render_artifact_schema_block(
             execution_contract=execution_contract_input,
             ml_view=ml_view,
+        )
+        data_partitioning_context = self._build_data_partitioning_context(
+            execution_contract=execution_contract_input,
+            ml_view=ml_view,
+            ml_plan=ml_plan,
         )
 
         # V4.1: Use ml_engineer_runbook directly, no legacy role_runbooks
@@ -3445,6 +3658,7 @@ $strategy_json
             execution_profile_json=execution_profile_json,
             dataset_scale=dataset_scale,
             artifact_schema_block=artifact_schema_block,
+            data_partitioning_context=data_partitioning_context,
         )
         # Safe Rendering for System Prompt
         system_prompt, render_kwargs, prompt_budget_meta = self._build_system_prompt_with_budget(

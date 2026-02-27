@@ -55,6 +55,7 @@ _CONTRACT_FALLBACK_WARNING = "CONTRACT_BROKEN_FALLBACK: qa_gates missing; please
 # must always be present regardless of contract state.
 _UNCONDITIONAL_SAFETY_GATES = [
     {"name": "security_sandbox", "severity": "HARD", "params": {}},
+    {"name": "output_row_count_consistency", "severity": "HARD", "params": {}},
 ]
 
 
