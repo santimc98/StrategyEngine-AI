@@ -8541,6 +8541,128 @@ def _build_retry_context(
     }
 
 
+def _candidate_optimization_blueprint_paths(state: Dict[str, Any], run_id: str) -> List[str]:
+    token = str(run_id or "").strip()
+    if not token:
+        return []
+    rel_parts = ["runs", token, "agents", "model_analyst", "optimization_blueprint.json"]
+    rel_path = os.path.join(*rel_parts)
+    candidates: List[str] = [rel_path]
+
+    work_dir = state.get("work_dir")
+    if isinstance(work_dir, str) and work_dir.strip():
+        candidates.append(os.path.join(work_dir, *rel_parts))
+
+    orig_cwd = state.get("orig_cwd")
+    if isinstance(orig_cwd, str) and orig_cwd.strip():
+        candidates.append(os.path.join(orig_cwd, *rel_parts))
+        candidates.append(
+            os.path.join(
+                orig_cwd,
+                "runs",
+                token,
+                "work",
+                *rel_parts,
+            )
+        )
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidates.append(os.path.join(project_root, *rel_parts))
+    candidates.append(
+        os.path.join(
+            project_root,
+            "runs",
+            token,
+            "work",
+            *rel_parts,
+        )
+    )
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        if not raw:
+            continue
+        normalized = os.path.normcase(os.path.normpath(os.path.abspath(raw)))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(os.path.abspath(raw))
+    return deduped
+
+
+def _load_optimization_blueprint_from_disk(
+    state: Dict[str, Any],
+    run_id: str,
+) -> tuple[Dict[str, Any] | None, str]:
+    for candidate_path in _candidate_optimization_blueprint_paths(state, run_id):
+        if not os.path.isfile(candidate_path):
+            continue
+        try:
+            with open(candidate_path, "r", encoding="utf-8") as f_bp:
+                payload = json.load(f_bp)
+        except Exception as exc:
+            print(f"BLUEPRINT_RECOVERY_ERROR: path={candidate_path} error={exc}")
+            continue
+        if isinstance(payload, dict) and payload:
+            return payload, candidate_path
+    return None, ""
+
+
+def _persist_optimization_blueprint_to_disk(
+    state: Dict[str, Any],
+    run_id: str,
+    blueprint: Dict[str, Any],
+) -> List[str]:
+    if not isinstance(blueprint, dict) or not blueprint:
+        return []
+    saved_paths: List[str] = []
+    for candidate_path in _candidate_optimization_blueprint_paths(state, run_id):
+        try:
+            os.makedirs(os.path.dirname(candidate_path), exist_ok=True)
+            with open(candidate_path, "w", encoding="utf-8") as f_bp:
+                json.dump(blueprint, f_bp, indent=2, default=str)
+            saved_paths.append(candidate_path)
+        except Exception as exc:
+            print(f"BLUEPRINT_PERSIST_ERROR: path={candidate_path} error={exc}")
+    return saved_paths
+
+
+def _resolve_cached_optimization_blueprint(
+    state: Dict[str, Any],
+    *,
+    run_id: str = "",
+) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    current = state.get("optimization_blueprint")
+    if isinstance(current, dict) and current:
+        return current
+
+    handoff = state.get("iteration_handoff")
+    if isinstance(handoff, dict):
+        from_handoff = handoff.get("optimization_blueprint")
+        if isinstance(from_handoff, dict) and from_handoff:
+            state["optimization_blueprint"] = from_handoff
+            return from_handoff
+
+    gate_ctx = state.get("last_gate_context")
+    if isinstance(gate_ctx, dict):
+        from_gate = gate_ctx.get("optimization_blueprint")
+        if isinstance(from_gate, dict) and from_gate:
+            state["optimization_blueprint"] = from_gate
+            return from_gate
+
+    run_token = str(run_id or state.get("run_id") or "").strip()
+    if run_token:
+        recovered, recovered_path = _load_optimization_blueprint_from_disk(state, run_token)
+        if isinstance(recovered, dict) and recovered:
+            state["optimization_blueprint"] = recovered
+            print(f"BLUEPRINT_RECOVERY: loaded optimization blueprint from {recovered_path}")
+            return recovered
+    return {}
+
+
 def _build_iteration_handoff(
     state: Dict[str, Any] | None,
     status: str | None,
@@ -8723,12 +8845,20 @@ def _build_iteration_handoff(
         and hypothesis_technique
         and hypothesis_technique.upper() != "NO_OP"
     )
+    cached_handoff = state.get("iteration_handoff") if isinstance(state.get("iteration_handoff"), dict) else {}
     optimization_context = (
         state.get("ml_optimization_context")
         if isinstance(state.get("ml_optimization_context"), dict)
         else {}
     )
+    if not optimization_context and isinstance(cached_handoff.get("optimization_context"), dict):
+        optimization_context = copy.deepcopy(cached_handoff.get("optimization_context") or {})
     if enforce_apply_hypothesis and not optimization_context:
+        run_id = str(state.get("run_id") or "")
+        tracker_recent = load_recent_experiment_entries(run_id, k=10) if run_id else []
+        round_history = state.get("ml_improvement_round_history")
+        if not isinstance(round_history, list):
+            round_history = []
         optimization_context = {
             "policy": {},
             "metric_snapshot": {
@@ -8740,9 +8870,13 @@ def _build_iteration_handoff(
             },
             "contract_lock": _build_metric_round_contract_lock(contract, required_outputs, metric_name or "unknown"),
             "active_hypothesis": compress_long_lists(hypothesis_packet or {})[0],
-            "experiment_tracker_recent": [],
-            "round_history_recent": [],
+            "experiment_tracker_recent": compress_long_lists((tracker_recent or [])[-5:])[0],
+            "round_history_recent": compress_long_lists((round_history or [])[-4:])[0],
         }
+    optimization_blueprint = _resolve_cached_optimization_blueprint(
+        state,
+        run_id=str(state.get("run_id") or ""),
+    )
     if enforce_apply_hypothesis:
         enforce_msg = (
             "Metric-improvement round: apply active hypothesis '"
@@ -8808,11 +8942,7 @@ def _build_iteration_handoff(
             else {}
         ),
         "hypothesis_packet": hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
-        "optimization_blueprint": (
-            state.get("optimization_blueprint")
-            if isinstance(state.get("optimization_blueprint"), dict)
-            else {}
-        ),
+        "optimization_blueprint": optimization_blueprint if isinstance(optimization_blueprint, dict) else {},
         "editor_constraints": {
             "must_apply_hypothesis": bool(enforce_apply_hypothesis),
             "forbid_noop": bool(enforce_apply_hypothesis),
@@ -9663,6 +9793,8 @@ class AgentState(TypedDict):
     ml_improvement_round_history: List[Dict[str, Any]]
     ml_improvement_pareto_frontier: List[Dict[str, Any]]
     ml_improvement_apply_guard_report: Dict[str, Any]
+    optimization_blueprint: Dict[str, Any]
+    ml_optimization_context: Dict[str, Any]
 
 from src.agents.domain_expert import DomainExpertAgent
 
@@ -10168,6 +10300,8 @@ def run_steward(state: AgentState) -> AgentState:
         "ml_improvement_round_history": [],
         "ml_improvement_pareto_frontier": [],
         "ml_improvement_apply_guard_report": {},
+        "optimization_blueprint": {},
+        "ml_optimization_context": {},
         "leakage_audit_summary": "",
         "restrategize_count": state.get("restrategize_count", 0) if state else 0,
         "strategist_context_override": state.get("strategist_context_override", "") if state else "",
@@ -22841,21 +22975,8 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     tracker_entries = load_recent_experiment_entries(run_id, k=20) if run_id else []
 
     # --- Model Analyst: deep baseline analysis (runs once on first round) ---
-    optimization_blueprint = state.get("optimization_blueprint")
-    # Fallback: recover blueprint from persisted file if state lost it between
-    # rounds (LangGraph state serialization may not preserve large dicts).
-    if (not isinstance(optimization_blueprint, dict) or not optimization_blueprint) and run_id:
-        try:
-            _bp_path = os.path.join("runs", run_id, "agents", "model_analyst", "optimization_blueprint.json")
-            if os.path.isfile(_bp_path):
-                with open(_bp_path) as _bp_f:
-                    _bp_recovered = json.load(_bp_f)
-                if isinstance(_bp_recovered, dict) and _bp_recovered:
-                    optimization_blueprint = _bp_recovered
-                    state["optimization_blueprint"] = optimization_blueprint
-        except Exception:
-            pass
-    if not isinstance(optimization_blueprint, dict) and int(round_id) <= 1:
+    optimization_blueprint = _resolve_cached_optimization_blueprint(state, run_id=run_id)
+    if (not isinstance(optimization_blueprint, dict) or not optimization_blueprint) and int(round_id) <= 1:
         try:
             baseline_script = str(state.get("generated_code") or state.get("last_generated_code") or "")
             analyst = ModelAnalystAgent()
@@ -22868,16 +22989,25 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
                 "models_used": (baseline_metrics or {}).get("models_used", []),
             }
             optimization_blueprint = analyst.analyze_baseline(analyst_context)
-            state["optimization_blueprint"] = optimization_blueprint
-            if run_id:
-                blueprint_dir = os.path.join("runs", run_id, "agents", "model_analyst")
-                os.makedirs(blueprint_dir, exist_ok=True)
-                with open(os.path.join(blueprint_dir, "optimization_blueprint.json"), "w") as f:
-                    json.dump(optimization_blueprint, f, indent=2, default=str)
-                print(f"MODEL_ANALYST: blueprint generated with {len(optimization_blueprint.get('improvement_actions', []))} actions")
+            if isinstance(optimization_blueprint, dict) and optimization_blueprint:
+                state["optimization_blueprint"] = optimization_blueprint
+                persisted = _persist_optimization_blueprint_to_disk(
+                    state,
+                    run_id,
+                    optimization_blueprint,
+                )
+                print(
+                    f"MODEL_ANALYST: blueprint generated with "
+                    f"{len(optimization_blueprint.get('improvement_actions', []))} actions "
+                    f"(persisted_paths={len(persisted)})"
+                )
+            else:
+                optimization_blueprint = {}
         except Exception as exc:
             print(f"MODEL_ANALYST_ERROR: {exc}")
-            optimization_blueprint = None
+            optimization_blueprint = {}
+    if isinstance(optimization_blueprint, dict) and optimization_blueprint:
+        state["optimization_blueprint"] = optimization_blueprint
 
     # Adjust patience dynamically: if the blueprint provides N improvement
     # actions, allow at least N-1 consecutive non-improvements before stopping.
