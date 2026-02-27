@@ -22664,6 +22664,15 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         return False
 
     rounds, min_delta, patience = _metric_improvement_policy(contract)
+    # Preserve dynamic patience/rounds from prior blueprint adjustment (persisted
+    # in state by Mejora B) — the contract policy gives the base defaults, but
+    # a previous round may have boosted these based on blueprint action count.
+    state_patience = state.get("ml_improvement_patience")
+    if isinstance(state_patience, (int, float)) and int(state_patience) > patience:
+        patience = int(state_patience)
+    state_rounds = state.get("ml_improvement_rounds_allowed")
+    if isinstance(state_rounds, (int, float)) and int(state_rounds) > rounds:
+        rounds = int(state_rounds)
     if rounds <= 0:
         if run_id:
             try:
@@ -23086,6 +23095,11 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "patch_objectives": patch_objectives,
         "critic_packet": critique_packet,
         "hypothesis_packet": hypothesis_packet,
+        "optimization_blueprint": (
+            state.get("optimization_blueprint")
+            if isinstance(state.get("optimization_blueprint"), dict)
+            else {}
+        ),
     }
 
     state["ml_improvement_critique_packet"] = critique_packet
