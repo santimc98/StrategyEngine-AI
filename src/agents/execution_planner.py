@@ -4129,6 +4129,34 @@ def build_contract_min(
         return mapping
 
     row_count_hints = _extract_row_count_hints(contract, data_profile)
+
+    # Robust fallback: if n_train/n_test are still missing but the data_profile
+    # has outcome_analysis with non_null_count, derive them directly.  This is
+    # universal — it works for any supervised learning task where the target
+    # column has null values for the test/scoring split.
+    if "n_train" not in row_count_hints and "n_total" in row_count_hints:
+        _profile_for_fallback = data_profile if isinstance(data_profile, dict) else {}
+        _oa = _profile_for_fallback.get("outcome_analysis")
+        if isinstance(_oa, dict):
+            for _target_col in outcome_cols:
+                _target_entry = _oa.get(_target_col)
+                if not isinstance(_target_entry, dict):
+                    continue
+                _nnc = _coerce_positive_count(_target_entry.get("non_null_count"))
+                _total = row_count_hints["n_total"]
+                if _nnc is not None and 0 < _nnc < _total:
+                    row_count_hints["n_train"] = _nnc
+                    row_count_hints["n_test"] = _total - _nnc
+                    break
+                # Also try deriving from null_frac
+                _null_frac = _target_entry.get("null_frac")
+                if isinstance(_null_frac, (int, float)) and 0.0 < float(_null_frac) < 1.0:
+                    _inferred_train = int(round(_total * (1.0 - float(_null_frac))))
+                    if 0 < _inferred_train < _total:
+                        row_count_hints["n_train"] = _inferred_train
+                        row_count_hints["n_test"] = _total - _inferred_train
+                        break
+
     artifact_kind_map = _collect_artifact_kind_map(contract)
 
     def _resolve_expected_row_count(value: Any) -> Optional[int]:
@@ -4420,6 +4448,13 @@ def build_contract_min(
         for col in steward_split_cols:
             if isinstance(col, str) and col.strip():
                 candidates.append(col.strip())
+            elif isinstance(col, dict):
+                # Handle split_candidates dicts: {"column": "is_train", ...}
+                col_name = str(
+                    col.get("column") or col.get("name") or col.get("split_column") or ""
+                ).strip()
+                if col_name:
+                    candidates.append(col_name)
         split_fields = (
             contract.get("split_column"),
             contract.get("split_columns"),
