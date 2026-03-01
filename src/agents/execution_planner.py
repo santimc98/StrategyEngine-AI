@@ -3587,6 +3587,27 @@ def build_contract_min(
     steward_identifiers = _coerce_list(steward_semantics.get("identifier_columns"))
     steward_time_cols = _coerce_list(steward_semantics.get("time_columns"))
     steward_categorical = _coerce_list(steward_semantics.get("categorical_columns"))
+    # Extract primary_target from Steward's dataset_semantics.  The Steward
+    # always stores the authoritative target column here; without it the
+    # contract ends up with outcome_columns=[] which cascades into
+    # heavy_runner "target column missing" failures.
+    steward_primary_target: str | None = None
+    _spt = steward_semantics.get("primary_target")
+    if isinstance(_spt, str) and _spt.strip():
+        steward_primary_target = _spt.strip()
+    if not steward_primary_target:
+        _ta = steward_semantics.get("target_analysis")
+        if isinstance(_ta, dict):
+            _spt2 = _ta.get("primary_target")
+            if isinstance(_spt2, str) and _spt2.strip():
+                steward_primary_target = _spt2.strip()
+    # Also check data_profile top-level for backward compatibility
+    if not steward_primary_target and isinstance(data_profile, dict):
+        for _tkey in ("primary_target", "target_column", "target"):
+            _dpv = data_profile.get(_tkey)
+            if isinstance(_dpv, str) and _dpv.strip():
+                steward_primary_target = _dpv.strip()
+                break
     # split_candidates may contain dicts ({"column": "is_train", ...}) or strings.
     # Do NOT use _coerce_list here — it converts dicts to their str() repr, making
     # _resolve_split_column unable to extract the column name from dict entries.
@@ -3621,6 +3642,15 @@ def build_contract_min(
             if col in canonical_columns and col not in time_columns:
                 time_columns.append(col)
         print(f"STEWARD_TIME_COLUMNS: Using Steward-provided time columns: {time_columns}")
+
+    # Inject Steward's primary_target into outcome_cols when the LLM/strategy
+    # failed to populate it.  This is the single-point fix that prevents the
+    # cascade: empty outcome_columns → missing target_col in heavy_runner →
+    # "target column missing" abort → ML Engineer never executes.
+    if not outcome_cols and steward_primary_target:
+        if steward_primary_target in canonical_columns:
+            outcome_cols = [steward_primary_target]
+            print(f"STEWARD_PRIMARY_TARGET: Injected '{steward_primary_target}' into outcome_cols (was empty)")
 
     # FALLBACK: Only use regex heuristics if Steward didn't provide role information
     if not steward_identifiers or not steward_time_cols:
@@ -4081,6 +4111,33 @@ def build_contract_min(
                 _scan_outcome_counts(source.get("dataset_profile"))
                 _scan_outcome_counts(source.get("data_profile"))
                 _scan_outcome_counts(source.get("evaluation_spec"))
+
+        # Fallback: extract row counts from dataset_semantics.target_analysis.
+        # The Steward stores authoritative train/test split sizes there even
+        # when outcome_analysis is empty (which is common).
+        if "n_train" not in hints or "n_test" not in hints:
+            _ds = profile_dict.get("dataset_semantics")
+            if isinstance(_ds, dict):
+                _ta = _ds.get("target_analysis")
+                if isinstance(_ta, dict):
+                    _ta_total = _coerce_positive_count(
+                        _ta.get("target_total_count_exact")
+                        or _ta.get("total_count")
+                        or _ta.get("n_rows")
+                    )
+                    _ta_missing = _coerce_positive_count(
+                        _ta.get("target_missing_count_exact")
+                        or _ta.get("missing_count")
+                        or _ta.get("null_count")
+                    )
+                    if isinstance(_ta_total, int) and isinstance(_ta_missing, int) and _ta_total > _ta_missing:
+                        _ta_labeled = _ta_total - _ta_missing
+                        if "n_train" not in hints and _ta_labeled > 0:
+                            hints["n_train"] = _ta_labeled
+                        if "n_test" not in hints and _ta_missing > 0:
+                            hints["n_test"] = _ta_missing
+                        if "n_total" not in hints and _ta_total > 0:
+                            hints["n_total"] = _ta_total
 
         n_train = hints.get("n_train")
         n_test = hints.get("n_test")
