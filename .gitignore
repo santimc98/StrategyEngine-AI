@@ -43,6 +43,9 @@ runs/
 
 
 
+# Local datasets and generated data workspace
+/data/
+
 # Data artifacts (keep raw fixtures and other CSVs)
 data/cleaned_data.csv
 data/cleaned_full.csv
