@@ -1974,6 +1974,32 @@ class MLEngineerAgent:
                     )
                 )
 
+        # HPO scaling guidance — universal, based on dataset size.
+        # Prevents Optuna/HPO from timing out with 0 useful trials on large datasets.
+        if n_train is not None and n_train > 0:
+            lines.append("")
+            lines.append("HPO SCALING GUIDANCE (based on training set size):")
+            if n_train > 300_000:
+                lines.append(
+                    f"  - LARGE DATASET ({n_train:,} training rows). Each CV fold is expensive."
+                )
+                lines.append(
+                    "  - For Optuna/HPO: set timeout >= 3600 (1h) or reduce n_trials to 10-20."
+                )
+                lines.append(
+                    "  - Alternative: use 3-fold CV inside HPO trials (keep 5-fold for final eval)."
+                )
+                lines.append(
+                    "  - For CatBoost HPO: limit iterations to 500-1000 with early_stopping_rounds=30."
+                )
+            elif n_train > 100_000:
+                lines.append(
+                    f"  - MEDIUM DATASET ({n_train:,} training rows)."
+                )
+                lines.append(
+                    "  - For Optuna/HPO: set timeout >= 1200 (20min) with n_trials=30-50."
+                )
+
         lines.append("")
         lines.append("CRITICAL RULES:")
         if n_test is not None:

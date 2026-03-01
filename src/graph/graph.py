@@ -21502,6 +21502,13 @@ def _metric_improvement_policy(contract: Dict[str, Any] | None) -> Tuple[int, fl
         rounds = 12
     if min_delta < 0:
         min_delta = 0.0
+    # Clamp min_delta to a sensible ceiling.  LLM-generated contracts sometimes
+    # set overly strict thresholds (e.g. 0.001) that reject genuinely useful
+    # but small improvements.  0.0005 is the system default; allowing higher
+    # values wastes optimization rounds by discarding marginal gains that
+    # compound across rounds and often translate to LB improvement.
+    if min_delta > 0.0005:
+        min_delta = 0.0005
     if patience < 1:
         patience = 1
     if rounds > 0:
