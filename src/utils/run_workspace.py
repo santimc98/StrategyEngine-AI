@@ -6,6 +6,7 @@ cross-run contamination from leftover artifacts.
 """
 import os
 import re
+import shutil
 from typing import Dict, Any, Optional
 
 
@@ -105,6 +106,23 @@ def enter_run_workspace(state: Dict[str, Any], run_dir: str) -> Dict[str, Any]:
     orig_cwd = os.getcwd()
     state["orig_cwd"] = orig_cwd
 
+    # Snapshot data/ contents before workspace entry to detect leaked artifacts later
+    root_data_dir = os.path.join(orig_cwd, "data")
+    if os.path.isdir(root_data_dir):
+        try:
+            snapshot = set()
+            for dirpath, dirnames, filenames in os.walk(root_data_dir):
+                rel_dir = os.path.relpath(dirpath, root_data_dir)
+                for fn in filenames:
+                    snapshot.add(os.path.normcase(os.path.join(rel_dir, fn)))
+                for dn in dirnames:
+                    snapshot.add(os.path.normcase(os.path.join(rel_dir, dn) + os.sep))
+            state["_data_dir_snapshot"] = snapshot
+        except OSError:
+            state["_data_dir_snapshot"] = None
+    else:
+        state["_data_dir_snapshot"] = None
+
     for key in ("csv_path", "raw_csv_path", "input_csv_path"):
         value = state.get(key)
         if not value or not isinstance(value, str):
@@ -135,6 +153,72 @@ def enter_run_workspace(state: Dict[str, Any], run_dir: str) -> Dict[str, Any]:
     return state
 
 
+def _cleanup_leaked_artifacts(
+    state: Dict[str, Any],
+    orig_cwd: Optional[str],
+) -> None:
+    """
+    Remove files that appeared in {orig_cwd}/data/ during the run.
+
+    Compares the current data/ directory contents against the snapshot
+    taken at workspace entry.  Any new files/directories are pipeline
+    artifacts that leaked out of the run workspace and are removed.
+    """
+    if not isinstance(state, dict):
+        return
+    snapshot = state.get("_data_dir_snapshot")
+    if snapshot is None:
+        return
+    if not orig_cwd or not os.path.isdir(orig_cwd):
+        return
+
+    root_data_dir = os.path.join(orig_cwd, "data")
+    if not os.path.isdir(root_data_dir):
+        return
+
+    try:
+        # Collect current files/dirs
+        new_files: list[str] = []
+        new_dirs: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(root_data_dir):
+            rel_dir = os.path.relpath(dirpath, root_data_dir)
+            for fn in filenames:
+                rel_path = os.path.normcase(os.path.join(rel_dir, fn))
+                if rel_path not in snapshot:
+                    new_files.append(os.path.join(dirpath, fn))
+            for dn in dirnames:
+                rel_path = os.path.normcase(os.path.join(rel_dir, dn) + os.sep)
+                if rel_path not in snapshot:
+                    new_dirs.append(os.path.join(dirpath, dn))
+
+        removed_count = 0
+
+        # Remove leaked files first
+        for fpath in new_files:
+            try:
+                os.remove(fpath)
+                removed_count += 1
+            except OSError:
+                pass
+
+        # Remove leaked directories (deepest first to handle nesting)
+        new_dirs.sort(key=len, reverse=True)
+        for dpath in new_dirs:
+            try:
+                shutil.rmtree(dpath, ignore_errors=True)
+                removed_count += 1
+            except OSError:
+                pass
+
+        if removed_count:
+            print(
+                f"WORKSPACE_CLEANUP: Removed {removed_count} leaked "
+                f"artifact(s) from {root_data_dir}"
+            )
+    except OSError:
+        pass
+
+
 def exit_run_workspace(state: Dict[str, Any]) -> None:
     """
     Exit the run workspace - restores original cwd.
@@ -156,6 +240,10 @@ def exit_run_workspace(state: Dict[str, Any]) -> None:
 
     if isinstance(state, dict):
         state["workspace_active"] = False
+
+    # Clean up artifacts that leaked into the project root's data/ directory.
+    # Compare current contents against the snapshot taken at workspace entry.
+    _cleanup_leaked_artifacts(state, orig_cwd)
 
     # Note: We don't delete work_dir by default (useful for debug).
     # Set env CLEANUP_RUN_WORKSPACE=1 to enable cleanup in future.
