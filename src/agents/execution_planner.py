@@ -3587,9 +3587,21 @@ def build_contract_min(
     steward_identifiers = _coerce_list(steward_semantics.get("identifier_columns"))
     steward_time_cols = _coerce_list(steward_semantics.get("time_columns"))
     steward_categorical = _coerce_list(steward_semantics.get("categorical_columns"))
-    steward_split_cols = _coerce_list(steward_semantics.get("split_candidates"))
+    # split_candidates may contain dicts ({"column": "is_train", ...}) or strings.
+    # Do NOT use _coerce_list here — it converts dicts to their str() repr, making
+    # _resolve_split_column unable to extract the column name from dict entries.
+    def _coerce_split_candidates(raw: Any) -> list:
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            return [item for item in raw if item]
+        if isinstance(raw, (str, dict)):
+            return [raw]
+        return []
+
+    steward_split_cols = _coerce_split_candidates(steward_semantics.get("split_candidates"))
     if not steward_split_cols:
-        steward_split_cols = _coerce_list(data_profile.get("split_candidates")) if data_profile else []
+        steward_split_cols = _coerce_split_candidates(data_profile.get("split_candidates")) if data_profile else []
 
     # Also check data_profile top-level for backward compatibility
     if not steward_identifiers:
@@ -3663,9 +3675,18 @@ def build_contract_min(
 
     # Exclude split/partition columns from model_features — they are structural
     # (constant in training set) and provide no predictive signal.
-    if steward_split_cols:
-        filtered_model = [col for col in model_features if col not in steward_split_cols]
-        removed_splits = [col for col in model_features if col in steward_split_cols]
+    # steward_split_cols may contain dicts or strings; extract column names.
+    _split_col_names: set[str] = set()
+    for _sc in steward_split_cols:
+        if isinstance(_sc, str) and _sc.strip():
+            _split_col_names.add(_sc.strip())
+        elif isinstance(_sc, dict):
+            _scn = str(_sc.get("column") or _sc.get("name") or "").strip()
+            if _scn:
+                _split_col_names.add(_scn)
+    if _split_col_names:
+        filtered_model = [col for col in model_features if col not in _split_col_names]
+        removed_splits = [col for col in model_features if col in _split_col_names]
         if removed_splits:
             model_features = filtered_model
             print(f"SPLIT_COLUMN_GUARD: Excluded split columns from model_features: {removed_splits}")
