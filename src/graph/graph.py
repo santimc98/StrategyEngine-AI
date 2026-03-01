@@ -47,6 +47,7 @@ from src.agents.execution_planner import (
     build_execution_plan,
     build_dataset_profile,
     build_plot_spec,
+    build_contract_min,
 )
 from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
@@ -13100,6 +13101,54 @@ def run_execution_planner(state: AgentState) -> AgentState:
     contract_scope = normalize_contract_scope(contract.get("scope")) if isinstance(contract, dict) else ""
     if not evaluation_spec and contract_scope in {"ml_only", "full_pipeline"}:
         print("Warning: execution_contract has no evaluation_spec; reviewers will use contract-level gates only.")
+    # Deterministic enrichment: build_contract_min computes file_schemas,
+    # row_count_hints (n_train/n_test), and scored_rows_schema from data_profile.
+    # The LLM contract rarely populates these correctly, so we always merge
+    # the deterministic values as a post-processing step (universal, idempotent).
+    try:
+        _deterministic_enrichment = build_contract_min(
+            full_contract_or_partial=copy.deepcopy(contract) if isinstance(contract, dict) else {},
+            strategy=strategy if isinstance(strategy, dict) else {},
+            column_inventory=column_inventory or [],
+            relevant_columns=column_inventory or [],
+            target_candidates=None,
+            data_profile=planner_data_profile if isinstance(planner_data_profile, dict) else {},
+            business_objective_hint=business_objective or "",
+        )
+        if isinstance(_deterministic_enrichment, dict) and _deterministic_enrichment:
+            _det_artifacts = _deterministic_enrichment.get("artifact_requirements")
+            if isinstance(_det_artifacts, dict):
+                _contract_artifacts = contract.get("artifact_requirements")
+                if not isinstance(_contract_artifacts, dict):
+                    _contract_artifacts = {}
+                    contract["artifact_requirements"] = _contract_artifacts
+                # Merge file_schemas (deterministic always wins over empty)
+                _det_fs = _det_artifacts.get("file_schemas")
+                if isinstance(_det_fs, dict) and _det_fs:
+                    _existing_fs = _contract_artifacts.get("file_schemas")
+                    if not isinstance(_existing_fs, dict) or not _existing_fs:
+                        _contract_artifacts["file_schemas"] = _det_fs
+                # Merge row_count_hints (prefer richer set)
+                _det_rch = _det_artifacts.get("row_count_hints")
+                if isinstance(_det_rch, dict) and _det_rch:
+                    _existing_rch = _contract_artifacts.get("row_count_hints")
+                    if not isinstance(_existing_rch, dict):
+                        _existing_rch = {}
+                    for _rch_key in ("n_total", "n_train", "n_test"):
+                        _rch_val = _det_rch.get(_rch_key)
+                        if isinstance(_rch_val, int) and _rch_val > 0 and _rch_key not in _existing_rch:
+                            _existing_rch[_rch_key] = _rch_val
+                    if _existing_rch:
+                        _contract_artifacts["row_count_hints"] = _existing_rch
+                # Merge scored_rows_schema (deterministic always wins over empty)
+                _det_srs = _det_artifacts.get("scored_rows_schema")
+                if isinstance(_det_srs, dict) and _det_srs:
+                    _existing_srs = _contract_artifacts.get("scored_rows_schema")
+                    if not isinstance(_existing_srs, dict) or not _existing_srs.get("required_any_of_groups"):
+                        _contract_artifacts["scored_rows_schema"] = _det_srs
+    except Exception as _enrich_err:
+        print(f"Warning: deterministic contract enrichment failed: {_enrich_err}")
+
     work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
     try:
         data_dir = _abs_in_work(work_dir_abs, "data")
