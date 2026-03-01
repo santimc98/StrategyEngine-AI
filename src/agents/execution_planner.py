@@ -3802,11 +3802,19 @@ def build_contract_min(
     required_any_of_groups.append(group1)
     required_any_of_group_severity.append("warning")  # Identifier is optional (warning)
 
-    # Group 2 (predicción/score): sinónimos universales
-    required_any_of_groups.append([
+    # Group 2 (predicción/score): sinónimos universales + target column names.
+    # The ML Engineer often writes the prediction column using the original
+    # target name (e.g. "Churn" instead of "probability").  Including the
+    # resolved outcome columns ensures this common pattern is accepted.
+    prediction_synonyms = [
         "prediction", "pred", "probability", "prob", "score",
-        "risk_score", "predicted_prob", "predicted_value", "y_pred"
-    ])
+        "risk_score", "predicted_prob", "predicted_value", "y_pred",
+    ]
+    for oc in outcome_cols:
+        oc_clean = str(oc).strip()
+        if oc_clean and oc_clean.lower() not in {s.lower() for s in prediction_synonyms}:
+            prediction_synonyms.append(oc_clean)
+    required_any_of_groups.append(prediction_synonyms)
     required_any_of_group_severity.append("fail")  # Prediction/score is critical (fail)
 
     # Group 3 (ranking/prioridad) SOLO si objective_type sugiere ranking/triage/targeting
