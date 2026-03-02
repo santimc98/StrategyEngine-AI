@@ -278,7 +278,7 @@ class ModelAnalystAgent:
                 "technique": "optuna_hpo",
                 "action_family": "hyperparameter_search",
                 "concrete_params": params,
-                "code_change_hint": f"Add Optuna HPO with n_trials={params['n_trials']}, timeout={params['timeout_seconds']}s. Use early stopping inside each trial to stay within time budget",
+                "code_change_hint": f"Add Optuna HPO with n_trials={params['n_trials']}, timeout={params['timeout_seconds']}s, cv_folds={params.get('cv_folds', 5)} inside objective. Use early stopping inside each trial to stay within time budget",
                 "expected_delta": 0.002,
                 "priority": 1,
             })
@@ -564,19 +564,27 @@ class ModelAnalystAgent:
                     if n_rows > 0:
                         break
 
-        if n_rows > 500_000:
-            n_trials = 10
-            timeout = 3600
-        elif n_rows > 100_000:
-            n_trials = 20
-            timeout = 1800
-        elif n_rows > 10_000:
-            n_trials = 30
-            timeout = 900
-        else:
+        # ── HPO scaling tiers (aligned with ML Engineer MANDATORY guidance) ──
+        # These must stay in sync with the prescriptive constants in
+        # ml_engineer.py's _build_hpo_scaling_guidance() so the blueprint
+        # never contradicts the prompt the ML Engineer receives.
+        if n_rows > 300_000:
             n_trials = 50
+            timeout = 3600
+            cv_folds = 3
+        elif n_rows > 100_000:
+            n_trials = 50
+            timeout = 1800
+            cv_folds = 3
+        elif n_rows > 10_000:
+            n_trials = 100
             timeout = 600
-        base: Dict[str, Any] = {"n_trials": n_trials, "timeout_seconds": timeout}
+            cv_folds = 5
+        else:
+            n_trials = 100
+            timeout = 600
+            cv_folds = 5
+        base: Dict[str, Any] = {"n_trials": n_trials, "timeout_seconds": timeout, "cv_folds": cv_folds}
         if framework == "catboost":
             base["param_space"] = {
                 "learning_rate": [0.01, 0.1],
