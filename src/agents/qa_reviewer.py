@@ -1853,6 +1853,29 @@ def _expr_references_alias(expr: ast.AST, aliases: set[str]) -> bool:
     return False
 
 
+# Methods that preserve row count — calling them on a subset still yields a
+# subset, and calling them on a full frame yields a full frame.  This list is
+# intentionally conservative: only methods whose output has the *same* number
+# of rows as the receiver are included.  It is universal and not tied to any
+# particular ML task or library.
+_ROW_PRESERVING_METHODS: frozenset[str] = frozenset({
+    "copy", "reset_index", "rename", "astype", "set_index",
+    "sort_values", "sort_index", "fillna", "replace", "assign",
+    "clip", "round", "abs", "to_frame", "squeeze",
+    "infer_objects", "convert_dtypes", "reindex_like",
+})
+
+
+def _is_row_preserving_call(expr: ast.AST) -> bool:
+    """True if *expr* is a method call that preserves the row count of its receiver."""
+    if not isinstance(expr, ast.Call):
+        return False
+    func = expr.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    return func.attr in _ROW_PRESERVING_METHODS
+
+
 def _expr_has_subset_signal(expr: ast.AST, aliases: set[str], subset_vars: set[str]) -> bool:
     def _is_full_row_slice(slice_node: ast.AST) -> bool:
         if isinstance(slice_node, ast.Slice):
@@ -1930,6 +1953,16 @@ def _collect_dataframe_lineage(
                 # a direct subset extractor from the base frame.
                 if isinstance(expr, ast.Subscript):
                     subset_vars.add(var_name)
+                elif _is_row_preserving_call(expr):
+                    # .copy(), .reset_index(), etc. preserve the row scope of
+                    # their receiver.  Trace back to the receiver object to
+                    # determine whether this is a subset or full frame.
+                    _receiver = expr.func.value
+                    _recv_subset = _expr_has_subset_signal(_receiver, full_aliases, subset_vars)
+                    if _recv_subset:
+                        subset_vars.add(var_name)
+                    else:
+                        full_aliases.add(var_name)
                 elif isinstance(expr, ast.Call) and _call_name(expr).endswith("DataFrame"):
                     full_component = False
                     subset_component = False
@@ -2025,6 +2058,11 @@ def _classify_row_scope(
             if "subset" in verdicts:
                 return "subset"
             return "unknown"
+        # Row-preserving methods propagate the scope of their receiver.
+        if _is_row_preserving_call(expr):
+            return _classify_row_scope(
+                expr.func.value, assignment_map, full_aliases, subset_vars, depth=depth + 1,
+            )
     has_subset = _expr_has_subset_signal(expr, full_aliases, subset_vars)
     has_full = _expr_references_alias(expr, full_aliases)
     if has_subset and not has_full:
@@ -2032,6 +2070,11 @@ def _classify_row_scope(
     if has_subset and has_full:
         if isinstance(expr, ast.Subscript):
             return "subset"
+        # Row-preserving calls with mixed signals: trace receiver scope.
+        if _is_row_preserving_call(expr):
+            return _classify_row_scope(
+                expr.func.value, assignment_map, full_aliases, subset_vars, depth=depth + 1,
+            )
         # Mixed full/subset signals in one expression are treated as risky.
         return "full"
     if has_full:
