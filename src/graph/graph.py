@@ -21519,6 +21519,132 @@ def _resolve_opt_eval_folds(contract: Dict[str, Any] | None) -> Tuple[int, int]:
     return quick, full
 
 
+def _compute_adaptive_min_delta(
+    baseline_metrics: Dict[str, Any],
+    metric_name: str,
+    n_train: int | None,
+) -> float | None:
+    """Compute an adaptive min_delta based on fold-score variance and dataset size.
+
+    Uses a hybrid approach:
+      1. Statistical: ``fold_se = std(fold_scores) / sqrt(n_folds)``
+         → ``min_delta = fold_se * 0.5``  (accept improvements ≥ 0.5 standard-errors)
+      2. Floor by dataset size (safety net for small datasets or missing folds):
+         - n_train > 500K  → 0.00005
+         - n_train > 100K  → 0.0001
+         - n_train > 10K   → 0.0002
+         - else             → 0.0005
+      3. Final: ``max(stat_delta, floor)``
+
+    Returns ``None`` when no fold data is available and n_train is unknown,
+    leaving the caller to use the static default.
+    """
+    import math as _math
+
+    if not isinstance(baseline_metrics, dict):
+        baseline_metrics = {}
+
+    # ------------------------------------------------------------------
+    # 1. Try to derive fold standard error from baseline metrics
+    # ------------------------------------------------------------------
+    fold_se: float | None = None
+
+    # Pattern A: explicit fold-level scores array  (fold_aucs, fold_scores, …)
+    _metric_norm = metric_name.lower().replace("-", "_").replace(" ", "_")
+    _fold_array_keys = [
+        f"fold_{_metric_norm}s",     # fold_auc_rocs
+        f"fold_{_metric_norm}",      # fold_auc_roc
+        "fold_aucs",
+        "fold_scores",
+        "fold_values",
+        "fold_metrics",
+        "cv_fold_scores",
+    ]
+    fold_values: list[float] | None = None
+    for fk in _fold_array_keys:
+        raw = baseline_metrics.get(fk)
+        if isinstance(raw, list) and len(raw) >= 2:
+            try:
+                parsed = [float(v) for v in raw]
+                if all(_math.isfinite(v) for v in parsed):
+                    fold_values = parsed
+                    break
+            except (TypeError, ValueError):
+                continue
+
+    if fold_values is not None:
+        n_folds = len(fold_values)
+        mean_val = sum(fold_values) / n_folds
+        variance = sum((v - mean_val) ** 2 for v in fold_values) / (n_folds - 1)
+        std_val = _math.sqrt(variance)
+        fold_se = std_val / _math.sqrt(n_folds)
+    else:
+        # Pattern B: pre-computed cv_std  (cv_auc_roc_std, cv_std, …)
+        _std_keys = [
+            f"cv_{_metric_norm}_std",
+            "cv_std",
+            f"{_metric_norm}_std",
+            "std",
+        ]
+        _nfolds_keys = ["n_folds", "cv_folds", "num_folds", "k_folds"]
+        cv_std: float | None = None
+        for sk in _std_keys:
+            raw_std = baseline_metrics.get(sk)
+            if raw_std is not None:
+                try:
+                    val = float(raw_std)
+                    if _math.isfinite(val) and val > 0:
+                        cv_std = val
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if cv_std is not None:
+            n_folds_val = 5  # default
+            for nk in _nfolds_keys:
+                raw_nf = baseline_metrics.get(nk)
+                if raw_nf is not None:
+                    try:
+                        nf = int(raw_nf)
+                        if nf >= 2:
+                            n_folds_val = nf
+                            break
+                    except (TypeError, ValueError):
+                        continue
+            fold_se = cv_std / _math.sqrt(n_folds_val)
+
+    # ------------------------------------------------------------------
+    # 2. Floor by dataset size
+    # ------------------------------------------------------------------
+    if isinstance(n_train, (int, float)) and n_train > 0:
+        n = int(n_train)
+        if n > 500_000:
+            floor_delta = 0.00005
+        elif n > 100_000:
+            floor_delta = 0.0001
+        elif n > 10_000:
+            floor_delta = 0.0002
+        else:
+            floor_delta = 0.0005
+    else:
+        floor_delta = 0.0003  # conservative when dataset size unknown
+
+    # ------------------------------------------------------------------
+    # 3. Combine
+    # ------------------------------------------------------------------
+    if fold_se is not None and fold_se > 0:
+        stat_delta = fold_se * 0.5
+        adaptive = max(stat_delta, floor_delta)
+    elif n_train is not None:
+        adaptive = floor_delta
+    else:
+        return None  # no data → caller uses static default
+
+    # Hard ceiling: never exceed the old static default of 0.0005
+    adaptive = min(adaptive, 0.0005)
+
+    return adaptive
+
+
 def _metric_improvement_policy(contract: Dict[str, Any] | None) -> Tuple[int, float, int]:
     policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
     if not isinstance(policy, dict):
@@ -22947,6 +23073,33 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         return False
 
     rounds, min_delta, patience = _metric_improvement_policy(contract)
+
+    # ── Adaptive min_delta: override the static default using baseline fold
+    # variance and dataset size.  This is universal — it calibrates the
+    # improvement threshold to the statistical noise floor of each specific
+    # dataset/metric combination, preventing rejection of genuinely useful
+    # but small improvements that compound across rounds.
+    _rc_hints = (
+        contract.get("artifact_requirements", {}).get("row_count_hints")
+        if isinstance(contract, dict)
+        else None
+    )
+    _n_train_for_delta: int | None = None
+    if isinstance(_rc_hints, dict):
+        _raw_nt = _rc_hints.get("n_train")
+        if _raw_nt is not None:
+            try:
+                _n_train_for_delta = int(_raw_nt) if int(_raw_nt) > 0 else None
+            except (TypeError, ValueError):
+                pass
+    adaptive_min_delta = _compute_adaptive_min_delta(baseline_metrics, metric_name, _n_train_for_delta)
+    if adaptive_min_delta is not None:
+        print(
+            f"ADAPTIVE_MIN_DELTA: static={min_delta:.6f} → adaptive={adaptive_min_delta:.6f}"
+            f" (n_train={_n_train_for_delta}, metric={metric_name})"
+        )
+        min_delta = adaptive_min_delta
+
     # Preserve dynamic patience/rounds from prior blueprint adjustment (persisted
     # in state by Mejora B) — the contract policy gives the base defaults, but
     # a previous round may have boosted these based on blueprint action count.
