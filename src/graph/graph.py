@@ -4724,10 +4724,10 @@ def _detect_refscore_alias(execution_output: str, contract: Dict[str, Any]) -> b
 
 DEFAULT_RUN_BUDGET = {
     "max_de_calls": 4,
-    "max_ml_calls": 6,
-    "max_reviewer_calls": 5,
-    "max_qa_calls": 5,
-    "max_execution_calls": 6,
+    "max_ml_calls": 12,
+    "max_reviewer_calls": 10,
+    "max_qa_calls": 10,
+    "max_execution_calls": 12,
 }
 
 def _ensure_budget_state(state: Dict[str, Any]) -> Dict[str, Any]:

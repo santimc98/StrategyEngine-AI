@@ -1976,28 +1976,56 @@ class MLEngineerAgent:
 
         # HPO scaling guidance — universal, based on dataset size.
         # Prevents Optuna/HPO from timing out with 0 useful trials on large datasets.
+        # The guidance is PRESCRIPTIVE (not suggestive) to ensure the LLM uses
+        # adequate timeout values.  The framework grants generous script-level
+        # timeouts (up to hours), so the bottleneck is the Optuna-internal
+        # timeout the LLM hardcodes in the generated script.
         if n_train is not None and n_train > 0:
             lines.append("")
-            lines.append("HPO SCALING GUIDANCE (based on training set size):")
+            lines.append("HPO SCALING GUIDANCE (MANDATORY — based on training set size):")
             if n_train > 300_000:
+                hpo_timeout = 3600
+                hpo_n_trials = 50
+                hpo_cv_folds = 3
                 lines.append(
                     f"  - LARGE DATASET ({n_train:,} training rows). Each CV fold is expensive."
                 )
                 lines.append(
-                    "  - For Optuna/HPO: set timeout >= 3600 (1h) or reduce n_trials to 10-20."
+                    f"  - MANDATORY: When using Optuna/HPO, you MUST set timeout={hpo_timeout} (1h) and n_trials={hpo_n_trials}."
                 )
                 lines.append(
-                    "  - Alternative: use 3-fold CV inside HPO trials (keep 5-fold for final eval)."
+                    f"  - MANDATORY: Use {hpo_cv_folds}-fold CV inside HPO objective function (keep 5-fold for final evaluation only)."
                 )
                 lines.append(
                     "  - For CatBoost HPO: limit iterations to 500-1000 with early_stopping_rounds=30."
                 )
+                lines.append(
+                    f"  - Define these constants at the top of your script: HPO_TIMEOUT = {hpo_timeout}; HPO_N_TRIALS = {hpo_n_trials}; HPO_CV_FOLDS = {hpo_cv_folds}"
+                )
             elif n_train > 100_000:
+                hpo_timeout = 1800
+                hpo_n_trials = 50
+                hpo_cv_folds = 3
                 lines.append(
                     f"  - MEDIUM DATASET ({n_train:,} training rows)."
                 )
                 lines.append(
-                    "  - For Optuna/HPO: set timeout >= 1200 (20min) with n_trials=30-50."
+                    f"  - MANDATORY: When using Optuna/HPO, you MUST set timeout={hpo_timeout} (30min) and n_trials={hpo_n_trials}."
+                )
+                lines.append(
+                    f"  - Use {hpo_cv_folds}-fold CV inside HPO objective function (keep 5-fold for final evaluation only)."
+                )
+                lines.append(
+                    f"  - Define these constants at the top of your script: HPO_TIMEOUT = {hpo_timeout}; HPO_N_TRIALS = {hpo_n_trials}; HPO_CV_FOLDS = {hpo_cv_folds}"
+                )
+            else:
+                hpo_timeout = 600
+                hpo_n_trials = 100
+                lines.append(
+                    f"  - SMALL DATASET ({n_train:,} training rows)."
+                )
+                lines.append(
+                    f"  - For Optuna/HPO: set timeout={hpo_timeout} (10min) and n_trials={hpo_n_trials}."
                 )
 
         lines.append("")
