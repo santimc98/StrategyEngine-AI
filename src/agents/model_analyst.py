@@ -173,14 +173,14 @@ class ModelAnalystAgent:
         deterministic = self._analyze_baseline_deterministic(context)
 
         if self.mode == "deterministic":
-            return self._finalize_blueprint(deterministic)
+            return self._finalize_blueprint(deterministic, context)
 
         llm_result = self._analyze_baseline_llm(context)
         if llm_result and self._validate_blueprint(llm_result):
             merged = self._merge_llm_and_deterministic(llm_result, deterministic)
-            return self._finalize_blueprint(merged)
+            return self._finalize_blueprint(merged, context)
 
-        return self._finalize_blueprint(deterministic)
+        return self._finalize_blueprint(deterministic, context)
 
     # ------------------------------------------------------------------
     # LLM analysis
@@ -250,6 +250,24 @@ class ModelAnalystAgent:
         framework = self._detect_framework(code_lower)
         model_type = self._detect_model_type(framework, code_lower)
         actions: List[Dict[str, Any]] = []
+
+        # ── Compute budget estimation for viability checks ──
+        # Used to skip ensemble/stacking proposals that are physically
+        # impossible within the framework timeout.
+        _n_rows_est = 0
+        for _rk in ("n_train_rows", "n_rows", "n_samples", "n_train"):
+            _rv = dataset_profile.get(_rk) or metrics.get(_rk)
+            if _rv is not None:
+                try:
+                    _n_rows_est = int(_rv)
+                except (TypeError, ValueError):
+                    pass
+                if _n_rows_est > 0:
+                    break
+        _per_fold_sec = self._estimate_per_fold_seconds(framework, _n_rows_est) if _n_rows_est > 0 else 0.0
+        # Framework timeout ceiling (conservative: use 7200s as reference)
+        _framework_budget = 7200.0
+        _cv_folds_default = 3 if _n_rows_est > 100_000 else 5
 
         # 1. Early stopping
         has_early_stopping = any(
@@ -407,6 +425,57 @@ class ModelAnalystAgent:
         if model_count >= 2 and not has_weight_opt:
             assessment += ", equal-weight ensemble"
 
+        # ── Filter computationally infeasible actions ──
+        # For large datasets, some techniques (multi-model ensemble, stacking,
+        # multi-seed) multiply training cost beyond the framework timeout.
+        if _per_fold_sec > 0 and _n_rows_est > 0:
+            viable_actions: List[Dict[str, Any]] = []
+            for action in actions:
+                tech = action.get("technique", "")
+                family = action.get("action_family", "")
+                params = action.get("concrete_params", {})
+
+                # Estimate total compute seconds for this action
+                est_total: float = 0.0
+                if family == "ensemble_or_stacking":
+                    if tech == "multi_seed_averaging":
+                        n_seeds = len(params.get("seeds", [42, 123, 456]))
+                        est_total = _per_fold_sec * _cv_folds_default * n_seeds
+                    elif tech == "stacking_ensemble":
+                        # Stacking: N base models + 1 meta-learner, each with K-fold
+                        n_base = max(model_count, 2)
+                        est_total = _per_fold_sec * _cv_folds_default * (n_base + 1)
+                    elif tech == "weighted_ensemble":
+                        # Weight optimization itself is cheap (scipy.optimize on OOF
+                        # predictions).  But the ML Engineer often MISINTERPRETS this
+                        # as "create N diverse models", so estimate conservatively.
+                        est_total = _per_fold_sec * _cv_folds_default * 3
+                    elif tech == "diverse_ensemble_averaging":
+                        n_models = len(params.get("models", []))
+                        if n_models < 2:
+                            n_models = 3
+                        est_total = _per_fold_sec * _cv_folds_default * n_models
+                    else:
+                        est_total = _per_fold_sec * _cv_folds_default * 3
+                elif family == "hyperparameter_search" and tech in ("optuna_hpo", "optuna_hyperparameter_optimization"):
+                    # HPO is already capped by _hpo_params; double-check
+                    hpo_trials = params.get("n_trials", 50)
+                    hpo_folds = params.get("cv_folds", _cv_folds_default)
+                    est_total = _per_fold_sec * hpo_folds * hpo_trials
+                else:
+                    # Feature engineering, LR reduction, calibration, etc. — cheap
+                    est_total = _per_fold_sec * _cv_folds_default
+
+                if est_total <= _framework_budget * 0.85:
+                    viable_actions.append(action)
+                else:
+                    print(
+                        f"BLUEPRINT_VIABILITY: Skipping '{tech}' — estimated {est_total:.0f}s "
+                        f"exceeds framework budget {_framework_budget:.0f}s "
+                        f"(per_fold={_per_fold_sec:.1f}s, n_rows={_n_rows_est})"
+                    )
+            actions = viable_actions
+
         return {
             "model_type": model_type,
             "framework": framework,
@@ -470,11 +539,63 @@ class ModelAnalystAgent:
         )
         return result
 
-    def _finalize_blueprint(self, blueprint: Dict[str, Any]) -> Dict[str, Any]:
+    def _finalize_blueprint(self, blueprint: Dict[str, Any], context: Dict[str, Any] | None = None) -> Dict[str, Any]:
         blueprint["blueprint_version"] = "1.0"
         blueprint["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
         actions = blueprint.get("improvement_actions")
         if isinstance(actions, list):
+            # ── Final viability filter (applies to LLM + deterministic actions) ──
+            ctx = context if isinstance(context, dict) else {}
+            dp = ctx.get("dataset_profile") if isinstance(ctx.get("dataset_profile"), dict) else {}
+            mx = ctx.get("metrics") if isinstance(ctx.get("metrics"), dict) else {}
+            _n_rows = 0
+            for _rk in ("n_train_rows", "n_rows", "n_samples", "n_train"):
+                _rv = dp.get(_rk) or mx.get(_rk)
+                if _rv is not None:
+                    try:
+                        _n_rows = int(_rv)
+                    except (TypeError, ValueError):
+                        pass
+                    if _n_rows > 0:
+                        break
+            if _n_rows > 0:
+                fw = str(blueprint.get("framework") or "catboost").lower()
+                _pfs = self._estimate_per_fold_seconds(fw, _n_rows)
+                _budget = 7200.0
+                _cv = 3 if _n_rows > 100_000 else 5
+                viable = []
+                for act in actions:
+                    if not isinstance(act, dict):
+                        continue
+                    family = str(act.get("action_family", ""))
+                    tech = str(act.get("technique", ""))
+                    params = act.get("concrete_params") if isinstance(act.get("concrete_params"), dict) else {}
+                    est = 0.0
+                    if family == "ensemble_or_stacking":
+                        if "seed" in tech:
+                            n_seeds = len(params.get("seeds", [1, 2, 3]))
+                            est = _pfs * _cv * n_seeds
+                        elif "stacking" in tech:
+                            est = _pfs * _cv * 4  # conservative
+                        else:
+                            # weighted_ensemble, diverse_ensemble, etc.
+                            n_m = len(params.get("models", [])) or 3
+                            est = _pfs * _cv * n_m
+                    elif "hpo" in tech.lower() or "hyperparameter" in tech.lower():
+                        hpo_t = params.get("n_trials", 50)
+                        hpo_cv = params.get("cv_folds", _cv)
+                        est = _pfs * hpo_cv * hpo_t
+                    else:
+                        est = _pfs * _cv  # single retrain
+
+                    if est <= _budget * 0.85:
+                        viable.append(act)
+                    else:
+                        print(
+                            f"BLUEPRINT_VIABILITY_FINAL: Dropped '{tech}' — est={est:.0f}s "
+                            f"> budget={_budget * 0.85:.0f}s (per_fold={_pfs:.1f}s, rows={_n_rows})"
+                        )
+                actions = viable
             blueprint["improvement_actions"] = actions[:6]
         return blueprint
 
@@ -541,6 +662,28 @@ class ModelAnalystAgent:
             return {"patience": 10, "min_delta": 0.0001, "restore_best_weights": True}
         return {"early_stopping_rounds": 50}
 
+    @staticmethod
+    def _estimate_per_fold_seconds(framework: str, n_rows: int) -> float:
+        """Estimate wall-clock seconds for ONE model training on ONE fold.
+
+        Conservative heuristic based on empirical observations:
+          - CatBoost on 600K rows ≈ 60-120s per fold (with early stopping)
+          - LightGBM is ~3x faster than CatBoost
+          - XGBoost is ~2x faster than CatBoost
+          - Neural nets vary widely; use CatBoost-level estimate
+
+        Returns a per-fold estimate in seconds.  The caller multiplies by
+        ``cv_folds * n_trials`` (or ``cv_folds * n_models``) to get total.
+        """
+        # seconds per 10K rows (with early stopping, ~1000 iterations typical)
+        _rate: Dict[str, float] = {
+            "catboost": 1.8,
+            "lightgbm": 0.6,
+            "xgboost": 1.0,
+        }
+        rate = _rate.get(framework.lower(), 1.8)  # default to CatBoost-level
+        return max(5.0, (n_rows / 10_000) * rate)
+
     def _hpo_params(self, framework: str, metrics: Dict[str, Any], dataset_profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         n_rows = 0
         if isinstance(dataset_profile, dict):
@@ -584,6 +727,19 @@ class ModelAnalystAgent:
             n_trials = 100
             timeout = 600
             cv_folds = 5
+        # ── Computational viability cap ──
+        # Ensure n_trials × cv_folds × per_fold_time fits within the HPO
+        # timeout with margin.  This prevents generating blueprints that
+        # are physically impossible to execute.
+        if n_rows > 0:
+            per_fold_sec = self._estimate_per_fold_seconds(framework, n_rows)
+            cost_per_trial = per_fold_sec * cv_folds
+            # Leave 20% margin for overhead (data loading, pruning, final eval)
+            usable_budget = timeout * 0.80
+            max_viable_trials = max(5, int(usable_budget / cost_per_trial))
+            if n_trials > max_viable_trials:
+                n_trials = max_viable_trials
+
         base: Dict[str, Any] = {"n_trials": n_trials, "timeout_seconds": timeout, "cv_folds": cv_folds}
         if framework == "catboost":
             base["param_space"] = {
