@@ -1,2 +1,19 @@
 [server]
 maxUploadSize = 1024
+enableWebsocketCompression = true
+
+# Keep disconnected sessions alive for 24 hours (86400 seconds).
+# This prevents Streamlit from killing the graph execution when the
+# browser tab is backgrounded, minimized, or the websocket briefly drops.
+# Default is 120s (2 min) which is far too short for multi-hour ML runs.
+disconnectedSessionTTL = 86400
+
+# Send websocket pings every 20 seconds to keep the connection alive
+# through proxies and browser throttling.
+websocketPingInterval = 20
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+fastReruns = false
