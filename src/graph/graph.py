@@ -22760,6 +22760,41 @@ def _resolve_metric_round_hybrid_policy(
             if secondary:
                 bundle_techniques.append(secondary)
 
+    # ── Dedup: skip hybrid bundles that were already tried and failed ──
+    # Compute the would-be bundle signature and check the tracker for prior
+    # failed attempts with the same signature.  This prevents the system from
+    # wasting rounds retrying the exact same technique combination.
+    if len(bundle_techniques) >= 2:
+        _candidate_sig_base = "|".join(bundle_techniques[:2])
+        _candidate_hyb_sig = "hyb_" + hashlib.sha1(
+            (_candidate_sig_base + "|" + ",".join(
+                normalize_target_columns(hypothesis.get("target_columns"))[:12]
+            )).encode("utf-8")
+        ).hexdigest()[:12]
+        _bundle_already_failed = False
+        if isinstance(tracker_entries, list):
+            for _te in tracker_entries:
+                if not isinstance(_te, dict):
+                    continue
+                _te_sig = str(_te.get("signature") or "").strip()
+                if _te_sig != _candidate_hyb_sig:
+                    continue
+                _te_event = str(_te.get("event") or "").strip().lower()
+                if _te_event in ("candidate_evaluated", "hypothesis_memory"):
+                    _te_improved = _te.get("improved_by_metric")
+                    if isinstance(_te_improved, bool) and not _te_improved:
+                        _bundle_already_failed = True
+                        break
+        if _bundle_already_failed:
+            # Reduce bundle to the primary technique only (avoid repeating
+            # the failed combination).  The single technique still gets a
+            # fair chance on its own.
+            print(
+                f"HYBRID_BUNDLE_DEDUP: Skipping already-failed bundle "
+                f"'{' + '.join(bundle_techniques[:2])}' (sig={_candidate_hyb_sig})"
+            )
+            bundle_techniques = bundle_techniques[:1]
+
     if len(bundle_techniques) >= 2:
         primary = bundle_techniques[0]
         secondary = bundle_techniques[1]
