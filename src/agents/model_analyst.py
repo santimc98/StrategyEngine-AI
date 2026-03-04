@@ -264,7 +264,24 @@ class ModelAnalystAgent:
                     pass
                 if _n_rows_est > 0:
                     break
-        _per_fold_sec = self._estimate_per_fold_seconds(framework, _n_rows_est) if _n_rows_est > 0 else 0.0
+        # Extract complexity hints from baseline script for better estimation
+        _code_max_iters = 0
+        _code_max_depth = 0
+        import re as _re_local
+        for _iters_match in _re_local.finditer(r'(?:iterations|n_estimators)\s*[=:]\s*(\d+)', script):
+            try:
+                _code_max_iters = max(_code_max_iters, int(_iters_match.group(1)))
+            except (ValueError, TypeError):
+                pass
+        for _depth_match in _re_local.finditer(r'(?:depth|max_depth)\s*[=:]\s*(\d+)', script):
+            try:
+                _code_max_depth = max(_code_max_depth, int(_depth_match.group(1)))
+            except (ValueError, TypeError):
+                pass
+        _per_fold_sec = self._estimate_per_fold_seconds(
+            framework, _n_rows_est,
+            max_iterations=_code_max_iters, max_depth=_code_max_depth,
+        ) if _n_rows_est > 0 else 0.0
         # Framework timeout ceiling (conservative: use 7200s as reference)
         _framework_budget = 7200.0
         _cv_folds_default = 3 if _n_rows_est > 100_000 else 5
@@ -560,7 +577,31 @@ class ModelAnalystAgent:
                         break
             if _n_rows > 0:
                 fw = str(blueprint.get("framework") or "catboost").lower()
-                _pfs = self._estimate_per_fold_seconds(fw, _n_rows)
+                # Extract worst-case iterations/depth from param_space
+                _bp_iters = 0
+                _bp_depth = 0
+                _bp_ps = blueprint.get("hpo_params", {})
+                if isinstance(_bp_ps, dict):
+                    _bp_ps_space = _bp_ps.get("param_space", {})
+                    if isinstance(_bp_ps_space, dict):
+                        for _ik in ("iterations", "n_estimators"):
+                            _iv = _bp_ps_space.get(_ik)
+                            if isinstance(_iv, list) and _iv:
+                                try:
+                                    _bp_iters = max(_bp_iters, int(max(_iv)))
+                                except (TypeError, ValueError):
+                                    pass
+                        for _dk in ("depth", "max_depth"):
+                            _dv = _bp_ps_space.get(_dk)
+                            if isinstance(_dv, list) and _dv:
+                                try:
+                                    _bp_depth = max(_bp_depth, int(max(_dv)))
+                                except (TypeError, ValueError):
+                                    pass
+                _pfs = self._estimate_per_fold_seconds(
+                    fw, _n_rows,
+                    max_iterations=_bp_iters, max_depth=_bp_depth,
+                )
                 _budget = 7200.0
                 _cv = 3 if _n_rows > 100_000 else 5
                 viable = []
@@ -663,26 +704,48 @@ class ModelAnalystAgent:
         return {"early_stopping_rounds": 50}
 
     @staticmethod
-    def _estimate_per_fold_seconds(framework: str, n_rows: int) -> float:
+    def _estimate_per_fold_seconds(
+        framework: str,
+        n_rows: int,
+        *,
+        max_iterations: int = 0,
+        max_depth: int = 0,
+    ) -> float:
         """Estimate wall-clock seconds for ONE model training on ONE fold.
 
-        Conservative heuristic based on empirical observations:
-          - CatBoost on 600K rows ≈ 60-120s per fold (with early stopping)
+        Conservative heuristic calibrated on real run data:
+          - CatBoost 594K rows, depth=8, iters=1000 → ~800s/fold (observed)
           - LightGBM is ~3x faster than CatBoost
           - XGBoost is ~2x faster than CatBoost
-          - Neural nets vary widely; use CatBoost-level estimate
 
-        Returns a per-fold estimate in seconds.  The caller multiplies by
-        ``cv_folds * n_trials`` (or ``cv_folds * n_models``) to get total.
+        The base rate assumes moderate params (depth≤6, iterations≤500).
+        When ``max_iterations`` or ``max_depth`` are provided, a complexity
+        multiplier is applied to avoid underestimation on expensive configs.
+
+        Returns a per-fold estimate in seconds.
         """
-        # seconds per 10K rows (with early stopping, ~1000 iterations typical)
+        # Base rate: seconds per 10K rows (moderate params: depth≤6, iters≤500)
         _rate: Dict[str, float] = {
-            "catboost": 1.8,
-            "lightgbm": 0.6,
-            "xgboost": 1.0,
+            "catboost": 2.5,
+            "lightgbm": 0.8,
+            "xgboost": 1.4,
         }
-        rate = _rate.get(framework.lower(), 1.8)  # default to CatBoost-level
-        return max(5.0, (n_rows / 10_000) * rate)
+        rate = _rate.get(framework.lower(), 2.5)
+        base = max(5.0, (n_rows / 10_000) * rate)
+
+        # Complexity multiplier for iterations above moderate baseline
+        iter_mult = 1.0
+        if max_iterations > 500:
+            # Linear scaling: 1000 iters → 2x, 2000 iters → 4x
+            iter_mult = max_iterations / 500.0
+
+        # Complexity multiplier for tree depth above moderate baseline
+        depth_mult = 1.0
+        if max_depth > 6:
+            # Exponential-ish: depth 8 → ~2.5x, depth 10 → ~4x
+            depth_mult = 2.0 ** ((max_depth - 6) / 2.0)
+
+        return base * iter_mult * depth_mult
 
     def _hpo_params(self, framework: str, metrics: Dict[str, Any], dataset_profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         n_rows = 0
@@ -732,7 +795,19 @@ class ModelAnalystAgent:
         # timeout with margin.  This prevents generating blueprints that
         # are physically impossible to execute.
         if n_rows > 0:
-            per_fold_sec = self._estimate_per_fold_seconds(framework, n_rows)
+            # Use worst-case param_space bounds for estimation
+            _max_iters = 0
+            _max_depth = 0
+            if framework == "catboost":
+                _max_iters, _max_depth = 2000, 10
+            elif framework == "xgboost":
+                _max_iters, _max_depth = 2000, 10
+            elif framework == "lightgbm":
+                _max_iters, _max_depth = 2000, 12
+            per_fold_sec = self._estimate_per_fold_seconds(
+                framework, n_rows,
+                max_iterations=_max_iters, max_depth=_max_depth,
+            )
             cost_per_trial = per_fold_sec * cv_folds
             # Leave 20% margin for overhead (data loading, pruning, final eval)
             usable_budget = timeout * 0.80

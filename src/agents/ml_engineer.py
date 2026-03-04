@@ -1725,6 +1725,7 @@ class MLEngineerAgent:
         execution_contract: Dict[str, Any] | None,
         ml_view: Dict[str, Any] | None,
         ml_plan: Dict[str, Any] | None,
+        execution_profile: Dict[str, Any] | None = None,
     ) -> str:
         contract = execution_contract if isinstance(execution_contract, dict) else {}
         view = ml_view if isinstance(ml_view, dict) else {}
@@ -1974,6 +1975,37 @@ class MLEngineerAgent:
                     )
                 )
 
+        # Script-level hard timeout — extract from execution_profile or use
+        # the runner's MAX_SCRIPT_TIMEOUT_SECONDS as fallback.  This tells the
+        # ML Engineer the absolute wall-clock ceiling so it can budget HPO +
+        # final CV + prediction + I/O within that envelope.
+        _script_hard_timeout = 7200  # runner default
+        _ep = execution_profile if isinstance(execution_profile, dict) else {}
+        _rb = _ep.get("runtime_budget") if isinstance(_ep.get("runtime_budget"), dict) else {}
+        _ht = _rb.get("hard_timeout_seconds")
+        if isinstance(_ht, (int, float)) and _ht > 0:
+            _script_hard_timeout = min(int(_ht), 7200)  # runner caps at 7200
+
+        lines.append("")
+        lines.append("SCRIPT RUNTIME BUDGET (MANDATORY — hard limit, script is killed after this):")
+        lines.append(
+            f"  - Your ENTIRE script (HPO + final CV + predictions + CSV I/O) MUST complete within {_script_hard_timeout} seconds."
+        )
+        lines.append(
+            "  - Budget allocation rule: HPO should use at most 50% of this budget. "
+            "Reserve the remaining 50% for final model training, CV evaluation, predictions, and file I/O."
+        )
+        lines.append(
+            f"  - MANDATORY: set HPO timeout to at most {_script_hard_timeout // 2} seconds."
+        )
+        lines.append(
+            "  - For large datasets (>300K rows): limit CatBoost search space to iterations<=500, depth<=6 during HPO. "
+            "Train the final model with higher iterations + early_stopping_rounds=50."
+        )
+        lines.append(
+            "  - If using subsampling for HPO, subsample to 50K-100K rows for the HPO phase, then retrain on full data."
+        )
+
         # HPO scaling guidance — universal, based on dataset size.
         # Prevents Optuna/HPO from timing out with 0 useful trials on large datasets.
         # The guidance is PRESCRIPTIVE (not suggestive) to ensure the LLM uses
@@ -1984,26 +2016,27 @@ class MLEngineerAgent:
             lines.append("")
             lines.append("HPO SCALING GUIDANCE (MANDATORY — based on training set size):")
             if n_train > 300_000:
-                hpo_timeout = 3600
+                hpo_timeout = min(3600, _script_hard_timeout // 2)
                 hpo_n_trials = 50
                 hpo_cv_folds = 3
                 lines.append(
                     f"  - LARGE DATASET ({n_train:,} training rows). Each CV fold is expensive."
                 )
                 lines.append(
-                    f"  - MANDATORY: When using Optuna/HPO, you MUST set timeout={hpo_timeout} (1h) and n_trials={hpo_n_trials}."
+                    f"  - MANDATORY: When using Optuna/HPO, you MUST set timeout={hpo_timeout} and n_trials={hpo_n_trials}."
                 )
                 lines.append(
                     f"  - MANDATORY: Use {hpo_cv_folds}-fold CV inside HPO objective function (keep 5-fold for final evaluation only)."
                 )
                 lines.append(
-                    "  - For CatBoost HPO: limit iterations to 500-1000 with early_stopping_rounds=30."
+                    f"  - For CatBoost HPO: limit search space to iterations<=500, depth<=6, and use early_stopping_rounds=30. "
+                    f"Higher iterations (1000+) should ONLY be used for the FINAL model training, NOT during HPO trials."
                 )
                 lines.append(
                     f"  - Define these constants at the top of your script: HPO_TIMEOUT = {hpo_timeout}; HPO_N_TRIALS = {hpo_n_trials}; HPO_CV_FOLDS = {hpo_cv_folds}"
                 )
             elif n_train > 100_000:
-                hpo_timeout = 1800
+                hpo_timeout = min(1800, _script_hard_timeout // 2)
                 hpo_n_trials = 50
                 hpo_cv_folds = 3
                 lines.append(
@@ -3502,6 +3535,7 @@ $strategy_json
             execution_contract=execution_contract_input,
             ml_view=ml_view,
             ml_plan=ml_plan,
+            execution_profile=execution_profile,
         )
 
         # V4.1: Use ml_engineer_runbook directly, no legacy role_runbooks

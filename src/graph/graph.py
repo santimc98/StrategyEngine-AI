@@ -9815,6 +9815,58 @@ failure_explainer = FailureExplainerAgent()
 results_advisor = ResultsAdvisorAgent()
 
 
+_RUNTIME_MODEL_AGENT_KEYS = ("strategist", "data_engineer", "ml_engineer")
+
+
+def _normalize_runtime_model_name(raw_value: Any) -> str:
+    return str(raw_value or "").strip()
+
+
+def get_runtime_agent_models() -> Dict[str, str]:
+    return {
+        "strategist": _normalize_runtime_model_name(getattr(strategist, "model_name", "")),
+        "data_engineer": _normalize_runtime_model_name(getattr(data_engineer, "model_name", "")),
+        "ml_engineer": _normalize_runtime_model_name(getattr(ml_engineer, "model_name", "")),
+    }
+
+
+def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    if not isinstance(overrides, dict):
+        return get_runtime_agent_models()
+
+    normalized: Dict[str, str] = {}
+    for agent_key in _RUNTIME_MODEL_AGENT_KEYS:
+        candidate = _normalize_runtime_model_name(overrides.get(agent_key))
+        if candidate:
+            normalized[agent_key] = candidate
+
+    strategist_model = normalized.get("strategist")
+    if strategist_model:
+        strategist.model_name = strategist_model
+        strategist.model_chain = [
+            model_name
+            for model_name in [
+                _normalize_runtime_model_name(getattr(strategist, "model_name", "")),
+                _normalize_runtime_model_name(getattr(strategist, "fallback_model_name", "")),
+            ]
+            if model_name
+        ]
+        strategist.last_model_used = None
+
+    data_engineer_model = normalized.get("data_engineer")
+    if data_engineer_model:
+        data_engineer.model_name = data_engineer_model
+        if hasattr(data_engineer, "last_model_used"):
+            data_engineer.last_model_used = None
+
+    ml_engineer_model = normalized.get("ml_engineer")
+    if ml_engineer_model:
+        ml_engineer.model_name = ml_engineer_model
+        ml_engineer.last_model_used = None
+
+    return get_runtime_agent_models()
+
+
 # 2. Define Nodes
 
 def run_steward(state: AgentState) -> AgentState:

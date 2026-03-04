@@ -16,7 +16,13 @@ from typing import Any, Dict, List, Tuple
 APP_ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(APP_ROOT)
 
-from src.graph.graph import app_graph, request_abort, clear_abort
+from src.graph.graph import (
+    app_graph,
+    request_abort,
+    clear_abort,
+    get_runtime_agent_models,
+    set_runtime_agent_models,
+)
 from src.utils.run_workspace import recover_orphaned_workspace_cwd
 
 # Auto-heal cwd when prior run crashed inside runs/<run_id>/work.
@@ -27,6 +33,24 @@ except Exception as cwd_err:
     print(f"APP_CWD_WARNING: {cwd_err}")
 
 _SIGNAL_HANDLER_INSTALLED = False
+
+AGENT_MODEL_LABELS: Dict[str, str] = {
+    "strategist": "Strategist",
+    "data_engineer": "Data Engineer",
+    "ml_engineer": "ML Engineer",
+}
+MODEL_PRESET_OPTIONS: List[Tuple[str, str]] = [
+    ("z-ai/glm-5", "GLM-5"),
+    ("moonshotai/kimi-k2.5", "Kimi K2.5"),
+    ("minimax/minimax-m2.5", "Minimax M-2.5"),
+    ("deepseek/deepseek-chat-v3.2", "DeepSeek V3.2"),
+    ("anthropic/claude-opus-4.6", "Claude Opus 4.6"),
+    ("openai/chatgpt-5.2", "ChatGPT 5.2"),
+    ("openai/chatgpt-5.3-codex", "ChatGPT 5.3 Codex"),
+]
+CUSTOM_MODEL_OPTION = "__custom_model__"
+MODEL_OVERRIDES_PATH = os.path.join(APP_ROOT, "data", "agent_model_overrides.json")
+MODEL_PRESET_LABELS: Dict[str, str] = {model_id: label for model_id, label in MODEL_PRESET_OPTIONS}
 
 def _load_json(path: str):
     try:
@@ -138,6 +162,67 @@ def _resolve_ml_artifact_files(output_report: Dict[str, Any], result: Dict[str, 
 
     return resolved
 
+
+def _sanitize_agent_model_map(raw: Any) -> Dict[str, str]:
+    cleaned: Dict[str, str] = {}
+    if not isinstance(raw, dict):
+        return cleaned
+    for agent_key in AGENT_MODEL_LABELS:
+        value = str(raw.get(agent_key) or "").strip()
+        if value:
+            cleaned[agent_key] = value
+    return cleaned
+
+
+def _merge_agent_model_maps(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, str]:
+    merged: Dict[str, str] = {}
+    base_map = _sanitize_agent_model_map(base)
+    overrides_map = _sanitize_agent_model_map(overrides)
+    for agent_key in AGENT_MODEL_LABELS:
+        merged[agent_key] = overrides_map.get(agent_key) or base_map.get(agent_key) or ""
+    return merged
+
+
+def _load_agent_model_overrides() -> Dict[str, str]:
+    return _sanitize_agent_model_map(_load_json(MODEL_OVERRIDES_PATH))
+
+
+def _save_agent_model_overrides(overrides: Dict[str, Any]) -> None:
+    payload = _sanitize_agent_model_map(overrides)
+    os.makedirs(os.path.dirname(MODEL_OVERRIDES_PATH), exist_ok=True)
+    with open(MODEL_OVERRIDES_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _model_option_label(option_id: str) -> str:
+    if option_id == CUSTOM_MODEL_OPTION:
+        return "Personalizado (ID OpenRouter)"
+    return MODEL_PRESET_LABELS.get(option_id, option_id)
+
+
+def _init_runtime_model_settings() -> None:
+    if "base_agent_models" not in st.session_state:
+        st.session_state["base_agent_models"] = _sanitize_agent_model_map(get_runtime_agent_models())
+
+    if "agent_model_overrides" not in st.session_state:
+        persisted_overrides = _load_agent_model_overrides()
+        st.session_state["agent_model_overrides"] = _merge_agent_model_maps(
+            st.session_state["base_agent_models"],
+            persisted_overrides,
+        )
+
+    if "show_model_settings" not in st.session_state:
+        st.session_state["show_model_settings"] = False
+
+    applied_models = _sanitize_agent_model_map(
+        set_runtime_agent_models(st.session_state.get("agent_model_overrides", {}))
+    )
+    st.session_state["agent_model_overrides"] = _merge_agent_model_maps(
+        st.session_state.get("base_agent_models", {}),
+        applied_models,
+    )
+
+
 def _handle_shutdown(signum, frame):
     request_abort(f"signal={signum}")
     raise KeyboardInterrupt
@@ -163,6 +248,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+_init_runtime_model_settings()
 
 # ---------------------------------------------------------------------------
 # Professional CSS Design System
@@ -527,6 +614,29 @@ section[data-testid="stSidebar"] .stButton > button:hover {
     opacity: 0.9 !important;
 }
 
+/* ---------- Sidebar Settings Panel ---------- */
+.sidebar-settings-panel {
+    background: linear-gradient(160deg, rgba(79,139,249,0.12) 0%, rgba(8,17,28,0.35) 100%);
+    border: 1px solid rgba(79,139,249,0.35);
+    border-radius: 12px;
+    padding: 0.9rem 0.9rem 0.4rem;
+    margin: 0.6rem 0 0.9rem;
+}
+.sidebar-settings-panel .ssp-title {
+    color: #e6edf3;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    margin-bottom: 0.45rem;
+}
+.sidebar-settings-panel .ssp-desc {
+    color: #b6c2cf;
+    font-size: 0.78rem;
+    margin-bottom: 0.75rem;
+    line-height: 1.4;
+}
+
 /* ---------- Fade-in animation ---------- */
 @keyframes fadeIn {
     from { opacity: 0; transform: translateY(8px); }
@@ -660,6 +770,106 @@ with st.sidebar:
         <span style="font-size:0.72rem; color:#8b949e; letter-spacing:0.05em;">v2.0 &bull; Enterprise AI Platform</span>
     </div>
     """, unsafe_allow_html=True)
+
+    if st.button("⚙ Ajustes de modelos", key="toggle_model_settings", use_container_width=True):
+        st.session_state["show_model_settings"] = not bool(st.session_state.get("show_model_settings"))
+
+    active_models = _merge_agent_model_maps(
+        st.session_state.get("base_agent_models", {}),
+        st.session_state.get("agent_model_overrides", {}),
+    )
+    active_model_lines = "".join(
+        f"<div><strong>{AGENT_MODEL_LABELS[agent_key]}:</strong> {active_models.get(agent_key, 'N/A')}</div>"
+        for agent_key in AGENT_MODEL_LABELS
+    )
+    st.markdown(
+        f"""
+        <div class="sidebar-settings-panel">
+            <div class="ssp-title">Modelos activos</div>
+            <div class="ssp-desc">{active_model_lines}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state.get("show_model_settings"):
+        st.markdown(
+            """
+            <div class="sidebar-settings-panel">
+                <div class="ssp-title">Configuracion de modelos por agente</div>
+                <div class="ssp-desc">Selecciona el modelo principal para cada agente (ruteado por OpenRouter).</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        pending_models: Dict[str, str] = {}
+        preset_ids = [model_id for model_id, _ in MODEL_PRESET_OPTIONS]
+        selector_options = preset_ids + [CUSTOM_MODEL_OPTION]
+
+        for agent_key, agent_label in AGENT_MODEL_LABELS.items():
+            current_model = str(active_models.get(agent_key) or "").strip()
+            current_is_preset = current_model in MODEL_PRESET_LABELS
+            default_option = current_model if current_is_preset else CUSTOM_MODEL_OPTION
+            if default_option not in selector_options:
+                default_option = CUSTOM_MODEL_OPTION
+            selected_option = st.selectbox(
+                f"Modelo para {agent_label}",
+                selector_options,
+                index=selector_options.index(default_option),
+                format_func=_model_option_label,
+                key=f"model_option_{agent_key}",
+            )
+            if selected_option == CUSTOM_MODEL_OPTION:
+                custom_default = "" if current_is_preset else current_model
+                custom_model = st.text_input(
+                    f"ID OpenRouter ({agent_label})",
+                    value=custom_default,
+                    placeholder="proveedor/modelo",
+                    key=f"model_custom_{agent_key}",
+                )
+                pending_models[agent_key] = str(custom_model or "").strip()
+            else:
+                pending_models[agent_key] = selected_option
+
+        apply_col, reset_col = st.columns(2)
+        with apply_col:
+            apply_models_btn = st.button("Guardar y aplicar", key="apply_agent_models", use_container_width=True)
+        with reset_col:
+            reset_models_btn = st.button("Restablecer", key="reset_agent_models", use_container_width=True)
+
+        if apply_models_btn:
+            missing_agents = [AGENT_MODEL_LABELS[k] for k, v in pending_models.items() if not str(v or "").strip()]
+            if missing_agents:
+                st.error(f"Falta definir modelo para: {', '.join(missing_agents)}")
+            else:
+                merged_models = _merge_agent_model_maps(
+                    st.session_state.get("base_agent_models", {}),
+                    pending_models,
+                )
+                applied_models = _sanitize_agent_model_map(set_runtime_agent_models(merged_models))
+                st.session_state["agent_model_overrides"] = _merge_agent_model_maps(
+                    st.session_state.get("base_agent_models", {}),
+                    applied_models,
+                )
+                _save_agent_model_overrides(st.session_state["agent_model_overrides"])
+                st.success("Configuracion aplicada.")
+                st.rerun()
+
+        if reset_models_btn:
+            default_models = _merge_agent_model_maps({}, st.session_state.get("base_agent_models", {}))
+            applied_models = _sanitize_agent_model_map(set_runtime_agent_models(default_models))
+            st.session_state["agent_model_overrides"] = _merge_agent_model_maps(default_models, applied_models)
+            _save_agent_model_overrides(st.session_state["agent_model_overrides"])
+            for agent_key in AGENT_MODEL_LABELS:
+                option_key = f"model_option_{agent_key}"
+                custom_key = f"model_custom_{agent_key}"
+                if option_key in st.session_state:
+                    del st.session_state[option_key]
+                if custom_key in st.session_state:
+                    del st.session_state[custom_key]
+            st.success("Modelos restablecidos.")
+            st.rerun()
 
     st.markdown("---")
     st.markdown("##### Fuente de Datos")
