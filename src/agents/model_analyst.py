@@ -79,6 +79,33 @@ Analyze the code for these categories (skip categories that are not applicable):
 5. CALIBRATION GAPS: No probability calibration? Predictions not well-calibrated?
 6. LOSS/OBJECTIVE GAPS: Default loss function? Could benefit from custom objective
    or focal loss for imbalanced data?
+7. VARIANCE REDUCTION GAPS: No multi-seed averaging? Only a single random state?
+   Multi-seed averaging (train same pipeline with 5-10 seeds, average predictions)
+   is one of the most reliable ways to gain +0.001-0.003 in any metric with zero
+   risk of overfitting. Always suggest it if not already present.
+8. ADVANCED ENCODING GAPS: Using simple ordinal/one-hot for categoricals?
+   Target encoding (with proper K-fold leave-one-out regularization to prevent leakage)
+   often extracts more signal than ordinal encoding for boosting models.
+   Frequency encoding and count encoding are also useful complements.
+9. SEMI-SUPERVISED GAPS: Large unlabeled test set available? Pseudo-labeling
+   (using high-confidence predictions on unlabeled data as additional training data)
+   is a standard technique that leverages the test set distribution.
+   Only recommend if test_rows > 10% of total rows.
+10. STACKING GAPS: Multiple models but only simple averaging or blending?
+    True 2-level stacking (out-of-fold predictions from diverse base learners
+    fed into a meta-learner like LogisticRegression/Ridge) captures model
+    complementarity better than any weighted average.
+
+LATE-STAGE OPTIMIZATION PRIORITY ORDER (when baseline is already strong):
+When the baseline metric is already high (e.g., AUC > 0.90), the biggest gains
+come from variance reduction and model diversity, NOT from hyperparameter micro-tuning.
+Priority order for high-baseline scenarios:
+  1. Multi-seed averaging (safest, most reliable gain)
+  2. Stacking with diverse base learners (LightGBM + CatBoost + XGBoost + Linear)
+  3. Target encoding / advanced feature encoding
+  4. Pseudo-labeling (if large unlabeled set available)
+  5. Probability calibration (for log-loss or probability-based metrics)
+  6. HPO fine-tuning (diminishing returns at high baselines)
 
 For each gap found, provide a concrete improvement action with ACTUAL parameter values
 (not placeholders). Be specific about what code to change.
@@ -434,6 +461,71 @@ class ModelAnalystAgent:
                 "priority": 4,
             })
 
+        # 9. Target encoding for categorical features
+        has_target_encoding = any(
+            kw in code_lower
+            for kw in ["targetencoder", "target_encoding", "target_encode", "leave_one_out", "loo_encoding", "woeencoder"]
+        )
+        has_categoricals = any(
+            kw in code_lower
+            for kw in ["ordinalencoder", "labelencoder", "onehotencoder", "category_encoders", "cat_features", "categorical_feature"]
+        )
+        if has_categoricals and not has_target_encoding and script.strip():
+            actions.append({
+                "technique": "target_encoding",
+                "action_family": "feature_engineering",
+                "concrete_params": {
+                    "method": "kfold_target_encoding",
+                    "cv": 5,
+                    "smoothing": 10.0,
+                    "handle_unknown": "global_mean",
+                },
+                "code_change_hint": "Add K-fold target encoding for categorical features (fit on train folds, transform on held-out fold to prevent leakage)",
+                "expected_delta": 0.0005,
+                "priority": 3,
+            })
+
+        # 10. Pseudo-labeling (semi-supervised learning)
+        has_pseudo_label = any(
+            kw in code_lower
+            for kw in ["pseudo_label", "pseudolabel", "semi_supervised", "self_training", "selftraining"]
+        )
+        _n_test_est = 0
+        for _tk in ("n_test_rows", "n_test", "n_test_samples"):
+            _tv = dataset_profile.get(_tk) or metrics.get(_tk)
+            if _tv is not None:
+                try:
+                    _n_test_est = int(_tv)
+                except (TypeError, ValueError):
+                    pass
+                if _n_test_est > 0:
+                    break
+        # Only suggest pseudo-labeling if test set is substantial (>10% of total)
+        _total_est = _n_rows_est + _n_test_est
+        if (
+            not has_pseudo_label
+            and _n_test_est > 0
+            and _total_est > 0
+            and (_n_test_est / _total_est) > 0.10
+            and script.strip()
+        ):
+            actions.append({
+                "technique": "pseudo_labeling",
+                "action_family": "feature_engineering",
+                "concrete_params": {
+                    "confidence_threshold_high": 0.95,
+                    "confidence_threshold_low": 0.05,
+                    "max_pseudo_ratio": 0.3,
+                    "retrain_epochs": 1,
+                },
+                "code_change_hint": (
+                    "After initial training, predict on test set. Add high-confidence predictions "
+                    "(prob > 0.95 or < 0.05) as pseudo-labeled training data and retrain the model"
+                ),
+                "expected_delta": 0.0003,
+                "priority": 5,
+            })
+
         assessment = f"{model_type} model using {framework}"
         if not has_hpo:
             assessment += ", no HPO"
@@ -442,15 +534,16 @@ class ModelAnalystAgent:
         if model_count >= 2 and not has_weight_opt:
             assessment += ", equal-weight ensemble"
 
-        # ── Filter computationally infeasible actions ──
-        # For large datasets, some techniques (multi-model ensemble, stacking,
-        # multi-seed) multiply training cost beyond the framework timeout.
+        # ── Adaptive viability filter ──
+        # Instead of silently discarding expensive techniques, adapt them to fit
+        # within the compute budget.  This ensures multi-seed, stacking, etc.
+        # are always proposed — just with resource-aware parameters.
         if _per_fold_sec > 0 and _n_rows_est > 0:
             viable_actions: List[Dict[str, Any]] = []
             for action in actions:
                 tech = action.get("technique", "")
                 family = action.get("action_family", "")
-                params = action.get("concrete_params", {})
+                params = dict(action.get("concrete_params") or {})
 
                 # Estimate total compute seconds for this action
                 est_total: float = 0.0
@@ -459,13 +552,9 @@ class ModelAnalystAgent:
                         n_seeds = len(params.get("seeds", [42, 123, 456]))
                         est_total = _per_fold_sec * _cv_folds_default * n_seeds
                     elif tech == "stacking_ensemble":
-                        # Stacking: N base models + 1 meta-learner, each with K-fold
                         n_base = max(model_count, 2)
                         est_total = _per_fold_sec * _cv_folds_default * (n_base + 1)
                     elif tech == "weighted_ensemble":
-                        # Weight optimization itself is cheap (scipy.optimize on OOF
-                        # predictions).  But the ML Engineer often MISINTERPRETS this
-                        # as "create N diverse models", so estimate conservatively.
                         est_total = _per_fold_sec * _cv_folds_default * 3
                     elif tech == "diverse_ensemble_averaging":
                         n_models = len(params.get("models", []))
@@ -475,22 +564,80 @@ class ModelAnalystAgent:
                     else:
                         est_total = _per_fold_sec * _cv_folds_default * 3
                 elif family == "hyperparameter_search" and tech in ("optuna_hpo", "optuna_hyperparameter_optimization"):
-                    # HPO is already capped by _hpo_params; double-check
                     hpo_trials = params.get("n_trials", 50)
                     hpo_folds = params.get("cv_folds", _cv_folds_default)
                     est_total = _per_fold_sec * hpo_folds * hpo_trials
                 else:
-                    # Feature engineering, LR reduction, calibration, etc. — cheap
                     est_total = _per_fold_sec * _cv_folds_default
 
-                if est_total <= _framework_budget * 0.85:
+                budget_limit = _framework_budget * 0.85
+                if est_total <= budget_limit:
                     viable_actions.append(action)
                 else:
+                    # ── Adapt the technique to fit within budget instead of discarding ──
+                    adapted = dict(action)
+                    adapted["concrete_params"] = dict(params)
+                    adapted_reason = ""
+
+                    if tech == "multi_seed_averaging":
+                        # Reduce seeds to fit budget; minimum 3 seeds for meaningful averaging
+                        max_seeds = max(3, int(budget_limit / (_per_fold_sec * _cv_folds_default)))
+                        all_seeds = params.get("seeds", [42, 123, 456, 789, 2024])
+                        adapted["concrete_params"]["seeds"] = all_seeds[:max_seeds]
+                        adapted["code_change_hint"] = (
+                            f"Multi-seed averaging with {max_seeds} seeds (budget-adapted). "
+                            "Train the full pipeline with each seed and average final predictions."
+                        )
+                        adapted_reason = f"seeds {len(all_seeds)}->{max_seeds}"
+
+                    elif tech == "stacking_ensemble":
+                        # Reduce CV folds for stacking and/or use subsample for base learners
+                        stacking_cv = 3
+                        n_base = max(model_count, 2)
+                        new_est = _per_fold_sec * stacking_cv * (n_base + 1)
+                        if new_est > budget_limit and _n_rows_est > 100_000:
+                            # Use subsampling for OOF generation
+                            subsample_frac = min(0.5, budget_limit / new_est)
+                            adapted["concrete_params"]["subsample_for_oof"] = round(subsample_frac, 2)
+                            adapted_reason = f"cv=3, subsample={subsample_frac:.0%}"
+                        else:
+                            adapted_reason = "cv=3"
+                        adapted["concrete_params"]["cv"] = stacking_cv
+                        adapted["code_change_hint"] = (
+                            f"Stacking with {stacking_cv}-fold OOF (budget-adapted). "
+                            "Generate out-of-fold predictions from diverse base learners, "
+                            "then train a meta-learner (LogisticRegression/Ridge) on them."
+                        )
+
+                    elif tech == "weighted_ensemble":
+                        adapted["concrete_params"]["use_precomputed_oof"] = True
+                        adapted["code_change_hint"] = (
+                            "Optimize ensemble weights using precomputed OOF predictions "
+                            "(no retraining needed — just scipy.optimize on existing predictions)"
+                        )
+                        adapted_reason = "use precomputed OOF"
+
+                    elif tech in ("optuna_hpo", "optuna_hyperparameter_optimization"):
+                        # Reduce trials to fit budget
+                        max_trials = max(5, int(budget_limit / (_per_fold_sec * _cv_folds_default)))
+                        adapted["concrete_params"]["n_trials"] = min(max_trials, params.get("n_trials", 50))
+                        adapted["concrete_params"]["timeout_seconds"] = int(budget_limit * 0.8)
+                        adapted_reason = f"trials->{adapted['concrete_params']['n_trials']}"
+
+                    else:
+                        # Generic fallback: still include but flag as budget-constrained
+                        adapted["code_change_hint"] = (
+                            str(action.get("code_change_hint", "")) +
+                            f" [BUDGET NOTE: estimated {est_total:.0f}s vs budget {budget_limit:.0f}s — "
+                            "use subsampling or fewer folds to fit within budget]"
+                        )
+                        adapted_reason = "budget-constrained"
+
                     print(
-                        f"BLUEPRINT_VIABILITY: Skipping '{tech}' — estimated {est_total:.0f}s "
-                        f"exceeds framework budget {_framework_budget:.0f}s "
-                        f"(per_fold={_per_fold_sec:.1f}s, n_rows={_n_rows_est})"
+                        f"BLUEPRINT_VIABILITY: Adapted '{tech}' to fit budget "
+                        f"({est_total:.0f}s -> budget {budget_limit:.0f}s): {adapted_reason}"
                     )
+                    viable_actions.append(adapted)
             actions = viable_actions
 
         return {

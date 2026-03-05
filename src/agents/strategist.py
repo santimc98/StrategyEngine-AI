@@ -492,6 +492,35 @@ class StrategistAgent:
                     "objective": "Apply bounded quantile bins to reduce over-sensitive continuous splits.",
                 }
             )
+        # Late-stage universal candidates (variance reduction + advanced encoding)
+        # These are always beneficial when the baseline is already reasonable.
+        out.append(
+            {
+                "technique": "target_encoding",
+                "target_columns": ["ALL_CATEGORICAL"],
+                "feature_scope": "model_features",
+                "params": {"cv": 5, "smoothing": 10.0},
+                "objective": "Add K-fold target encoding for categoricals to extract more signal than ordinal encoding.",
+            }
+        )
+        out.append(
+            {
+                "technique": "multi_seed_averaging",
+                "target_columns": ["ALL"],
+                "feature_scope": "model_features",
+                "params": {"seeds": [42, 123, 456, 789, 2024], "aggregation": "mean"},
+                "objective": "Train with multiple random seeds and average predictions for variance reduction.",
+            }
+        )
+        out.append(
+            {
+                "technique": "stacking_ensemble",
+                "target_columns": ["ALL"],
+                "feature_scope": "model_features",
+                "params": {"meta_learner": "LogisticRegression", "cv": 3},
+                "objective": "Build 2-level stacking with diverse base learners and a meta-learner on OOF predictions.",
+            }
+        )
         # Apply feasibility filter against dataset profile
         out = self._filter_candidates_by_feasibility(out, dataset_profile)
         if not out:
@@ -1565,6 +1594,43 @@ $payload_json
         - "The business wants to understand what customer segments exist based on behavior patterns.
            This is a DESCRIPTIVE objective because the goal is pattern discovery, not prediction.
            Success metric: Segment interpretability and separation quality (silhouette score)."
+
+        *** METRIC OPTIMIZATION PROGRESSION (Senior Data Science Best Practice) ***
+        When designing a predictive strategy, plan for PROGRESSIVE OPTIMIZATION across multiple
+        improvement rounds. A senior data scientist knows the optimal order of operations:
+
+        PHASE 1 — SOLID BASELINE (rounds 1-2):
+          - Clean, correct pipeline with proper train/test separation
+          - Strong baseline model (gradient boosting: LightGBM, XGBoost, or CatBoost)
+          - Proper cross-validation aligned with the evaluation metric
+          - Basic feature engineering: encoding categoricals, handling missing values
+
+        PHASE 2 — FEATURE ENGINEERING (rounds 3-4):
+          - Target encoding with K-fold regularization (prevents leakage, extracts more signal
+            from categoricals than ordinal encoding — especially impactful for boosting models)
+          - Interaction features between top predictors
+          - Frequency encoding, count encoding for high-cardinality features
+          - Feature selection (drop noisy features that add variance without signal)
+
+        PHASE 3 — HYPERPARAMETER OPTIMIZATION (rounds 4-5):
+          - Optuna/Bayesian HPO with proper timeout constraints
+          - Learning rate reduction + more iterations (proven technique for boosting)
+          - Early stopping calibration
+
+        PHASE 4 — VARIANCE REDUCTION AND ENSEMBLING (rounds 5+):
+          - Multi-seed averaging: Train the SAME pipeline with 5+ different random seeds and
+            average predictions. This is the single most reliable technique for gaining +0.001-0.003
+            with ZERO risk of overfitting. Should ALWAYS be part of a mature pipeline.
+          - Stacking: Generate out-of-fold predictions from diverse base models (LightGBM + CatBoost
+            + XGBoost + LogisticRegression), then train a simple meta-learner (Ridge/LR) on them.
+            Real stacking > simple weighted blending because it captures model complementarity.
+          - Pseudo-labeling: If the unlabeled test set is large (>10% of total data), use
+            high-confidence model predictions (>0.95 or <0.05) on test data as additional
+            training samples. Standard semi-supervised technique.
+
+        IMPORTANT: Include techniques from ALL phases in your strategy's "techniques" list.
+        The improvement loop will execute them in order. Do NOT stop at Phase 1-2.
+        A complete strategy should include at least one technique from each phase.
 
         *** STEP 3: CONTEXT-AWARE STRATEGY DESIGN ***
         You are a Chief Data Strategist designing executable plans. Your decisions must be driven by DATA CONTEXT,
