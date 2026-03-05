@@ -23355,6 +23355,11 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         try:
             baseline_script = str(state.get("generated_code") or state.get("last_generated_code") or "")
             analyst = ModelAnalystAgent()
+            # Inherit strategist model override so the analyst uses the same
+            # premium model the user selected (instead of the default GLM-5).
+            _strategist_model = getattr(strategist, "model_name", "")
+            if _strategist_model and _strategist_model != analyst.model_name:
+                analyst.model_name = _strategist_model
             analyst_context = {
                 "script_code": baseline_script,
                 "metrics": baseline_metrics if isinstance(baseline_metrics, dict) else {},
