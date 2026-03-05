@@ -26,6 +26,14 @@ def flatten_numeric_metrics(payload: Any, prefix: str = "") -> List[Tuple[str, f
                 items.append((next_key, float(value)))
             elif isinstance(value, dict):
                 items.extend(flatten_numeric_metrics(value, next_key))
+            elif isinstance(value, list) and value:
+                # Compute mean of numeric lists (e.g. fold scores like
+                # cv_results.roc_auc: [0.91, 0.92, 0.90]) and expose
+                # as a scalar so metric extraction can find it.
+                nums = [float(v) for v in value if isinstance(v, (int, float))]
+                if nums and len(nums) == len(value):
+                    mean_val = sum(nums) / len(nums)
+                    items.append((f"{next_key}_mean", mean_val))
     return items
 
 

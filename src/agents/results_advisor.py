@@ -1934,6 +1934,15 @@ class ResultsAdvisorAgent:
             if isinstance(value, dict):
                 flat.update(self._flatten_numeric_metrics(value, f"{metric_key}."))
                 continue
+            if isinstance(value, list) and value:
+                nums = []
+                for v in value:
+                    n = self._coerce_number(v, ".")
+                    if n is not None:
+                        nums.append(float(n))
+                if nums and len(nums) == len(value):
+                    flat[f"{metric_key}_mean"] = sum(nums) / len(nums)
+                continue
             num = self._coerce_number(value, ".")
             if num is not None:
                 flat[str(metric_key)] = float(num)

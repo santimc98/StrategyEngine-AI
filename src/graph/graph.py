@@ -22128,6 +22128,11 @@ def _flatten_numeric_metrics_for_improvement(payload: Any, prefix: str = "") -> 
                 items.append((next_key, float(value)))
             elif isinstance(value, dict):
                 items.extend(_flatten_numeric_metrics_for_improvement(value, next_key))
+            elif isinstance(value, list) and value:
+                nums = [float(v) for v in value if isinstance(v, (int, float))]
+                if nums and len(nums) == len(value):
+                    mean_val = sum(nums) / len(nums)
+                    items.append((f"{next_key}_mean", mean_val))
     return items
 
 
