@@ -46,7 +46,7 @@ MODEL_PRESET_OPTIONS: List[Tuple[str, str]] = [
     ("deepseek/deepseek-chat-v3.2", "DeepSeek V3.2"),
     ("anthropic/claude-opus-4.6", "Claude Opus 4.6"),
     ("openai/chatgpt-5.2", "ChatGPT 5.2"),
-    ("openai/chatgpt-5.3-codex", "ChatGPT 5.3 Codex"),
+    ("openai/gpt-5.3-codex", "GPT-5.3 Codex"),
 ]
 CUSTOM_MODEL_OPTION = "__custom_model__"
 MODEL_OVERRIDES_PATH = os.path.join(APP_ROOT, "data", "agent_model_overrides.json")
