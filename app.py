@@ -1370,7 +1370,7 @@ if start_btn:
 
             final_state = initial_state.copy()
 
-            for event in app_graph.stream(initial_state, config={"recursion_limit": 100}):
+            for event in app_graph.stream(initial_state, config={"recursion_limit": 250}):
                 if event is None:
                     continue
 

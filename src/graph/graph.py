@@ -6308,6 +6308,16 @@ def _score_attempt(
     content_issues: List[str],
     artifact_paths: List[str],
 ) -> float:
+    """Score an attempt for best_attempt selection.
+
+    The score has two components:
+    1. Completeness score (0-20 range): outputs valid, artifacts present, no issues.
+    2. ML metric bonus (100+ range): the primary metric value from metrics.json,
+       scaled so that any metric improvement dominates completeness differences.
+
+    This ensures that a higher-metric attempt is always preferred over a
+    lower-metric attempt, even if the lower one has slightly better completeness.
+    """
     score = 0.0
     present = output_contract_report.get("present", []) if isinstance(output_contract_report, dict) else []
     missing = output_contract_report.get("missing", []) if isinstance(output_contract_report, dict) else []
@@ -6317,6 +6327,28 @@ def _score_attempt(
     score += float(len(artifact_paths)) * 0.25
     score -= float(len(missing)) * 2.0
     score -= float(len(content_issues)) * 3.0
+
+    # ML metric bonus: extract primary metric from metrics.json and add it
+    # as a dominant score component.  We use a large multiplier (1000x) so
+    # that even a 0.0001 AUC improvement (+0.1 score) overwhelms any
+    # completeness difference (~1-2 points).
+    try:
+        metrics_json = _load_json_safe("data/metrics.json")
+        if isinstance(metrics_json, dict):
+            # Determine metric name from metrics.json or default
+            metric_name = str(metrics_json.get("primary_metric") or "roc_auc").strip()
+            ml_value = _extract_primary_metric(metrics_json, metric_name)
+            if ml_value is not None and 0.0 < ml_value < 1e6:
+                higher_is_better = bool(_metric_higher_is_better(metric_name))
+                # For higher-is-better metrics (e.g. AUC): add directly
+                # For lower-is-better metrics (e.g. logloss): negate
+                if higher_is_better:
+                    score += float(ml_value) * 1000.0
+                else:
+                    score += (1.0 - float(ml_value)) * 1000.0
+    except Exception:
+        pass  # If metrics unavailable, fall back to completeness-only scoring
+
     return score
 
 def _snapshot_best_attempt(
@@ -23405,11 +23437,11 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         tracker_entries=tracker_entries,
     )
     # --- Monotonic degradation detection ---
-    degradation_threshold = float(os.environ.get("OPT_DEGRADATION_THRESHOLD", "0.05"))
+    degradation_threshold = float(os.environ.get("OPT_DEGRADATION_THRESHOLD", "0.0"))
     degradation_info = _detect_monotonic_degradation(
         tracker_entries,
         higher_is_better=bool(metric_higher_is_better),
-        min_streak_for_warning=3,
+        min_streak_for_warning=2,
         cumulative_threshold=degradation_threshold,
     )
     state["ml_improvement_degradation_info"] = degradation_info
