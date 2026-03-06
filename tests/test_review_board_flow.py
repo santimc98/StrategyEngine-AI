@@ -205,6 +205,43 @@ def test_run_review_board_metric_only_needs_improvement_is_downgraded(tmp_path, 
     assert any("REVIEW_BOARD_POLICY" in item for item in (result.get("feedback_history") or []))
 
 
+def test_run_review_board_reconciles_provisional_attempt_cycle(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardNeedsImprovement())
+    state = {
+        "iteration_count": 0,
+        "execution_attempt": 1,
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "review_feedback": "Provisional approval before board.",
+        "feedback_history": [],
+        "last_gate_context": {"failed_gates": [], "required_fixes": []},
+        "attempt_ledger": [
+            {
+                "phase": "compliance",
+                "outcome": "approved",
+                "root_cause": "",
+                "source": "run_result_evaluator",
+                "execution_attempt": 1,
+                "iteration_count": 0,
+                "cycle_key": "result_evaluator|1|1|compliance|approved",
+            }
+        ],
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False},
+            "result_evaluator": {"status": "APPROVE_WITH_WARNINGS"},
+            "reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "REJECTED", "failed_gates": ["gate_x"]},
+            "results_advisor": {"status": "APPROVE_WITH_WARNINGS"},
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+    assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
+    assert result["attempt_ledger"][-1]["outcome"] == "needs_improvement"
+    assert result["attempt_ledger"][-1]["phase"] == "compliance"
+
+
 def test_run_review_board_drops_spurious_failed_areas_when_packets_are_clean(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)

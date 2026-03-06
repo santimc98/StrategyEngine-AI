@@ -4445,6 +4445,389 @@ def _extract_contract_artifact_issues(oc_report: Dict[str, Any] | None) -> Dict[
 
     return {"missing_paths": missing_paths, "schema_issues": schema_issues}
 
+
+_ATTEMPT_LEDGER_MAX_ENTRIES = 160
+
+
+def _normalize_cycle_phase(raw: Any) -> str:
+    token = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not token:
+        return "other"
+    mapping = {
+        "baseline": "compliance",
+        "bootstrap": "compliance",
+        "bootstrap_review": "compliance",
+        "compliance_bootstrap": "compliance",
+        "retry": "compliance",
+        "review_complete": "compliance",
+        "metric_improvement": "metric",
+        "metric_improvement_round": "metric",
+        "optimization": "metric",
+        "runtime_fix": "runtime",
+        "runtime_failure": "runtime",
+    }
+    normalized = mapping.get(token, token)
+    if normalized in {"compliance", "metric", "runtime", "other"}:
+        return normalized
+    return "other"
+
+
+def _normalize_cycle_outcome(raw: Any) -> str:
+    token = str(raw or "").strip().lower().replace(" ", "_")
+    return token[:64] if token else "unknown"
+
+
+def _normalize_root_cause_signature(raw: Any) -> str:
+    text = str(raw or "").strip().lower().replace("\\", "/")
+    if not text:
+        return ""
+    text = re.sub(r"0x[0-9a-f]+", "0x?", text)
+    text = re.sub(r"\bline\s+\d+\b", "line ?", text)
+    text = re.sub(r"\b\d+\b", "?", text)
+    text = re.sub(r"\s+", " ", text)
+    return text[:220]
+
+
+def _get_attempt_ledger_entries(state: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    if not isinstance(state, dict):
+        return []
+    raw_entries = state.get("attempt_ledger")
+    if not isinstance(raw_entries, list):
+        return []
+    return [dict(entry) for entry in raw_entries if isinstance(entry, dict)]
+
+
+def _compute_attempt_phase_counts(entries: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {"compliance": 0, "metric": 0, "runtime": 0, "other": 0}
+    for entry in entries:
+        phase = _normalize_cycle_phase(entry.get("phase"))
+        counts[phase] = counts.get(phase, 0) + 1
+    return counts
+
+
+def _sync_attempt_ledger_state(state: Dict[str, Any]) -> Dict[str, int]:
+    entries = _get_attempt_ledger_entries(state)
+    counts = _compute_attempt_phase_counts(entries)
+    explicit_total = sum(int(v or 0) for v in counts.values())
+    current_total = _coerce_nonnegative_int(state.get("expensive_cycle_count", 0), default=0)
+    current_metric = _coerce_nonnegative_int(state.get("metric_iterations", 0), default=0)
+    current_runtime = _coerce_nonnegative_int(state.get("runtime_iterations", 0), default=0)
+    state["attempt_ledger"] = entries[-_ATTEMPT_LEDGER_MAX_ENTRIES:]
+    state["phase_cycle_counts"] = counts
+    state["expensive_cycle_count"] = max(current_total, explicit_total)
+    state["metric_iterations"] = max(
+        current_metric,
+        counts.get("metric", 0),
+        _coerce_nonnegative_int(state.get("ml_improvement_round_count", 0), default=0),
+    )
+    state["runtime_iterations"] = max(
+        current_runtime,
+        counts.get("runtime", 0),
+        _coerce_nonnegative_int(state.get("runtime_fix_count", 0), default=0),
+    )
+    return counts
+
+
+def _build_attempt_cycle_key(
+    *,
+    phase: str,
+    outcome: str,
+    state: Dict[str, Any],
+    root_cause: str = "",
+    source: str = "",
+    cycle_key: str | None = None,
+) -> str:
+    if cycle_key:
+        return str(cycle_key)
+    return "|".join(
+        [
+            phase,
+            outcome,
+            str(source or ""),
+            str(_coerce_nonnegative_int(state.get("iteration_count", 0), default=0)),
+            str(_coerce_nonnegative_int(state.get("ml_engineer_attempt", 0), default=0)),
+            str(_coerce_nonnegative_int(state.get("execution_attempt", 0), default=0)),
+            str(_coerce_nonnegative_int(state.get("ml_improvement_round_count", 0), default=0)),
+            root_cause[:120],
+        ]
+    )
+
+
+def _append_attempt_cycle(
+    state: Dict[str, Any],
+    *,
+    phase: Any,
+    outcome: Any,
+    root_cause: Any = "",
+    source: str = "",
+    details: Dict[str, Any] | None = None,
+    cycle_key: str | None = None,
+) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    entries = _get_attempt_ledger_entries(state)
+    normalized_phase = _normalize_cycle_phase(phase)
+    normalized_outcome = _normalize_cycle_outcome(outcome)
+    normalized_root_cause = _normalize_root_cause_signature(root_cause)
+    normalized_details = dict(details) if isinstance(details, dict) else {}
+    normalized_cycle_key = _build_attempt_cycle_key(
+        phase=normalized_phase,
+        outcome=normalized_outcome,
+        state=state,
+        root_cause=normalized_root_cause,
+        source=source,
+        cycle_key=cycle_key,
+    )
+    if entries and str(entries[-1].get("cycle_key") or "") == normalized_cycle_key:
+        state["attempt_ledger"] = entries[-_ATTEMPT_LEDGER_MAX_ENTRIES:]
+        _sync_attempt_ledger_state(state)
+        return dict(entries[-1])
+
+    phase_counts = _compute_attempt_phase_counts(entries)
+    next_cycle_id = max(
+        _coerce_nonnegative_int(state.get("expensive_cycle_count", 0), default=0),
+        len(entries),
+    ) + 1
+    entry = {
+        "cycle_id": int(next_cycle_id),
+        "phase": normalized_phase,
+        "phase_cycle_index": int(phase_counts.get(normalized_phase, 0) + 1),
+        "outcome": normalized_outcome,
+        "root_cause": normalized_root_cause,
+        "source": str(source or ""),
+        "iteration_count": _coerce_nonnegative_int(state.get("iteration_count", 0), default=0),
+        "ml_engineer_attempt": _coerce_nonnegative_int(state.get("ml_engineer_attempt", 0), default=0),
+        "execution_attempt": _coerce_nonnegative_int(state.get("execution_attempt", 0), default=0),
+        "runtime_fix_count": _coerce_nonnegative_int(state.get("runtime_fix_count", 0), default=0),
+        "round_id": _coerce_nonnegative_int(state.get("ml_improvement_round_count", 0), default=0),
+        "review_verdict": str(state.get("review_verdict") or ""),
+        "cycle_key": normalized_cycle_key,
+    }
+    if normalized_details:
+        entry["details"] = normalized_details
+    entries.append(entry)
+    state["attempt_ledger"] = entries[-_ATTEMPT_LEDGER_MAX_ENTRIES:]
+    _sync_attempt_ledger_state(state)
+    return entry
+
+
+def _reconcile_latest_attempt_cycle(
+    state: Dict[str, Any],
+    *,
+    phase: Any,
+    outcome: Any,
+    root_cause: Any = "",
+    source: str = "run_result_evaluator",
+    details: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    entries = _get_attempt_ledger_entries(state)
+    if not entries:
+        return _append_attempt_cycle(
+            state,
+            phase=phase,
+            outcome=outcome,
+            root_cause=root_cause,
+            source=source,
+            details=details,
+        )
+    current_execution_attempt = _coerce_nonnegative_int(state.get("execution_attempt", 0), default=0)
+    target_index: int | None = None
+    for idx in range(len(entries) - 1, -1, -1):
+        entry = entries[idx]
+        if str(entry.get("source") or "") != str(source or ""):
+            continue
+        if _coerce_nonnegative_int(entry.get("execution_attempt", -1), default=-1) != current_execution_attempt:
+            continue
+        target_index = idx
+        break
+    if target_index is None:
+        return _append_attempt_cycle(
+            state,
+            phase=phase,
+            outcome=outcome,
+            root_cause=root_cause,
+            source=source,
+            details=details,
+        )
+
+    normalized_phase = _normalize_cycle_phase(phase)
+    normalized_outcome = _normalize_cycle_outcome(outcome)
+    normalized_root_cause = _normalize_root_cause_signature(root_cause)
+    entry = dict(entries[target_index])
+    entry["phase"] = normalized_phase
+    entry["outcome"] = normalized_outcome
+    entry["root_cause"] = normalized_root_cause
+    entry["cycle_key"] = _build_attempt_cycle_key(
+        phase=normalized_phase,
+        outcome=normalized_outcome,
+        state=state,
+        root_cause=normalized_root_cause,
+        source=source,
+    )
+    if isinstance(details, dict) and details:
+        merged_details = dict(entry.get("details") or {})
+        merged_details.update(details)
+        entry["details"] = merged_details
+    entries[target_index] = entry
+    state["attempt_ledger"] = entries[-_ATTEMPT_LEDGER_MAX_ENTRIES:]
+    _sync_attempt_ledger_state(state)
+    return entry
+
+
+def _iteration_budget_snapshot(state: Dict[str, Any]) -> Dict[str, int]:
+    entries = _get_attempt_ledger_entries(state)
+    phase_counts = _compute_attempt_phase_counts(entries)
+    compliance_retries = _coerce_nonnegative_int(state.get("compliance_iterations", 0), default=0)
+    metric_rounds = max(
+        phase_counts.get("metric", 0),
+        _coerce_nonnegative_int(state.get("metric_iterations", 0), default=0),
+        _coerce_nonnegative_int(state.get("ml_improvement_round_count", 0), default=0),
+    )
+    runtime_cycles = max(
+        phase_counts.get("runtime", 0),
+        _coerce_nonnegative_int(state.get("runtime_iterations", 0), default=0),
+        _coerce_nonnegative_int(state.get("runtime_fix_count", 0), default=0),
+    )
+    explicit_total = _coerce_nonnegative_int(state.get("expensive_cycle_count", 0), default=0)
+    phase_total = sum(int(v or 0) for v in phase_counts.values())
+    legacy_total = max(
+        _coerce_nonnegative_int(state.get("iteration_count", 0), default=0),
+        compliance_retries + metric_rounds + runtime_cycles,
+    )
+    total_cycles = max(explicit_total, phase_total, legacy_total)
+    return {
+        "total_cycles": int(total_cycles),
+        "compliance_retries": int(compliance_retries),
+        "metric_rounds": int(metric_rounds),
+        "runtime_cycles": int(runtime_cycles),
+        "ledger_compliance_cycles": int(phase_counts.get("compliance", 0)),
+        "ledger_metric_cycles": int(phase_counts.get("metric", 0)),
+        "ledger_runtime_cycles": int(phase_counts.get("runtime", 0)),
+    }
+
+
+def _derive_root_cause_signature(
+    state: Dict[str, Any],
+    phase: Any,
+    *,
+    gate_context: Dict[str, Any] | None = None,
+    feedback_text: str | None = None,
+) -> str:
+    normalized_phase = _normalize_cycle_phase(phase)
+    if normalized_phase == "runtime":
+        runtime_summary = _summarize_runtime_error(
+            state.get("last_runtime_error_tail") or state.get("execution_output")
+        )
+        if isinstance(runtime_summary, dict):
+            token = runtime_summary.get("message") or runtime_summary.get("type")
+            normalized = _normalize_root_cause_signature(token)
+            if normalized:
+                return normalized
+        runtime_tail = str(state.get("last_runtime_error_tail") or state.get("execution_output") or "").strip()
+        if runtime_tail:
+            return _normalize_root_cause_signature(runtime_tail.splitlines()[-1])
+        return ""
+
+    gate = gate_context if isinstance(gate_context, dict) else (
+        state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+    )
+    candidate_fields = (
+        ("hard_failure", gate.get("hard_failures")),
+        ("failed_gate", gate.get("failed_gates")),
+        ("required_fix", gate.get("required_fixes")),
+    )
+    for prefix, values in candidate_fields:
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            normalized = _normalize_root_cause_signature(f"{prefix}:{item}")
+            if normalized:
+                return normalized
+
+    feedback_candidates = [
+        feedback_text,
+        gate.get("feedback"),
+        state.get("review_feedback"),
+    ]
+    for item in feedback_candidates:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        normalized = _normalize_root_cause_signature(text.splitlines()[0])
+        if normalized:
+            return normalized
+    return ""
+
+
+def _resolve_root_cause_repeat_limit(state: Dict[str, Any], phase: Any) -> int:
+    normalized_phase = _normalize_cycle_phase(phase)
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    policy = contract.get("iteration_policy") if isinstance(contract.get("iteration_policy"), dict) else {}
+    phase_key = f"{normalized_phase}_root_cause_repeat_limit"
+    env_key = f"{normalized_phase.upper()}_ROOT_CAUSE_REPEAT_LIMIT"
+    default_map = {
+        "runtime": 2,
+        "compliance": 3,
+        "metric": 2,
+        "other": 3,
+    }
+    for raw in (
+        policy.get(phase_key),
+        policy.get("root_cause_repeat_limit"),
+        os.getenv(env_key),
+        os.getenv("ROOT_CAUSE_REPEAT_LIMIT"),
+    ):
+        try:
+            value = int(raw)
+        except Exception:
+            continue
+        if value > 0:
+            return value
+    return int(default_map.get(normalized_phase, 3))
+
+
+def _recent_root_cause_streak(state: Dict[str, Any], phase: Any, root_cause: str) -> int:
+    normalized_phase = _normalize_cycle_phase(phase)
+    normalized_root_cause = _normalize_root_cause_signature(root_cause)
+    if not normalized_root_cause:
+        return 0
+    entries = _get_attempt_ledger_entries(state)
+    streak = 0
+    started = False
+    for entry in reversed(entries):
+        entry_phase = _normalize_cycle_phase(entry.get("phase"))
+        if entry_phase != normalized_phase:
+            if started:
+                break
+            continue
+        entry_root_cause = _normalize_root_cause_signature(entry.get("root_cause"))
+        if not entry_root_cause:
+            if started:
+                break
+            continue
+        if entry_root_cause == normalized_root_cause:
+            streak += 1
+            started = True
+            continue
+        if started:
+            break
+        return 0
+    return streak
+
+
+def _should_stop_repeated_root_cause(state: Dict[str, Any], phase: Any, root_cause: str) -> Tuple[bool, int, int]:
+    normalized_root_cause = _normalize_root_cause_signature(root_cause)
+    if not normalized_root_cause:
+        return False, 0, 0
+    repeat_limit = _resolve_root_cause_repeat_limit(state, phase)
+    if repeat_limit <= 0:
+        return False, 0, repeat_limit
+    predicted_streak = _recent_root_cause_streak(state, phase, normalized_root_cause) + 1
+    return predicted_streak >= repeat_limit, predicted_streak, repeat_limit
+
+
 def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
     contract = state.get("execution_contract") or {}
     policy = contract.get("iteration_policy")
@@ -8402,6 +8785,7 @@ def _clear_runtime_blockers() -> Dict[str, Any]:
         "execution_output_stale": False,
         "sandbox_failed": False,
         "runtime_fix_terminal": False,
+        "runtime_fix_terminal_reason": "",
         "last_runtime_error_tail": None,
     }
 
@@ -10159,6 +10543,10 @@ class AgentState(TypedDict):
     final_report: str
     # Feedback Loop Fields
     iteration_count: int
+    expensive_cycle_count: int
+    runtime_iterations: int
+    attempt_ledger: List[Dict[str, Any]]
+    phase_cycle_counts: Dict[str, int]
     ml_iteration_memory: List[Dict[str, Any]]
     ml_iteration_memory_block: str
     ml_journal_written_ids: List[str]
@@ -10256,6 +10644,7 @@ class AgentState(TypedDict):
     runtime_fix_count: int
     max_runtime_fix_attempts: int
     runtime_fix_terminal: bool
+    runtime_fix_terminal_reason: str
     last_runtime_error_tail: str # Added for Runtime Error Visibility
     data_engineer_audit_override: str
     data_engineer_feedback_record: Dict[str, Any]
@@ -10837,10 +11226,14 @@ def run_steward(state: AgentState) -> AgentState:
         "column_manifest": column_manifest,
         "column_manifest_summary": column_manifest_summary,
         "iteration_count": 0,
+        "expensive_cycle_count": 0,
         "compliance_iterations": 0,
         "metric_iterations": 0,
+        "runtime_iterations": 0,
         "compliance_passed": False,
         "last_iteration_type": None,
+        "attempt_ledger": [],
+        "phase_cycle_counts": {"compliance": 0, "metric": 0, "runtime": 0, "other": 0},
         "ml_journal_written_ids": [],
         "feedback_history": [],
         "has_partial_visuals": False,
@@ -10896,6 +11289,11 @@ def run_steward(state: AgentState) -> AgentState:
         "ml_improvement_apply_guard_report": {},
         "optimization_blueprint": {},
         "ml_optimization_context": {},
+        "execution_attempt": 0,
+        "runtime_fix_count": 0,
+        "runtime_fix_terminal": False,
+        "runtime_fix_terminal_reason": "",
+        "last_runtime_error_tail": None,
         "leakage_audit_summary": "",
         "restrategize_count": state.get("restrategize_count", 0) if state else 0,
         "strategist_context_override": state.get("strategist_context_override", "") if state else "",
@@ -21407,6 +21805,49 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         except Exception:
             pass
 
+    if not metric_improvement_round_active:
+        ledger_state = dict(state or {})
+        ledger_state.update(result_state)
+        cycle_phase = _normalize_cycle_phase(iteration_type or "compliance")
+        if status in {"APPROVED", "APPROVE_WITH_WARNINGS"} and cycle_phase == "other":
+            cycle_phase = "compliance"
+        cycle_outcome = "approved" if status in {"APPROVED", "APPROVE_WITH_WARNINGS"} else "needs_improvement"
+        cycle_root_cause = ""
+        if cycle_outcome != "approved":
+            cycle_root_cause = _derive_root_cause_signature(
+                ledger_state,
+                cycle_phase,
+                gate_context=gate_context,
+                feedback_text=review_feedback,
+            )
+        _append_attempt_cycle(
+            ledger_state,
+            phase=cycle_phase,
+            outcome=cycle_outcome,
+            root_cause=cycle_root_cause,
+            source="run_result_evaluator",
+            details={
+                "status": str(status),
+                "failed_gates": [str(item) for item in (failed_gates or []) if str(item).strip()][:8],
+                "required_fixes": [str(item) for item in (required_fixes or []) if str(item).strip()][:8],
+            },
+            cycle_key=(
+                "result_evaluator|"
+                + str(int(iter_id))
+                + "|"
+                + str(int(state.get("execution_attempt", 0) or 0))
+                + "|"
+                + str(cycle_phase)
+                + "|"
+                + str(cycle_outcome)
+            ),
+        )
+        result_state["attempt_ledger"] = ledger_state.get("attempt_ledger")
+        result_state["phase_cycle_counts"] = ledger_state.get("phase_cycle_counts")
+        result_state["expensive_cycle_count"] = ledger_state.get("expensive_cycle_count")
+        result_state["runtime_iterations"] = ledger_state.get("runtime_iterations", state.get("runtime_iterations", 0))
+        result_state["metric_iterations"] = ledger_state.get("metric_iterations", metric_iterations)
+
     if status == "NEEDS_IMPROVEMENT":
         result_state["iteration_count"] = state.get("iteration_count", 0) + 1
     if run_id:
@@ -21849,6 +22290,41 @@ def run_review_board(state: AgentState) -> AgentState:
         "last_gate_context": gate_context,
         "iteration_handoff": iteration_handoff,
     }
+    if not bool(state.get("ml_improvement_round_active")):
+        ledger_state = dict(state or {})
+        ledger_state.update(result)
+        board_phase = _normalize_cycle_phase(
+            gate_context.get("iteration_type") or state.get("last_iteration_type") or "compliance"
+        )
+        if final_status in {"APPROVED", "APPROVE_WITH_WARNINGS"} and board_phase == "other":
+            board_phase = "compliance"
+        board_outcome = "approved" if final_status in {"APPROVED", "APPROVE_WITH_WARNINGS"} else "needs_improvement"
+        board_root_cause = ""
+        if board_outcome != "approved":
+            board_root_cause = _derive_root_cause_signature(
+                ledger_state,
+                board_phase,
+                gate_context=gate_context,
+                feedback_text=current_feedback,
+            )
+        _reconcile_latest_attempt_cycle(
+            ledger_state,
+            phase=board_phase,
+            outcome=board_outcome,
+            root_cause=board_root_cause,
+            source="run_result_evaluator",
+            details={
+                "final_review_verdict": str(final_status),
+                "board_status": str(board_status),
+                "failed_areas": [str(item) for item in failed_areas[:8]],
+                "required_actions": [str(item) for item in required_actions[:8]],
+            },
+        )
+        result["attempt_ledger"] = ledger_state.get("attempt_ledger")
+        result["phase_cycle_counts"] = ledger_state.get("phase_cycle_counts")
+        result["expensive_cycle_count"] = ledger_state.get("expensive_cycle_count")
+        result["runtime_iterations"] = ledger_state.get("runtime_iterations", state.get("runtime_iterations", 0))
+        result["metric_iterations"] = ledger_state.get("metric_iterations", state.get("metric_iterations", 0))
     if board_feedback_record:
         result["ml_feedback_record"] = board_feedback_record
     # Iteration counter guard:
@@ -21959,6 +22435,27 @@ def check_execution_status(state: AgentState):
         return "evaluate"
 
     if has_error:
+        runtime_root_cause = _derive_root_cause_signature(state, "runtime")
+        repeated_root_cause_stop, predicted_streak, repeat_limit = _should_stop_repeated_root_cause(
+            state,
+            "runtime",
+            runtime_root_cause,
+        )
+        if repeated_root_cause_stop:
+            state["runtime_fix_terminal"] = True
+            state["runtime_fix_terminal_reason"] = "repeated_root_cause"
+            _append_feedback_history(
+                state,
+                (
+                    "ROOT_CAUSE_REPEAT_STOP: runtime root cause repeated "
+                    + f"{predicted_streak}x (limit={repeat_limit}); stopping targeted runtime retries."
+                ),
+            )
+            print(
+                "RUNTIME_REPEAT_GUARD: "
+                + f"root_cause={runtime_root_cause[:120]} streak={predicted_streak} limit={repeat_limit}"
+            )
+            return "failed_runtime"
         max_runtime_fixes = int(state.get("max_runtime_fix_attempts", 3))
         next_attempt = runtime_fix_count + 1
         if runtime_fix_count < max_runtime_fixes:
@@ -21976,6 +22473,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     terminal_fix = bool(state.get("runtime_fix_terminal"))
     fix_attempt = base_fix_count if terminal_fix else base_fix_count + 1
     max_runtime_fixes = int(state.get("max_runtime_fix_attempts", 3))
+    terminal_reason = str(state.get("runtime_fix_terminal_reason") or "").strip().lower()
 
     error_context = {
         "source": "Execution Runtime",
@@ -22034,6 +22532,15 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     if repair_hints:
         error_context["repair_hints"] = repair_hints
 
+    if terminal_fix and terminal_reason == "repeated_root_cause":
+        repeat_note = (
+            "REPEATED_ROOT_CAUSE_GUARD: identical runtime root cause persisted across targeted fixes; "
+            "stop retrying and re-plan instead of burning more attempts."
+        )
+        error_context["required_fixes"].append(repeat_note)
+        error_context["feedback"] = f"{error_context['feedback']}\n\n{repeat_note}".strip()
+        feedback_history.append(repeat_note)
+
     run_id = state.get("run_id")
     if run_id:
         contract = state.get("execution_contract", {}) or {}
@@ -22085,12 +22592,45 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     else:
         written_ids = state.get("ml_journal_written_ids")
 
+    runtime_signature = _derive_root_cause_signature(state, "runtime")
+    ledger_state = dict(state or {})
+    ledger_state["runtime_fix_count"] = base_fix_count if terminal_fix else fix_attempt
+    ledger_state["runtime_fix_terminal"] = bool(terminal_fix)
+    ledger_state["runtime_fix_terminal_reason"] = str(state.get("runtime_fix_terminal_reason") or "")
+    _append_attempt_cycle(
+        ledger_state,
+        phase="runtime",
+        outcome="terminal_failure" if terminal_fix else "retry_fix",
+        root_cause=runtime_signature,
+        source="prepare_runtime_fix",
+        details={
+            "terminal": bool(terminal_fix),
+            "terminal_reason": str(state.get("runtime_fix_terminal_reason") or ""),
+            "fix_attempt": int(fix_attempt),
+            "max_runtime_fixes": int(max_runtime_fixes),
+        },
+        cycle_key=(
+            "runtime|"
+            + str(int(fix_attempt))
+            + "|"
+            + ("terminal" if terminal_fix else "retry")
+            + "|"
+            + runtime_signature[:120]
+        ),
+    )
+
     return {
         "last_gate_context": error_context,
          # We add error to history so it persists
         "feedback_history": feedback_history + [f"RUNTIME ERROR (Attempt {fix_attempt}/{max_runtime_fixes}):\n{output[-500:]}"],
         "ml_engineer_audit_override": ml_override,
         "runtime_fix_count": base_fix_count if terminal_fix else fix_attempt,
+        "runtime_fix_terminal_reason": str(state.get("runtime_fix_terminal_reason") or ""),
+        "attempt_ledger": ledger_state.get("attempt_ledger"),
+        "phase_cycle_counts": ledger_state.get("phase_cycle_counts"),
+        "expensive_cycle_count": ledger_state.get("expensive_cycle_count"),
+        "runtime_iterations": ledger_state.get("runtime_iterations"),
+        "metric_iterations": ledger_state.get("metric_iterations", state.get("metric_iterations", 0)),
         "ml_journal_written_ids": written_ids,
     }
 
@@ -22098,8 +22638,12 @@ def finalize_runtime_failure(state: AgentState) -> AgentState:
     print("--- [!] Final runtime failure: capturing failure explanation ---")
     state_with_terminal = dict(state)
     state_with_terminal["runtime_fix_terminal"] = True
+    state_with_terminal["runtime_fix_terminal_reason"] = str(
+        state.get("runtime_fix_terminal_reason") or "max_runtime_fix_attempts_reached"
+    )
     result = prepare_runtime_fix(state_with_terminal)
     result["runtime_fix_terminal"] = True
+    result["runtime_fix_terminal_reason"] = str(state_with_terminal.get("runtime_fix_terminal_reason") or "")
     return result
 
 
@@ -24869,6 +25413,39 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     round_history.append(round_record)
     state["ml_improvement_round_history"] = round_history[-24:]
     state["ml_improvement_no_improve_streak"] = int(no_improve_streak)
+    _append_attempt_cycle(
+        state,
+        phase="metric",
+        outcome=(
+            "improved"
+            if improved
+            else ("forced_stop" if force_finalize else "baseline_restored")
+        ),
+        root_cause=(
+            ""
+            if improved
+            else (
+                str(hypothesis_payload_for_round.get("technique") or "metric_round")
+                + " | "
+                + str(round_reason or "")
+            )
+        ),
+        source="finalize_metric_improvement_round",
+        details={
+            "round_id": int(round_id or 0),
+            "approved": bool(approved),
+            "improved_by_metric": bool(improved_by_metric),
+            "stability_ok": bool(stability_ok),
+            "runtime_failed": bool(runtime_failed),
+            "forced_finalize": bool(force_finalize),
+            "kept": str(state.get("ml_improvement_kept") or ""),
+        },
+        cycle_key="metric_round|" + str(int(round_id or 0)),
+    )
+    state["metric_iterations"] = max(
+        _coerce_nonnegative_int(state.get("metric_iterations", 0), default=0),
+        int(round_id or 0),
+    )
 
     rounds_done = int(state.get("ml_improvement_round_count", 0) or 0)
     has_budget = rounds_done < int(max(0, rounds_allowed))
@@ -25338,11 +25915,15 @@ def check_evaluation(state: AgentState):
 
     if state.get("runtime_fix_terminal"):
         metric_name, metric_value, best_value = _get_metric_info()
+        terminal_reason = str(state.get("runtime_fix_terminal_reason") or "").strip().upper()
+        stop_reason = "TERMINAL_RUNTIME_FAILURE"
+        if terminal_reason == "REPEATED_ROOT_CAUSE":
+            stop_reason = "RUNTIME_ROOT_CAUSE_REPEAT"
         print(
-            f"ITER_DECISION type=runtime action=stop reason=TERMINAL_RUNTIME_FAILURE "
+            f"ITER_DECISION type=runtime action=stop reason={stop_reason} "
             f"metric={metric_name}:{metric_value} best={best_value} budget_left=0"
         )
-        state["stop_reason"] = "TERMINAL_RUNTIME_FAILURE"
+        state["stop_reason"] = stop_reason
         return "approved"
 
     contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
@@ -25351,27 +25932,21 @@ def check_evaluation(state: AgentState):
         return _finalize_metric_improvement_round(state, contract)
 
     policy = _get_iteration_policy(state)
-    last_iter_type = state.get("last_iteration_type")
-    metric_iters = _coerce_nonnegative_int(state.get("metric_iterations", 0), default=0)
-    if metric_iters <= 0:
-        rounds_done = _coerce_nonnegative_int(state.get("ml_improvement_round_count", 0), default=0)
-        if rounds_done > 0:
-            metric_iters = rounds_done
-    if metric_iters <= 0:
-        total_iters = _coerce_nonnegative_int(state.get("iteration_count", 0), default=0)
-        compliance_iters = _coerce_nonnegative_int(state.get("compliance_iterations", 0), default=0)
-        metric_iters = max(0, total_iters - compliance_iters)
+    last_iter_type = _normalize_cycle_phase(state.get("last_iteration_type"))
+    budget_snapshot = _iteration_budget_snapshot(state if isinstance(state, dict) else {})
+    metric_iters = int(budget_snapshot.get("metric_rounds", 0))
+    compliance_retries = int(budget_snapshot.get("compliance_retries", 0))
+    total_cycles_used = int(budget_snapshot.get("total_cycles", 0))
     metric_max = policy.get("metric_improvement_max") if policy else None
     budget_left = max(0, metric_max - metric_iters) if metric_max else "unlimited"
     total_limit = _resolve_total_iteration_limit(state, policy, contract)
-    total_iters = _coerce_nonnegative_int(state.get("iteration_count", 0), default=0)
     metric_name, metric_value, best_value = _get_metric_info()
 
     allow_metric_continue_over_total = bool(state.get("ml_improvement_continue"))
-    if total_limit > 0 and total_iters >= total_limit and not allow_metric_continue_over_total:
+    if total_limit > 0 and total_cycles_used >= total_limit and not allow_metric_continue_over_total:
         print(
             "WARNING: Total iteration limit reached. "
-            + f"Proceeding with current results (used={total_iters}, limit={total_limit})."
+            + f"Proceeding with current results (used={total_cycles_used}, limit={total_limit})."
         )
         state["stop_reason"] = "BUDGET"
         print(
@@ -25382,13 +25957,21 @@ def check_evaluation(state: AgentState):
 
     if policy:
         compliance_max = policy.get("compliance_bootstrap_max")
-        if last_iter_type == "compliance" and compliance_max:
-            if state.get("compliance_iterations", 0) >= compliance_max:
+        if (
+            last_iter_type == "compliance"
+            and compliance_max
+            and state.get("review_verdict") == "NEEDS_IMPROVEMENT"
+        ):
+            if compliance_retries >= compliance_max:
                 print("WARNING: Compliance bootstrap limit reached. Proceeding with current results.")
                 state["stop_reason"] = "BUDGET"
                 print(f"ITER_DECISION type=compliance action=stop reason=BUDGET metric={metric_name}:{metric_value} best={best_value} budget_left=0")
                 return "approved"
-        if last_iter_type != "compliance" and metric_max:
+        if (
+            last_iter_type != "compliance"
+            and metric_max
+            and (state.get("review_verdict") == "NEEDS_IMPROVEMENT" or bool(state.get("ml_improvement_continue")))
+        ):
             if metric_iters >= metric_max:
                 print("WARNING: Metric-iteration limit reached. Proceeding with current results.")
                 state["stop_reason"] = "BUDGET"
@@ -25401,8 +25984,32 @@ def check_evaluation(state: AgentState):
     # Adaptive stop: if case alignment degrades or stagnates, stop early.
     if last_iter_type == "compliance":
         if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
-            print(f"ITER_DECISION type=compliance action=retry reason=COMPLIANCE_FIX metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
-            return "retry"
+            if _is_blocking_retry_reason(state if isinstance(state, dict) else {}):
+                compliance_root_cause = _derive_root_cause_signature(state, "compliance")
+                repeated_root_cause_stop, predicted_streak, repeat_limit = _should_stop_repeated_root_cause(
+                    state,
+                    "compliance",
+                    compliance_root_cause,
+                )
+                if repeated_root_cause_stop:
+                    _append_feedback_history(
+                        state,
+                        (
+                            "ROOT_CAUSE_REPEAT_STOP: compliance blocker repeated "
+                            + f"{predicted_streak}x (limit={repeat_limit}); stopping retries to avoid wasted cycles."
+                        ),
+                    )
+                    state["stop_reason"] = "ROOT_CAUSE_REPEAT"
+                    print(
+                        f"ITER_DECISION type=compliance action=stop reason=ROOT_CAUSE_REPEAT metric={metric_name}:{metric_value} "
+                        + f"best={best_value} budget_left={budget_left}"
+                    )
+                    return "approved"
+                print(f"ITER_DECISION type=compliance action=retry reason=COMPLIANCE_FIX metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+                return "retry"
+            print(f"ITER_DECISION type=compliance action=stop reason=ADVISORY_ONLY metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
+            state["stop_reason"] = "ADVISORY_ONLY"
+            return "approved"
         print(f"ITER_DECISION type=compliance action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
         return "approved"
 
