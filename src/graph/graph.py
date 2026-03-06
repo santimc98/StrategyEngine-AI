@@ -6422,10 +6422,9 @@ def _promote_best_attempt(state: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     pass
             if meta.get("execution_output"):
+                updated.update(_clear_runtime_blockers())
                 updated["execution_output"] = meta.get("execution_output")
                 updated["execution_output_stale"] = True
-                updated["execution_error"] = False
-                updated["sandbox_failed"] = False
             if meta.get("plots_local") is not None:
                 updated["plots_local"] = meta.get("plots_local")
     except Exception:
@@ -8086,6 +8085,17 @@ def _has_runtime_failure_marker(output: str | None) -> bool:
         "Response 404",
     ]
     return any(token in text for token in checks)
+
+
+def _clear_runtime_blockers() -> Dict[str, Any]:
+    return {
+        "execution_error": False,
+        "execution_output_stale": False,
+        "sandbox_failed": False,
+        "runtime_fix_terminal": False,
+        "last_runtime_error_tail": None,
+    }
+
 
 def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
     if not output:
@@ -12732,6 +12742,7 @@ def _finalize_heavy_execution(
         "ml_data_path": cleaned_path or state.get("ml_data_path"),
     }
     if not error_in_output:
+        result.update(_clear_runtime_blockers())
         result["runtime_fix_count"] = 0
         result["last_successful_execution_output"] = output
         result["last_successful_plots"] = plots_local
@@ -19071,6 +19082,7 @@ def execute_code(state: AgentState) -> AgentState:
         "budget_counters": counters,
     }
     if not error_in_output:
+        result.update(_clear_runtime_blockers())
         result["runtime_fix_count"] = 0
         result["last_successful_execution_output"] = output
         result["last_successful_plots"] = plots_local
@@ -22086,6 +22098,75 @@ def _is_metric_round_advisory_review_mode(state: Dict[str, Any], contract: Dict[
     return mode in {"hybrid_guarded", "advisor_only"}
 
 
+def _review_board_blocker_matches_current_state(
+    blocker: Any,
+    state: Dict[str, Any],
+    gate_context: Dict[str, Any] | None = None,
+    *,
+    include_review_signals: bool = True,
+) -> bool:
+    token = str(blocker or "").strip()
+    if not token:
+        return False
+    lower = token.lower()
+    oc_report = state.get("output_contract_report")
+    if not isinstance(oc_report, dict):
+        oc_report = {}
+    current_gate = gate_context if isinstance(gate_context, dict) else (
+        state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+    )
+    missing_outputs = {
+        str(path).strip()
+        for path in (oc_report.get("missing") or [])
+        if str(path).strip()
+    }
+    artifact_issues = _extract_contract_artifact_issues(oc_report)
+    schema_issues = {
+        str(issue).strip()
+        for issue in (artifact_issues.get("schema_issues") or [])
+        if str(issue).strip()
+    }
+
+    if lower == "runtime_failed":
+        return bool(state.get("runtime_fix_terminal")) or bool(state.get("sandbox_failed")) or _has_runtime_failure_marker(
+            state.get("execution_output")
+        )
+    if lower == "sandbox_failed":
+        return bool(state.get("sandbox_failed"))
+    if lower == "output_contract_error":
+        artifact_report = oc_report.get("artifact_requirements_report")
+        return (
+            str(oc_report.get("overall_status") or "").strip().lower() == "error"
+            or (
+                isinstance(artifact_report, dict)
+                and str(artifact_report.get("status") or "").strip().lower() == "error"
+            )
+        )
+    if lower.startswith("missing_required_artifact:"):
+        return token.split(":", 1)[1].strip() in missing_outputs
+    if lower.startswith("output_schema_issue:"):
+        return token.split(":", 1)[1].strip() in schema_issues
+    if not include_review_signals:
+        return False
+
+    hard_failures = {
+        str(item).strip()
+        for item in (current_gate.get("hard_failures") or [])
+        if str(item).strip()
+    }
+    if "_hard_failure:" in lower:
+        return token.split(":", 1)[1].strip() in hard_failures
+
+    if "_failed_gate:" in lower:
+        gate_name = token.split(":", 1)[1].strip()
+        return any(
+            str(item).strip() == gate_name and _looks_blocking_retry_signal(item)
+            for item in (current_gate.get("failed_gates") or [])
+        )
+
+    return False
+
+
 def _metric_round_has_deterministic_blockers(
     state: Dict[str, Any],
     gate_context: Dict[str, Any] | None = None,
@@ -22110,16 +22191,24 @@ def _metric_round_has_deterministic_blockers(
             if str(artifact_report.get("status") or "").strip().lower() == "error":
                 return True
 
+    current_gate = gate_context if isinstance(gate_context, dict) else (
+        state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+    )
     board_payload = state.get("review_board_verdict")
     if isinstance(board_payload, dict):
         blockers = [str(x) for x in (board_payload.get("deterministic_blockers") or []) if x]
-        if blockers:
+        if any(
+            _review_board_blocker_matches_current_state(
+                blocker,
+                state,
+                current_gate,
+                include_review_signals=include_review_signals,
+            )
+            for blocker in blockers
+        ):
             return True
 
     if include_review_signals:
-        current_gate = gate_context if isinstance(gate_context, dict) else (
-            state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
-        )
         hard_failures = [str(x) for x in (current_gate.get("hard_failures") or []) if x]
         if hard_failures:
             return True
@@ -22127,6 +22216,12 @@ def _metric_round_has_deterministic_blockers(
             if _looks_blocking_retry_signal(gate):
                 return True
     return False
+
+
+def _build_hybrid_bundle_signature(bundle_techniques: List[str], target_columns: Any) -> str:
+    bundle = [str(item).strip() for item in (bundle_techniques or []) if str(item).strip()][:2]
+    signature_base = "|".join(bundle) + "|" + ",".join(normalize_target_columns(target_columns)[:12])
+    return "hyb_" + hashlib.sha1(signature_base.encode("utf-8")).hexdigest()[:12]
 
 
 def _is_data_limited_mode_active(state: Dict[str, Any], contract: Dict[str, Any]) -> bool:
@@ -22853,13 +22948,18 @@ def _resolve_metric_round_hybrid_policy(
     # Compute the would-be bundle signature and check the tracker for prior
     # failed attempts with the same signature.  This prevents the system from
     # wasting rounds retrying the exact same technique combination.
+    hybrid_target_columns: List[str] = []
     if len(bundle_techniques) >= 2:
-        _candidate_sig_base = "|".join(bundle_techniques[:2])
-        _candidate_hyb_sig = "hyb_" + hashlib.sha1(
-            (_candidate_sig_base + "|" + ",".join(
-                normalize_target_columns(hypothesis.get("target_columns"))[:12]
-            )).encode("utf-8")
-        ).hexdigest()[:12]
+        primary = bundle_techniques[0]
+        secondary = bundle_techniques[1]
+        primary_meta = plan_map.get(primary.lower(), {})
+        secondary_meta = plan_map.get(secondary.lower(), {})
+        hybrid_target_columns = normalize_target_columns(
+            (primary_meta.get("target_columns") or [])
+            + (secondary_meta.get("target_columns") or [])
+            + (hypothesis.get("target_columns") if isinstance(hypothesis.get("target_columns"), list) else [])
+        )
+        _candidate_hyb_sig = _build_hybrid_bundle_signature(bundle_techniques[:2], hybrid_target_columns)
         _bundle_already_failed = False
         if isinstance(tracker_entries, list):
             for _te in tracker_entries:
@@ -22885,15 +22985,7 @@ def _resolve_metric_round_hybrid_policy(
             bundle_techniques = bundle_techniques[:1]
 
     if len(bundle_techniques) >= 2:
-        primary = bundle_techniques[0]
-        secondary = bundle_techniques[1]
-        primary_meta = plan_map.get(primary.lower(), {})
-        secondary_meta = plan_map.get(secondary.lower(), {})
-        target_columns = normalize_target_columns(
-            (primary_meta.get("target_columns") or [])
-            + (secondary_meta.get("target_columns") or [])
-            + (hypothesis.get("target_columns") if isinstance(hypothesis.get("target_columns"), list) else [])
-        )
+        target_columns = hybrid_target_columns or normalize_target_columns(hypothesis.get("target_columns"))
         params = hypothesis.get("params") if isinstance(hypothesis.get("params"), dict) else {}
         params = dict(params)
         params["bundle_techniques"] = bundle_techniques[:2]
@@ -22916,8 +23008,7 @@ def _resolve_metric_round_hybrid_policy(
             5,
         )
         packet["application_constraints"] = app_constraints
-        signature_base = "|".join(bundle_techniques[:2]) + "|" + ",".join(target_columns[:12])
-        signature = "hyb_" + hashlib.sha1(signature_base.encode("utf-8")).hexdigest()[:12]
+        signature = _build_hybrid_bundle_signature(bundle_techniques[:2], target_columns)
         tracker_context = (
             dict(packet.get("tracker_context"))
             if isinstance(packet.get("tracker_context"), dict)
@@ -24478,6 +24569,9 @@ def _sync_review_board_verdict_after_metric_round(
     )
     payload["summary"] = _upsert_metric_improvement_summary(str(payload.get("summary") or ""), summary_line)
     payload["final_review_verdict"] = final_verdict
+    payload["runtime_fix_terminal"] = bool(state.get("runtime_fix_terminal"))
+    if not deterministic_blockers:
+        payload["deterministic_blockers"] = []
     payload["metric_round_finalization"] = {
         "metric_name": metric_name,
         "kept": kept,

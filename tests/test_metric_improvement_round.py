@@ -2,6 +2,10 @@ import json
 from pathlib import Path
 
 from src.graph.graph import (
+    _build_hybrid_bundle_signature,
+    _metric_round_has_deterministic_blockers,
+    _promote_best_attempt,
+    _resolve_metric_round_hybrid_policy,
     check_evaluation,
     check_metric_improvement_bootstrap_route,
     _is_improvement,
@@ -117,6 +121,101 @@ def test_check_evaluation_restores_baseline_when_improvement_is_below_delta(tmp_
     assert route == "approved"
     assert state.get("ml_improvement_kept") == "baseline"
     assert restored == baseline
+
+
+def test_metric_round_blockers_ignore_stale_review_board_payload() -> None:
+    state = {
+        "execution_output": "Training completed successfully.",
+        "runtime_fix_terminal": False,
+        "sandbox_failed": False,
+        "output_contract_report": {"overall_status": "ok", "missing": []},
+        "last_gate_context": {"failed_gates": [], "hard_failures": []},
+        "review_board_verdict": {
+            "deterministic_blockers": [
+                "runtime_failed",
+                "missing_required_artifact:data/metrics.json",
+            ]
+        },
+    }
+
+    assert _metric_round_has_deterministic_blockers(state, include_review_signals=False) is False
+
+
+def test_promote_best_attempt_clears_runtime_blockers(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    best_dir = Path("artifacts/best_attempt")
+    best_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "artifact_index": [],
+        "output_contract_report": {"overall_status": "ok", "missing": []},
+        "execution_output": "Recovered execution output",
+        "plots_local": [],
+    }
+    (best_dir / "best_attempt.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    updates = _promote_best_attempt(
+        {
+            "best_attempt_dir": str(best_dir),
+            "runtime_fix_terminal": True,
+            "sandbox_failed": True,
+            "execution_error": True,
+            "last_runtime_error_tail": "Traceback ...",
+        }
+    )
+
+    assert updates["execution_output"] == "Recovered execution output"
+    assert updates["execution_output_stale"] is True
+    assert updates["runtime_fix_terminal"] is False
+    assert updates["sandbox_failed"] is False
+    assert updates["execution_error"] is False
+    assert updates["last_runtime_error_tail"] is None
+
+
+def test_hybrid_policy_dedup_uses_merged_target_signature() -> None:
+    hypothesis_packet = {
+        "action": "APPLY",
+        "hypothesis": {
+            "technique": "optuna_hpo",
+            "objective": "Tune the incumbent model.",
+            "target_columns": ["score_hint"],
+            "feature_scope": "model_features",
+            "params": {},
+        },
+        "tracker_context": {"signature": "hyp_seed"},
+    }
+    feature_engineering_plan = {
+        "techniques": [
+            {"technique": "optuna_hpo", "columns": ["score_hint"], "params": {}},
+            {"technique": "kfold_target_encoding", "columns": ["contract_type"], "params": {}},
+        ]
+    }
+    failed_bundle_signature = _build_hybrid_bundle_signature(
+        ["optuna_hpo", "kfold_target_encoding"],
+        ["score_hint", "contract_type", "score_hint"],
+    )
+    tracker_entries = [
+        {
+            "event": "candidate_evaluated",
+            "signature": failed_bundle_signature,
+            "improved_by_metric": False,
+        }
+    ]
+
+    packet, policy_meta = _resolve_metric_round_hybrid_policy(
+        round_id=3,
+        rounds_allowed=4,
+        no_improve_streak=0,
+        patience=2,
+        min_delta=0.0001,
+        higher_is_better=True,
+        hypothesis_packet=hypothesis_packet,
+        feature_engineering_plan=feature_engineering_plan,
+        tracker_entries=tracker_entries,
+    )
+
+    assert packet["hypothesis"]["technique"] == "optuna_hpo"
+    assert packet["hypothesis"]["params"].get("bundle_techniques") is None
+    assert policy_meta["bundle_size"] == 1
 
 
 def test_finalize_round_syncs_review_board_verdict_with_kept_artifact(tmp_path, monkeypatch) -> None:
