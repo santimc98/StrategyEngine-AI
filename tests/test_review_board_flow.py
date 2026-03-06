@@ -288,3 +288,99 @@ def test_run_review_board_preserves_metric_optimization_handoff(tmp_path, monkey
     assert handoff.get("mode") == "optimize"
     assert handoff.get("source") == "actor_critic_metric_improvement"
     assert isinstance(handoff.get("hypothesis_packet"), dict) and handoff.get("hypothesis_packet")
+
+
+def test_contract_consistency_promotes_implied_hard_gate_failure() -> None:
+    packet = graph_mod._normalize_review_packet_for_state(
+        {
+            "status": "APPROVE_WITH_WARNINGS",
+            "feedback": (
+                "The code uses Ordinal Encoding instead of the requested "
+                "K-fold Target Encoding for categorical features."
+            ),
+            "failed_gates": [],
+            "required_fixes": [],
+            "hard_failures": [],
+            "evidence": [
+                {
+                    "claim": "Ordinal Encoding is used instead of the requested K-fold Target Encoding.",
+                    "source": "script:120",
+                }
+            ],
+        },
+        default_status="UNKNOWN",
+    )
+    contract = {
+        "qa_gates": [
+            {
+                "name": "target_encoding_leakage_guard",
+                "severity": "HARD",
+                "params": {"method": "k-fold_out_of_fold"},
+            }
+        ]
+    }
+
+    enforced = graph_mod._enforce_review_packet_contract_consistency(
+        packet,
+        contract=contract,
+        actor="qa_reviewer",
+    )
+
+    assert enforced.get("status") == "REJECTED"
+    assert "target_encoding_leakage_guard" in (enforced.get("failed_gates") or [])
+    assert "target_encoding_leakage_guard" in (enforced.get("hard_failures") or [])
+
+
+def test_contract_consistency_keeps_advisory_gate_suggestion_non_blocking() -> None:
+    packet = graph_mod._normalize_review_packet_for_state(
+        {
+            "status": "APPROVE_WITH_WARNINGS",
+            "feedback": "Implement K-fold Target Encoding to improve performance.",
+            "failed_gates": [],
+            "required_fixes": [],
+            "hard_failures": [],
+        },
+        default_status="UNKNOWN",
+    )
+    contract = {
+        "qa_gates": [
+            {
+                "name": "target_encoding_leakage_guard",
+                "severity": "HARD",
+                "params": {"method": "k-fold_out_of_fold"},
+            }
+        ]
+    }
+
+    enforced = graph_mod._enforce_review_packet_contract_consistency(
+        packet,
+        contract=contract,
+        actor="qa_reviewer",
+    )
+
+    assert enforced.get("status") == "APPROVE_WITH_WARNINGS"
+    assert not enforced.get("failed_gates")
+    assert not enforced.get("hard_failures")
+
+
+def test_blocking_signal_ignores_advisory_leakage_wording() -> None:
+    assert graph_mod._looks_blocking_retry_signal(
+        "Exclude post-outcome features and document leakage prevention."
+    ) is False
+    assert graph_mod._looks_blocking_retry_signal(
+        "qa_reviewer_hard_failure:target_encoding_leakage_guard"
+    ) is True
+
+
+def test_normalize_reason_tags_avoids_positive_baseline_and_leakage_mentions() -> None:
+    positive_tags = graph_mod._normalize_reason_tags(
+        "Baseline DummyClassifier is implemented and data leakage is prevented by excluding forbidden columns."
+    )
+    negative_tags = graph_mod._normalize_reason_tags(
+        "Baseline missing and leakage risk detected in the current pipeline."
+    )
+
+    assert "baseline_missing" not in positive_tags
+    assert "leakage" not in positive_tags
+    assert "baseline_missing" in negative_tags
+    assert "leakage" in negative_tags

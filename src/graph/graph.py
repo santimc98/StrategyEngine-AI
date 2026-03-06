@@ -1290,6 +1290,252 @@ def _harmonize_review_packets_with_final_eval(
     return _patch_packet(dict(reviewer_packet or {}), "reviewer"), _patch_packet(dict(qa_packet or {}), "qa_reviewer"), notes
 
 
+_GATE_TEXT_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
+
+
+def _normalize_gate_match_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
+
+
+def _gate_text_tokens(value: Any) -> set[str]:
+    tokens: set[str] = set()
+    normalized = _normalize_gate_match_text(value)
+    for token in normalized.split():
+        if token in _GATE_TEXT_STOPWORDS:
+            continue
+        if len(token) <= 2 and token not in {"cv", "lb", "id", "oof"}:
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def _gate_failure_language_detected(text: Any) -> bool:
+    value = _normalize_gate_match_text(text)
+    if not value:
+        return False
+    patterns = (
+        r"\bfailed\b",
+        r"\bfailure\b",
+        r"\bviolat\w*\b",
+        r"\breject\w*\b",
+        r"\binstead of\b",
+        r"\brather than\b",
+        r"\bdid not\b",
+        r"\bdoes not\b",
+        r"\bnot implemented\b",
+        r"\bmissing\b",
+        r"\bmismatch\b",
+        r"\bwithout\b",
+        r"\bignor\w*\b",
+        r"\bbypass\w*\b",
+        r"\bwrong\b",
+    )
+    return any(re.search(pattern, value) for pattern in patterns)
+
+
+def _collect_active_hard_gate_specs(contract: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    sources = []
+    if isinstance(contract, dict):
+        sources.extend([get_qa_gates(contract) or [], get_reviewer_gates(contract) or []])
+    for gate_list in sources:
+        for gate in gate_list:
+            if not isinstance(gate, dict):
+                continue
+            name = str(gate.get("name") or gate.get("id") or gate.get("gate") or "").strip()
+            if not name:
+                continue
+            if str(gate.get("severity") or "HARD").strip().upper() != "HARD":
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+            merged.append({"name": name, "severity": "HARD", "params": params})
+    return merged
+
+
+def _collect_review_packet_text_fragments(packet: Dict[str, Any] | None) -> List[str]:
+    if not isinstance(packet, dict):
+        return []
+    fragments: List[str] = []
+    for key in ("feedback",):
+        value = packet.get(key)
+        if isinstance(value, str) and value.strip():
+            fragments.append(value.strip())
+    for key in ("warnings", "required_fixes", "failed_gates", "hard_failures"):
+        values = packet.get(key)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            text = str(item or "").strip()
+            if text:
+                fragments.append(text)
+    evidence = packet.get("evidence")
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict):
+                for key in ("claim", "source"):
+                    text = str(item.get(key) or "").strip()
+                    if text:
+                        fragments.append(text)
+            else:
+                text = str(item or "").strip()
+                if text:
+                    fragments.append(text)
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for fragment in fragments:
+        normalized = _normalize_gate_match_text(fragment)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(fragment)
+    return deduped[:40]
+
+
+def _gate_match_fragments(gate_spec: Dict[str, Any]) -> List[str]:
+    fragments: List[str] = []
+    name = str(gate_spec.get("name") or "").strip()
+    if name:
+        fragments.append(name)
+    params = gate_spec.get("params") if isinstance(gate_spec.get("params"), dict) else {}
+    for key, value in params.items():
+        if isinstance(value, str) and value.strip():
+            fragments.append(value.strip())
+            fragments.append(f"{key} {value}".strip())
+        elif isinstance(value, (int, float, bool)):
+            fragments.append(f"{key} {value}")
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for fragment in fragments:
+        normalized = _normalize_gate_match_text(fragment)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def _packet_implied_hard_gate_failures(
+    packet: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+) -> List[str]:
+    if not isinstance(packet, dict) or not isinstance(contract, dict):
+        return []
+    hard_gate_specs = _collect_active_hard_gate_specs(contract)
+    if not hard_gate_specs:
+        return []
+    packet_fragments = _collect_review_packet_text_fragments(packet)
+    if not packet_fragments:
+        return []
+
+    normalized_packet_fragments = [
+        (_normalize_gate_match_text(fragment), _gate_text_tokens(fragment))
+        for fragment in packet_fragments
+    ]
+    implied: List[str] = []
+    for gate_spec in hard_gate_specs:
+        gate_name = str(gate_spec.get("name") or "").strip()
+        if not gate_name:
+            continue
+        gate_fragments = _gate_match_fragments(gate_spec)
+        gate_token_sets = [tokens for tokens in (_gate_text_tokens(fragment) for fragment in gate_fragments) if len(tokens) >= 2]
+        for normalized_fragment, fragment_tokens in normalized_packet_fragments:
+            if not normalized_fragment or not _gate_failure_language_detected(normalized_fragment):
+                continue
+            if any(gate_fragment and gate_fragment in normalized_fragment for gate_fragment in gate_fragments):
+                implied.append(gate_name)
+                break
+            if not fragment_tokens:
+                continue
+            matched = False
+            for gate_tokens in gate_token_sets:
+                overlap = fragment_tokens & gate_tokens
+                if len(overlap) >= 2:
+                    implied.append(gate_name)
+                    matched = True
+                    break
+            if matched:
+                break
+    return list(dict.fromkeys([name for name in implied if name]))
+
+
+def _build_gate_resolution_fix(gate_spec: Dict[str, Any]) -> str:
+    gate_name = str(gate_spec.get("name") or "unknown_gate").strip()
+    params = gate_spec.get("params") if isinstance(gate_spec.get("params"), dict) else {}
+    hints: List[str] = []
+    for key, value in params.items():
+        if isinstance(value, (str, int, float, bool)) and str(value).strip():
+            hints.append(f"{key}={value}")
+    hint_text = f" ({', '.join(hints[:3])})" if hints else ""
+    return f"Resolve active HARD gate '{gate_name}'{hint_text}."
+
+
+def _enforce_review_packet_contract_consistency(
+    packet: Dict[str, Any] | None,
+    *,
+    contract: Dict[str, Any] | None,
+    actor: str,
+) -> Dict[str, Any]:
+    normalized = dict(packet) if isinstance(packet, dict) else {}
+    if not normalized or not isinstance(contract, dict):
+        return normalized
+
+    implied_failures = _packet_implied_hard_gate_failures(normalized, contract)
+    if not implied_failures:
+        return normalized
+
+    gate_lookup = {str(gate.get("name") or "").strip().lower(): gate for gate in _collect_active_hard_gate_specs(contract)}
+    failed_gates = [str(item) for item in (_normalize_handoff_items(normalized.get("failed_gates"), max_items=20, max_len=180)) if item]
+    hard_failures = [str(item) for item in (_normalize_handoff_items(normalized.get("hard_failures"), max_items=15, max_len=180)) if item]
+    required_fixes = [str(item) for item in (_normalize_handoff_items(normalized.get("required_fixes"), max_items=20, max_len=220)) if item]
+
+    for gate_name in implied_failures:
+        if gate_name not in failed_gates:
+            failed_gates.append(gate_name)
+        if gate_name not in hard_failures:
+            hard_failures.append(gate_name)
+        gate_spec = gate_lookup.get(gate_name.lower())
+        if gate_spec:
+            fix = _build_gate_resolution_fix(gate_spec)
+            if fix not in required_fixes:
+                required_fixes.append(fix)
+
+    status = _normalize_review_status(str(normalized.get("status") or "UNKNOWN"))
+    if status in {"APPROVED", "APPROVE_WITH_WARNINGS", "UNKNOWN"}:
+        normalized["status"] = "REJECTED"
+    feedback = str(normalized.get("feedback") or "").strip()
+    consistency_note = (
+        f"{str(actor or 'reviewer').upper()}_CONTRACT_CONSISTENCY: "
+        f"evidence implies unresolved HARD gate failure(s): {', '.join(implied_failures[:6])}."
+    )
+    normalized["feedback"] = f"{feedback}\n{consistency_note}".strip() if feedback else consistency_note
+    normalized["failed_gates"] = failed_gates[:20]
+    normalized["hard_failures"] = hard_failures[:15]
+    normalized["required_fixes"] = required_fixes[:20]
+    return normalized
+
+
 _RUN_FACTS_BLOCK_RE = re.compile(
     r"=== RUN_FACTS_PACK_JSON \(read-only\) ===.*?=== END RUN_FACTS_PACK_JSON ===",
     re.DOTALL,
@@ -4370,7 +4616,6 @@ def _looks_blocking_retry_signal(text: Any) -> bool:
         "qa_",
         "code_audit",
         "hard_fail",
-        "leakage",
         "security",
         "decisioning",
         "visual_requirements",
@@ -4385,7 +4630,36 @@ def _looks_blocking_retry_signal(text: Any) -> bool:
         "static_precheck",
         "syntax",
     ]
-    return any(token in value for token in blocking_tokens)
+    if any(token in value for token in blocking_tokens):
+        return True
+    if "leakage" in value:
+        leakage_positive_markers = [
+            "document leakage prevention",
+            "exclude post-outcome features",
+            "excluding forbidden columns",
+            "prevents data leakage",
+            "leakage is prevented",
+        ]
+        if any(marker in value for marker in leakage_positive_markers) and not any(
+            marker in value for marker in ["failed", "failure", "violation", "rejected", "hard"]
+        ):
+            return False
+        leakage_blocking_markers = [
+            "failed",
+            "failure",
+            "violat",
+            "hard",
+            "guard",
+            "deterministic",
+            "reject",
+            "post-outcome",
+            "forbidden",
+            "target leak",
+            "leakage_prevention",
+        ]
+        if any(marker in value for marker in leakage_blocking_markers):
+            return True
+    return False
 
 def _is_blocking_retry_reason(
     state: Dict[str, Any] | None,
@@ -7824,6 +8098,8 @@ def _normalize_review_packet_for_state(
         normalized["retry_worth_it"] = bool(packet.get("retry_worth_it"))
     if isinstance(packet.get("json_parse_trace"), dict):
         normalized["json_parse_trace"] = packet.get("json_parse_trace")
+    if isinstance(packet.get("evidence"), list):
+        normalized["evidence"] = _normalize_handoff_evidence(packet.get("evidence"), max_items=10)
     return normalized
 
 
@@ -8000,9 +8276,7 @@ def _normalize_reason_tags(text: str, failed_gates: List[str] | None = None) -> 
         ("df_column", "df_mutation"),
         ("unknown_columns_referenced", "unknown_columns"),
         ("unknown column", "unknown_columns"),
-        ("baseline", "baseline_missing"),
         ("imputer", "imputer_missing"),
-        ("leakage", "leakage"),
         ("output_contract_missing", "contract_missing_outputs"),
         ("required_outputs_missing", "contract_missing_outputs"),
         ("missing output", "contract_missing_outputs"),
@@ -8017,6 +8291,41 @@ def _normalize_reason_tags(text: str, failed_gates: List[str] | None = None) -> 
     for token, tag in mapping:
         if token in combined and tag not in tags:
             tags.append(tag)
+    baseline_missing_patterns = (
+        "baseline missing",
+        "missing baseline",
+        "baseline_check_failed",
+        "without baseline",
+        "no baseline",
+        "dummyclassifier missing",
+        "dummyregressor missing",
+    )
+    if any(pattern in combined for pattern in baseline_missing_patterns) and "baseline_missing" not in tags:
+        tags.append("baseline_missing")
+    leakage_positive_patterns = (
+        "prevents data leakage",
+        "prevent data leakage",
+        "leakage is prevented",
+        "data leakage is prevented",
+        "excluding forbidden columns",
+        "exclude forbidden columns",
+    )
+    leakage_negative_patterns = (
+        "leakage risk",
+        "leakage detected",
+        "leakage guard",
+        "target leakage",
+        "post-outcome",
+        "leakage_prevention",
+        "target_encoding_leakage_guard",
+        "deterministic_target_relation",
+    )
+    if (
+        any(pattern in combined for pattern in leakage_negative_patterns)
+        or ("leakage" in combined and _gate_failure_language_detected(combined))
+    ) and not any(pattern in combined for pattern in leakage_positive_patterns):
+        if "leakage" not in tags:
+            tags.append("leakage")
     return tags
 
 
@@ -20527,6 +20836,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         qa_packet_for_state["status"] = "APPROVE_WITH_WARNINGS"
     elif not qa_packet_for_state.get("status"):
         qa_packet_for_state["status"] = "UNKNOWN"
+    qa_packet_for_state = _enforce_review_packet_contract_consistency(
+        qa_packet_for_state,
+        contract=contract if isinstance(contract, dict) else {},
+        actor="qa_reviewer",
+    )
+    if qa_packet_for_state.get("hard_failures"):
+        qa_packet_for_state["status"] = "REJECTED"
 
     reviewer_packet_for_state["failed_gates"] = list(
         dict.fromkeys(
@@ -20552,6 +20868,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         reviewer_packet_for_state["status"] = "APPROVE_WITH_WARNINGS"
     elif not reviewer_packet_for_state.get("status"):
         reviewer_packet_for_state["status"] = "UNKNOWN"
+    reviewer_packet_for_state = _enforce_review_packet_contract_consistency(
+        reviewer_packet_for_state,
+        contract=contract if isinstance(contract, dict) else {},
+        actor="reviewer",
+    )
+    if reviewer_packet_for_state.get("hard_failures"):
+        reviewer_packet_for_state["status"] = "REJECTED"
     result_state = {
         "review_verdict": status,
         "review_feedback": review_feedback,
@@ -20693,18 +21016,22 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "retry_worth_it": bool(retry_worth_it) if retry_worth_it is not None else None,
         "evidence": _normalize_handoff_evidence(eval_result.get("evidence"), max_items=8),
     }
-    reviewer_packet = _normalize_review_packet_for_state(
-        review_result if isinstance(review_result, dict) else {},
-        default_status="SKIPPED",
-    )
+    reviewer_packet = dict(reviewer_packet_for_state) if isinstance(reviewer_packet_for_state, dict) else {}
+    if not reviewer_packet:
+        reviewer_packet = _normalize_review_packet_for_state(
+            review_result if isinstance(review_result, dict) else {},
+            default_status="SKIPPED",
+        )
     reviewer_packet["evidence"] = _normalize_handoff_evidence(
         (review_result or {}).get("evidence") if isinstance(review_result, dict) else [],
         max_items=8,
     )
-    qa_packet = _normalize_review_packet_for_state(
-        qa_result if isinstance(qa_result, dict) else {},
-        default_status="SKIPPED",
-    )
+    qa_packet = dict(qa_packet_for_state) if isinstance(qa_packet_for_state, dict) else {}
+    if not qa_packet:
+        qa_packet = _normalize_review_packet_for_state(
+            qa_result if isinstance(qa_result, dict) else {},
+            default_status="SKIPPED",
+        )
     qa_packet["evidence"] = _normalize_handoff_evidence(
         (qa_result or {}).get("evidence") if isinstance(qa_result, dict) else [],
         max_items=8,
