@@ -894,6 +894,62 @@ class MLEngineerAgent:
             tail_len=1500,
         )
 
+    def _build_guardrail_repair_context(
+        self,
+        handoff_payload: Dict[str, Any] | None,
+        gate_context: Dict[str, Any] | None,
+        feedback_history: List[str] | None,
+    ) -> str:
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        gate_context = gate_context if isinstance(gate_context, dict) else {}
+        quality_focus = (
+            handoff_payload.get("quality_focus")
+            if isinstance(handoff_payload.get("quality_focus"), dict)
+            else {}
+        )
+        patch_objectives = self._normalize_handoff_items(
+            handoff_payload.get("patch_objectives"),
+            max_items=6,
+            max_len=220,
+        )
+        required_fixes = self._normalize_handoff_items(
+            quality_focus.get("required_fixes") or gate_context.get("required_fixes"),
+            max_items=6,
+            max_len=220,
+        )
+        must_preserve = self._normalize_handoff_items(
+            handoff_payload.get("must_preserve"),
+            max_items=6,
+            max_len=220,
+        )
+        feedback_text = self._collect_editor_feedback_text(
+            gate_context=gate_context,
+            handoff_payload=handoff_payload,
+            feedback_history=feedback_history,
+        )
+
+        lines: List[str] = []
+        if patch_objectives:
+            lines.append("ACTIVE_PATCH_OBJECTIVES:")
+            lines.extend([f"- {item}" for item in patch_objectives])
+        if required_fixes:
+            lines.append("ACTIVE_REQUIRED_FIXES:")
+            lines.extend([f"- {item}" for item in required_fixes])
+        if must_preserve:
+            lines.append("MUST_PRESERVE:")
+            lines.extend([f"- {item}" for item in must_preserve])
+        if feedback_text:
+            lines.append(
+                "ACTIVE_REVIEW_FEEDBACK:\n"
+                + self._truncate_prompt_text(
+                    feedback_text,
+                    max_len=1800,
+                    head_len=1200,
+                    tail_len=400,
+                )
+            )
+        return "\n".join(lines).strip()
+
     def _is_metric_optimization_context(
         self,
         gate_context: Dict[str, Any] | None,
@@ -1134,7 +1190,35 @@ class MLEngineerAgent:
             if isinstance(values, list):
                 failed_tokens.extend([str(item).strip().lower() for item in values if str(item).strip()])
 
-        combined = " ".join(failed_tokens + [str(feedback_text or "").lower()])
+        failed_blob = " ".join(failed_tokens)
+        feedback_blob = str(feedback_text or "").lower()
+        combined = " ".join([failed_blob, feedback_blob]).strip()
+        training_gate_tokens = [
+            "strategy_followed",
+            "leakage_prevention",
+            "target_variance_guard",
+            "validation_method",
+            "cross_validation",
+            "train_filter",
+            "feature_governance",
+        ]
+        training_edit_tokens = [
+            "replace logistic",
+            "boosting",
+            "stacking",
+            "ensemble",
+            "target encoding",
+            "onehotencoding",
+            "onehotencoder",
+            "ordinalencoder",
+            "out-of-fold",
+            "oof",
+            "meta-learner",
+            "model choice",
+            "preprocessing",
+            "zero-variance",
+            "nunique",
+        ]
         persistence_tokens = [
             "output_contract",
             "required output",
@@ -1153,6 +1237,10 @@ class MLEngineerAgent:
             "persist",
             "write artifact",
         ]
+        if any(token in failed_blob for token in training_gate_tokens):
+            return "training"
+        if any(token in feedback_blob for token in training_edit_tokens):
+            return "training"
         if any(token in combined for token in persistence_tokens):
             return "persistence"
         return "training"
@@ -2584,6 +2672,28 @@ class MLEngineerAgent:
         return False
 
     def _synthetic_call_reason(self, call_node: ast.Call) -> str | None:
+        known_sklearn_make_generators = {
+            "make_biclusters",
+            "make_blobs",
+            "make_checkerboard",
+            "make_circles",
+            "make_classification",
+            "make_friedman1",
+            "make_friedman2",
+            "make_friedman3",
+            "make_gaussian_quantiles",
+            "make_hastie_10_2",
+            "make_low_rank_matrix",
+            "make_moons",
+            "make_multilabel_classification",
+            "make_regression",
+            "make_s_curve",
+            "make_sparse_coded_signal",
+            "make_sparse_spd_matrix",
+            "make_sparse_uncorrelated",
+            "make_spd_matrix",
+            "make_swiss_roll",
+        }
         parts = self._get_call_parts(call_node.func)
         if parts:
             func_name = parts[-1].lower()
@@ -2592,9 +2702,26 @@ class MLEngineerAgent:
                 allowed = {"seed", "choice", "randint", "permutation", "shuffle", "default_rng"}
                 if func_name not in allowed:
                     return f"forbidden_np_random_call:{module_prefix}.{func_name}"
+            if (
+                func_name in known_sklearn_make_generators
+                and (
+                    not module_prefix
+                    or module_prefix.endswith(".datasets")
+                    or module_prefix in {
+                        "datasets",
+                        "sklearn.datasets",
+                        "sklearn.datasets.samples_generator",
+                    }
+                )
+            ):
+                return f"forbidden_sklearn_make_call:{self._call_name(call_node).lower() or func_name}"
 
         call_name = self._call_name(call_node).lower()
-        if "sklearn.datasets.make_" in call_name or ".datasets.make_" in call_name or call_name.startswith("make_"):
+        if (
+            "sklearn.datasets.make_" in call_name
+            or ".datasets.make_" in call_name
+            or call_name in known_sklearn_make_generators
+        ):
             return f"forbidden_sklearn_make_call:{call_name}"
         if "faker" in call_name:
             return f"forbidden_faker_call:{call_name}"
@@ -4638,20 +4765,32 @@ $strategy_json
             )
             reasons = self._detect_forbidden_input_fallback(code, data_path)
             if reasons:
+                guard_context = self._build_guardrail_repair_context(
+                    handoff_payload=handoff_payload,
+                    gate_context=gate_context,
+                    feedback_history=feedback_history,
+                )
                 guard_system = (
                     "You are a senior ML engineer. Remove forbidden input-existence checks "
                     "and synthetic fallbacks. Assume input exists at $data_path. "
-                    "Return full python script only."
+                    "Preserve the active patch objectives and existing compliance fixes unless "
+                    "they are themselves the forbidden pattern. Return full python script only."
                 )
                 guard_user = (
                     "Remove any input existence checks and any fallback branches that generate data.\n"
                     "Detected forbidden patterns:\n"
                     + "\n".join([f"- {reason}" for reason in reasons])
+                    + (
+                        "\n\nACTIVE TASK CONTEXT:\n" + guard_context
+                        if guard_context
+                        else ""
+                    )
                     + "\n\nCODE:\n"
                     + self._truncate_code_for_patch(code)
                     + "\n\nReturn the FULL script only, without any input existence checks, "
                     "FileNotFoundError fallbacks, or synthetic data generation (np.random, "
-                    "sklearn.datasets.make_*, faker)."
+                    "sklearn.datasets.make_*, faker). Keep the original compliance/training "
+                    "patch intent intact while removing only the forbidden branches."
                 )
                 model_for_repairs = self.last_model_used or self.model_name
                 repaired = code

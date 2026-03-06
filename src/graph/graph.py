@@ -9586,6 +9586,143 @@ def _load_ml_iteration_journal(run_id: str, base_dir: str = "runs") -> List[Dict
         return []
     return entries
 
+def _normalize_iteration_memory_items(
+    items: Any,
+    *,
+    max_items: int = 8,
+    max_len: int = 220,
+) -> List[str]:
+    return [
+        str(item)
+        for item in _normalize_handoff_items(items, max_items=max_items, max_len=max_len)
+        if str(item).strip()
+    ]
+
+
+def _is_generic_iteration_memory_action(action: str) -> bool:
+    text = str(action or "").strip().lower()
+    if not text:
+        return True
+    generic_prefixes = (
+        "resolve failed gates:",
+        "apply reviewer feedback",
+        "apply review_board required actions",
+        "apply reviewer and qa feedback",
+        "apply the latest review feedback",
+    )
+    return text.startswith(generic_prefixes)
+
+
+def _derive_iteration_memory_actions(
+    *,
+    outputs_missing: List[str] | None,
+    handoff_obj: Dict[str, Any] | None,
+    reviewer_packet: Dict[str, Any] | None,
+    qa_packet: Dict[str, Any] | None,
+    fallback_actions: List[str] | None,
+) -> List[str]:
+    handoff_obj = handoff_obj if isinstance(handoff_obj, dict) else {}
+    reviewer_packet = reviewer_packet if isinstance(reviewer_packet, dict) else {}
+    qa_packet = qa_packet if isinstance(qa_packet, dict) else {}
+    quality_focus = (
+        handoff_obj.get("quality_focus")
+        if isinstance(handoff_obj.get("quality_focus"), dict)
+        else {}
+    )
+    outputs_missing = [str(item) for item in (outputs_missing or []) if str(item).strip()]
+    preferred: List[str] = []
+    generic: List[str] = []
+    seen: set[str] = set()
+
+    def _push(action: str) -> None:
+        item = str(action or "").strip()
+        if not item or item in seen:
+            return
+        seen.add(item)
+        if _is_generic_iteration_memory_action(item):
+            generic.append(item)
+        else:
+            preferred.append(item)
+
+    if outputs_missing:
+        _push("Write required outputs: " + str(outputs_missing[:5]))
+
+    structured_sources = (
+        handoff_obj.get("patch_objectives"),
+        quality_focus.get("required_fixes"),
+        reviewer_packet.get("required_fixes"),
+        qa_packet.get("required_fixes"),
+    )
+    for source in structured_sources:
+        for item in _normalize_iteration_memory_items(source, max_items=8, max_len=240):
+            _push(item)
+    if not preferred:
+        for item in _normalize_iteration_memory_items(fallback_actions, max_items=8, max_len=240):
+            _push(item)
+
+    merged = preferred + generic
+    if not merged:
+        merged = ["Apply reviewer feedback and align outputs to the execution contract."]
+    return merged[:4]
+
+
+def _extract_iteration_memory_blockers(entry: Dict[str, Any] | None) -> List[str]:
+    entry = entry if isinstance(entry, dict) else {}
+    blockers: List[str] = []
+    seen: set[str] = set()
+
+    def _append(prefix: str, values: Any, *, max_items: int = 6, max_len: int = 180) -> None:
+        for item in _normalize_iteration_memory_items(values, max_items=max_items, max_len=max_len):
+            token = f"{prefix}:{item}"
+            if token in seen:
+                continue
+            seen.add(token)
+            blockers.append(token)
+
+    quality_failed = _normalize_iteration_memory_items(entry.get("quality_failed_gates"), max_items=8, max_len=180)
+    quality_hard = _normalize_iteration_memory_items(entry.get("quality_hard_failures"), max_items=8, max_len=180)
+    if quality_failed:
+        _append("quality_gate", quality_failed)
+    if quality_hard:
+        _append("quality_hard", quality_hard)
+    if not blockers:
+        _append("reviewer_gate", entry.get("reviewer_failed_gates"))
+        _append("qa_gate", entry.get("qa_failed_gates"))
+        _append("reviewer_hard", entry.get("reviewer_hard_failures"))
+        _append("qa_hard", entry.get("qa_hard_failures"))
+
+    _append("preflight", entry.get("preflight_issues"), max_items=5, max_len=160)
+    _append("missing_output", entry.get("outputs_missing"), max_items=5, max_len=160)
+
+    runtime_error = entry.get("runtime_error")
+    if isinstance(runtime_error, dict):
+        runtime_label = str(runtime_error.get("type") or "").strip()
+        runtime_message = str(runtime_error.get("message") or "").strip()
+        if runtime_label:
+            _append("runtime", [runtime_label], max_items=1, max_len=120)
+        elif runtime_message:
+            _append("runtime", [runtime_message.splitlines()[0]], max_items=1, max_len=120)
+
+    if not blockers:
+        _append("reason", entry.get("reviewer_reasons"), max_items=5, max_len=120)
+        _append("reason", entry.get("qa_reasons"), max_items=5, max_len=120)
+    return blockers[:8]
+
+
+def _build_iteration_memory_cautions(blockers: List[str]) -> List[str]:
+    cautions: List[str] = []
+    blocker_text = " ".join([str(item).lower() for item in (blockers or []) if item])
+    if "strategy_followed" in blocker_text:
+        cautions.append("Avoid: do not keep the old model family when strategy_followed is still failing.")
+    if "leakage_prevention" in blocker_text or "quality_gate:leakage" in blocker_text:
+        cautions.append("Avoid: do not use forbidden/post-outcome features or in-fold target encoding.")
+    if "target_variance_guard" in blocker_text:
+        cautions.append("Avoid: do not train before validating target/cardinality guards.")
+    if "output_row_count_consistency" in blocker_text or "missing_output" in blocker_text:
+        cautions.append("Avoid: do not bypass output row-count and artifact write checks.")
+    return cautions[:3]
+
+
 def _build_ml_iteration_memory_block(entries: List[Dict[str, Any]], max_chars: int = 1200) -> str:
     if not entries:
         return ""
@@ -9608,39 +9745,32 @@ def _build_ml_iteration_memory_block(entries: List[Dict[str, Any]], max_chars: i
         "pct_nan_optimal_price": diagnostics.get("pct_nan_optimal_price") if isinstance(diagnostics, dict) else None,
         "root_cause": diagnostics.get("root_cause") if isinstance(diagnostics, dict) else None,
     }
+    current_blockers = _extract_iteration_memory_blockers(last)
+    if current_blockers:
+        last_summary["current_blockers"] = current_blockers[:5]
+
     counts: Dict[str, int] = {}
     for entry in entries:
-        for tag in (entry.get("reviewer_reasons") or []) + (entry.get("qa_reasons") or []) + (entry.get("preflight_issues") or []):
+        for tag in _extract_iteration_memory_blockers(entry):
             if not tag:
                 continue
             key = str(tag)
             counts[key] = counts.get(key, 0) + 1
-    top_failures = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:3]
+    top_failures = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:4]
     top_failures_list = [f"{name} (x{count})" for name, count in top_failures]
-    do_lines = []
-    for item in last.get("next_actions") or []:
-        if not item:
-            continue
-        do_lines.append(f"DO: {item}")
-        if len(do_lines) >= 3:
-            break
-    dont_lines = []
-    dont_map = {
-        "synthetic": "Don't generate synthetic data.",
-        "df_mutation": "Don't assign new df columns outside allowed patterns.",
-        "unknown_columns": "Don't reference columns not in the contract.",
-        "contract_missing_outputs": "Don't skip required artifacts.",
-        "leakage": "Don't use post-outcome features.",
-    }
-    for key in counts.keys():
-        tag = str(key)
-        if tag in dont_map and len(dont_lines) < 3:
-            dont_lines.append(dont_map[tag])
+    previous_blockers = _extract_iteration_memory_blockers(entries[-2]) if len(entries) >= 2 else []
+    resolved_blockers = [item for item in previous_blockers if item not in current_blockers][:3]
+    next_actions = _normalize_iteration_memory_items(last.get("next_actions"), max_items=4, max_len=240)
+    caution_lines = _build_iteration_memory_cautions(current_blockers)
     lines = [
         "Last attempt summary: " + json.dumps(last_summary, ensure_ascii=True),
-        "Top recurring failures: " + json.dumps(top_failures_list, ensure_ascii=True),
+        "Repeated blockers: " + json.dumps(top_failures_list, ensure_ascii=True),
     ]
-    lines.extend(do_lines + dont_lines)
+    if resolved_blockers:
+        lines.append("Resolved since last attempt: " + json.dumps(resolved_blockers, ensure_ascii=True))
+    for item in next_actions:
+        lines.append("NEXT: " + item)
+    lines.extend(caution_lines)
     block = "\n".join(lines)
     if len(block) <= max_chars:
         return block
@@ -9713,6 +9843,58 @@ def _build_ml_iteration_journal_entry(
         "from_iteration": _safe_int(handoff_obj.get("from_iteration")),
         "next_iteration": _safe_int(handoff_obj.get("next_iteration")),
     }
+    quality_focus = (
+        handoff_obj.get("quality_focus")
+        if isinstance(handoff_obj.get("quality_focus"), dict)
+        else {}
+    )
+    quality_failed_gates = _normalize_iteration_memory_items(
+        quality_focus.get("failed_gates"),
+        max_items=10,
+        max_len=180,
+    )
+    quality_required_fixes = _normalize_iteration_memory_items(
+        quality_focus.get("required_fixes"),
+        max_items=10,
+        max_len=240,
+    )
+    quality_hard_failures = _normalize_iteration_memory_items(
+        quality_focus.get("hard_failures"),
+        max_items=10,
+        max_len=180,
+    )
+    patch_objectives = _normalize_iteration_memory_items(
+        handoff_obj.get("patch_objectives"),
+        max_items=8,
+        max_len=240,
+    )
+    reviewer_failed_gates = _normalize_iteration_memory_items(
+        reviewer_packet.get("failed_gates"),
+        max_items=8,
+        max_len=180,
+    )
+    reviewer_hard_failures = _normalize_iteration_memory_items(
+        reviewer_packet.get("hard_failures"),
+        max_items=8,
+        max_len=180,
+    )
+    qa_failed_gates = _normalize_iteration_memory_items(
+        qa_packet.get("failed_gates"),
+        max_items=8,
+        max_len=180,
+    )
+    qa_hard_failures = _normalize_iteration_memory_items(
+        qa_packet.get("hard_failures"),
+        max_items=8,
+        max_len=180,
+    )
+    effective_next_actions = _derive_iteration_memory_actions(
+        outputs_missing=outputs_missing,
+        handoff_obj=handoff_obj,
+        reviewer_packet=reviewer_packet,
+        qa_packet=qa_packet,
+        fallback_actions=next_actions,
+    )
     reviewer_trace = reviewer_packet.get("json_parse_trace") if isinstance(reviewer_packet, dict) else {}
     qa_trace = qa_packet.get("json_parse_trace") if isinstance(qa_packet, dict) else {}
     metric_round_info: Dict[str, Any] = {}
@@ -9781,7 +9963,15 @@ def _build_ml_iteration_journal_entry(
         "reviewer_reasons": reviewer_reasons or [],
         "qa_verdict": qa_verdict or "UNKNOWN",
         "qa_reasons": qa_reasons or [],
-        "next_actions": next_actions or [],
+        "quality_failed_gates": quality_failed_gates,
+        "quality_required_fixes": quality_required_fixes,
+        "quality_hard_failures": quality_hard_failures,
+        "patch_objectives": patch_objectives,
+        "reviewer_failed_gates": reviewer_failed_gates,
+        "reviewer_hard_failures": reviewer_hard_failures,
+        "qa_failed_gates": qa_failed_gates,
+        "qa_hard_failures": qa_hard_failures,
+        "next_actions": effective_next_actions,
         "iteration_diagnostics": diagnostics,
         "handoff_meta": handoff_meta,
         "reviewer_packet_status": str(reviewer_packet.get("status") or ""),
