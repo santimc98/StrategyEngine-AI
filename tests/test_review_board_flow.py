@@ -327,6 +327,42 @@ def test_run_review_board_preserves_metric_optimization_handoff(tmp_path, monkey
     assert isinstance(handoff.get("hypothesis_packet"), dict) and handoff.get("hypothesis_packet")
 
 
+def test_run_review_board_switches_to_repair_first_handoff_when_blocking_retry(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardNeedsImprovement())
+    state = {
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "review_feedback": "Blocking QA conflict remains.",
+        "feedback_history": [],
+        "last_gate_context": {"failed_gates": [], "required_fixes": [], "hard_failures": []},
+        "iteration_handoff": {
+            "mode": "optimize",
+            "source": "actor_critic_metric_improvement",
+            "patch_objectives": ["Metric-improvement round: apply active hypothesis 'catboost' with material edits (NO_OP forbidden)."],
+            "editor_constraints": {"must_apply_hypothesis": True, "forbid_noop": True, "patch_intensity": "aggressive"},
+            "optimization_context": {"policy": {"phase": "explore"}},
+            "hypothesis_packet": {"action": "APPLY", "hypothesis": {"technique": "catboost"}},
+        },
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False},
+            "result_evaluator": {"status": "APPROVE_WITH_WARNINGS"},
+            "reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "REJECTED", "hard_failures": ["target_mapping_check"]},
+            "results_advisor": {"status": "APPROVE_WITH_WARNINGS"},
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+
+    handoff = result.get("iteration_handoff", {})
+    assert handoff.get("mode") == "patch"
+    assert handoff.get("source") == "review_board_repair_first"
+    assert handoff.get("repair_policy", {}).get("primary_focus") == "compliance"
+    assert handoff.get("editor_constraints", {}).get("must_apply_hypothesis") is False
+    assert handoff.get("deferred_optimization", {}).get("resume_condition")
+
+
 def test_contract_consistency_promotes_implied_hard_gate_failure() -> None:
     packet = graph_mod._normalize_review_packet_for_state(
         {
@@ -386,6 +422,38 @@ def test_contract_consistency_keeps_advisory_gate_suggestion_non_blocking() -> N
                 "severity": "HARD",
                 "params": {"method": "k-fold_out_of_fold"},
             }
+        ]
+    }
+
+    enforced = graph_mod._enforce_review_packet_contract_consistency(
+        packet,
+        contract=contract,
+        actor="qa_reviewer",
+    )
+
+    assert enforced.get("status") == "APPROVE_WITH_WARNINGS"
+    assert not enforced.get("failed_gates")
+    assert not enforced.get("hard_failures")
+
+
+def test_contract_consistency_ignores_positive_gate_mentions_when_failure_is_elsewhere() -> None:
+    packet = graph_mod._normalize_review_packet_for_state(
+        {
+            "status": "APPROVE_WITH_WARNINGS",
+            "feedback": (
+                "The code successfully passes all critical QA gates, including strict split isolation and target mapping. "
+                "However, the implementation uses HistGradientBoostingClassifier instead of CatBoostClassifier."
+            ),
+            "failed_gates": [],
+            "required_fixes": [],
+            "hard_failures": [],
+        },
+        default_status="UNKNOWN",
+    )
+    contract = {
+        "qa_gates": [
+            {"name": "leakage_prevention_split", "severity": "HARD"},
+            {"name": "target_mapping_check", "severity": "HARD"},
         ]
     }
 

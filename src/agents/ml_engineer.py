@@ -644,6 +644,16 @@ class MLEngineerAgent:
             if isinstance(raw.get("editor_constraints"), dict)
             else {}
         )
+        repair_policy = raw.get("repair_policy") if isinstance(raw.get("repair_policy"), dict) else {}
+        retry_context = raw.get("retry_context") if isinstance(raw.get("retry_context"), dict) else {}
+        deferred_optimization = (
+            raw.get("deferred_optimization")
+            if isinstance(raw.get("deferred_optimization"), dict)
+            else {}
+        )
+        repair_first = bool(repair_policy.get("repair_first")) or str(
+            repair_policy.get("primary_focus") or retry_context.get("repair_focus") or ""
+        ).strip().lower() in {"runtime", "persistence", "compliance"}
         gate_enforcement = (
             gate_context.get("metric_round_enforcement")
             if isinstance(gate_context.get("metric_round_enforcement"), dict)
@@ -758,10 +768,15 @@ class MLEngineerAgent:
                     else []
                 ),
             }
+        if repair_first:
+            optimization_focus = {}
+            optimization_context = {}
+            critic_packet = {}
+            hypothesis_packet = {}
 
         return {
             "handoff_version": raw.get("handoff_version") or "v1",
-            "mode": str(raw.get("mode") or ("patch" if gate_context else "build")).lower(),
+            "mode": "patch" if repair_first else str(raw.get("mode") or ("patch" if gate_context else "build")).lower(),
             "source": raw.get("source") or "result_evaluator",
             "from_iteration": raw.get("from_iteration"),
             "next_iteration": raw.get("next_iteration"),
@@ -785,6 +800,9 @@ class MLEngineerAgent:
                 "runtime_error_tail": str(feedback.get("runtime_error_tail") or "").strip(),
                 "evidence": evidence_focus,
             },
+            "repair_policy": repair_policy if isinstance(repair_policy, dict) else {},
+            "deferred_optimization": deferred_optimization if isinstance(deferred_optimization, dict) else {},
+            "retry_context": retry_context if isinstance(retry_context, dict) else {},
             "must_preserve": must_preserve[:8],
             "patch_objectives": patch_objectives[:8],
             "critic_packet": critic_packet if isinstance(critic_packet, dict) else {},
@@ -950,6 +968,75 @@ class MLEngineerAgent:
             )
         return "\n".join(lines).strip()
 
+    def _is_repair_first_context(
+        self,
+        gate_context: Dict[str, Any] | None,
+        handoff_payload: Dict[str, Any] | None,
+    ) -> bool:
+        gate_context = gate_context if isinstance(gate_context, dict) else {}
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        repair_policy = (
+            handoff_payload.get("repair_policy")
+            if isinstance(handoff_payload.get("repair_policy"), dict)
+            else {}
+        )
+        retry_context = (
+            handoff_payload.get("retry_context")
+            if isinstance(handoff_payload.get("retry_context"), dict)
+            else {}
+        )
+        quality_focus = (
+            handoff_payload.get("quality_focus")
+            if isinstance(handoff_payload.get("quality_focus"), dict)
+            else {}
+        )
+        contract_focus = (
+            handoff_payload.get("contract_focus")
+            if isinstance(handoff_payload.get("contract_focus"), dict)
+            else {}
+        )
+        if bool(repair_policy.get("repair_first")):
+            return True
+        primary_focus = str(
+            repair_policy.get("primary_focus") or retry_context.get("repair_focus") or ""
+        ).strip().lower()
+        if primary_focus in {"runtime", "persistence", "compliance"}:
+            return True
+        if gate_context.get("runtime_error"):
+            return True
+        missing_outputs = contract_focus.get("missing_outputs")
+        if isinstance(missing_outputs, list) and any(str(item).strip() for item in missing_outputs):
+            return True
+        hard_failures = []
+        for values in (
+            gate_context.get("hard_failures"),
+            quality_focus.get("hard_failures"),
+        ):
+            if isinstance(values, list):
+                hard_failures.extend([str(item).strip().lower() for item in values if str(item).strip()])
+        if hard_failures:
+            return True
+        failed_gates = []
+        for values in (
+            gate_context.get("failed_gates"),
+            quality_focus.get("failed_gates"),
+        ):
+            if isinstance(values, list):
+                failed_gates.extend([str(item).strip().lower() for item in values if str(item).strip()])
+        blocking_tokens = (
+            "runtime",
+            "output_contract",
+            "required output",
+            "required artifact",
+            "artifact",
+            "alignment_check",
+            "contract",
+            "hard",
+            "leakage_prevention",
+            "target_mapping",
+        )
+        return any(any(token in gate for token in blocking_tokens) for gate in failed_gates)
+
     def _is_metric_optimization_context(
         self,
         gate_context: Dict[str, Any] | None,
@@ -957,6 +1044,8 @@ class MLEngineerAgent:
     ) -> bool:
         gate_context = gate_context if isinstance(gate_context, dict) else {}
         handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        if self._is_repair_first_context(gate_context=gate_context, handoff_payload=handoff_payload):
+            return False
         mode = str(handoff_payload.get("mode") or "").strip().lower()
         source = str(handoff_payload.get("source") or gate_context.get("source") or "").strip().lower()
         quality_focus = handoff_payload.get("quality_focus") if isinstance(handoff_payload.get("quality_focus"), dict) else {}
@@ -1174,11 +1263,6 @@ class MLEngineerAgent:
         handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
         quality_focus = handoff_payload.get("quality_focus")
         quality_focus = quality_focus if isinstance(quality_focus, dict) else {}
-        if self._is_metric_optimization_context(
-            gate_context=gate_context,
-            handoff_payload=handoff_payload,
-        ):
-            return "optimization"
 
         failed_tokens: List[str] = []
         for values in (
@@ -1193,6 +1277,18 @@ class MLEngineerAgent:
         failed_blob = " ".join(failed_tokens)
         feedback_blob = str(feedback_text or "").lower()
         combined = " ".join([failed_blob, feedback_blob]).strip()
+        runtime_tokens = [
+            "runtime",
+            "traceback",
+            "exception",
+            "timeout",
+            "timed out",
+            "deadline exceeded",
+            "script exceeded",
+            "oom",
+            "memoryerror",
+            "sandbox",
+        ]
         training_gate_tokens = [
             "strategy_followed",
             "leakage_prevention",
@@ -1237,12 +1333,22 @@ class MLEngineerAgent:
             "persist",
             "write artifact",
         ]
+        if self._is_repair_first_context(
+            gate_context=gate_context,
+            handoff_payload=handoff_payload,
+        ) and any(token in combined for token in runtime_tokens):
+            return "runtime_repair"
         if any(token in failed_blob for token in training_gate_tokens):
             return "training"
         if any(token in feedback_blob for token in training_edit_tokens):
             return "training"
         if any(token in combined for token in persistence_tokens):
             return "persistence"
+        if self._is_metric_optimization_context(
+            gate_context=gate_context,
+            handoff_payload=handoff_payload,
+        ):
+            return "optimization"
         return "training"
 
     def _build_last_run_memory_block(
@@ -4108,7 +4214,10 @@ $strategy_json
         1) Return ONLY the full updated Python script. No markdown, no explanation.
         2) Keep script structure and apply targeted edits required by patch objectives and enforcement.
         3) Keep strategy/objective/contract paths unchanged.
-        4) If phase is "persistence", do not modify training/model selection logic.
+        4) If phase is "runtime_repair", fix runtime/cost root cause first.
+           If the failure is a timeout or OOM, reduce compute cost within the same model family before changing strategy.
+           Do not resume deferred metric-improvement work until required outputs are produced again.
+        5) If phase is "persistence", do not modify training/model selection logic.
            Only fix persistence/serialization/artifact-writing blocks.
         """
 

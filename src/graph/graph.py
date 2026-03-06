@@ -1373,6 +1373,26 @@ def _collect_active_hard_gate_specs(contract: Dict[str, Any] | None) -> List[Dic
             merged.append({"name": name, "severity": "HARD", "params": params})
     return merged
 
+_FEEDBACK_FRAGMENT_SPLIT_RE = re.compile(r"(?<=[\.\!\?])\s+|\n+")
+
+
+def _split_feedback_fragments(text: Any) -> List[str]:
+    raw = str(text or "").replace("\r", "\n").strip()
+    if not raw:
+        return []
+    fragments: List[str] = []
+    seen: set[str] = set()
+    for block in _FEEDBACK_FRAGMENT_SPLIT_RE.split(raw):
+        candidate = str(block or "").strip(" -\t")
+        if not candidate:
+            continue
+        normalized = _normalize_gate_match_text(candidate)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        fragments.append(candidate)
+    return fragments[:40] if fragments else [raw[:500]]
+
 
 def _collect_review_packet_text_fragments(packet: Dict[str, Any] | None) -> List[str]:
     if not isinstance(packet, dict):
@@ -1381,7 +1401,7 @@ def _collect_review_packet_text_fragments(packet: Dict[str, Any] | None) -> List
     for key in ("feedback",):
         value = packet.get(key)
         if isinstance(value, str) and value.strip():
-            fragments.append(value.strip())
+            fragments.extend(_split_feedback_fragments(value))
     for key in ("warnings", "required_fixes", "failed_gates", "hard_failures"):
         values = packet.get(key)
         if not isinstance(values, list):
@@ -1389,7 +1409,7 @@ def _collect_review_packet_text_fragments(packet: Dict[str, Any] | None) -> List
         for item in values:
             text = str(item or "").strip()
             if text:
-                fragments.append(text)
+                fragments.extend(_split_feedback_fragments(text))
     evidence = packet.get("evidence")
     if isinstance(evidence, list):
         for item in evidence:
@@ -1397,11 +1417,11 @@ def _collect_review_packet_text_fragments(packet: Dict[str, Any] | None) -> List
                 for key in ("claim", "source"):
                     text = str(item.get(key) or "").strip()
                     if text:
-                        fragments.append(text)
+                        fragments.extend(_split_feedback_fragments(text))
             else:
                 text = str(item or "").strip()
                 if text:
-                    fragments.append(text)
+                    fragments.extend(_split_feedback_fragments(text))
     deduped: List[str] = []
     seen: set[str] = set()
     for fragment in fragments:
@@ -8795,11 +8815,27 @@ def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
         return None
     text = str(output)
     line = text.strip().splitlines()[-1] if text.strip() else ""
+    details = _classify_runtime_failure_details(text)
     if "Traceback" in text:
-        return {"type": "runtime_error", "message": line[:300]}
+        return {
+            "type": "runtime_error",
+            "message": line[:300],
+            "failure_type": str(details.get("failure_type") or "runtime_error"),
+            "repair_focus": str(details.get("repair_focus") or "runtime"),
+        }
     if "EXECUTION ERROR" in text or "Sandbox Execution Failed" in text:
-        return {"type": "execution_error", "message": line[:300]}
-    return {"type": "error", "message": line[:300]}
+        return {
+            "type": "execution_error",
+            "message": line[:300],
+            "failure_type": str(details.get("failure_type") or "runtime_error"),
+            "repair_focus": str(details.get("repair_focus") or "runtime"),
+        }
+    return {
+        "type": "error",
+        "message": line[:300],
+        "failure_type": str(details.get("failure_type") or "runtime_error"),
+        "repair_focus": str(details.get("repair_focus") or "runtime"),
+    }
 
 
 def _is_editable_ml_code(previous_code: str | None) -> bool:
@@ -8863,6 +8899,18 @@ def _classify_ml_memory_phase(failed_gates: List[str] | None, feedback: str | No
     tokens = [str(item).strip().lower() for item in (failed_gates or []) if str(item).strip()]
     text = str(feedback or "").lower()
     combined = " ".join(tokens + [text])
+    runtime_tokens = [
+        "runtime",
+        "traceback",
+        "exception",
+        "timeout",
+        "timed out",
+        "oom",
+        "memoryerror",
+        "sandbox",
+    ]
+    if any(token in combined for token in runtime_tokens):
+        return "runtime"
     persistence_tokens = [
         "output_contract",
         "required output",
@@ -9225,33 +9273,12 @@ def _build_retry_context(
     Build a structured retry_context for targeted error recovery.
     Classifies the error type so downstream agents know exactly what to fix.
     """
-    error_type = "unknown"
-    specific_error = ""
+    runtime_details = _classify_runtime_failure_details(runtime_tail, missing_outputs=missing_outputs)
+    error_type = str(runtime_details.get("failure_type") or "unknown")
+    specific_error = str(runtime_details.get("summary") or "")
     blocked_imports: List[str] = []
-
     runtime_lower = (runtime_tail or "").lower()
-
-    # Classify error type
-    if runtime_tail and ("traceback" in runtime_lower or "error" in runtime_lower):
-        if "importerror" in runtime_lower or "modulenotfounderror" in runtime_lower:
-            error_type = "security_violation"
-            # Extract blocked import names from error
-            import re as _re
-            import_match = _re.search(r"(?:import|module).*?['\"]([^'\"]+)['\"]", runtime_lower)
-            if import_match:
-                blocked_imports.append(import_match.group(1))
-            specific_error = runtime_tail[:500]
-        elif "blocked" in runtime_lower or "forbidden" in runtime_lower or "security" in runtime_lower:
-            error_type = "security_violation"
-            specific_error = runtime_tail[:500]
-        else:
-            error_type = "runtime_error"
-            specific_error = runtime_tail[:500]
-    elif missing_outputs:
-        error_type = "output_missing"
-        specific_error = f"Missing outputs: {', '.join(missing_outputs[:5])}"
-    elif failed_gates:
-        error_type = "gate_failure"
+    if not specific_error and failed_gates:
         specific_error = f"Failed gates: {', '.join(failed_gates[:5])}"
 
     # Extract blocked imports from state if available
@@ -9263,6 +9290,11 @@ def _build_retry_context(
                 name = str(v.get("module") if isinstance(v, dict) else v)
                 if name and name not in blocked_imports:
                     blocked_imports.append(name)
+    if error_type == "import_error" and not blocked_imports:
+        import re as _re
+        import_match = _re.search(r"(?:import|module).*?['\"]([^'\"]+)['\"]", runtime_lower)
+        if import_match:
+            blocked_imports.append(import_match.group(1))
 
     return {
         "error_type": error_type,
@@ -9270,11 +9302,259 @@ def _build_retry_context(
         "blocked_imports": blocked_imports[:10],
         "missing_outputs": missing_outputs[:10],
         "working_components": present_outputs[:8],
+        "repair_focus": str(runtime_details.get("repair_focus") or "runtime"),
+        "cost_reduction_required": bool(runtime_details.get("cost_reduction_required")),
+        "recommended_actions": [
+            str(item) for item in (runtime_details.get("recommended_actions") or []) if str(item).strip()
+        ][:5],
         "failed_gates": [
             {"gate": g, "evidence": "see quality_focus for details"}
             for g in failed_gates[:8]
         ],
     }
+
+
+def _classify_runtime_failure_details(
+    output: Any,
+    *,
+    missing_outputs: List[str] | None = None,
+) -> Dict[str, Any]:
+    text = str(output or "").strip()
+    lower = text.lower()
+    last_line = text.splitlines()[-1].strip() if text else ""
+    failure_type = "runtime_error"
+    repair_focus = "runtime"
+    cost_reduction_required = False
+    recommended_actions: List[str] = []
+
+    timeout_tokens = (
+        "timeout",
+        "timed out",
+        "time limit",
+        "deadline exceeded",
+        "exceeded 7200",
+        "exceeded 3600",
+        "script exceeded",
+    )
+    oom_tokens = (
+        "out of memory",
+        "oom",
+        "memoryerror",
+        "cannot allocate memory",
+        "killed process",
+        "memory pressure",
+    )
+    import_tokens = ("modulenotfounderror", "importerror")
+    io_tokens = (
+        "filenotfounderror",
+        "no such file",
+        "permission denied",
+        "json serialization",
+        "to_csv",
+        "write artifact",
+    )
+    shape_tokens = (
+        "shape mismatch",
+        "length mismatch",
+        "inconsistent numbers of samples",
+        "could not convert",
+        "valueerror",
+        "typeerror",
+    )
+
+    if any(token in lower for token in timeout_tokens):
+        failure_type = "timeout"
+        repair_focus = "runtime"
+        cost_reduction_required = True
+        recommended_actions = [
+            "Reduce compute cost within the current runtime budget before changing strategy.",
+            "Keep the current model family/contract outputs stable while cutting seeds, trials, folds, or iterations only as needed.",
+            "Rerun and confirm all contract artifacts are produced before resuming metric optimization.",
+        ]
+    elif _is_memory_pressure_error(text) or any(token in lower for token in oom_tokens):
+        failure_type = "oom"
+        repair_focus = "runtime"
+        cost_reduction_required = True
+        recommended_actions = [
+            "Reduce memory footprint before retrying the same modeling approach.",
+            "Prefer bounded batch/feature/seed settings over broader replanning.",
+            "Verify all required artifacts are produced after the resource fix.",
+        ]
+    elif any(token in lower for token in import_tokens):
+        failure_type = "import_error"
+        repair_focus = "runtime"
+        recommended_actions = [
+            "Use only runtime-compatible dependencies and imports allowed by the contract.",
+            "Replace unavailable imports with declared fallbacks before changing model logic.",
+        ]
+    elif any(token in lower for token in io_tokens):
+        failure_type = "artifact_io"
+        repair_focus = "persistence"
+        recommended_actions = [
+            "Fix artifact writing/serialization/path handling first.",
+            "Preserve valid training logic unless the contract explicitly requires a modeling change.",
+        ]
+    elif missing_outputs:
+        failure_type = "output_missing"
+        repair_focus = "persistence"
+        recommended_actions = [
+            "Regenerate missing contract outputs at the exact required paths.",
+            "Keep the rest of the pipeline stable while restoring artifact completeness.",
+        ]
+    elif any(token in lower for token in shape_tokens):
+        failure_type = "shape_or_dtype"
+        repair_focus = "runtime"
+        recommended_actions = [
+            "Fix shape/dtype/root-cause issues before further optimization changes.",
+            "Preserve the broader pipeline and contract outputs while patching the failing block.",
+        ]
+    else:
+        recommended_actions = [
+            "Fix the runtime root cause first and keep the rest of the pipeline stable.",
+            "Regenerate required artifacts after the runtime issue is resolved.",
+        ]
+
+    summary = last_line or text[:320]
+    if failure_type == "output_missing" and missing_outputs:
+        summary = "Missing outputs: " + ", ".join([str(path) for path in (missing_outputs or [])[:5]])
+    return {
+        "failure_type": failure_type,
+        "repair_focus": repair_focus,
+        "cost_reduction_required": cost_reduction_required,
+        "summary": summary[:500],
+        "recommended_actions": recommended_actions[:5],
+    }
+
+
+def _resolve_repair_first_focus(
+    *,
+    retry_context: Dict[str, Any] | None,
+    failed_gates: List[str] | None,
+    hard_failures: List[str] | None,
+    missing_outputs: List[str] | None,
+) -> str:
+    retry_context = retry_context if isinstance(retry_context, dict) else {}
+    retry_focus = str(retry_context.get("repair_focus") or "").strip().lower()
+    retry_error_type = str(retry_context.get("error_type") or "").strip().lower()
+    retry_specific = str(retry_context.get("specific_error") or "").strip().lower()
+    runtime_markers = ("runtime", "traceback", "exception", "timeout", "sandbox", "memory", "oom")
+    if retry_error_type in {"timeout", "oom", "import_error", "shape_or_dtype"}:
+        return "runtime"
+    if retry_error_type == "runtime_error" and any(token in retry_specific for token in runtime_markers):
+        return "runtime"
+    if missing_outputs:
+        return "persistence"
+    if hard_failures:
+        return "compliance"
+    if any(_looks_blocking_retry_signal(item) for item in (failed_gates or [])):
+        return "compliance"
+    if retry_focus in {"runtime", "persistence", "compliance"}:
+        return retry_focus
+    return ""
+
+
+def _prune_patch_objectives_for_repair_focus(
+    patch_objectives: List[str] | None,
+    *,
+    focus: str,
+    add_defer_note: bool = False,
+) -> List[str]:
+    items = [str(item) for item in (patch_objectives or []) if str(item).strip()]
+    if focus not in {"runtime", "persistence", "compliance"}:
+        return items[:8]
+    deferred_tokens = (
+        "metric-improvement round:",
+        "apply the active metric-improvement hypothesis",
+        "no_op forbidden",
+        "improve primary metric",
+    )
+    kept: List[str] = []
+    removed_optimization = False
+    for item in items:
+        lower = item.lower()
+        if any(token in lower for token in deferred_tokens):
+            removed_optimization = True
+            continue
+        kept.append(item)
+        if len(kept) >= 6:
+            break
+    if add_defer_note and removed_optimization:
+        note = (
+            "Defer the active metric-improvement hypothesis until "
+            + focus
+            + " blockers are cleared and required outputs are stable."
+        )
+        if note not in kept:
+            kept.append(note)
+    return kept[:8] if kept else items[:6]
+
+
+def _apply_repair_first_handoff(
+    handoff: Dict[str, Any] | None,
+    *,
+    repair_focus: str,
+    retry_context: Dict[str, Any] | None,
+    source: str,
+    reason: str,
+) -> Dict[str, Any]:
+    repaired = copy.deepcopy(handoff) if isinstance(handoff, dict) else {}
+    retry_context = copy.deepcopy(retry_context) if isinstance(retry_context, dict) else {}
+    if repair_focus not in {"runtime", "persistence", "compliance"}:
+        return repaired
+
+    deferred_optimization = (
+        dict(repaired.get("deferred_optimization"))
+        if isinstance(repaired.get("deferred_optimization"), dict)
+        else {}
+    )
+    optimization_context = (
+        repaired.get("optimization_context")
+        if isinstance(repaired.get("optimization_context"), dict)
+        else {}
+    )
+    hypothesis_packet = (
+        repaired.get("hypothesis_packet")
+        if isinstance(repaired.get("hypothesis_packet"), dict)
+        else {}
+    )
+    if not deferred_optimization and (optimization_context or hypothesis_packet):
+        active_hypothesis = optimization_context.get("active_hypothesis") if isinstance(optimization_context, dict) else {}
+        technique = _extract_hypothesis_technique(hypothesis_packet) or str(
+            ((active_hypothesis.get("hypothesis") or {}).get("technique") if isinstance(active_hypothesis, dict) else "")
+            or ""
+        ).strip()
+        deferred_optimization = {
+            "reason": reason or f"repair_first:{repair_focus}",
+            "resume_condition": (
+                "Resume metric optimization only after repair-first blockers are cleared and contract outputs are stable."
+            ),
+            "active_technique": technique or None,
+        }
+    repaired["mode"] = "patch"
+    repaired["source"] = source
+    repaired["repair_policy"] = {
+        "repair_first": True,
+        "primary_focus": repair_focus,
+        "reason": reason or f"repair_first:{repair_focus}",
+    }
+    repaired["retry_context"] = retry_context
+    if deferred_optimization:
+        repaired["deferred_optimization"] = deferred_optimization
+    editor_constraints = (
+        dict(repaired.get("editor_constraints"))
+        if isinstance(repaired.get("editor_constraints"), dict)
+        else {}
+    )
+    editor_constraints["must_apply_hypothesis"] = False
+    editor_constraints["forbid_noop"] = False
+    editor_constraints["patch_intensity"] = "incremental"
+    repaired["editor_constraints"] = editor_constraints
+    repaired["patch_objectives"] = _prune_patch_objectives_for_repair_focus(
+        repaired.get("patch_objectives"),
+        focus=repair_focus,
+        add_defer_note=bool(deferred_optimization),
+    )
+    return repaired
 
 
 def _candidate_optimization_blueprint_paths(state: Dict[str, Any], run_id: str) -> List[str]:
@@ -9613,15 +9893,6 @@ def _build_iteration_handoff(
         state,
         run_id=str(state.get("run_id") or ""),
     )
-    if enforce_apply_hypothesis:
-        enforce_msg = (
-            "Metric-improvement round: apply active hypothesis '"
-            + hypothesis_technique
-            + "' with material edits (NO_OP forbidden)."
-        )
-        if enforce_msg not in patch_objectives:
-            patch_objectives.insert(0, enforce_msg)
-
     # ── Retry context: structured error classification for targeted retries ──
     retry_context = _build_retry_context(
         runtime_tail=runtime_tail,
@@ -9632,13 +9903,35 @@ def _build_iteration_handoff(
         required_fixes=required_fixes,
         state=state,
     )
+    repair_first_focus = _resolve_repair_first_focus(
+        retry_context=retry_context,
+        failed_gates=failed_gates,
+        hard_failures=hard_failures,
+        missing_outputs=missing_outputs,
+    )
+    if enforce_apply_hypothesis and not repair_first_focus:
+        enforce_msg = (
+            "Metric-improvement round: apply active hypothesis '"
+            + hypothesis_technique
+            + "' with material edits (NO_OP forbidden)."
+        )
+        if enforce_msg not in patch_objectives:
+            patch_objectives.insert(0, enforce_msg)
 
     handoff: Dict[str, Any] = {
         "handoff_version": "v1",
-        "mode": "optimize" if enforce_apply_hypothesis else ("patch" if next_iteration > 1 else "build"),
+        "mode": (
+            "optimize"
+            if enforce_apply_hypothesis and not repair_first_focus
+            else ("patch" if next_iteration > 1 or repair_first_focus else "build")
+        ),
         "from_iteration": iteration_count,
         "next_iteration": next_iteration,
-        "source": "actor_critic_metric_improvement" if enforce_apply_hypothesis else "result_evaluator",
+        "source": (
+            "actor_critic_metric_improvement"
+            if enforce_apply_hypothesis and not repair_first_focus
+            else "result_evaluator"
+        ),
         "contract_focus": {
             "required_outputs": required_outputs[:15],
             "present_outputs": present_outputs,
@@ -9680,12 +9973,20 @@ def _build_iteration_handoff(
         "hypothesis_packet": hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
         "optimization_blueprint": optimization_blueprint if isinstance(optimization_blueprint, dict) else {},
         "editor_constraints": {
-            "must_apply_hypothesis": bool(enforce_apply_hypothesis),
-            "forbid_noop": bool(enforce_apply_hypothesis),
-            "patch_intensity": "aggressive" if enforce_apply_hypothesis else "incremental",
+            "must_apply_hypothesis": bool(enforce_apply_hypothesis and not repair_first_focus),
+            "forbid_noop": bool(enforce_apply_hypothesis and not repair_first_focus),
+            "patch_intensity": "aggressive" if enforce_apply_hypothesis and not repair_first_focus else "incremental",
         },
         "retry_context": retry_context,
     }
+    if repair_first_focus:
+        handoff = _apply_repair_first_handoff(
+            handoff,
+            repair_focus=repair_first_focus,
+            retry_context=retry_context,
+            source="result_evaluator_repair_first",
+            reason=f"repair_first:{repair_first_focus}",
+        )
     if preflight_failures:
         handoff["preflight_gates"] = {
             "fails": preflight_failures[:10],
@@ -22135,6 +22436,7 @@ def run_review_board(state: AgentState) -> AgentState:
             if blocker not in board_hard_failures:
                 board_hard_failures.append(blocker)
         gate_context["hard_failures"] = board_hard_failures[:20]
+    blocking_retry = False
     if final_status == "NEEDS_IMPROVEMENT":
         blocking_retry = _is_blocking_retry_reason(
             state if isinstance(state, dict) else {},
@@ -22218,7 +22520,30 @@ def run_review_board(state: AgentState) -> AgentState:
         "evidence": _normalize_handoff_evidence(evidence, max_items=8),
     }
     iteration_handoff["quality_focus"] = handoff_quality
-    if preserve_metric_handoff:
+    repair_retry_context = _build_retry_context(
+        runtime_tail=str(state.get("last_runtime_error_tail") or state.get("execution_output") or ""),
+        hard_failures=[str(x) for x in (gate_context.get("hard_failures") or []) if str(x).strip()],
+        failed_gates=[str(x) for x in current_failed if str(x).strip()],
+        missing_outputs=_normalize_handoff_items(
+            ((state.get("output_contract_report") or {}).get("missing") if isinstance(state.get("output_contract_report"), dict) else []),
+            max_items=12,
+            max_len=180,
+        ),
+        present_outputs=_normalize_handoff_items(
+            ((state.get("output_contract_report") or {}).get("present") if isinstance(state.get("output_contract_report"), dict) else []),
+            max_items=12,
+            max_len=180,
+        ),
+        required_fixes=current_required,
+        state=state if isinstance(state, dict) else {},
+    )
+    repair_focus = _resolve_repair_first_focus(
+        retry_context=repair_retry_context,
+        failed_gates=current_failed,
+        hard_failures=gate_context.get("hard_failures") if isinstance(gate_context.get("hard_failures"), list) else [],
+        missing_outputs=repair_retry_context.get("missing_outputs") if isinstance(repair_retry_context, dict) else [],
+    )
+    if preserve_metric_handoff and not (final_status == "NEEDS_IMPROVEMENT" and blocking_retry and repair_focus):
         if patch_objectives and (final_status == "NEEDS_IMPROVEMENT" or not iteration_handoff.get("patch_objectives")):
             iteration_handoff["patch_objectives"] = patch_objectives
         if not isinstance(iteration_handoff.get("critic_packet"), dict) or not iteration_handoff.get("critic_packet"):
@@ -22237,6 +22562,14 @@ def run_review_board(state: AgentState) -> AgentState:
         iteration_handoff["source"] = "review_board"
         iteration_handoff["mode"] = str(iteration_handoff.get("mode") or "patch").strip().lower() or "patch"
         iteration_handoff["patch_objectives"] = patch_objectives
+    if final_status == "NEEDS_IMPROVEMENT" and blocking_retry and repair_focus:
+        iteration_handoff = _apply_repair_first_handoff(
+            iteration_handoff,
+            repair_focus=repair_focus,
+            retry_context=repair_retry_context,
+            source="review_board_repair_first",
+            reason=f"review_board_blocking:{repair_focus}",
+        )
 
     board_payload = {
         "status": board_status,
@@ -22474,14 +22807,45 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     fix_attempt = base_fix_count if terminal_fix else base_fix_count + 1
     max_runtime_fixes = int(state.get("max_runtime_fix_attempts", 3))
     terminal_reason = str(state.get("runtime_fix_terminal_reason") or "").strip().lower()
+    output_contract_report = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
+    missing_outputs = _normalize_handoff_items(output_contract_report.get("missing"), max_items=12, max_len=180)
+    runtime_details = _classify_runtime_failure_details(
+        state.get("last_runtime_error_tail") or output,
+        missing_outputs=missing_outputs,
+    )
+    runtime_failure_type = str(runtime_details.get("failure_type") or "runtime_error")
+    runtime_focus = str(runtime_details.get("repair_focus") or "runtime")
+    runtime_summary = str(runtime_details.get("summary") or "Runtime failure")
+    recommended_runtime_actions = [
+        str(item) for item in (runtime_details.get("recommended_actions") or []) if str(item).strip()
+    ]
 
     error_context = {
         "source": "Execution Runtime",
         "status": "REJECTED",
-        "feedback": f"RUNTIME ERROR trace:\n{output[-2000:]}\n\nFIX THIS CRASH.",
-        "failed_gates": ["Runtime Stability"],
-        "required_fixes": ["Fix the exception."]
+        "feedback": (
+            f"RUNTIME FAILURE [{runtime_failure_type}]: {runtime_summary}\n"
+            f"RUNTIME ERROR trace:\n{output[-2000:]}\n\n"
+            "Apply repair-first handling and keep the rest of the pipeline stable."
+        ),
+        "failed_gates": list(dict.fromkeys(["Runtime Stability", "runtime_failure", runtime_failure_type]))[:6],
+        "required_fixes": ["Fix the runtime root cause before resuming metric/compliance edits."],
+        "runtime_error": {
+            "type": runtime_failure_type,
+            "summary": runtime_summary,
+            "repair_focus": runtime_focus,
+            "cost_reduction_required": bool(runtime_details.get("cost_reduction_required")),
+            "recommended_actions": recommended_runtime_actions[:4],
+        },
+        "iteration_type": "runtime",
     }
+    if missing_outputs:
+        error_context["required_fixes"].append(
+            "Regenerate missing contract outputs at exact paths: " + ", ".join(missing_outputs[:5])
+        )
+    for action in recommended_runtime_actions[:3]:
+        if action not in error_context["required_fixes"]:
+            error_context["required_fixes"].append(action)
 
     ml_override = state.get("ml_engineer_audit_override", "")
     feedback_history = list(state.get("feedback_history", []))
@@ -22618,6 +22982,33 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
             + runtime_signature[:120]
         ),
     )
+    existing_handoff = state.get("iteration_handoff") if isinstance(state.get("iteration_handoff"), dict) else {}
+    runtime_retry_context = _build_retry_context(
+        runtime_tail=str(state.get("last_runtime_error_tail") or output or ""),
+        hard_failures=[],
+        failed_gates=[str(item) for item in (error_context.get("failed_gates") or []) if str(item).strip()],
+        missing_outputs=missing_outputs,
+        present_outputs=_normalize_handoff_items(output_contract_report.get("present"), max_items=12, max_len=180),
+        required_fixes=[str(item) for item in (error_context.get("required_fixes") or []) if str(item).strip()],
+        state=state if isinstance(state, dict) else {},
+    )
+    iteration_handoff = _apply_repair_first_handoff(
+        existing_handoff,
+        repair_focus=runtime_focus if runtime_focus in {"runtime", "persistence"} else "runtime",
+        retry_context=runtime_retry_context,
+        source="prepare_runtime_fix",
+        reason=f"runtime_fix:{runtime_failure_type}",
+    )
+    iteration_handoff["quality_focus"] = {
+        "status": "REJECTED",
+        "failed_gates": [str(item) for item in (error_context.get("failed_gates") or []) if str(item).strip()][:12],
+        "required_fixes": [str(item) for item in (error_context.get("required_fixes") or []) if str(item).strip()][:12],
+        "hard_failures": [],
+        "evidence": [],
+    }
+    feedback_block = iteration_handoff.get("feedback") if isinstance(iteration_handoff.get("feedback"), dict) else {}
+    feedback_block["runtime_error_tail"] = str(state.get("last_runtime_error_tail") or output or "")[-2000:]
+    iteration_handoff["feedback"] = feedback_block
 
     return {
         "last_gate_context": error_context,
@@ -22626,6 +23017,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
         "ml_engineer_audit_override": ml_override,
         "runtime_fix_count": base_fix_count if terminal_fix else fix_attempt,
         "runtime_fix_terminal_reason": str(state.get("runtime_fix_terminal_reason") or ""),
+        "iteration_handoff": iteration_handoff,
         "attempt_ledger": ledger_state.get("attempt_ledger"),
         "phase_cycle_counts": ledger_state.get("phase_cycle_counts"),
         "expensive_cycle_count": ledger_state.get("expensive_cycle_count"),
@@ -23046,7 +23438,18 @@ def _metric_improvement_skip_reason(state: Dict[str, Any], contract: Dict[str, A
     if not isinstance(state, dict) or not isinstance(contract, dict):
         return "invalid_state_or_contract"
     if not _is_approved_review_status(state.get("review_verdict")):
-        return "review_verdict_not_approved"
+        gate_context = state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+        board_payload = state.get("review_board_verdict") if isinstance(state.get("review_board_verdict"), dict) else {}
+        board_failed = [str(x) for x in (board_payload.get("failed_areas") or []) if str(x).strip()]
+        board_required = [str(x) for x in (board_payload.get("required_actions") or []) if str(x).strip()]
+        blocking_retry = _is_blocking_retry_reason(
+            state,
+            gate_context=gate_context,
+            board_failed_areas=board_failed,
+            board_required_actions=board_required,
+        )
+        if blocking_retry:
+            return "review_verdict_not_approved"
     if not _has_real_baseline_reviewer_approval(state):
         return "baseline_reviewer_pair_not_approved"
     if bool(state.get("execution_error")):

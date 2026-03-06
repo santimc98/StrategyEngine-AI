@@ -58,6 +58,26 @@ def test_should_run_metric_improvement_round_accepts_ml_review_stack_fallback() 
     assert _should_run_metric_improvement_round(state, {}) is True
 
 
+def test_should_run_metric_improvement_round_ignores_nonblocking_needs_improvement_when_no_structured_blockers() -> None:
+    state = {
+        "review_verdict": "NEEDS_IMPROVEMENT",
+        "review_board_verdict": {
+            "status": "APPROVE_WITH_WARNINGS",
+            "final_review_verdict": "NEEDS_IMPROVEMENT",
+            "failed_areas": ["metric_gap"],
+            "required_actions": ["Try additional model families."],
+        },
+        "last_gate_context": {"failed_gates": [], "required_fixes": [], "hard_failures": []},
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_attempted": False,
+    }
+
+    assert _should_run_metric_improvement_round(state, {}) is True
+
+
 def test_is_improvement_respects_min_delta_threshold() -> None:
     assert _is_improvement(0.8000, 0.8003, True, 0.0005) is False
     assert _is_improvement(0.8000, 0.8010, True, 0.0005) is True

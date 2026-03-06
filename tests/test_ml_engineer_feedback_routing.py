@@ -110,3 +110,27 @@ def test_guardrail_repair_context_preserves_active_patch_intent():
     assert "MUST_PRESERVE" in context
     assert "Preserve artifact generation for data/metrics.json" in context
     assert "ACTIVE_REVIEW_FEEDBACK" in context
+
+
+def test_editor_phase_prioritizes_runtime_repair_over_metric_optimization():
+    agent = _agent()
+    handoff = {
+        "mode": "optimize",
+        "repair_policy": {"repair_first": True, "primary_focus": "runtime"},
+        "contract_focus": {"missing_outputs": ["data/metrics.json"]},
+        "quality_focus": {"failed_gates": ["runtime_failure"], "required_fixes": ["Reduce runtime cost."]},
+        "editor_constraints": {"must_apply_hypothesis": False},
+    }
+    gate_context = {
+        "runtime_error": {"type": "timeout", "summary": "TIMEOUT: Script exceeded 7200s limit"},
+        "failed_gates": ["runtime_failure"],
+    }
+
+    phase = agent._classify_editor_phase(
+        gate_context=gate_context,
+        handoff_payload=handoff,
+        feedback_text="TIMEOUT: Script exceeded 7200s limit while generating data/metrics.json",
+    )
+
+    assert phase == "runtime_repair"
+    assert agent._is_metric_optimization_context(gate_context, handoff) is False

@@ -74,3 +74,50 @@ def test_iteration_handoff_extracts_target_from_qa_gate_params():
     assert metric_focus["target_value"] == pytest.approx(0.85)
     assert metric_focus["target_source"].startswith("evaluation_spec.qa_gates")
     assert metric_focus["gap_to_target"] == pytest.approx(0.06, abs=1e-6)
+
+
+def test_iteration_handoff_defers_metric_optimization_when_runtime_blockers_exist():
+    state = {
+        "iteration_count": 1,
+        "execution_contract": {"required_outputs": ["data/metrics.json", "data/submission.csv"]},
+        "primary_metric_snapshot": {
+            "primary_metric_name": "roc_auc",
+            "primary_metric_value": 0.91,
+            "baseline_value": 0.905,
+        },
+        "ml_improvement_round_active": True,
+        "ml_improvement_hypothesis_packet": {
+            "action": "APPLY",
+            "hypothesis": {"technique": "multi_seed_catboost_averaging"},
+        },
+        "ml_optimization_context": {
+            "policy": {"phase": "explore"},
+            "active_hypothesis": {
+                "hypothesis": {"technique": "multi_seed_catboost_averaging"},
+            },
+        },
+        "execution_output": "TIMEOUT: Script exceeded 7200s limit",
+        "last_runtime_error_tail": "TIMEOUT: Script exceeded 7200s limit",
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Reduce runtime cost."],
+            "feedback": "Runtime timeout detected.",
+        },
+        oc_report={"present": [], "missing": ["data/metrics.json", "data/submission.csv"]},
+        review_result={},
+        qa_result={},
+        evaluation_spec={"primary_metric": "roc_auc"},
+    )
+
+    assert handoff["mode"] == "patch"
+    assert handoff["repair_policy"]["repair_first"] is True
+    assert handoff["repair_policy"]["primary_focus"] == "runtime"
+    assert handoff["editor_constraints"]["must_apply_hypothesis"] is False
+    assert handoff["retry_context"]["error_type"] == "timeout"
+    assert handoff["retry_context"]["cost_reduction_required"] is True
+    assert handoff["deferred_optimization"]["active_technique"] == "multi_seed_catboost_averaging"
