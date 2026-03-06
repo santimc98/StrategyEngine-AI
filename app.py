@@ -47,6 +47,7 @@ MODEL_PRESET_OPTIONS: List[Tuple[str, str]] = [
     ("anthropic/claude-opus-4.6", "Claude Opus 4.6"),
     ("openai/chatgpt-5.2", "ChatGPT 5.2"),
     ("openai/gpt-5.3-codex", "GPT-5.3 Codex"),
+    ("openai/gpt-5.4", "GPT-5.4"),
 ]
 CUSTOM_MODEL_OPTION = "__custom_model__"
 MODEL_OVERRIDES_PATH = os.path.join(APP_ROOT, "data", "agent_model_overrides.json")
