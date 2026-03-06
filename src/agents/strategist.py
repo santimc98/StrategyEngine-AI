@@ -376,6 +376,348 @@ class StrategistAgent:
                 return True
         return False
 
+    def _extract_dataset_n_rows(self, dataset_profile: Dict[str, Any]) -> int:
+        if not isinstance(dataset_profile, dict):
+            return 0
+        basic_stats = dataset_profile.get("basic_stats") if isinstance(dataset_profile.get("basic_stats"), dict) else {}
+        candidates = [
+            basic_stats.get("n_rows"),
+            dataset_profile.get("n_rows"),
+            dataset_profile.get("row_count"),
+        ]
+        for value in candidates:
+            try:
+                rows = int(value or 0)
+            except Exception:
+                rows = 0
+            if rows > 0:
+                return rows
+        return 0
+
+    def _normalize_technique_name(self, technique: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", str(technique or "").strip().lower()).strip("_")
+
+    def _candidate_family_key(self, technique: Any) -> str:
+        token = self._normalize_technique_name(technique)
+        if not token:
+            return "generic"
+        ordered_tags = [
+            "target_encoding",
+            "frequency_encoding",
+            "rare_category_grouping",
+            "missingness",
+            "regularization",
+            "quantile_binning",
+            "interaction_features",
+            "ensemble",
+            "variance_reduction",
+            "hpo",
+            "categorical_features",
+        ]
+        tags = self._technique_tags(technique)
+        for tag in ordered_tags:
+            if tag in tags:
+                return tag
+        return token
+
+    def _technique_tags(self, technique: Any) -> set[str]:
+        token = self._normalize_technique_name(technique)
+        tags: set[str] = set()
+        if not token:
+            return tags
+        if any(part in token for part in ("missing", "imput")):
+            tags.add("missingness")
+        if any(part in token for part in ("categor", "rare", "frequency", "target_encoding", "ordinal", "one_hot")):
+            tags.add("categorical_features")
+        if "rare" in token or "group" in token:
+            tags.add("rare_category_grouping")
+        if "frequency" in token or "count_encoding" in token:
+            tags.add("frequency_encoding")
+        if "target_encoding" in token or "kfold_target_encoding" in token:
+            tags.add("target_encoding")
+        if any(part in token for part in ("regularization", "lr_reduction", "shrinkage", "dropout")):
+            tags.add("regularization")
+        if any(part in token for part in ("quantile", "binning", "bucket")):
+            tags.add("quantile_binning")
+        if any(part in token for part in ("interaction", "cross", "ratio", "polynomial")):
+            tags.add("interaction_features")
+        if any(part in token for part in ("stack", "ensemble", "blend")):
+            tags.add("ensemble")
+        if any(part in token for part in ("multi_seed", "seed_averaging", "bagging")):
+            tags.add("variance_reduction")
+        if any(part in token for part in ("hyperparameter", "optuna", "hpo", "tuning")):
+            tags.add("hpo")
+        return tags
+
+    def _extract_tracker_technique(self, entry: Dict[str, Any]) -> str:
+        if not isinstance(entry, dict):
+            return ""
+        direct = str(entry.get("technique") or "").strip()
+        if direct:
+            return direct
+        hypothesis = entry.get("hypothesis")
+        if isinstance(hypothesis, dict):
+            nested = str(hypothesis.get("technique") or hypothesis.get("name") or "").strip()
+            if nested:
+                return nested
+        extra = entry.get("extra")
+        if isinstance(extra, dict):
+            nested = str(extra.get("technique") or "").strip()
+            if nested:
+                return nested
+        return ""
+
+    def _collect_tracker_technique_stats(self, tracker_entries: List[Dict[str, Any]]) -> tuple[Dict[str, Dict[str, Any]], List[str]]:
+        stats: Dict[str, Dict[str, Any]] = {}
+        recent_families: List[str] = []
+        recent_family_seen: set[str] = set()
+        recent_entries = tracker_entries[-8:] if isinstance(tracker_entries, list) else []
+        for entry in recent_entries:
+            technique = self._extract_tracker_technique(entry)
+            family = self._candidate_family_key(technique)
+            if family and family not in recent_family_seen:
+                recent_families.append(family)
+                recent_family_seen.add(family)
+        for entry in tracker_entries if isinstance(tracker_entries, list) else []:
+            technique = self._extract_tracker_technique(entry)
+            norm = self._normalize_technique_name(technique)
+            if not norm:
+                continue
+            bucket = stats.setdefault(
+                norm,
+                {
+                    "attempts": 0,
+                    "runtime_failed": 0,
+                    "non_improving": 0,
+                    "negative_deltas": 0,
+                    "positive_deltas": 0,
+                    "last_delta": None,
+                    "last_approved": None,
+                },
+            )
+            bucket["attempts"] += 1
+            runtime_failed = bool(entry.get("runtime_failed"))
+            extra = entry.get("extra") if isinstance(entry.get("extra"), dict) else {}
+            if extra.get("runtime_failed"):
+                runtime_failed = True
+            if runtime_failed:
+                bucket["runtime_failed"] += 1
+            delta = entry.get("delta")
+            try:
+                delta_value = float(delta)
+            except Exception:
+                delta_value = None
+            if delta_value is not None:
+                bucket["last_delta"] = float(delta_value)
+                if delta_value > 0:
+                    bucket["positive_deltas"] += 1
+                elif delta_value < 0:
+                    bucket["negative_deltas"] += 1
+            improved = entry.get("improved_by_metric")
+            approved = entry.get("approved")
+            if improved is False or approved is False:
+                bucket["non_improving"] += 1
+            if isinstance(approved, bool):
+                bucket["last_approved"] = approved
+        return stats, recent_families
+
+    def _candidate_cost_penalty(self, technique: Any, dataset_profile: Dict[str, Any]) -> float:
+        rows = self._extract_dataset_n_rows(dataset_profile)
+        if rows <= 0:
+            return 0.0
+        tags = self._technique_tags(technique)
+        penalty = 0.0
+        if rows >= 250000:
+            if "ensemble" in tags:
+                penalty += 3.0
+            if "hpo" in tags:
+                penalty += 2.5
+            if "variance_reduction" in tags:
+                penalty += 2.0
+            if "target_encoding" in tags:
+                penalty += 1.5
+        elif rows >= 100000:
+            if "ensemble" in tags:
+                penalty += 1.5
+            if "hpo" in tags:
+                penalty += 1.0
+            if "variance_reduction" in tags:
+                penalty += 0.75
+        return penalty
+
+    def _score_iteration_candidate(
+        self,
+        candidate: Dict[str, Any],
+        *,
+        critique_packet: Dict[str, Any],
+        dataset_profile: Dict[str, Any],
+        tracker_stats: Dict[str, Dict[str, Any]],
+        recent_families: List[str],
+    ) -> tuple[float, List[str]]:
+        technique = str(candidate.get("technique") or "").strip()
+        technique_norm = self._normalize_technique_name(technique)
+        tags = self._technique_tags(technique)
+        family = self._candidate_family_key(technique)
+        score = 0.0
+        reasons: List[str] = []
+
+        if str(candidate.get("_source") or "").strip() == "model_analyst_blueprint":
+            score += 1.5
+            reasons.append("blueprint_prior")
+        priority_raw = candidate.get("_priority")
+        try:
+            priority = int(priority_raw)
+        except Exception:
+            priority = 5
+        score += max(0, 6 - max(1, min(priority, 10))) * 0.35
+
+        error_modes = critique_packet.get("error_modes") if isinstance(critique_packet.get("error_modes"), list) else []
+        risk_flags = {
+            str(item or "").strip().lower()
+            for item in (critique_packet.get("risk_flags") or [])
+            if str(item or "").strip()
+        }
+        mode_tag_map = {
+            "fold_instability": {"missingness", "regularization", "variance_reduction", "quantile_binning"},
+            "minority_class_recall_low": {"rare_category_grouping", "frequency_encoding", "target_encoding", "ensemble"},
+            "generalization_gap_high": {"regularization", "quantile_binning", "variance_reduction"},
+            "delta_below_threshold": {"target_encoding", "interaction_features", "ensemble", "hpo"},
+            "metric_stagnation": {"target_encoding", "interaction_features", "ensemble", "hpo"},
+        }
+        severity_weight = {"high": 3.0, "medium": 2.0, "low": 1.0}
+        for item in error_modes:
+            if not isinstance(item, dict):
+                continue
+            mode_id = str(item.get("id") or "").strip().lower()
+            if not mode_id:
+                continue
+            matching_tags = mode_tag_map.get(mode_id, set())
+            if tags & matching_tags:
+                weight = severity_weight.get(str(item.get("severity") or "").strip().lower(), 1.0)
+                score += 1.5 * weight
+                reasons.append(f"targets_{mode_id}")
+
+        if "class_imbalance_sensitivity" in risk_flags and tags & {
+            "rare_category_grouping",
+            "frequency_encoding",
+            "target_encoding",
+        }:
+            score += 1.75
+            reasons.append("risk_class_imbalance")
+        if {"potential_overfitting", "generalization_instability"} & risk_flags and tags & {
+            "regularization",
+            "quantile_binning",
+            "variance_reduction",
+        }:
+            score += 1.75
+            reasons.append("risk_generalization")
+        if "no_material_metric_gain" in risk_flags and tags & {"target_encoding", "interaction_features", "ensemble", "hpo"}:
+            score += 1.25
+            reasons.append("risk_stagnation")
+
+        if self._dataset_has_missingness_signal(dataset_profile) and "missingness" in tags:
+            score += 1.75
+            reasons.append("data_missingness")
+        if self._dataset_has_high_cardinality_signal(dataset_profile) and tags & {
+            "rare_category_grouping",
+            "frequency_encoding",
+            "target_encoding",
+        }:
+            score += 2.0
+            reasons.append("data_high_cardinality")
+        if self._dataset_has_categorical_signal(dataset_profile) and "categorical_features" in tags:
+            score += 1.0
+            reasons.append("data_categorical")
+        if self._dataset_has_numeric_signal(dataset_profile) and tags & {"quantile_binning", "interaction_features"}:
+            score += 0.75
+            reasons.append("data_numeric")
+
+        history = tracker_stats.get(technique_norm, {})
+        if history:
+            positive_deltas = int(history.get("positive_deltas", 0) or 0)
+            non_improving = int(history.get("non_improving", 0) or 0)
+            negative_deltas = int(history.get("negative_deltas", 0) or 0)
+            runtime_failed = int(history.get("runtime_failed", 0) or 0)
+            if positive_deltas > 0:
+                score += min(2.0, 0.75 * positive_deltas)
+                reasons.append("historical_positive_delta")
+            if non_improving > 0:
+                score -= min(6.0, 2.0 * non_improving)
+                reasons.append("historical_non_improving")
+            if negative_deltas > 0:
+                score -= min(4.0, 1.25 * negative_deltas)
+                reasons.append("historical_negative_delta")
+            if runtime_failed > 0 and non_improving == 0:
+                score -= 0.5
+                reasons.append("runtime_retry_risk")
+
+        if family and family not in recent_families:
+            score += 0.75
+            reasons.append("family_diversity")
+        elif family and family in recent_families:
+            score -= 0.25
+            reasons.append("recent_family_repeat")
+
+        cost_penalty = self._candidate_cost_penalty(technique, dataset_profile)
+        if cost_penalty > 0:
+            score -= cost_penalty
+            reasons.append("cost_scaled_to_dataset")
+
+        objective = str(candidate.get("objective") or "").strip()
+        if objective:
+            score += 0.15
+
+        return score, list(dict.fromkeys(reasons))
+
+    def _rank_iteration_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        critique_packet: Dict[str, Any],
+        dataset_profile: Dict[str, Any],
+        tracker_entries: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        tracker_stats, recent_families = self._collect_tracker_technique_stats(tracker_entries)
+        ranked: List[Dict[str, Any]] = []
+        for idx, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            signature = build_hypothesis_signature(
+                technique=candidate.get("technique"),
+                target_columns=candidate.get("target_columns"),
+                feature_scope=candidate.get("feature_scope"),
+                params=candidate.get("params"),
+            )
+            score, reasons = self._score_iteration_candidate(
+                candidate,
+                critique_packet=critique_packet,
+                dataset_profile=dataset_profile,
+                tracker_stats=tracker_stats,
+                recent_families=recent_families,
+            )
+            try:
+                ranking_priority = int(candidate.get("_priority", 5) or 5)
+            except Exception:
+                ranking_priority = 5
+            enriched = dict(candidate)
+            enriched["_signature"] = signature
+            enriched["_ranking_score"] = round(float(score), 3)
+            enriched["_ranking_reasons"] = reasons[:6]
+            enriched["_ranking_index"] = idx
+            enriched["_ranking_priority"] = ranking_priority
+            ranked.append(enriched)
+
+        ranked.sort(
+            key=lambda item: (
+                float(item.get("_ranking_score", 0.0)),
+                -int(item.get("_ranking_priority", 5) or 5),
+                1 if str(item.get("_source") or "").strip() == "model_analyst_blueprint" else 0,
+                -int(item.get("_ranking_index", 0) or 0),
+            ),
+            reverse=True,
+        )
+        return ranked
+
     def _candidate_techniques_from_plan(
         self,
         feature_engineering_plan: Dict[str, Any],
@@ -570,6 +912,9 @@ class StrategistAgent:
                 "has_high_cardinality_signal": self._dataset_has_high_cardinality_signal(
                     context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
                 ),
+                "n_rows": self._extract_dataset_n_rows(
+                    context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
+                ),
             },
         }
         if blueprint_actions:
@@ -579,8 +924,10 @@ class StrategistAgent:
         if blueprint_actions:
             blueprint_instruction = (
                 "PRIORITY: An optimization blueprint is provided in 'optimization_blueprint_actions'. "
-                "Pick the NEXT unused technique from the blueprint (skip those already in experiment_tracker). "
-                "Use the concrete_params and code_change_hint from the blueprint action. "
+                "Treat it as a prior, not a fixed queue. Prefer an unused blueprint action only when it aligns with "
+                "critique_packet error_modes, dataset_profile_signals, and recent experiment_tracker outcomes. "
+                "Down-rank techniques that recently regressed or are disproportionately expensive for the dataset size. "
+                "When a blueprint action is selected, use its concrete_params and code_change_hint. "
             )
 
         llm_prompt = (
@@ -660,20 +1007,27 @@ class StrategistAgent:
 
         candidates = self._candidate_techniques_from_plan(feature_engineering_plan, dataset_profile=dataset_profile)
         if blueprint_candidates:
-            bp_techniques = {bc.get("technique") for bc in blueprint_candidates}
-            candidates = blueprint_candidates + [c for c in candidates if c.get("technique") not in bp_techniques]
+            candidates = self._dedupe_candidates(blueprint_candidates + candidates)
         if not candidates:
             candidates = self._fallback_candidates_from_critique(critique_packet, context=context)
+        ranked_candidates = self._rank_iteration_candidates(
+            candidates,
+            critique_packet=critique_packet,
+            dataset_profile=dataset_profile,
+            tracker_entries=tracker_entries,
+        )
 
         selected_candidate = None
         selected_signature = ""
-        for candidate in candidates:
-            signature = build_hypothesis_signature(
-                technique=candidate.get("technique"),
-                target_columns=candidate.get("target_columns"),
-                feature_scope=candidate.get("feature_scope"),
-                params=candidate.get("params"),
-            )
+        for candidate in ranked_candidates:
+            signature = str(candidate.get("_signature") or "").strip()
+            if not signature:
+                signature = build_hypothesis_signature(
+                    technique=candidate.get("technique"),
+                    target_columns=candidate.get("target_columns"),
+                    feature_scope=candidate.get("feature_scope"),
+                    params=candidate.get("params"),
+                )
             if signature not in known_signatures:
                 selected_candidate = candidate
                 selected_signature = signature
@@ -682,7 +1036,7 @@ class StrategistAgent:
         duplicate_of = None
         action = "APPLY"
         if selected_candidate is None:
-            selected_candidate = candidates[0] if candidates else {
+            selected_candidate = ranked_candidates[0] if ranked_candidates else {
                 "technique": "NO_OP",
                 "target_columns": ["ALL_NUMERIC"],
                 "feature_scope": "model_features",
@@ -717,6 +1071,12 @@ class StrategistAgent:
         ][:3]
         if not target_error_modes:
             target_error_modes = ["metric_stagnation"]
+        ranking_reasons = (
+            [str(item) for item in (selected_candidate.get("_ranking_reasons") or []) if str(item).strip()]
+            if isinstance(selected_candidate, dict)
+            else []
+        )
+        ranking_reason_text = ", ".join(ranking_reasons[:3])
 
         packet = {
             "packet_type": "iteration_hypothesis_packet",
@@ -754,7 +1114,11 @@ class StrategistAgent:
                 "duplicate_of": duplicate_of,
             },
             "explanation": (
-                "Single hypothesis selected from feature_engineering_plan and critique packet."
+                (
+                    "Evidence-ranked candidate selected from blueprint/plan: " + ranking_reason_text
+                    if ranking_reason_text and action == "APPLY"
+                    else "Single hypothesis selected from feature_engineering_plan and critique packet."
+                )
                 if action == "APPLY"
                 else "No-op hypothesis because selected signature already exists in experiment tracker."
             )[:280],
@@ -765,7 +1129,12 @@ class StrategistAgent:
         if selected_candidate and selected_candidate.get("_source") == "model_analyst_blueprint":
             packet["hypothesis"]["blueprint_params"] = selected_candidate.get("params", {})
             packet["hypothesis"]["code_change_hint"] = selected_candidate.get("objective", "")
-            packet["explanation"] = f"Blueprint-driven: {selected_candidate.get('objective', '')}"[:280]
+            if ranking_reason_text:
+                packet["explanation"] = (
+                    f"Blueprint-ranked: {ranking_reason_text}. {selected_candidate.get('objective', '')}"
+                )[:280]
+            else:
+                packet["explanation"] = f"Blueprint-driven: {selected_candidate.get('objective', '')}"[:280]
 
         valid_packet, errors = validate_iteration_hypothesis_packet(packet)
         if valid_packet:

@@ -16299,16 +16299,28 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 with open("data/leakage_audit.json", "w", encoding="utf-8") as f:
                     json.dump(audit, f, indent=2)
                 findings = audit.get("relations", [])
+                risk_flags = audit.get("risk_flags", [])
+                summary_parts = []
                 if findings:
-                    top = findings[:3]
-                    leakage_audit_summary = "; ".join(
+                    top_relations = findings[:3]
+                    summary_parts.extend(
                         [
                             f"{rel.get('type')}:{','.join(rel.get('columns', []))} (support={rel.get('support_frac', 0):.3f})"
-                            for rel in top
+                            for rel in top_relations
                         ]
                     )
+                if risk_flags:
+                    top_risks = risk_flags[:3]
+                    summary_parts.extend(
+                        [
+                            f"{flag.get('type')}:{','.join(flag.get('columns', []))} (support={flag.get('support_frac', 0):.3f})"
+                            for flag in top_risks
+                        ]
+                    )
+                if summary_parts:
+                    leakage_audit_summary = "; ".join(summary_parts)
                 else:
-                    leakage_audit_summary = "No deterministic numeric relations found."
+                    leakage_audit_summary = "No deterministic leakage signals found."
             except Exception as audit_err:
                 print(f"Warning: leakage audit failed: {audit_err}")
                 leakage_audit_summary = "Leakage audit failed; proceed with caution."

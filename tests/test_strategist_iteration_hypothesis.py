@@ -150,3 +150,103 @@ def test_generate_iteration_hypothesis_repairs_long_objective_without_noop(monke
     objective = str(packet.get("hypothesis", {}).get("objective") or "")
     assert objective
     assert len(objective) <= 220
+
+
+def test_generate_iteration_hypothesis_ranks_evidence_over_blueprint_order(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("STRATEGIST_ITERATION_MODE", "deterministic")
+    strategist = StrategistAgent()
+    packet = strategist.generate_iteration_hypothesis(
+        {
+            "run_id": "run_test",
+            "iteration": 2,
+            "primary_metric_name": "roc_auc",
+            "min_delta": 0.0005,
+            "feature_engineering_plan": {
+                "techniques": [
+                    {
+                        "technique": "rare_category_grouping",
+                        "columns": ["ALL_CATEGORICAL"],
+                        "rationale": "Compress long-tail categories before the next round.",
+                    }
+                ]
+            },
+            "optimization_blueprint": {
+                "improvement_actions": [
+                    {
+                        "technique": "stacking_ensemble",
+                        "priority": 1,
+                        "concrete_params": {"meta_model": "logistic_regression"},
+                        "code_change_hint": "Try stacking as the next blueprint action.",
+                    }
+                ]
+            },
+            "critique_packet": {
+                "error_modes": [{"id": "minority_class_recall_low", "severity": "high"}],
+                "risk_flags": ["class_imbalance_sensitivity"],
+            },
+            "dataset_profile": {
+                "basic_stats": {"n_rows": 300000},
+                "high_cardinality_columns": ["merchant_id"],
+                "column_types": {
+                    "categorical": ["merchant_id", "segment"],
+                    "numeric": ["amount"],
+                },
+                "cardinality": {"merchant_id": {"unique": 5000}},
+            },
+            "experiment_tracker": [],
+        }
+    )
+    assert packet.get("action") == "APPLY"
+    assert packet.get("hypothesis", {}).get("technique") == "rare_category_grouping"
+    assert "Evidence-ranked" in str(packet.get("explanation") or "")
+
+
+def test_generate_iteration_hypothesis_downranks_recent_regressions(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("STRATEGIST_ITERATION_MODE", "deterministic")
+    strategist = StrategistAgent()
+    packet = strategist.generate_iteration_hypothesis(
+        {
+            "run_id": "run_test",
+            "iteration": 4,
+            "primary_metric_name": "roc_auc",
+            "min_delta": 0.0005,
+            "feature_engineering_plan": {
+                "techniques": [
+                    {
+                        "technique": "target_encoding",
+                        "columns": ["merchant_id"],
+                        "rationale": "Encode high-cardinality categoricals with target statistics.",
+                    },
+                    {
+                        "technique": "frequency_encoding",
+                        "columns": ["merchant_id"],
+                        "rationale": "Try a cheaper categorical compression alternative.",
+                    },
+                ]
+            },
+            "critique_packet": {
+                "error_modes": [{"id": "minority_class_recall_low", "severity": "high"}],
+                "risk_flags": ["class_imbalance_sensitivity"],
+            },
+            "dataset_profile": {
+                "basic_stats": {"n_rows": 50000},
+                "high_cardinality_columns": ["merchant_id"],
+                "column_types": {
+                    "categorical": ["merchant_id", "segment"],
+                    "numeric": ["amount"],
+                },
+                "cardinality": {"merchant_id": {"unique": 2500}},
+            },
+            "experiment_tracker": [
+                {
+                    "technique": "target_encoding",
+                    "delta": -0.0012,
+                    "approved": False,
+                }
+            ],
+        }
+    )
+    assert packet.get("action") == "APPLY"
+    assert packet.get("hypothesis", {}).get("technique") == "frequency_encoding"
