@@ -1446,6 +1446,11 @@ Generate ONLY valid JSON (no markdown, no commentary), in language code: $target
 Goal: produce an outline plan for the final executive report.
 The final decision label must be: $executive_decision_label
 
+Reasoning workflow:
+1. Decide what an executive needs to know first.
+2. Group the evidence into a small number of sections that explain decision, evidence, risks, and next actions.
+3. Use only supported claims; if evidence is weak, surface that uncertainty in the outline.
+
 FACTS_BLOCK:
 $facts_block_json
 
@@ -1458,12 +1463,12 @@ $evidence_paths
 execution_results:
 $execution_results
 
-Return exactly this schema:
+Return JSON with this schema:
 {
   "executive_decision": {"label": "...", "reason": "..."},
   "sections": [
     {
-      "id": "decision|objective_approach|evidence_metrics|business_impact|risks_limitations|next_actions|visual_insights",
+      "id": "short_section_identifier",
       "heading": "...",
       "bullets": ["...", "..."],
       "evidence_refs": ["artifact/path.json", "..."]
@@ -2201,8 +2206,8 @@ $context_appendix_json
 OUTPUT RULES:
 - Markdown output, no markdown pipe tables.
 - Prefer provided HTML tables for visual summaries.
-- If Outline Plan is non-empty, follow it as the narrative skeleton while preserving factual consistency.
-- Required sections:
+- If Outline Plan is non-empty, treat it as a proposed narrative skeleton. You may merge or reorder sections when that improves clarity without losing factual consistency.
+- Ensure the final report covers these topics, even if section titles differ:
   1) Executive Decision / Decisión Ejecutiva
   2) Objective & Approach / Objetivo y enfoque
   3) Evidence & Metrics

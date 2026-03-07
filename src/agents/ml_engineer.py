@@ -2930,84 +2930,88 @@ class MLEngineerAgent:
         strategy_dict = strategy or {}
 
         PLAN_PROMPT = """
-You are a Senior ML Engineer. Your task is to reason about the data facts and contract requirements to produce a Robust ML Plan.
+        You are a Senior ML Engineer. Your task is to infer a robust ML execution plan from the evidence and constraints below.
 
-*** DATA FACTS (Facts Only - CANONICAL EVIDENCE) ***
-$data_profile_json
+        *** DATA FACTS (Facts Only - CANONICAL EVIDENCE) ***
+        $data_profile_json
 
-*** EXECUTION CONTRACT ***
-$execution_contract_json
+        *** EXECUTION CONTRACT ***
+        $execution_contract_json
 
-*** STRATEGY ***
-$strategy_json
+        *** STRATEGY ***
+        $strategy_json
 
-*** BUSINESS OBJECTIVE ***
-"$business_objective"
+        *** BUSINESS OBJECTIVE ***
+        "$business_objective"
 
-*** UNIVERSAL CONSTRAINTS (apply always) ***
-1. If outcome_analysis shows any outcome column with null_frac > 0, you CANNOT use "use_all_rows" for training_rows_policy.
-   Reason: You cannot compute loss/metric on rows without labels.
-2. METRIC SOURCE PRIORITY: Use contract.validation_requirements.primary_metric if set. Otherwise use evaluation_spec.primary_metric.
-   If qa_gates specify a metric, use that exact metric name. Do NOT invent or normalize metric names.
-3. If leakage_flags exist in data_profile, leakage_policy.action should be "exclude_flagged_columns" unless contract explicitly allows them.
-4. If no primary metric is specified anywhere, infer a minimal metric from analysis_type and state this explicitly in notes.
+        *** REASONING TASK ***
+        Infer the safest and most executable plan for:
+        - which rows are trainable,
+        - which metric and validation policy are authoritative,
+        - how scoring rows should be selected,
+        - and what leakage policy is required.
 
-*** INSTRUCTIONS ***
-1. Analyze 'outcome_analysis' to check for partial labels. If null_frac > 0 for any outcome, set training_rows_policy to "only_rows_with_label".
-2. Check 'split_candidates'. If a split column exists AND has values like 'train'/'test', consider "use_split_column". If you choose NOT to use it, explain why in evidence_used.split_evaluation.
-3. Check contract for primary_metric (validation_requirements.primary_metric or evaluation_spec primary metric / qa_gates metric). Use that exact metric name.
-4. DO NOT invent rules. Base every decision on 'evidence' found in the data_profile.
-5. CRITICAL: Populate 'evidence_used' with STRUCTURED facts you used for decisions. This enables QA to verify coherence.
-6. If you choose "only_rows_with_label", set train_filter.type="label_not_null" and train_filter.column=target.
-7. If you choose "use_split_column", set train_filter.type="split_equals", train_filter.column=split_column, and train_filter.value to the training value (e.g., "train").
-8. Avoid ambiguity: select ONE training policy and make it explicit via train_filter.
+        Use this reasoning workflow internally:
+        1. Resolve training eligibility from label availability, split semantics, and contract intent.
+        2. Resolve evaluation authority from contract.validation_requirements, evaluation_spec, and qa_gates.
+        3. Choose the simplest validation policy that is credible for the data structure and objective.
+        4. Set scoring_policy and leakage_policy from explicit evidence, not assumptions.
+        5. Record the structured facts that justified each decision so QA can verify coherence.
 
-*** REQUIRED OUTPUT (JSON ONLY, NO MARKDOWN) ***
-{
-  "training_rows_policy": "use_all_rows | only_rows_with_label | use_split_column | custom",
-  "training_rows_rule": "string rule if custom, or null",
-  "split_column": "col_name or null",
-  "train_filter": {
-      "type": "none | label_not_null | split_equals | custom_rule",
-      "column": "column name or null",
-      "value": "value for split_equals or null",
-      "rule": "rule string for custom_rule or null"
-  },
-  "metric_policy": {
-      "primary_metric": "metric_name",
-      "secondary_metrics": [],
-      "report_with_cv": true,
-      "notes": "brief justification"
-  },
-  "cv_policy": {
-      "strategy": "StratifiedKFold | KFold | TimeSeriesSplit | GroupKFold | auto",
-      "n_splits": 5,
-      "shuffle": true,
-      "stratified": true,
-      "notes": "brief justification"
-  },
-  "scoring_policy": {
-      "generate_scores": true,
-      "score_rows": "all | labeled_only | unlabeled_only"
-  },
-  "leakage_policy": {
-      "action": "none | exclude_flagged_columns | manual_review",
-      "flagged_columns": [],
-      "notes": "brief justification"
-  },
-  "evidence_used": {
-      "outcome_null_frac": {"column": "target_col", "null_frac": 0.3},
-      "split_candidates": [{"column": "__split", "values": ["train", "test"]}],
-      "split_evaluation": "used split column because..." or "ignored split because...",
-      "contract_primary_metric": "roc_auc or null if not specified",
-      "analysis_type": "classification"
-  },
-  "evidence": ["fact1 from profile", "fact2 from profile"],
-  "assumptions": [],
-  "open_questions": [],
-  "notes": ["brief reasoning notes"]
-}
-"""
+        *** GUARDRAILS ***
+        - If outcome_analysis shows any outcome column with null_frac > 0, you cannot use "use_all_rows" for training_rows_policy.
+        - Use the exact primary metric from validation_requirements, evaluation_spec, or qa_gates when provided. Do not invent or normalize metric names.
+        - If leakage_flags exist in data_profile, prefer leakage_policy.action="exclude_flagged_columns" unless the contract explicitly allows those columns.
+        - If no primary metric is specified anywhere, infer the minimal defensible metric from analysis_type and state that inference in notes.
+        - Avoid ambiguity: select ONE training_rows_policy and make it explicit via train_filter.
+        - Base every decision on evidence found in the data_profile or contract. Do not invent rules.
+
+        *** REQUIRED OUTPUT (JSON ONLY, NO MARKDOWN) ***
+        {
+          "training_rows_policy": "use_all_rows | only_rows_with_label | use_split_column | custom",
+          "training_rows_rule": "string rule if custom, or null",
+          "split_column": "col_name or null",
+          "train_filter": {
+              "type": "none | label_not_null | split_equals | custom_rule",
+              "column": "column name or null",
+              "value": "value for split_equals or null",
+              "rule": "rule string for custom_rule or null"
+          },
+          "metric_policy": {
+              "primary_metric": "metric_name",
+              "secondary_metrics": [],
+              "report_with_cv": true,
+              "notes": "brief justification"
+          },
+          "cv_policy": {
+              "strategy": "StratifiedKFold | KFold | TimeSeriesSplit | GroupKFold | auto",
+              "n_splits": 5,
+              "shuffle": true,
+              "stratified": true,
+              "notes": "brief justification"
+          },
+          "scoring_policy": {
+              "generate_scores": true,
+              "score_rows": "all | labeled_only | unlabeled_only"
+          },
+          "leakage_policy": {
+              "action": "none | exclude_flagged_columns | manual_review",
+              "flagged_columns": [],
+              "notes": "brief justification"
+          },
+          "evidence_used": {
+              "outcome_null_frac": {"column": "target_col", "null_frac": 0.3},
+              "split_candidates": [{"column": "__split", "values": ["train", "test"]}],
+              "split_evaluation": "used split column because..." or "ignored split because...",
+              "contract_primary_metric": "roc_auc or null if not specified",
+              "analysis_type": "classification"
+          },
+          "evidence": ["fact1 from profile", "fact2 from profile"],
+          "assumptions": [],
+          "open_questions": [],
+          "notes": ["brief reasoning notes"]
+        }
+        """
 
         # Check if we can make LLM calls
         has_llm_init = getattr(self, "model_name", None) is not None
@@ -3594,6 +3598,12 @@ $strategy_json
         3) CLEANED_DATA_SUMMARY_MIN and SIGNAL_SUMMARY (advisory only)
         - Never let advisory context override contract targets, required outputs, gates, or policies.
 
+        ENGINEERING DECISION WORKFLOW
+        - First map the contract into an executable training/scoring plan.
+        - Then identify the smallest coherent implementation that satisfies the contract.
+        - When feedback exists, diagnose the current dominant blocker before editing code.
+        - Prefer the simplest valid implementation that preserves working behavior and fits the runtime budget.
+
         HARD CONSTRAINTS
         - Output valid Python code only. No markdown, no code fences.
         - Read input data only from "$data_path" (no hardcoded alternatives).
@@ -3657,12 +3667,10 @@ $strategy_json
           like ".write_test_<uuid>.txt"; do not delete marker files.
         - Print PRE_FLIGHT_GATES with PASS/FAIL per gate.
 
-        REPAIR PRIORITY (WHEN FEEDBACK EXISTS)
-        - Priority order:
-          1) runtime traceback root cause
-          2) missing required outputs
-          3) contract/gate misalignment
-          4) quality improvements
+        REPAIR DECISION FRAMEWORK (WHEN FEEDBACK EXISTS)
+        - Identify the smallest blocker that currently dominates:
+          runtime/cost failure, missing required outputs, contract/gate misalignment, or optional quality improvement.
+        - Fix blockers before optional improvements.
         - Preserve valid prior logic and artifact generation.
         - Include a brief decision log comment with ROOT_CAUSE and FIX_APPLIED.
 
@@ -3670,10 +3678,9 @@ $strategy_json
         - Implement training_rows_policy and train_filter exactly when present.
         - Use evaluation_spec and validation_requirements as metric/CV authority.
         - If contract says requires_target=false, do not fit supervised models; still emit required artifacts with explicit no-train status.
-        - Use robust preprocessing for missing values and mixed dtypes.
+        - Choose preprocessing, validation, and scoring logic that matches the data structure rather than generic boilerplate.
         - Handle outliers with data-driven, non-destructive methods unless contract says otherwise.
-        - Array shapes: ensure prediction arrays match the subset they index (e.g., OOF predictions
-          sized to training rows, not the full dataset).
+        - Array shapes must match the subset they index (e.g., OOF predictions sized to training rows, not the full dataset).
 
         FEATURE GOVERNANCE
         - Use only contract-allowed features:
@@ -4156,25 +4163,26 @@ $strategy_json
         TARGETED EDIT HINTS:
         $edit_instructions
 
-        REQUIRED FIXES:
+        ACTIVE FIX CONTEXT:
         $fixes_bullets
-        - Fix runtime root cause first if traceback exists.
-        - Keep valid logic that already works.
-        - Ensure required outputs are written at exact contract paths.
+        - Diagnose the smallest coherent edit set that resolves the active blocker.
+        - If a traceback exists, fix its root cause before optional improvements.
+        - Preserve verified logic that already works.
+        - Ensure required outputs are still written at exact contract paths.
         - Do not generate synthetic data.
 
         PREVIOUS SCRIPT TO PATCH:
         $previous_code
 
-        Instructions:
-        1) Apply a minimal patch to the previous script. Do not rewrite from zero unless irrecoverable.
-        2) Keep contract context and execution map logic intact.
-        3) Return the full updated script (not a diff, not snippets).
+        Repair task:
+        - Apply a minimal but sufficient patch to the previous script. Do not rewrite from zero unless recovery is clearly cheaper and safer.
+        - Keep contract context and execution map logic intact.
+        - Return the full updated script (not a diff, not snippets).
         """
 
         USER_EDITOR_TEMPLATE = """
         MODE: CODE_EDITOR_MODE
-        You are in deterministic script-edit mode.
+        You are editing an existing script under tight constraints.
         Do not regenerate a new solution from zero and do not re-plan strategy.
 
         PHASE CLASSIFICATION:
@@ -4210,21 +4218,20 @@ $strategy_json
         PREVIOUS SCRIPT:
         $previous_code
 
-        EDITOR RULES:
-        1) Return ONLY the full updated Python script. No markdown, no explanation.
-        2) Keep script structure and apply targeted edits required by patch objectives and enforcement.
-        3) Keep strategy/objective/contract paths unchanged.
-        4) If phase is "runtime_repair", fix runtime/cost root cause first.
-           If the failure is a timeout or OOM, reduce compute cost within the same model family before changing strategy.
-           Do not resume deferred metric-improvement work until required outputs are produced again.
-        5) If phase is "persistence", do not modify training/model selection logic.
-           Only fix persistence/serialization/artifact-writing blocks.
+        EDITOR TASK:
+        - Return ONLY the full updated Python script. No markdown, no explanation.
+        - Keep script structure and apply the smallest coherent edits required by patch objectives and enforcement.
+        - Keep strategy/objective/contract paths unchanged.
+        - Treat phase as the current focus, not as a pre-scripted recipe.
+        - If phase is "runtime_repair", restore runnable behavior and required outputs before deferred metric-improvement work.
+          If the failure is a timeout or OOM, reduce compute cost within the same model family before changing strategy.
+        - If phase is "persistence", keep training/model selection logic stable unless a contract violation forces a broader fix.
         """
 
         USER_EDITOR_OPTIMIZATION_TEMPLATE = """
         MODE: OPTIMIZATION_MODE
         MODE: CODE_EDITOR_MODE_OPTIMIZATION
-        You are in deterministic action-driven optimization editor mode.
+        You are editing an existing script for one focused optimization move.
         Do not regenerate a new solution from zero and do not re-plan strategy.
 
         PHASE CLASSIFICATION:
@@ -4287,15 +4294,15 @@ $strategy_json
         PREVIOUS SCRIPT:
         $previous_code
 
-        OPTIMIZATION RULES:
-        1) Return ONLY the full updated Python script. No markdown, no explanation.
-        2) Apply the active hypothesis with a material code patch end-to-end.
-        3) Prioritize optimization_context + hypothesis_packet over legacy reviewer text.
-        4) If hypothesis_packet.params is empty, consult the optimization_blueprint for concrete_params matching the technique or action_family.
-        4) Treat contract fields as immutable lock constraints (paths/split/CV/gates), not as re-planning input.
-        5) Keep model family, CV/data-split protocol, and contract output paths stable.
-        6) Avoid unrelated refactors; edit only the regions needed for metric improvement.
-        7) Keep patch scope minimal for the selected action family.
+        OPTIMIZATION TASK:
+        - Return ONLY the full updated Python script. No markdown, no explanation.
+        - Apply one coherent optimization move that matches the active hypothesis and current round context.
+        - Prioritize optimization_context + hypothesis_packet over legacy reviewer text.
+        - If hypothesis_packet.params is empty, consult the optimization_blueprint for concrete_params matching the technique or action_family.
+        - Treat contract fields as immutable lock constraints (paths/split/CV/gates), not as re-planning input.
+        - Keep model family, CV/data-split protocol, and contract output paths stable.
+        - Avoid unrelated refactors; edit only the regions needed for metric improvement.
+        - Prefer the cheapest valid implementation that tests the idea without destabilizing working behavior.
         """
 
         USER_IMPROVE_TEMPLATE = """

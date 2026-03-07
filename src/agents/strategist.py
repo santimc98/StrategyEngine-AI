@@ -120,7 +120,7 @@ class StrategistAgent:
         except (ValueError, TypeError):
             self._max_tokens = 8192
         self.iteration_mode = self._normalize_iteration_mode(
-            os.getenv("STRATEGIST_ITERATION_MODE", "deterministic")
+            os.getenv("STRATEGIST_ITERATION_MODE", "hybrid")
         )
         self.last_iteration_hypothesis: Dict[str, Any] = {}
         self.last_iteration_meta: Dict[str, Any] = {
@@ -147,7 +147,7 @@ class StrategistAgent:
         value = str(raw or "").strip().lower()
         if value in {"llm", "hybrid", "deterministic"}:
             return value
-        return "deterministic"
+        return "hybrid"
 
     def generate_iteration_hypothesis(self, context: Dict[str, Any]) -> Dict[str, Any]:
         deterministic_packet = self._generate_iteration_hypothesis_deterministic(context)
@@ -923,21 +923,32 @@ class StrategistAgent:
         blueprint_instruction = ""
         if blueprint_actions:
             blueprint_instruction = (
-                "PRIORITY: An optimization blueprint is provided in 'optimization_blueprint_actions'. "
-                "Treat it as a prior, not a fixed queue. Prefer an unused blueprint action only when it aligns with "
-                "critique_packet error_modes, dataset_profile_signals, and recent experiment_tracker outcomes. "
-                "Down-rank techniques that recently regressed or are disproportionately expensive for the dataset size. "
-                "When a blueprint action is selected, use its concrete_params and code_change_hint. "
+                "An optimization blueprint is provided in 'optimization_blueprint_actions'. "
+                "Use it as a source of evidence and candidate ideas, not as a fixed queue. "
+                "Prefer a blueprint action only when it still aligns with critique_packet, "
+                "dataset_profile_signals, and recent experiment_tracker outcomes. "
+                "Down-rank techniques that recently regressed, duplicate prior work, or look too expensive "
+                "for the likely ROI. When you choose a blueprint action, reuse its concrete_params "
+                "and code_change_hint when they still make sense.\n"
             )
 
         llm_prompt = (
-            "Return ONLY JSON for one iteration_hypothesis_packet. "
-            "No markdown. No extra text.\n"
-            "Rules: exactly one hypothesis; action APPLY or NO_OP; "
-            "if duplicate signature then action must be NO_OP.\n"
-            "Allowed target macros: ALL_NUMERIC, ALL_CATEGORICAL, ALL_TEXT, ALL_DATETIME, ALL_BOOLEAN.\n"
+            "You are selecting the next metric-improvement experiment for a senior ML workflow.\n"
+            "Return ONLY JSON for one iteration_hypothesis_packet. No markdown. No extra text.\n\n"
+            "Reasoning workflow:\n"
+            "1. Diagnose what recent evidence suggests: variance issue, underfitting, feature signal gap, "
+            "search-space issue, calibration problem, or no credible next move.\n"
+            "2. Choose the single highest-ROI next hypothesis for THIS context, balancing expected lift, "
+            "compute cost, and recent regressions.\n"
+            "3. Prefer the cheapest valid experiment that meaningfully tests the idea.\n"
+            "4. Do not repeat a duplicate hypothesis signature. If every credible option is duplicate or low-value, emit NO_OP.\n\n"
+            "Rules:\n"
+            "- Exactly one hypothesis; action APPLY or NO_OP.\n"
+            "- If duplicate signature then action must be NO_OP.\n"
+            "- Allowed target macros: ALL_NUMERIC, ALL_CATEGORICAL, ALL_TEXT, ALL_DATETIME, ALL_BOOLEAN.\n"
+            "- Use critique_packet, experiment_tracker, dataset_profile_signals, and feature_engineering_plan as primary evidence.\n"
             + blueprint_instruction
-            + "Use this context:\n"
+            + "\nContext:\n"
             + json.dumps(llm_context, ensure_ascii=False)
         )
         try:
@@ -1964,42 +1975,25 @@ $payload_json
            This is a DESCRIPTIVE objective because the goal is pattern discovery, not prediction.
            Success metric: Segment interpretability and separation quality (silhouette score)."
 
-        *** METRIC OPTIMIZATION PROGRESSION (Senior Data Science Best Practice) ***
-        When designing a predictive strategy, plan for PROGRESSIVE OPTIMIZATION across multiple
-        improvement rounds. A senior data scientist knows the optimal order of operations:
+        *** STRATEGY ROADMAP THINKING (for iterative ML work) ***
+        If this looks like predictive or optimization work that may evolve across multiple
+        rounds, reason about WHICH levers matter most for THIS dataset and THIS business goal.
+        Use these levers as a toolbox, not as a mandatory sequence:
+        - baseline robustness and validation credibility
+        - feature signal extraction / encoding
+        - regularization / calibration
+        - hyperparameter search
+        - variance reduction
+        - ensembling / model diversification
 
-        PHASE 1 — SOLID BASELINE (rounds 1-2):
-          - Clean, correct pipeline with proper train/test separation
-          - Strong baseline model (gradient boosting: LightGBM, XGBoost, or CatBoost)
-          - Proper cross-validation aligned with the evaluation metric
-          - Basic feature engineering: encoding categoricals, handling missing values
+        For each lever, ask:
+        - What evidence says this lever has ROI now?
+        - What is the cheapest valid version of this idea?
+        - What could fail, and what is the fallback if it disappoints?
 
-        PHASE 2 — FEATURE ENGINEERING (rounds 3-4):
-          - Target encoding with K-fold regularization (prevents leakage, extracts more signal
-            from categoricals than ordinal encoding — especially impactful for boosting models)
-          - Interaction features between top predictors
-          - Frequency encoding, count encoding for high-cardinality features
-          - Feature selection (drop noisy features that add variance without signal)
-
-        PHASE 3 — HYPERPARAMETER OPTIMIZATION (rounds 4-5):
-          - Optuna/Bayesian HPO with proper timeout constraints
-          - Learning rate reduction + more iterations (proven technique for boosting)
-          - Early stopping calibration
-
-        PHASE 4 — VARIANCE REDUCTION AND ENSEMBLING (rounds 5+):
-          - Multi-seed averaging: Train the SAME pipeline with 5+ different random seeds and
-            average predictions. This is the single most reliable technique for gaining +0.001-0.003
-            with ZERO risk of overfitting. Should ALWAYS be part of a mature pipeline.
-          - Stacking: Generate out-of-fold predictions from diverse base models (LightGBM + CatBoost
-            + XGBoost + LogisticRegression), then train a simple meta-learner (Ridge/LR) on them.
-            Real stacking > simple weighted blending because it captures model complementarity.
-          - Pseudo-labeling: If the unlabeled test set is large (>10% of total data), use
-            high-confidence model predictions (>0.95 or <0.05) on test data as additional
-            training samples. Standard semi-supervised technique.
-
-        IMPORTANT: Include techniques from ALL phases in your strategy's "techniques" list.
-        The improvement loop will execute them in order. Do NOT stop at Phase 1-2.
-        A complete strategy should include at least one technique from each phase.
+        It is valid to recommend only a small number of techniques when extra complexity
+        is unlikely to pay off. Do NOT force every strategy to include every phase or
+        every advanced technique.
 
         *** STEP 3: CONTEXT-AWARE STRATEGY DESIGN ***
         You are a Chief Data Strategist designing executable plans. Your decisions must be driven by DATA CONTEXT,
@@ -2019,14 +2013,13 @@ $payload_json
            - Sparse features → consider appropriate encoding strategies
 
         3. **COMPUTE-VALUE TRADEOFF**: Is the added complexity justified by expected lift?
-           - Simple baseline + small improvement = ship the simple version
-           - Complex method + large improvement = worth the investment
-           - Always define: "What is the marginal value of 5% more accuracy?"
+           - Simple baseline + small improvement can be the right answer
+           - Complex method + meaningful improvement can justify the investment
+           - State the marginal value of extra performance in business terms when possible
 
         4. **FAILURE MODE ANALYSIS**: What happens if the method underperforms?
-           - Define graceful degradation: complex → medium → simple fallback chain
-           - Identify early-stopping criteria (e.g., validation loss plateau)
-           - Specify recovery actions
+           - Define graceful degradation: complex -> medium -> simple fallback chain
+           - Identify the likely failure mode and recovery action
 
         DYNAMIC CAPABILITY ASSESSMENT:
         Rather than fixed "can/cannot" lists, evaluate each technique against:
@@ -2055,28 +2048,15 @@ $payload_json
            - What exactly are we solving for? (e.g. Price Optimization -> Target = "Success Probability" given Price).
            
         *** STEP 4: DYNAMIC VALIDATION STRATEGY ***
-        Choose validation strategy based on DATA STRUCTURE, not defaults:
+        Choose validation strategy from the actual data structure, leakage risk, and compute budget.
+        Reason explicitly about:
+        - temporal ordering or sequence dependence
+        - grouped entities that must not leak across splits
+        - label imbalance and whether stratification matters
+        - sample size relative to feature complexity
+        - whether the budget supports repeated CV or only a lighter estimate
 
-        1. **TEMPORAL DATA**: If data has time ordering (dates, sequences):
-           - Use time-based split (train on past, validate on future)
-           - NEVER use random shuffle - it causes data leakage
-           - Consider walk-forward validation for robust estimates
-
-        2. **GROUPED DATA**: If observations belong to groups (customers, stores):
-           - Use group-aware splits (all of customer X in train OR test, not both)
-           - Prevents overfitting to specific entities
-
-        3. **IMBALANCED DATA**: If target class is rare (<10%):
-           - Use stratified sampling to preserve class ratios
-           - Consider precision-recall metrics over accuracy
-
-        4. **SMALL DATA**: If n < 1000 or n/features < 10:
-           - Use k-fold cross-validation (k=5 or k=10) for variance reduction
-           - Consider bootstrap for confidence intervals
-
-        5. **LARGE DATA**: If n > 50000:
-           - Simple holdout (70/15/15) is often sufficient
-           - Consider computational cost of cross-validation
+        Use numeric thresholds only when the current dataset context makes them defensible.
 
         *** STEP 5: EVALUATE APPROPRIATE METRICS ***
         Based on your objective_type, reason through what metrics best measure success.
@@ -2115,8 +2095,8 @@ $payload_json
               "signal_quality": "Assessment of data quality for proposed method",
               "compute_value_tradeoff": "Is complexity justified by expected lift?"
             },
-            "fallback_chain": ["Primary technique", "Fallback if primary fails", "Simple baseline"],
-            "expected_lift": "Quantified estimate: 'X% improvement over naive baseline because Y'",
+            "fallback_chain": ["Primary approach", "Credible fallback", "Simpler safe option"],
+            "expected_lift": "Estimated magnitude/direction of value relative to a simpler baseline",
             "estimated_difficulty": "Low | Medium | High (with data-driven justification)",
             "reasoning": "Why this strategy is optimal for the data and objective"
           }
@@ -2129,7 +2109,7 @@ $payload_json
         - If uncertain about a column, omit it (do not hallucinate).
         - "objective_reasoning" is MANDATORY and must connect business goal → objective_type.
         - "feasibility_analysis" is MANDATORY - no technique without data-driven justification.
-        - "fallback_chain" is MANDATORY - every strategy needs a Plan B.
+        - "fallback_chain" must be concise and credible - every strategy needs a Plan B.
         - "reasoning" must include: why this fits the objective, what could fail, and recovery plan.
         """
         

@@ -84,21 +84,21 @@ You are an Execution Contract Compiler for a multi-agent business intelligence s
 
 Goal:
 - Produce ONE JSON execution contract that downstream agents can execute and review.
-- Keep reasoning freedom, but obey a minimal stable interface.
-- Use phased contract compilation for robust, universal behavior across datasets/objectives.
+- Reason from business objective, strategy, column inventory, and dataset profile to produce an executable contract.
+- Obey a minimal stable interface, but do not let the schema turn into slot-filling without semantic justification.
 
-Phased contract compilation protocol (mandatory internal process):
+Phased contract compilation protocol (use internally as a guide, not as a rigid checklist):
 - Phase 1 FACTS_EXTRACTOR:
   - Extract only grounded facts from provided inputs (strategy/objective/column inventory/profile).
   - Resolve ambiguities conservatively; do not invent columns or artifacts.
 - Phase 2 CONTRACT_BUILDER:
-  - Fill the contract schema deterministically using required keys and scope constraints.
+  - Turn the grounded facts into executable fields that downstream agents can consume.
   - Keep interfaces consumable by data_engineer, ml_engineer, QA, reviewers, and translator views.
 - Phase 3 GATE_COMPOSER:
-  - Compose executable gates with stable semantics (name/severity/params) and evidence-backed params.
+  - Compose only the gates justified by the contract and risk surface, using stable semantics (name/severity/params).
   - Prefer universal gate primitives; avoid one-off ad hoc gates when an equivalent primitive exists.
 - Phase 4 VALIDATOR_REPAIR:
-  - Run a strict self-check against schema/semantics and downstream-consumer compatibility.
+  - Verify schema/semantics and downstream-consumer compatibility.
   - If issues exist, apply minimal edits; do not regenerate unrelated valid sections.
 
 Output discipline:
@@ -7411,7 +7411,7 @@ class ExecutionPlannerAgent:
             return (
                 "Repair the previous execution contract.\n"
                 "Return ONLY one valid JSON object (no markdown, no comments, no code fences).\n"
-                "Use phased repair: FACTS_EXTRACTOR -> CONTRACT_BUILDER -> GATE_COMPOSER -> VALIDATOR_REPAIR.\n"
+                "Use a repair workflow: re-ground facts, patch only the affected contract fields, then self-check.\n"
                 "Patch policy: keep unchanged valid fields stable; modify ONLY fields needed to resolve listed issues.\n"
                 "Schema registry examples:\n"
                 + CONTRACT_SCHEMA_EXAMPLES_TEXT
@@ -8026,11 +8026,11 @@ class ExecutionPlannerAgent:
                 "You are Execution Contract Compiler.\n"
                 f"SECTION: {section_id}\n"
                 f"GOAL: {section_goal}\n"
-                "Use phased compilation for this SECTION:\n"
-                "- Phase 1 FACTS_EXTRACTOR: resolve facts relevant to this section only.\n"
-                "- Phase 2 CONTRACT_BUILDER: populate required section keys with canonical shapes.\n"
-                "- Phase 3 GATE_COMPOSER: if gates are in scope, emit executable {name,severity,params} objects.\n"
-                "- Phase 4 VALIDATOR_REPAIR: self-check this section and minimally fix before returning.\n"
+                "Use this reasoning workflow for the section:\n"
+                "- Resolve the grounded facts relevant to this section only.\n"
+                "- Populate required section keys with canonical shapes that downstream agents can execute.\n"
+                "- If gates are in scope, emit executable {name,severity,params} objects only when justified.\n"
+                "- Self-check the section and minimally fix before returning.\n"
                 "Return ONLY one JSON object.\n"
                 "Do not include markdown, comments, or explanations.\n"
                 "Schema registry examples:\n"
@@ -8181,11 +8181,11 @@ class ExecutionPlannerAgent:
                 "Repair the section output.\n"
                 f"SECTION: {section_id}\n"
                 f"GOAL: {section_goal}\n"
-                "Use phased repair for this SECTION:\n"
-                "- Phase 1 FACTS_EXTRACTOR: identify grounded constraints from ORIGINAL INPUTS.\n"
-                "- Phase 2 CONTRACT_BUILDER: preserve valid keys and patch only section-required fields.\n"
-                "- Phase 3 GATE_COMPOSER: normalize gates to executable shape and stable semantics.\n"
-                "- Phase 4 VALIDATOR_REPAIR: apply minimal edits until section checks pass.\n"
+                "Use this repair workflow for the section:\n"
+                "- Re-ground the relevant constraints from ORIGINAL INPUTS.\n"
+                "- Preserve valid keys and patch only section-required fields.\n"
+                "- Normalize gates only when needed so they remain executable and semantically stable.\n"
+                "- Apply minimal edits until section checks pass.\n"
                 "Return ONLY one JSON object.\n"
                 "No markdown, no comments.\n"
                 "Patch policy: edit only fields required by this SECTION and listed issues; preserve already valid content.\n"

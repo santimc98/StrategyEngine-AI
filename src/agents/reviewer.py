@@ -958,6 +958,7 @@ class ReviewerAgent:
         $truncated_output
         
         *** EVALUATION CRITERIA (BUSINESS-FIRST) ***
+        Use the criteria below as a reasoning framework, not as a rigid checklist. Weight them according to the active evaluation spec and available evidence.
         1. **Answer Quality:** Does the output provide a clear answer/insight relevant to the BUSINESS OBJECTIVE?
         2. **Visuals:** Are plots generated when required? (If required by spec but missing, flag as warning).
         3. **Metrics - BUSINESS-RELATIVE EVALUATION (CRITICAL):**
@@ -976,7 +977,7 @@ class ReviewerAgent:
         You care that the system WORKS, is SAFE, and SOLVES THE PROBLEM.
         You do NOT care if the code looks exactly like a textbook example.
 
-        *** FALLBACK LOGIC ***
+        *** DECISION POLICY ***
         - If results are "weak" in absolute terms but methodology is sound and improves over baseline => APPROVE with note.
         - REJECT only if there are specific TECHNICAL fixes that would materially improve results.
         - If "Traceback" or "Error" persists in output despite your checks, REJECT.

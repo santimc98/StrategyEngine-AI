@@ -741,12 +741,18 @@ class ResultsAdvisorAgent:
         }
         compact_payload = self._truncate(json.dumps(payload, ensure_ascii=True), 14000)
         system_prompt = (
-            "You are a strict ML critic. Return ONLY a JSON object with no markdown. "
-            "Do not provide code advice. Focus on metric deltas, validation signals, and error modes. "
+            "You are a senior ML critic. Return ONLY a JSON object with no markdown. "
+            "Do not provide code advice. Focus on metric deltas, validation reliability, and error modes. "
             "Phase tells whether this is baseline assessment or candidate review."
         )
         user_prompt = (
-            "Return JSON with this exact contract:\n"
+            "Populate the critique packet schema below.\n"
+            "Reason internally in three passes before writing JSON:\n"
+            "1. Compare baseline vs candidate and decide whether any metric gain is material.\n"
+            "2. Assess how trustworthy the validation evidence is.\n"
+            "3. Surface the smallest set of error modes and risk flags that actually explain the result.\n"
+            "Keep the packet concise and evidence-driven.\n\n"
+            "JSON schema:\n"
             "{packet_type:'advisor_critique_packet',packet_version:'1.0',run_id,iteration,timestamp_utc,"
             "primary_metric_name,higher_is_better,metric_comparison:{baseline_value,candidate_value,delta_abs,delta_rel,min_delta_required,meets_min_delta},"
             "validation_signals:{validation_mode,cv?,holdout?,generalization_gap?},"
@@ -1154,6 +1160,7 @@ class ResultsAdvisorAgent:
             "Return ONLY concise bullet points in plain text (max 12 lines). "
             "Do not decide STOP/CONTINUE. "
             "Give incremental script-edit guidance for editor mode. "
+            "Reason from the current script, plan, and dataset signals before suggesting edits. "
             "Focus on: where to edit, leakage guards, CV-safe fitting, and contract alignment."
         )
         user_prompt = (
@@ -1161,8 +1168,8 @@ class ResultsAdvisorAgent:
             + compact_payload
             + "\n\nINSTRUCTIONS:\n"
             "- Keep existing script structure and change the minimum necessary.\n"
-            "- If plan techniques exist, prioritize them.\n"
-            "- If plan is empty, provide up to 2 universal low-cost techniques only if signals exist.\n"
+            "- If plan techniques exist, prioritize the ones with the clearest ROI for the current signals.\n"
+            "- If plan is empty, provide only low-cost, evidence-backed suggestions.\n"
             "- Mention where to edit (e.g., build_features, preprocessing block).\n"
         )
 
