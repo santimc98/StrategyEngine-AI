@@ -47,13 +47,14 @@ _ACTION_FAMILIES_STR = ", ".join(ACTION_FAMILIES)
 _MAX_SCRIPT_CHARS = 12000
 
 _LLM_PROMPT_TEMPLATE = """\
-You are an expert ML model analyst. Analyze the baseline model code and metrics below.
-Your goal: identify CONCRETE, ACTIONABLE improvements ordered by expected impact on the primary metric.
+You are a senior ML optimization analyst. Your job is to analyze a baseline model's code
+and metrics, reason about what would ACTUALLY improve the primary metric for THIS specific
+situation, and produce a prioritized action plan.
 
-=== MODEL CODE ===
+=== BASELINE CODE ===
 {script_code}
 
-=== METRICS ===
+=== METRICS (from cross-validation) ===
 {metrics_summary}
 
 === DATASET PROFILE ===
@@ -65,72 +66,67 @@ Your goal: identify CONCRETE, ACTIONABLE improvements ordered by expected impact
 === MODELS USED ===
 {models_used}
 
-=== ANALYSIS INSTRUCTIONS ===
-Analyze the code for these categories (skip categories that are not applicable):
+=== COMPUTE BUDGET ===
+Hard timeout: 7200 seconds (2 hours). ALL proposed optimizations must complete within
+this budget. Every technique you propose must be computationally feasible — estimate
+the wall-clock time for your parameters before proposing them.
 
-1. HYPERPARAMETER GAPS: Are key hyperparameters at defaults or suboptimal values?
-   Missing early_stopping? Missing learning rate schedule? Suboptimal regularization?
-2. FEATURE ENGINEERING GAPS: Missing interaction features? No target encoding for
-   high-cardinality categoricals? No binning for skewed numerics? Missing polynomial features?
-3. ENSEMBLE GAPS: Single model when ensemble would help? Equal weights in ensemble?
-   No stacking? Missing diversity in base models (e.g., only tree models)?
-4. TRAINING PROTOCOL GAPS: No multi-seed averaging? Fixed single random state?
-   No data augmentation when applicable?
-5. CALIBRATION GAPS: No probability calibration? Predictions not well-calibrated?
-6. LOSS/OBJECTIVE GAPS: Default loss function? Could benefit from custom objective
-   or focal loss for imbalanced data?
-7. VARIANCE REDUCTION GAPS: No multi-seed averaging? Only a single random state?
-   Multi-seed averaging (train same pipeline with 5-10 seeds, average predictions)
-   is one of the most reliable ways to gain +0.001-0.003 in any metric with zero
-   risk of overfitting. Always suggest it if not already present.
-8. ADVANCED ENCODING GAPS: Using simple ordinal/one-hot for categoricals?
-   Target encoding (with proper K-fold leave-one-out regularization to prevent leakage)
-   often extracts more signal than ordinal encoding for boosting models.
-   Frequency encoding and count encoding are also useful complements.
-9. SEMI-SUPERVISED GAPS: Large unlabeled test set available? Pseudo-labeling
-   (using high-confidence predictions on unlabeled data as additional training data)
-   is a standard technique that leverages the test set distribution.
-   Only recommend if test_rows > 10% of total rows.
-10. STACKING GAPS: Multiple models but only simple averaging or blending?
-    True 2-level stacking (out-of-fold predictions from diverse base learners
-    fed into a meta-learner like LogisticRegression/Ridge) captures model
-    complementarity better than any weighted average.
+=== YOUR TASK ===
+Think step-by-step like a senior data scientist. Do NOT follow a checklist — reason
+about what matters for THIS model, THIS dataset, and THIS metric.
 
-LATE-STAGE OPTIMIZATION PRIORITY ORDER (when baseline is already strong):
-When the baseline metric is already high (e.g., AUC > 0.90), the biggest gains
-come from variance reduction and model diversity, NOT from hyperparameter micro-tuning.
-Priority order for high-baseline scenarios:
-  1. Multi-seed averaging (safest, most reliable gain)
-  2. Stacking with diverse base learners (LightGBM + CatBoost + XGBoost + Linear)
-  3. Target encoding / advanced feature encoding
-  4. Pseudo-labeling (if large unlabeled set available)
-  5. Probability calibration (for log-loss or probability-based metrics)
-  6. HPO fine-tuning (diminishing returns at high baselines)
+STEP 1 — DIAGNOSE THE BASELINE:
+- What is the current metric value? How good is it already?
+- Look at CV fold std: is variance high (>0.002)? If so, variance reduction has ROI.
+  If std is already low (<0.001), multi-seed will give diminishing returns.
+- Is there a train-validation gap suggesting overfitting? If so, regularization > complexity.
+- What techniques are already applied? Don't suggest what's already there.
 
-For each gap found, provide a concrete improvement action with ACTUAL parameter values
-(not placeholders). Be specific about what code to change.
+STEP 2 — IDENTIFY THE HIGHEST-ROI IMPROVEMENTS:
+- Given the dataset size, metric quality, and remaining compute budget, which improvements
+  will give the best return per compute-second invested?
+- A technique that gains +0.001 in 600s is better than one that gains +0.002 in 6000s
+  if budget is tight.
+- Be realistic: at high baselines (>0.90 AUC), individual gains are typically +0.0005-0.003.
 
-IMPORTANT:
+STEP 3 — SET PARAMETERS THAT FIT THE COMPUTE BUDGET:
+- Estimate training time: n_rows × n_folds × n_seeds × iterations × (framework speed factor).
+- CatBoost is ~3x slower than LightGBM per iteration at the same data size.
+- For large datasets (>200K rows), use fewer seeds, fewer folds, and aggressive early stopping.
+- It is BETTER to succeed with conservative parameters than to timeout with ambitious ones.
+  A timed-out technique gives zero improvement.
+
+KNOWN TECHNIQUES (use as your toolbox, not as a checklist — only propose what makes sense):
+- Multi-seed averaging: average predictions from N seeds. Reduces variance.
+- Stacking: OOF predictions from diverse models → meta-learner. Captures complementarity.
+- Target encoding: K-fold regularized encoding for high-cardinality categoricals.
+- Pseudo-labeling: use high-confidence test predictions as training data.
+- HPO (Optuna): Bayesian hyperparameter search. Diminishing returns at high baselines.
+- Probability calibration: isotonic/Platt for probability-based metrics (log-loss, Brier).
+- Feature interactions: pairwise products of top features.
+- Learning rate reduction with more iterations.
+- Diverse ensembling: combine different frameworks (CatBoost + LightGBM + XGBoost).
+
+CONSTRAINTS:
 - action_family MUST be one of: {action_families}
-- priority 1 = highest impact, 5 = lowest
-- concrete_params must contain real values the engineer can use directly
-- expected_delta should be conservative (do not overestimate)
-- For HPO: scale n_trials to dataset size. Large datasets (>500K rows) need fewer trials
-  (10-15) with strict timeout. Small datasets (<10K) can afford 50+ trials.
-  Always include timeout_seconds in concrete_params to prevent sandbox timeouts.
-- The execution sandbox has a hard timeout of ~7200s. All optimization must complete within this budget.
+- priority 1 = highest expected impact, 5 = lowest
+- concrete_params must contain REAL values the ML engineer can use directly
+- expected_delta should be conservative and justified by your reasoning
+- Include a "reasoning" field explaining WHY this technique helps for this specific case
 
-Respond ONLY with valid JSON matching this schema:
+Respond ONLY with valid JSON:
 {{
   "model_type": "<gradient_boosting|neural_network|linear|tree|svm|other>",
   "framework": "<catboost|lightgbm|xgboost|sklearn|pytorch|tensorflow|keras|other>",
-  "baseline_assessment": "<brief 1-2 sentence assessment of the baseline model>",
+  "baseline_assessment": "<2-3 sentence diagnosis: metric quality, variance level, overfitting risk, key gaps>",
   "improvement_actions": [
     {{
-      "technique": "<specific_technique_name>",
+      "technique": "<technique_name>",
       "action_family": "<one of the allowed families>",
       "concrete_params": {{}},
-      "code_change_hint": "<1-2 line description of what to change>",
+      "code_change_hint": "<what to change in the code>",
+      "reasoning": "<why this technique helps for THIS specific case>",
+      "estimated_compute_seconds": 0,
       "expected_delta": 0.001,
       "priority": 1
     }}
@@ -195,18 +191,27 @@ class ModelAnalystAgent:
     # ------------------------------------------------------------------
 
     def analyze_baseline(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Produce an optimization_blueprint from baseline code + metrics."""
+        """Produce an optimization_blueprint from baseline code + metrics.
+
+        Philosophy:
+        - LLM/hybrid mode: trust the LLM's reasoning about what matters for THIS
+          specific model/dataset/metric. Only apply compute-budget guardrails.
+        - Deterministic mode: fallback when no LLM available — uses heuristic rules.
+        """
         context = context if isinstance(context, dict) else {}
-        deterministic = self._analyze_baseline_deterministic(context)
 
         if self.mode == "deterministic":
+            deterministic = self._analyze_baseline_deterministic(context)
             return self._finalize_blueprint(deterministic, context)
 
+        # LLM/hybrid: let the LLM reason freely, then validate feasibility
         llm_result = self._analyze_baseline_llm(context)
         if llm_result and self._validate_blueprint(llm_result):
-            merged = self._merge_llm_and_deterministic(llm_result, deterministic)
-            return self._finalize_blueprint(merged, context)
+            return self._finalize_blueprint(llm_result, context)
 
+        # LLM failed — fall back to deterministic
+        print("MODEL_ANALYST: LLM analysis failed, falling back to deterministic")
+        deterministic = self._analyze_baseline_deterministic(context)
         return self._finalize_blueprint(deterministic, context)
 
     # ------------------------------------------------------------------
@@ -226,7 +231,35 @@ class ModelAnalystAgent:
         primary_metric = str(context.get("primary_metric") or "unknown")
         models_used = context.get("models_used") if isinstance(context.get("models_used"), list) else []
 
-        metrics_summary = json.dumps(metrics, indent=2, default=str)[:3000]
+        # Enrich metrics with diagnostic signals the LLM needs for reasoning
+        enriched_metrics = dict(metrics)
+        # Compute per-fold time estimate so LLM can reason about budget
+        _n_rows = 0
+        for _rk in ("n_train_rows", "n_rows", "n_samples"):
+            _rv = dataset_profile.get(_rk) or metrics.get(_rk)
+            if _rv is not None:
+                try:
+                    _n_rows = int(_rv)
+                except (TypeError, ValueError):
+                    pass
+                if _n_rows > 0:
+                    break
+        if _n_rows > 0:
+            _code_iters = 0
+            import re as _re
+            for m in _re.finditer(r'(?:iterations|n_estimators)\s*[=:]\s*(\d+)', script_code):
+                try:
+                    _code_iters = max(_code_iters, int(m.group(1)))
+                except (ValueError, TypeError):
+                    pass
+            _fw = self._detect_framework(script_code.lower())
+            _pfs = self._estimate_per_fold_seconds(_fw, _n_rows, max_iterations=_code_iters)
+            _cv = 3 if _n_rows > 100_000 else 5
+            enriched_metrics["_estimated_per_fold_seconds"] = round(_pfs, 1)
+            enriched_metrics["_estimated_single_retrain_seconds"] = round(_pfs * _cv, 0)
+            enriched_metrics["_remaining_budget_seconds"] = 7200
+
+        metrics_summary = json.dumps(enriched_metrics, indent=2, default=str)[:4000]
         dataset_profile_summary = self._summarize_dataset_profile(dataset_profile)
 
         prompt = _LLM_PROMPT_TEMPLATE.format(
@@ -389,18 +422,57 @@ class ModelAnalystAgent:
                 "priority": 3,
             })
 
-        # 5. Multi-seed averaging
+        # 5. Multi-seed averaging — scale seeds & iterations to dataset size
         seed_matches = re.findall(r"(?:random_state|seed)\s*[=:]\s*(\d+)", script)
         unique_seeds = set(seed_matches)
         if len(unique_seeds) <= 1 and script.strip():
+            # Scale seeds inversely with dataset size:
+            #   <50K rows  → 5 seeds (high variance benefit)
+            #   50-200K    → 3 seeds
+            #   200K-500K  → 3 seeds with reduced iterations
+            #   >500K      → 2 seeds with aggressive early stopping
+            _all_seeds = [42, 123, 456, 789, 2024]
+            if _n_rows_est > 500_000:
+                _ms_seeds = _all_seeds[:2]
+                _ms_iters = max(300, _code_max_iters // 3) if _code_max_iters > 0 else 400
+                _ms_early_stop = 30
+                _ms_hint = (
+                    f"Multi-seed averaging with {len(_ms_seeds)} seeds (large dataset: {_n_rows_est:,} rows). "
+                    f"Use {_ms_iters} iterations with early_stopping={_ms_early_stop} to fit within timeout. "
+                    "Train full pipeline with each seed and average final predictions."
+                )
+            elif _n_rows_est > 200_000:
+                _ms_seeds = _all_seeds[:3]
+                _ms_iters = max(400, _code_max_iters // 2) if _code_max_iters > 0 else 500
+                _ms_early_stop = 50
+                _ms_hint = (
+                    f"Multi-seed averaging with {len(_ms_seeds)} seeds (medium-large dataset). "
+                    f"Use {_ms_iters} iterations with early_stopping={_ms_early_stop}."
+                )
+            elif _n_rows_est > 50_000:
+                _ms_seeds = _all_seeds[:3]
+                _ms_iters = _code_max_iters if _code_max_iters > 0 else 1000
+                _ms_early_stop = 50
+                _ms_hint = f"Multi-seed averaging with {len(_ms_seeds)} seeds."
+            else:
+                _ms_seeds = _all_seeds[:5]
+                _ms_iters = _code_max_iters if _code_max_iters > 0 else 1000
+                _ms_early_stop = 100
+                _ms_hint = f"Multi-seed averaging with {len(_ms_seeds)} seeds."
+
+            _ms_params: Dict[str, Any] = {
+                "seeds": _ms_seeds,
+                "aggregation": "mean",
+            }
+            # Only override iterations/early_stopping for large datasets
+            if _n_rows_est > 200_000:
+                _ms_params["max_iterations"] = _ms_iters
+                _ms_params["early_stopping_rounds"] = _ms_early_stop
             actions.append({
                 "technique": "multi_seed_averaging",
                 "action_family": "ensemble_or_stacking",
-                "concrete_params": {
-                    "seeds": [42, 123, 456, 789, 2024],
-                    "aggregation": "mean",
-                },
-                "code_change_hint": "Train with multiple random seeds and average predictions for stability",
+                "concrete_params": _ms_params,
+                "code_change_hint": _ms_hint,
                 "expected_delta": 0.0002,
                 "priority": 4,
             })
@@ -442,21 +514,32 @@ class ModelAnalystAgent:
                 "priority": 3,
             })
 
-        # 8. Stacking (if only simple averaging)
+        # 8. Stacking (if only simple averaging) — scale CV/subsample to dataset size
         has_stacking = any(
             kw in code_lower
             for kw in ["stackingclassifier", "stackingregressor", "stacking", "meta_model", "meta_learner"]
         )
         if model_count >= 2 and not has_stacking:
+            _stack_cv = 3 if _n_rows_est > 100_000 else 5
+            _stack_params: Dict[str, Any] = {
+                "meta_learner": "LogisticRegression" if "classif" in code_lower or "auc" in primary_metric else "Ridge",
+                "cv": _stack_cv,
+                "passthrough": False,
+            }
+            _stack_hint = "Replace simple averaging with stacking using a meta-learner on out-of-fold predictions"
+            if _n_rows_est > 300_000:
+                _stack_params["subsample_for_oof"] = 0.5
+                _stack_params["base_learner_iterations"] = max(300, _code_max_iters // 3) if _code_max_iters > 0 else 400
+                _stack_params["early_stopping_rounds"] = 30
+                _stack_hint += (
+                    f". Large dataset ({_n_rows_est:,} rows): use {_stack_cv}-fold OOF with 50% subsample, "
+                    f"reduced iterations, and early stopping to fit within timeout"
+                )
             actions.append({
                 "technique": "stacking_ensemble",
                 "action_family": "ensemble_or_stacking",
-                "concrete_params": {
-                    "meta_learner": "LogisticRegression" if "classif" in code_lower or "auc" in primary_metric else "Ridge",
-                    "cv": 5,
-                    "passthrough": False,
-                },
-                "code_change_hint": "Replace simple averaging with stacking using a meta-learner on out-of-fold predictions",
+                "concrete_params": _stack_params,
+                "code_change_hint": _stack_hint,
                 "expected_delta": 0.0005,
                 "priority": 4,
             })
@@ -580,15 +663,26 @@ class ModelAnalystAgent:
                     adapted_reason = ""
 
                     if tech == "multi_seed_averaging":
-                        # Reduce seeds to fit budget; minimum 3 seeds for meaningful averaging
-                        max_seeds = max(3, int(budget_limit / (_per_fold_sec * _cv_folds_default)))
+                        # Reduce seeds AND iterations to fit budget
                         all_seeds = params.get("seeds", [42, 123, 456, 789, 2024])
+                        # First try reducing seeds
+                        max_seeds = max(2, int(budget_limit / (_per_fold_sec * _cv_folds_default)))
+                        max_seeds = min(max_seeds, len(all_seeds))
                         adapted["concrete_params"]["seeds"] = all_seeds[:max_seeds]
+                        # If still too expensive, also reduce iterations
+                        new_est = _per_fold_sec * _cv_folds_default * max_seeds
+                        if new_est > budget_limit and _code_max_iters > 300:
+                            reduction = budget_limit / new_est
+                            new_iters = max(300, int(_code_max_iters * reduction))
+                            adapted["concrete_params"]["max_iterations"] = new_iters
+                            adapted["concrete_params"]["early_stopping_rounds"] = 30
+                            adapted_reason = f"seeds {len(all_seeds)}->{max_seeds}, iters->{new_iters}, early_stop=30"
+                        else:
+                            adapted_reason = f"seeds {len(all_seeds)}->{max_seeds}"
                         adapted["code_change_hint"] = (
                             f"Multi-seed averaging with {max_seeds} seeds (budget-adapted). "
                             "Train the full pipeline with each seed and average final predictions."
                         )
-                        adapted_reason = f"seeds {len(all_seeds)}->{max_seeds}"
 
                     elif tech == "stacking_ensemble":
                         # Reduce CV folds for stacking and/or use subsample for base learners
@@ -704,87 +798,134 @@ class ModelAnalystAgent:
         return result
 
     def _finalize_blueprint(self, blueprint: Dict[str, Any], context: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """Apply compute-budget guardrails and finalize the blueprint.
+
+        This is the safety layer: it ADAPTS (not drops) actions that exceed the
+        compute budget, ensuring every proposed technique has a chance to execute.
+        """
         blueprint["blueprint_version"] = "1.0"
         blueprint["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
         actions = blueprint.get("improvement_actions")
-        if isinstance(actions, list):
-            # ── Final viability filter (applies to LLM + deterministic actions) ──
-            ctx = context if isinstance(context, dict) else {}
-            dp = ctx.get("dataset_profile") if isinstance(ctx.get("dataset_profile"), dict) else {}
-            mx = ctx.get("metrics") if isinstance(ctx.get("metrics"), dict) else {}
-            _n_rows = 0
-            for _rk in ("n_train_rows", "n_rows", "n_samples", "n_train"):
-                _rv = dp.get(_rk) or mx.get(_rk)
-                if _rv is not None:
-                    try:
-                        _n_rows = int(_rv)
-                    except (TypeError, ValueError):
-                        pass
-                    if _n_rows > 0:
-                        break
-            if _n_rows > 0:
-                fw = str(blueprint.get("framework") or "catboost").lower()
-                # Extract worst-case iterations/depth from param_space
-                _bp_iters = 0
-                _bp_depth = 0
-                _bp_ps = blueprint.get("hpo_params", {})
-                if isinstance(_bp_ps, dict):
-                    _bp_ps_space = _bp_ps.get("param_space", {})
-                    if isinstance(_bp_ps_space, dict):
-                        for _ik in ("iterations", "n_estimators"):
-                            _iv = _bp_ps_space.get(_ik)
-                            if isinstance(_iv, list) and _iv:
-                                try:
-                                    _bp_iters = max(_bp_iters, int(max(_iv)))
-                                except (TypeError, ValueError):
-                                    pass
-                        for _dk in ("depth", "max_depth"):
-                            _dv = _bp_ps_space.get(_dk)
-                            if isinstance(_dv, list) and _dv:
-                                try:
-                                    _bp_depth = max(_bp_depth, int(max(_dv)))
-                                except (TypeError, ValueError):
-                                    pass
-                _pfs = self._estimate_per_fold_seconds(
-                    fw, _n_rows,
-                    max_iterations=_bp_iters, max_depth=_bp_depth,
-                )
-                _budget = 7200.0
-                _cv = 3 if _n_rows > 100_000 else 5
-                viable = []
-                for act in actions:
-                    if not isinstance(act, dict):
-                        continue
-                    family = str(act.get("action_family", ""))
-                    tech = str(act.get("technique", ""))
-                    params = act.get("concrete_params") if isinstance(act.get("concrete_params"), dict) else {}
-                    est = 0.0
-                    if family == "ensemble_or_stacking":
-                        if "seed" in tech:
-                            n_seeds = len(params.get("seeds", [1, 2, 3]))
-                            est = _pfs * _cv * n_seeds
-                        elif "stacking" in tech:
-                            est = _pfs * _cv * 4  # conservative
-                        else:
-                            # weighted_ensemble, diverse_ensemble, etc.
-                            n_m = len(params.get("models", [])) or 3
-                            est = _pfs * _cv * n_m
-                    elif "hpo" in tech.lower() or "hyperparameter" in tech.lower():
-                        hpo_t = params.get("n_trials", 50)
-                        hpo_cv = params.get("cv_folds", _cv)
-                        est = _pfs * hpo_cv * hpo_t
-                    else:
-                        est = _pfs * _cv  # single retrain
+        if not isinstance(actions, list):
+            return blueprint
 
-                    if est <= _budget * 0.85:
-                        viable.append(act)
-                    else:
-                        print(
-                            f"BLUEPRINT_VIABILITY_FINAL: Dropped '{tech}' — est={est:.0f}s "
-                            f"> budget={_budget * 0.85:.0f}s (per_fold={_pfs:.1f}s, rows={_n_rows})"
-                        )
-                actions = viable
+        ctx = context if isinstance(context, dict) else {}
+        dp = ctx.get("dataset_profile") if isinstance(ctx.get("dataset_profile"), dict) else {}
+        mx = ctx.get("metrics") if isinstance(ctx.get("metrics"), dict) else {}
+        _n_rows = 0
+        for _rk in ("n_train_rows", "n_rows", "n_samples", "n_train"):
+            _rv = dp.get(_rk) or mx.get(_rk)
+            if _rv is not None:
+                try:
+                    _n_rows = int(_rv)
+                except (TypeError, ValueError):
+                    pass
+                if _n_rows > 0:
+                    break
+
+        if _n_rows <= 0:
             blueprint["improvement_actions"] = actions[:6]
+            return blueprint
+
+        fw = str(blueprint.get("framework") or "catboost").lower()
+        # Extract baseline iterations/depth from code for estimation
+        import re as _re
+        _code = str(ctx.get("script_code") or "")
+        _code_iters = 0
+        _code_depth = 0
+        for m in _re.finditer(r'(?:iterations|n_estimators)\s*[=:]\s*(\d+)', _code):
+            try:
+                _code_iters = max(_code_iters, int(m.group(1)))
+            except (ValueError, TypeError):
+                pass
+        for m in _re.finditer(r'(?:depth|max_depth)\s*[=:]\s*(\d+)', _code):
+            try:
+                _code_depth = max(_code_depth, int(m.group(1)))
+            except (ValueError, TypeError):
+                pass
+
+        _pfs = self._estimate_per_fold_seconds(
+            fw, _n_rows,
+            max_iterations=_code_iters, max_depth=_code_depth,
+        )
+        _budget = 7200.0
+        _budget_limit = _budget * 0.85
+        _cv = 3 if _n_rows > 100_000 else 5
+
+        guarded: List[Dict[str, Any]] = []
+        for act in actions:
+            if not isinstance(act, dict):
+                continue
+            family = str(act.get("action_family", ""))
+            tech = str(act.get("technique", "")).lower()
+            params = dict(act.get("concrete_params") or {})
+
+            # Estimate compute time
+            est = 0.0
+            if family == "ensemble_or_stacking":
+                if "seed" in tech:
+                    n_seeds = len(params.get("seeds", [1, 2, 3]))
+                    est = _pfs * _cv * n_seeds
+                elif "stacking" in tech:
+                    n_base = len(params.get("models", [])) or 3
+                    stacking_cv = params.get("cv", _cv)
+                    est = _pfs * stacking_cv * (n_base + 1)
+                else:
+                    n_m = len(params.get("models", [])) or 3
+                    est = _pfs * _cv * n_m
+            elif "hpo" in tech or "hyperparameter" in tech:
+                hpo_t = params.get("n_trials", 50)
+                hpo_cv = params.get("cv_folds", _cv)
+                est = _pfs * hpo_cv * hpo_t
+            else:
+                est = _pfs * _cv
+
+            if est <= _budget_limit:
+                guarded.append(act)
+            else:
+                # ADAPT instead of drop — reduce parameters to fit budget
+                adapted = dict(act)
+                adapted["concrete_params"] = dict(params)
+                reason = ""
+
+                if "seed" in tech:
+                    max_seeds = max(2, int(_budget_limit / (_pfs * _cv)))
+                    all_seeds = params.get("seeds", [42, 123, 456])
+                    adapted["concrete_params"]["seeds"] = all_seeds[:max_seeds]
+                    new_est = _pfs * _cv * max_seeds
+                    if new_est > _budget_limit and _code_iters > 300:
+                        reduction = _budget_limit / new_est
+                        new_iters = max(300, int(_code_iters * reduction))
+                        adapted["concrete_params"]["max_iterations"] = new_iters
+                        adapted["concrete_params"]["early_stopping_rounds"] = 30
+                        reason = f"seeds->{max_seeds}, iters->{new_iters}"
+                    else:
+                        reason = f"seeds->{max_seeds}"
+
+                elif "stacking" in tech:
+                    adapted["concrete_params"]["cv"] = 3
+                    if _n_rows > 200_000:
+                        adapted["concrete_params"]["subsample_for_oof"] = 0.5
+                        reason = "cv=3, subsample=50%"
+                    else:
+                        reason = "cv=3"
+
+                elif "hpo" in tech or "hyperparameter" in tech:
+                    max_trials = max(5, int(_budget_limit / (_pfs * _cv)))
+                    adapted["concrete_params"]["n_trials"] = min(max_trials, params.get("n_trials", 50))
+                    adapted["concrete_params"]["timeout_seconds"] = int(_budget_limit * 0.8)
+                    reason = f"trials->{adapted['concrete_params']['n_trials']}"
+
+                else:
+                    reason = "budget-constrained"
+
+                print(
+                    f"BLUEPRINT_GUARDRAIL: Adapted '{tech}' "
+                    f"({est:.0f}s -> budget {_budget_limit:.0f}s): {reason}"
+                )
+                guarded.append(adapted)
+
+        blueprint["improvement_actions"] = guarded[:6]
         return blueprint
 
     # ------------------------------------------------------------------
@@ -1007,10 +1148,30 @@ class ModelAnalystAgent:
         if not profile:
             return "No dataset profile available."
         lines = []
-        for key in ("n_rows", "n_columns", "n_features"):
+        for key in ("n_rows", "n_train_rows", "n_test_rows", "n_columns", "n_features"):
             val = profile.get(key)
             if val is not None:
-                lines.append(f"{key}: {val}")
+                lines.append(f"{key}: {val:,}" if isinstance(val, (int, float)) else f"{key}: {val}")
+        # Compute size category for LLM guidance
+        n_train = None
+        for k in ("n_train_rows", "n_rows", "n_samples"):
+            v = profile.get(k)
+            if v is not None:
+                try:
+                    n_train = int(v)
+                except (TypeError, ValueError):
+                    pass
+                if n_train and n_train > 0:
+                    break
+        if n_train and n_train > 0:
+            if n_train > 500_000:
+                lines.append("DATASET_SIZE_CATEGORY: LARGE (>500K rows) — use conservative parameters: 2 seeds, 300-400 iters, 3-fold CV")
+            elif n_train > 200_000:
+                lines.append("DATASET_SIZE_CATEGORY: MEDIUM-LARGE (200K-500K rows) — use moderate parameters: 3 seeds, 400-500 iters, 3-fold CV")
+            elif n_train > 50_000:
+                lines.append("DATASET_SIZE_CATEGORY: MEDIUM (50K-200K rows) — standard parameters: 3-5 seeds, 5-fold CV")
+            else:
+                lines.append("DATASET_SIZE_CATEGORY: SMALL (<50K rows) — can afford expensive parameters: 5+ seeds, 5-fold CV, 50+ HPO trials")
         cat_cols = profile.get("categorical_columns") or profile.get("categorical_features")
         if isinstance(cat_cols, list):
             lines.append(f"categorical_features ({len(cat_cols)}): {cat_cols[:10]}")
