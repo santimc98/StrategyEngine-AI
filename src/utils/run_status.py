@@ -1,0 +1,221 @@
+"""Shared status protocol between background worker and Streamlit UI.
+
+The worker writes status/log files; Streamlit polls them.
+All writes are atomic (write-to-temp + os.replace) to prevent partial reads.
+"""
+
+import json
+import os
+import tempfile
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+
+RUNS_DIR = "runs"
+
+
+def _status_path(run_id: str) -> str:
+    return os.path.join(RUNS_DIR, run_id, "worker_status.json")
+
+
+def _log_path(run_id: str) -> str:
+    return os.path.join(RUNS_DIR, run_id, "worker_log.jsonl")
+
+
+def _final_state_path(run_id: str) -> str:
+    return os.path.join(RUNS_DIR, run_id, "worker_final_state.json")
+
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    """Write JSON atomically: write to temp file then replace."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dir_name = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Writer API (used by background_worker.py)
+# ---------------------------------------------------------------------------
+
+def write_status(
+    run_id: str,
+    *,
+    status: str = "running",
+    stage: Optional[str] = None,
+    stage_name: Optional[str] = None,
+    progress: int = 0,
+    iteration: int = 0,
+    max_iterations: int = 6,
+    metric_name: str = "",
+    metric_value: str = "",
+    completed_steps: Optional[List[str]] = None,
+    error: Optional[str] = None,
+    pid: Optional[int] = None,
+    started_at: Optional[float] = None,
+) -> None:
+    data = {
+        "pid": pid or os.getpid(),
+        "status": status,
+        "stage": stage,
+        "stage_name": stage_name or "",
+        "progress": progress,
+        "iteration": iteration,
+        "max_iterations": max_iterations,
+        "metric_name": metric_name,
+        "metric_value": metric_value,
+        "completed_steps": completed_steps or [],
+        "error": error,
+        "started_at": started_at or time.time(),
+        "updated_at": time.time(),
+    }
+    _atomic_write_json(_status_path(run_id), data)
+
+
+def append_log(run_id: str, agent: str, message: str, level: str = "info") -> None:
+    path = _log_path(run_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    entry = {
+        "ts": datetime.now().strftime("%H:%M:%S"),
+        "agent": agent,
+        "msg": message,
+        "level": level,
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def write_final_state(run_id: str, state: Dict[str, Any]) -> None:
+    """Serialize the final graph state for the results dashboard."""
+    # Only keep JSON-serializable fields that the UI needs
+    keys_to_keep = [
+        "review_verdict", "iteration_count", "current_iteration",
+        "selected_strategy", "gate_status", "data_summary",
+        "strategies", "selection_reason", "domain_expert_reviews",
+        "cleaning_code", "cleaned_data_preview",
+        "generated_code", "last_generated_code",
+        "execution_output", "last_successful_execution_output",
+        "final_report", "pdf_path", "output_contract_report",
+        "execution_feedback", "run_id",
+    ]
+    serializable = {}
+    for k in keys_to_keep:
+        v = state.get(k)
+        if v is not None:
+            try:
+                json.dumps(v, ensure_ascii=False)
+                serializable[k] = v
+            except (TypeError, ValueError):
+                serializable[k] = str(v)
+    _atomic_write_json(_final_state_path(run_id), serializable)
+
+
+def write_worker_input(run_id: str, csv_path: str, business_objective: str) -> str:
+    """Write the input parameters for the worker to read."""
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    input_path = os.path.join(run_dir, "worker_input.json")
+    _atomic_write_json(input_path, {
+        "csv_path": os.path.abspath(csv_path),
+        "business_objective": business_objective,
+    })
+    return input_path
+
+
+# ---------------------------------------------------------------------------
+# Reader API (used by app.py / Streamlit)
+# ---------------------------------------------------------------------------
+
+def read_status(run_id: str) -> Optional[Dict[str, Any]]:
+    path = _status_path(run_id)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def read_log_entries(run_id: str, after_line: int = 0) -> List[Dict[str, Any]]:
+    """Read log entries, optionally skipping the first `after_line` lines."""
+    path = _log_path(run_id)
+    entries = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i < after_line:
+                    continue
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except FileNotFoundError:
+        pass
+    return entries
+
+
+def read_final_state(run_id: str) -> Optional[Dict[str, Any]]:
+    path = _final_state_path(run_id)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def get_active_run_id() -> Optional[str]:
+    """Check if there's an active (running) worker."""
+    latest_path = os.path.join(RUNS_DIR, "latest", "run_id.txt")
+    try:
+        with open(latest_path, "r", encoding="utf-8") as f:
+            run_id = f.read().strip()
+    except FileNotFoundError:
+        return None
+    if not run_id:
+        return None
+
+    status = read_status(run_id)
+    if not status:
+        return None
+    if status.get("status") != "running":
+        return None
+
+    # Verify the worker process is still alive
+    pid = status.get("pid")
+    if pid and is_process_alive(pid):
+        return run_id
+    return None
+
+
+def is_process_alive(pid: int) -> bool:
+    """Check if a process with the given PID is still running."""
+    try:
+        import psutil
+        return psutil.pid_exists(pid) and psutil.Process(pid).is_running()
+    except ImportError:
+        pass
+    # Fallback: OS-level check
+    try:
+        if os.name == "nt":
+            import subprocess
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in result.stdout
+        else:
+            os.kill(pid, 0)
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False

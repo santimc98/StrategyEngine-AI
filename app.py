@@ -2,12 +2,14 @@ import streamlit as st
 import pandas as pd
 import os
 import json
+import subprocess
 import sys
 import time
 import glob
 import signal
 import threading
 import io
+import uuid as _uuid_mod
 import zipfile
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
@@ -24,6 +26,14 @@ from src.graph.graph import (
     set_runtime_agent_models,
 )
 from src.utils.run_workspace import recover_orphaned_workspace_cwd
+from src.utils.run_status import (
+    get_active_run_id as _get_active_run_id,
+    is_process_alive as _is_process_alive,
+    read_final_state as _read_final_state,
+    read_log_entries as _read_log_entries,
+    read_status as _read_run_status,
+    write_worker_input as _write_worker_input,
+)
 
 # Auto-heal cwd when prior run crashed inside runs/<run_id>/work.
 recover_orphaned_workspace_cwd(project_root=APP_ROOT)
@@ -1046,6 +1056,31 @@ if "analysis_result" not in st.session_state:
     st.session_state["analysis_result"] = None
 
 # ---------------------------------------------------------------------------
+# Background worker reconnection
+# ---------------------------------------------------------------------------
+def _get_latest_run_id() -> str | None:
+    try:
+        with open(os.path.join("runs", "latest", "run_id.txt"), "r") as f:
+            return f.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+if not st.session_state.get("analysis_complete"):
+    _reconnect_run = _get_active_run_id()
+    if _reconnect_run:
+        st.session_state["active_run_id"] = _reconnect_run
+    elif not st.session_state.get("active_run_id"):
+        # Check if latest run completed while session was disconnected
+        _latest = _get_latest_run_id()
+        if _latest:
+            _latest_status = _read_run_status(_latest)
+            if _latest_status and _latest_status.get("status") == "complete":
+                _final = _read_final_state(_latest)
+                if _final:
+                    st.session_state["analysis_result"] = _final
+                    st.session_state["analysis_complete"] = True
+
+# ---------------------------------------------------------------------------
 # Resolve data_path from any source
 # ---------------------------------------------------------------------------
 data_path = None
@@ -1232,9 +1267,176 @@ _STAGE_NAMES = {
 }
 
 # ---------------------------------------------------------------------------
-# Start Analysis
+# Background Worker Polling UI
 # ---------------------------------------------------------------------------
-if start_btn:
+def _run_polling_ui(run_id: str) -> None:
+    """Poll background worker status files and update Streamlit UI in real time."""
+    progress_header_placeholder = st.empty()
+    progress_bar = st.progress(0)
+    pipeline_placeholder = st.empty()
+    log_placeholder = st.empty()
+    sidebar_status_placeholder = st.sidebar.empty()
+
+    log_lines_read = 0
+    log_html_entries: list[str] = []
+
+    while True:
+        status = _read_run_status(run_id)
+        if not status:
+            time.sleep(2)
+            continue
+
+        # Read new log entries
+        new_logs = _read_log_entries(run_id, after_line=log_lines_read)
+        for entry in new_logs:
+            ts = entry.get("ts", "")
+            agent = entry.get("agent", "")
+            msg = entry.get("msg", "")
+            level = entry.get("level", "info")
+            cls = {"ok": "log-ok", "warn": "log-warn", "info": ""}.get(level, "")
+            log_html_entries.append(
+                f'<div class="log-entry">'
+                f'<span class="log-time">[{ts}]</span> '
+                f'<span class="log-agent">{agent}</span> '
+                f'<span class="{cls}">{msg}</span>'
+                f'</div>'
+            )
+        log_lines_read += len(new_logs)
+
+        # Current state from worker
+        stage = status.get("stage")
+        stage_name = status.get("stage_name") or _STAGE_NAMES.get(stage, stage or "Procesando")
+        progress = status.get("progress", 0)
+        iteration = status.get("iteration", 0)
+        max_iterations = status.get("max_iterations", 6)
+        metric_name = status.get("metric_name", "")
+        metric_value = status.get("metric_value", "")
+        completed_steps_set = set(status.get("completed_steps", []))
+        started_at = status.get("started_at", time.time())
+
+        elapsed_str = _fmt_elapsed(time.time() - started_at)
+
+        # --- Update UI elements ---
+        progress_header_placeholder.markdown(f"""
+        <div class="progress-header">
+            <div class="progress-timer">
+                <span class="progress-timer-icon">&#9202;</span>
+                <span>{elapsed_str}</span>
+            </div>
+            <div style="text-align:center;">
+                <div class="progress-stage">{stage_name}</div>
+            </div>
+            <div class="progress-pct">{progress}%</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        progress_bar.progress(min(progress, 100))
+
+        # Iteration badge
+        iter_info = ""
+        if iteration >= 1:
+            parts = [
+                f'<span class="iter-badge-label">Iteracion</span>',
+                f'<span class="iter-badge-value">{iteration}/{max_iterations}</span>',
+            ]
+            if metric_value:
+                parts.append(f'<span class="iter-badge-sep">|</span>')
+                parts.append(f'<span class="iter-badge-metric">{metric_name}: {metric_value}</span>')
+            iter_info = '<div class="iter-badge">' + " ".join(parts) + '</div>'
+
+        pipeline_placeholder.markdown(
+            '<div class="card">'
+            + _render_pipeline(completed_steps_set, stage, iter_info)
+            + '</div>',
+            unsafe_allow_html=True
+        )
+
+        log_placeholder.markdown(
+            '<div class="activity-log">' + "\n".join(log_html_entries) + '</div>',
+            unsafe_allow_html=True
+        )
+
+        # Sidebar run status
+        iter_display = f"{iteration}/{max_iterations}" if iteration > 0 else "--"
+        metric_display = f"{metric_name}: {metric_value}" if metric_value else "--"
+        sidebar_status_placeholder.markdown(f"""
+        <div class="sidebar-run-status">
+            <div class="srs-title">Ejecucion en Curso</div>
+            <div class="srs-row">
+                <span class="srs-label">Etapa</span>
+                <span class="srs-step">{stage_name}</span>
+            </div>
+            <div class="srs-row">
+                <span class="srs-label">Progreso</span>
+                <span class="srs-value">{progress}%</span>
+            </div>
+            <div class="srs-row">
+                <span class="srs-label">Tiempo</span>
+                <span class="srs-timer">{elapsed_str}</span>
+            </div>
+            <div class="srs-row">
+                <span class="srs-label">Iteracion ML</span>
+                <span class="srs-value">{iter_display}</span>
+            </div>
+            <div class="srs-row">
+                <span class="srs-label">Metrica</span>
+                <span class="srs-value">{metric_display}</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # --- Check for completion ---
+        run_status = status.get("status", "running")
+        if run_status == "complete":
+            final = _read_final_state(run_id)
+            if final:
+                st.session_state["analysis_result"] = final
+                st.session_state["analysis_complete"] = True
+            st.session_state.pop("active_run_id", None)
+            sidebar_status_placeholder.empty()
+            time.sleep(0.5)
+            st.rerun()
+            return
+
+        if run_status == "error":
+            error = status.get("error", "Error desconocido")
+            st.error(f"Error en la ejecucion: {error}")
+            final = _read_final_state(run_id)
+            if final:
+                st.session_state["analysis_result"] = final
+                st.session_state["analysis_complete"] = True
+            st.session_state.pop("active_run_id", None)
+            sidebar_status_placeholder.empty()
+            if st.session_state.get("analysis_complete"):
+                time.sleep(0.5)
+                st.rerun()
+            return
+
+        # Check if worker process died unexpectedly
+        pid = status.get("pid")
+        if pid and not _is_process_alive(pid):
+            st.error("El proceso de ejecucion ha terminado inesperadamente.")
+            final = _read_final_state(run_id)
+            if final:
+                st.session_state["analysis_result"] = final
+                st.session_state["analysis_complete"] = True
+            st.session_state.pop("active_run_id", None)
+            sidebar_status_placeholder.empty()
+            if st.session_state.get("analysis_complete"):
+                time.sleep(0.5)
+                st.rerun()
+            return
+
+        time.sleep(3)
+
+# ---------------------------------------------------------------------------
+# Start Analysis / Resume Active Run
+# ---------------------------------------------------------------------------
+if st.session_state.get("active_run_id") and not st.session_state.get("analysis_complete"):
+    # Resume polling an active background worker (survives session reconnect)
+    _run_polling_ui(st.session_state["active_run_id"])
+
+elif start_btn:
     if data_path is None:
         st.sidebar.error("Por favor carga datos: sube un archivo o conecta un CRM.")
     elif not business_objective:
@@ -1249,296 +1451,27 @@ if start_btn:
             for f in files:
                 os.remove(f)
 
-        try:
-            # --- UI placeholders ---
-            progress_header_placeholder = st.empty()
-            progress_bar = st.progress(0)
-            pipeline_placeholder = st.empty()
-            log_placeholder = st.empty()
+        # Generate run_id and write worker input
+        run_id = _uuid_mod.uuid4().hex[:8]
+        _write_worker_input(run_id, data_path, business_objective)
 
-            # --- Sidebar status placeholders ---
-            sidebar_status_placeholder = st.sidebar.empty()
+        # Launch background worker as independent subprocess
+        worker_log_dir = os.path.join("runs", run_id)
+        os.makedirs(worker_log_dir, exist_ok=True)
+        worker_stdout_path = os.path.join(worker_log_dir, "worker_stdout.log")
+        worker_stdout = open(worker_stdout_path, "w", encoding="utf-8")
+        subprocess.Popen(
+            [sys.executable, "-m", "src.utils.background_worker", run_id],
+            cwd=APP_ROOT,
+            stdout=worker_stdout,
+            stderr=subprocess.STDOUT,
+            # Detach from parent so it survives Streamlit session death
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        worker_stdout.close()  # child process has inherited the handle
 
-            # --- Tracking state ---
-            completed_steps: set = set()
-            active_step: str | None = "steward"
-            log_entries: list[str] = []
-            run_start = time.time()
-            current_progress: int = 0
-            ml_iteration: int = 0
-            ml_max_iterations: int = 6
-            best_metric_name: str = ""
-            best_metric_value: str = ""
-            current_metric_value: str = ""
-
-            def add_log(agent: str, message: str, level: str = "info"):
-                ts = datetime.now().strftime("%H:%M:%S")
-                cls = {"ok": "log-ok", "warn": "log-warn", "info": ""}.get(level, "")
-                log_entries.append(
-                    f'<div class="log-entry">'
-                    f'<span class="log-time">[{ts}]</span> '
-                    f'<span class="log-agent">{agent}</span> '
-                    f'<span class="{cls}">{message}</span>'
-                    f'</div>'
-                )
-
-            def _build_iter_badge() -> str:
-                """Build HTML for the ML iteration badge."""
-                if ml_iteration < 1:
-                    return ""
-                parts = [
-                    f'<span class="iter-badge-label">Iteracion</span>',
-                    f'<span class="iter-badge-value">{ml_iteration}/{ml_max_iterations}</span>',
-                ]
-                if current_metric_value:
-                    parts.append(f'<span class="iter-badge-sep">|</span>')
-                    parts.append(f'<span class="iter-badge-metric">{best_metric_name}: {current_metric_value}</span>')
-                return '<div class="iter-badge">' + " ".join(parts) + '</div>'
-
-            def refresh_ui():
-                elapsed = time.time() - run_start
-                elapsed_str = _fmt_elapsed(elapsed)
-                stage_name = _STAGE_NAMES.get(active_step, active_step or "Procesando")
-
-                # Progress header with timer and percentage
-                progress_header_placeholder.markdown(f"""
-                <div class="progress-header">
-                    <div class="progress-timer">
-                        <span class="progress-timer-icon">&#9202;</span>
-                        <span>{elapsed_str}</span>
-                    </div>
-                    <div style="text-align:center;">
-                        <div class="progress-stage">{stage_name}</div>
-                    </div>
-                    <div class="progress-pct">{current_progress}%</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # Progress bar
-                progress_bar.progress(min(current_progress, 100))
-
-                # Pipeline tracker with iteration badge
-                pipeline_placeholder.markdown(
-                    '<div class="card">'
-                    + _render_pipeline(completed_steps, active_step, _build_iter_badge())
-                    + '</div>',
-                    unsafe_allow_html=True
-                )
-
-                # Activity log
-                log_placeholder.markdown(
-                    '<div class="activity-log">' + "\n".join(log_entries) + '</div>',
-                    unsafe_allow_html=True
-                )
-
-                # Sidebar run status
-                iter_display = f"{ml_iteration}/{ml_max_iterations}" if ml_iteration > 0 else "--"
-                metric_display = f"{best_metric_name}: {current_metric_value}" if current_metric_value else "--"
-                sidebar_status_placeholder.markdown(f"""
-                <div class="sidebar-run-status">
-                    <div class="srs-title">Ejecucion en Curso</div>
-                    <div class="srs-row">
-                        <span class="srs-label">Etapa</span>
-                        <span class="srs-step">{stage_name}</span>
-                    </div>
-                    <div class="srs-row">
-                        <span class="srs-label">Progreso</span>
-                        <span class="srs-value">{current_progress}%</span>
-                    </div>
-                    <div class="srs-row">
-                        <span class="srs-label">Tiempo</span>
-                        <span class="srs-timer">{elapsed_str}</span>
-                    </div>
-                    <div class="srs-row">
-                        <span class="srs-label">Iteracion ML</span>
-                        <span class="srs-value">{iter_display}</span>
-                    </div>
-                    <div class="srs-row">
-                        <span class="srs-label">Metrica</span>
-                        <span class="srs-value">{metric_display}</span>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            add_log("Sistema", "Iniciando pipeline de analisis...", "info")
-            add_log("Data Steward", "Analizando calidad e integridad de datos...", "info")
-            refresh_ui()
-
-            initial_state = {
-                "csv_path": data_path,
-                "business_objective": business_objective
-            }
-
-            final_state = initial_state.copy()
-
-            for event in app_graph.stream(initial_state, config={"recursion_limit": 250}):
-                if event is None:
-                    continue
-
-                for key, value in event.items():
-                    if value is not None:
-                        final_state.update(value)
-
-                if 'steward' in event:
-                    completed_steps.add("steward")
-                    active_step = "strategist"
-                    current_progress = _STEP_PROGRESS["steward"]
-                    # Extract data summary stats
-                    summary = final_state.get('data_summary', '')
-                    add_log("Data Steward", "Auditoria de calidad completada.", "ok")
-                    add_log("Strategist", "Generando 3 estrategias de alto impacto...", "info")
-
-                elif 'strategist' in event:
-                    completed_steps.add("strategist")
-                    active_step = "domain_expert"
-                    current_progress = _STEP_PROGRESS["strategist"]
-                    # Extract strategy titles for detailed logging
-                    strategies = final_state.get('strategies', {})
-                    if isinstance(strategies, dict) and 'strategies' in strategies:
-                        strat_list = strategies['strategies']
-                        titles = [s.get('title', '?') for s in strat_list[:3]]
-                        add_log("Strategist", f"{len(strat_list)} estrategias generadas:", "ok")
-                        for i, t in enumerate(titles, 1):
-                            add_log("Strategist", f"  {i}. {t}", "info")
-                    else:
-                        add_log("Strategist", "Estrategias generadas.", "ok")
-                    add_log("Domain Expert", "Evaluando y puntuando cada estrategia...", "info")
-
-                elif 'domain_expert' in event:
-                    completed_steps.add("domain_expert")
-                    active_step = "data_engineer"
-                    current_progress = _STEP_PROGRESS["domain_expert"]
-                    selected = final_state.get('selected_strategy', {})
-                    reviews = final_state.get('domain_expert_reviews', [])
-                    # Log each strategy score
-                    if reviews:
-                        for rev in reviews:
-                            score = rev.get('score', '?')
-                            title = rev.get('title', '?')
-                            add_log("Domain Expert", f"  {title} — {score}/10", "info")
-                    sel_title = selected.get('title', 'N/A') if isinstance(selected, dict) else 'N/A'
-                    add_log("Domain Expert", f"Estrategia ganadora: {sel_title}", "ok")
-                    add_log("Data Engineer", "Ejecutando script de limpieza y estandarizacion...", "info")
-
-                elif 'data_engineer' in event:
-                    completed_steps.add("data_engineer")
-                    active_step = "engineer"
-                    current_progress = _STEP_PROGRESS["data_engineer"]
-                    add_log("Data Engineer", "Dataset limpiado y estandarizado.", "ok")
-                    # Detect iteration policy from contract
-                    contract = final_state.get('execution_contract', {})
-                    if isinstance(contract, dict):
-                        iter_policy = contract.get('iteration_policy', {})
-                        if isinstance(iter_policy, dict):
-                            limit = iter_policy.get('max_iterations', iter_policy.get('limit', ml_max_iterations))
-                            if isinstance(limit, (int, float)) and limit >= 1:
-                                ml_max_iterations = int(limit)
-                        metric = contract.get('primary_metric', contract.get('metric', ''))
-                        if metric:
-                            best_metric_name = str(metric).upper()
-                    if not best_metric_name:
-                        best_metric_name = "Metric"
-                    ml_iteration = 1
-                    add_log("ML Engineer", f"Generando codigo — Iteracion 1/{ml_max_iterations}...", "info")
-
-                elif 'engineer' in event:
-                    # ML code generation event
-                    iteration = final_state.get('current_iteration', ml_iteration)
-                    if isinstance(iteration, int) and iteration > ml_iteration:
-                        ml_iteration = iteration
-                    add_log("ML Engineer", f"Codigo generado (Iteracion {ml_iteration}). Ejecutando...", "info")
-                    # Interpolate progress between data_engineer (48%) and evaluate_results (82%)
-                    ml_range = _STEP_PROGRESS["evaluate_results"] - _STEP_PROGRESS["data_engineer"]
-                    iter_progress = min(ml_iteration / ml_max_iterations, 1.0)
-                    current_progress = _STEP_PROGRESS["data_engineer"] + int(ml_range * iter_progress * 0.7)
-
-                elif 'execute_code' in event:
-                    # Extract metric from execution output
-                    exec_output = str(final_state.get('execution_output', ''))
-                    import re
-                    # Try to find common metric patterns in output
-                    for pattern in [
-                        r'(?:RMSLE|rmsle)[:\s=]+([0-9]+\.?[0-9]*)',
-                        r'(?:RMSE|rmse)[:\s=]+([0-9]+\.?[0-9]*)',
-                        r'(?:MAE|mae)[:\s=]+([0-9]+\.?[0-9]*)',
-                        r'(?:AUC|auc)[:\s=]+([0-9]+\.?[0-9]*)',
-                        r'(?:F1|f1)[:\s=]+([0-9]+\.?[0-9]*)',
-                        r'(?:Accuracy|accuracy)[:\s=]+([0-9]+\.?[0-9]*)',
-                        r'(?:R2|r2|R-squared)[:\s=]+([0-9]+\.?[0-9]*)',
-                    ]:
-                        match = re.search(pattern, exec_output, re.IGNORECASE)
-                        if match:
-                            current_metric_value = match.group(1)
-                            # Auto-detect metric name if generic
-                            if best_metric_name == "Metric":
-                                name_match = re.search(r'([A-Za-z0-9_-]+)[:\s=]+' + re.escape(current_metric_value), exec_output)
-                                if name_match:
-                                    best_metric_name = name_match.group(1).upper()
-                            break
-                    metric_str = f" — {best_metric_name}: {current_metric_value}" if current_metric_value else ""
-                    add_log("ML Engineer", f"Ejecucion completada (Iteracion {ml_iteration}){metric_str}.", "ok")
-                    add_log("Reviewer", "Evaluando resultados vs. objetivo de negocio...", "info")
-                    active_step = "evaluate_results"
-
-                elif 'evaluate_results' in event:
-                    verdict = final_state.get('review_verdict', 'APPROVED')
-                    if verdict == "NEEDS_IMPROVEMENT":
-                        feedback = final_state.get('execution_feedback', '')
-                        # Truncate long feedback for the log
-                        if len(feedback) > 200:
-                            feedback = feedback[:200] + "..."
-                        add_log("Reviewer", f"Requiere mejoras: {feedback}", "warn")
-                        ml_iteration += 1
-                        if ml_iteration <= ml_max_iterations:
-                            add_log("ML Engineer", f"Refinando modelo — Iteracion {ml_iteration}/{ml_max_iterations}...", "info")
-                        active_step = "engineer"
-                        # Update progress for retry iterations
-                        ml_range = _STEP_PROGRESS["evaluate_results"] - _STEP_PROGRESS["data_engineer"]
-                        iter_progress = min(ml_iteration / ml_max_iterations, 1.0)
-                        current_progress = _STEP_PROGRESS["data_engineer"] + int(ml_range * iter_progress)
-                    else:
-                        completed_steps.add("engineer")
-                        completed_steps.add("evaluate_results")
-                        active_step = "translator"
-                        current_progress = _STEP_PROGRESS["evaluate_results"]
-                        metric_str = f" — {best_metric_name}: {current_metric_value}" if current_metric_value else ""
-                        add_log("Reviewer", f"Resultados aprobados{metric_str}.", "ok")
-                        add_log("Translator", "Generando informe ejecutivo...", "info")
-
-                elif 'retry_handler' in event:
-                    pass
-
-                elif 'translator' in event:
-                    completed_steps.add("translator")
-                    active_step = None
-                    current_progress = _STEP_PROGRESS["translator"]
-                    add_log("Translator", "Reporte ejecutivo generado.", "ok")
-
-                elif 'generate_pdf' in event:
-                    current_progress = _STEP_PROGRESS["generate_pdf"]
-                    add_log("Sistema", "PDF final generado.", "ok")
-
-                refresh_ui()
-
-            st.session_state["analysis_result"] = final_state
-            st.session_state["analysis_complete"] = True
-
-            # Final pipeline: all complete
-            completed_steps = {s[0] for s in PIPELINE_STEPS}
-            active_step = None
-            current_progress = 100
-            elapsed_total = _fmt_elapsed(time.time() - run_start)
-            add_log("Sistema", f"Pipeline completado en {elapsed_total}.", "ok")
-            refresh_ui()
-
-            time.sleep(0.5)
-            # Clear sidebar status before rerun
-            sidebar_status_placeholder.empty()
-            st.rerun()
-
-        except Exception as e:
-            st.error(f"Ocurrio un error critico: {e}")
-            st.exception(e)
+        st.session_state["active_run_id"] = run_id
+        _run_polling_ui(run_id)
 
 # ---------------------------------------------------------------------------
 # Results Dashboard
