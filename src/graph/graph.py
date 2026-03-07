@@ -9995,6 +9995,47 @@ def _build_iteration_handoff(
     return handoff
 
 
+def _persist_iteration_handoff_state(state: Dict[str, Any] | None) -> None:
+    state = state if isinstance(state, dict) else {}
+    handoff = state.get("iteration_handoff")
+    if not isinstance(handoff, dict) or not handoff:
+        return
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/iteration_handoff.json", handoff)
+        persisted_paths = ["data/iteration_handoff.json"]
+
+        review_stack = state.get("ml_review_stack")
+        if isinstance(review_stack, dict) and review_stack:
+            updated_stack = copy.deepcopy(review_stack)
+            updated_stack["iteration_handoff"] = copy.deepcopy(handoff)
+            metric_context = (
+                dict(updated_stack.get("metric_improvement_context"))
+                if isinstance(updated_stack.get("metric_improvement_context"), dict)
+                else {}
+            )
+            metric_context["active"] = bool(state.get("ml_improvement_round_active"))
+            review_mode = str(state.get("ml_improvement_review_mode") or "").strip()
+            if review_mode:
+                metric_context["review_mode"] = review_mode
+            elif "review_mode" not in metric_context:
+                metric_context["review_mode"] = None
+            updated_stack["metric_improvement_context"] = metric_context
+            dump_json("data/ml_review_stack.json", updated_stack)
+            state["ml_review_stack"] = updated_stack
+            persisted_paths.append("data/ml_review_stack.json")
+
+        existing_index = _load_json_any("data/produced_artifact_index.json")
+        normalized_existing = existing_index if isinstance(existing_index, list) else []
+        additions = _build_artifact_index(persisted_paths, None)
+        merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+        dump_json("data/produced_artifact_index.json", merged_index)
+        state["artifact_index"] = merged_index
+        state["produced_artifact_index"] = merged_index
+    except Exception as err:
+        print(f"Warning: failed to persist current iteration_handoff state: {err}")
+
+
 def _suggest_next_actions(
     preflight_issues: List[str],
     outputs_missing: List[str],
@@ -10408,6 +10449,53 @@ def _build_iteration_memory_cautions(blockers: List[str]) -> List[str]:
     return cautions[:3]
 
 
+def _build_iteration_memory_repeated_blockers(entries: List[Dict[str, Any]], current_blockers: List[str]) -> List[str]:
+    if not entries or not current_blockers:
+        return []
+    repeated: List[Tuple[str, int]] = []
+    for blocker in current_blockers:
+        blocker_key = str(blocker or "").strip()
+        if not blocker_key:
+            continue
+        streak = 0
+        for entry in reversed(entries):
+            if blocker_key in _extract_iteration_memory_blockers(entry):
+                streak += 1
+            elif streak > 0:
+                break
+        if streak >= 2:
+            repeated.append((blocker_key, streak))
+    repeated.sort(key=lambda item: (-item[1], item[0]))
+    return [f"{name} (x{count})" for name, count in repeated[:4]]
+
+
+def _build_iteration_memory_metric_outcomes(entries: List[Dict[str, Any]]) -> List[str]:
+    outcomes: List[str] = []
+    seen: set[str] = set()
+    for entry in reversed(entries):
+        metric_round = entry.get("metric_round") if isinstance(entry, dict) else {}
+        if not isinstance(metric_round, dict) or not metric_round:
+            continue
+        technique = str(metric_round.get("technique") or "").strip()
+        if not technique or technique in seen:
+            continue
+        seen.add(technique)
+        kept = str(metric_round.get("kept") or "").strip() or "pending"
+        reason = str(metric_round.get("reason") or "").strip()
+        delta = _coerce_float(metric_round.get("delta"))
+        summary = technique
+        if delta is not None:
+            delta_prefix = "+" if delta > 0 else ""
+            summary += f" ({delta_prefix}{delta:.6g})"
+        summary += f" -> {kept}"
+        if reason:
+            summary += f" [{reason}]"
+        outcomes.append(summary[:220])
+        if len(outcomes) >= 3:
+            break
+    return outcomes
+
+
 def _build_ml_iteration_memory_block(entries: List[Dict[str, Any]], max_chars: int = 1200) -> str:
     if not entries:
         return ""
@@ -10434,23 +10522,18 @@ def _build_ml_iteration_memory_block(entries: List[Dict[str, Any]], max_chars: i
     if current_blockers:
         last_summary["current_blockers"] = current_blockers[:5]
 
-    counts: Dict[str, int] = {}
-    for entry in entries:
-        for tag in _extract_iteration_memory_blockers(entry):
-            if not tag:
-                continue
-            key = str(tag)
-            counts[key] = counts.get(key, 0) + 1
-    top_failures = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:4]
-    top_failures_list = [f"{name} (x{count})" for name, count in top_failures]
+    top_failures_list = _build_iteration_memory_repeated_blockers(entries, current_blockers)
     previous_blockers = _extract_iteration_memory_blockers(entries[-2]) if len(entries) >= 2 else []
     resolved_blockers = [item for item in previous_blockers if item not in current_blockers][:3]
+    metric_outcomes = _build_iteration_memory_metric_outcomes(entries)
     next_actions = _normalize_iteration_memory_items(last.get("next_actions"), max_items=4, max_len=240)
     caution_lines = _build_iteration_memory_cautions(current_blockers)
     lines = [
         "Last attempt summary: " + json.dumps(last_summary, ensure_ascii=True),
         "Repeated blockers: " + json.dumps(top_failures_list, ensure_ascii=True),
     ]
+    if metric_outcomes:
+        lines.append("Recent metric outcomes: " + json.dumps(metric_outcomes, ensure_ascii=True))
     if resolved_blockers:
         lines.append("Resolved since last attempt: " + json.dumps(resolved_blockers, ensure_ascii=True))
     for item in next_actions:
@@ -25368,6 +25451,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         state["ml_improvement_round_history"] = round_history
     state["last_iteration_type"] = "metric"
     state["improvement_attempt_count"] = 0
+    _persist_iteration_handoff_state(state)
     if run_id:
         hypothesis = hypothesis_packet.get("hypothesis") if isinstance(hypothesis_packet.get("hypothesis"), dict) else {}
         tracker_context = hypothesis_packet.get("tracker_context") if isinstance(hypothesis_packet.get("tracker_context"), dict) else {}

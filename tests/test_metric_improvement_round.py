@@ -502,6 +502,14 @@ def test_bootstrap_node_activates_next_round_after_continue(tmp_path, monkeypatc
             "column_roles": {},
         },
         "feedback_history": [],
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False},
+            "result_evaluator": {"status": "APPROVED"},
+            "reviewer": {"status": "APPROVED"},
+            "qa_reviewer": {"status": "APPROVED"},
+            "results_advisor": {"status": "APPROVED"},
+            "metric_improvement_context": {"active": False, "review_mode": None},
+        },
     }
     updates = run_metric_improvement_bootstrap(state)
     merged_state = {**state, **updates}
@@ -509,6 +517,13 @@ def test_bootstrap_node_activates_next_round_after_continue(tmp_path, monkeypatc
     assert route == "retry"
     assert merged_state.get("ml_improvement_round_active") is True
     assert int(merged_state.get("ml_improvement_round_count", 0)) == 2
+    persisted_handoff = json.loads(Path("data/iteration_handoff.json").read_text(encoding="utf-8"))
+    assert persisted_handoff.get("mode") == "optimize"
+    assert persisted_handoff.get("source") == "actor_critic_metric_improvement"
+    assert persisted_handoff.get("hypothesis_packet", {}).get("hypothesis", {}).get("technique") == "missing_indicators"
+    persisted_stack = json.loads(Path("data/ml_review_stack.json").read_text(encoding="utf-8"))
+    assert persisted_stack.get("iteration_handoff", {}).get("source") == "actor_critic_metric_improvement"
+    assert persisted_stack.get("metric_improvement_context", {}).get("active") is True
 
 
 def test_check_finalize_route_bootstraps_next_round_when_continue_flag_is_set() -> None:
