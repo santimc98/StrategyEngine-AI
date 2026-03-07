@@ -82,22 +82,8 @@ def main(run_id: str) -> None:
     csv_path = params["csv_path"]
     business_objective = params["business_objective"]
 
-    # Apply model overrides if present
-    overrides_path = os.path.join("data", "agent_model_overrides.json")
-    if os.path.exists(overrides_path):
-        try:
-            with open(overrides_path, "r", encoding="utf-8") as f:
-                overrides = json.load(f)
-            if overrides:
-                from src.graph.graph import set_runtime_agent_models
-                set_runtime_agent_models(overrides)
-                print(f"WORKER: Applied model overrides: {overrides}")
-        except Exception as e:
-            print(f"WORKER: Could not load model overrides: {e}")
-
-    # Heavy import — do it after setup
-    from src.graph.graph import app_graph
-
+    # Write initial status IMMEDIATELY — before any heavy imports.
+    # This lets the Streamlit polling UI show progress right away.
     started_at = time.time()
     completed_steps: set = set()
     active_step = "steward"
@@ -112,11 +98,30 @@ def main(run_id: str) -> None:
         completed_steps=completed_steps, started_at=started_at,
     )
     append_log(run_id, "Sistema", "Iniciando pipeline de analisis...", "info")
+    append_log(run_id, "Sistema", "Cargando modulos (puede tardar unos minutos)...", "info")
+
+    # Heavy imports — graph module is ~27K lines, takes 1-3 minutes to load
+    overrides_path = os.path.join(_PROJECT_ROOT, "data", "agent_model_overrides.json")
+    if os.path.exists(overrides_path):
+        try:
+            with open(overrides_path, "r", encoding="utf-8") as f:
+                overrides = json.load(f)
+            if overrides:
+                from src.graph.graph import set_runtime_agent_models
+                set_runtime_agent_models(overrides)
+                print(f"WORKER: Applied model overrides: {overrides}")
+        except Exception as e:
+            print(f"WORKER: Could not load model overrides: {e}")
+
+    from src.graph.graph import app_graph
+
+    append_log(run_id, "Sistema", "Modulos cargados. Ejecutando pipeline...", "ok")
     append_log(run_id, "Data Steward", "Analizando calidad e integridad de datos...", "info")
 
     initial_state = {
         "csv_path": csv_path,
         "business_objective": business_objective,
+        "run_id": run_id,
     }
 
     final_state = initial_state.copy()
