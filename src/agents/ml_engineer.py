@@ -2408,6 +2408,86 @@ class MLEngineerAgent:
 
         return code
 
+    def _fix_output_paths_in_code(self, code: str, required_outputs: list) -> str:
+        """Post-processing safety check: ensure every required output path appears
+        as a write destination in the generated code.
+
+        When the LLM writes to a wrong path (e.g. 'data/cleaned_data.csv' instead
+        of 'data/submission.csv'), this detects the mismatch and patches the code
+        by replacing the wrong constant value with the correct one.
+
+        Only acts on CSV output paths that are completely absent from the code.
+        """
+        import re
+        if not required_outputs:
+            return code
+
+        csv_outputs = [p for p in required_outputs if isinstance(p, str) and p.endswith(".csv")]
+
+        for required_path in csv_outputs:
+            # Skip if the required path already appears as a string literal in code
+            if required_path in code:
+                continue
+
+            # Derive the "role" of this output from its filename
+            basename = os.path.basename(required_path).replace(".csv", "").upper()
+            # Look for a constant assignment whose name suggests this role but
+            # points to the wrong path.  E.g.:
+            #   SUBMISSION_DATA_PATH = 'data/cleaned_data.csv'  (wrong)
+            #   SUBMISSION_PATH = 'wrong.csv'                   (wrong)
+            role_keywords = [basename]
+            if "SUBMISSION" in basename or required_path == "data/submission.csv":
+                role_keywords = ["SUBMISSION"]
+            elif "SCORED" in basename:
+                role_keywords = ["SCORED", "SCORE"]
+            elif "PREDICTION" in basename:
+                role_keywords = ["PREDICTION", "PREDICT"]
+
+            fixed = False
+            for kw in role_keywords:
+                # Match: SOME_KEYWORD_PATH = 'wrong/path.csv'
+                pattern = r"([A-Z_]*" + re.escape(kw) + r"[A-Z_]*(?:PATH|FILE|OUTPUT))\s*=\s*['\"]([^'\"]+\.csv)['\"]"
+                match = re.search(pattern, code, re.IGNORECASE)
+                if match:
+                    var_name = match.group(1)
+                    wrong_path = match.group(2)
+                    if wrong_path != required_path:
+                        code = code.replace(
+                            f"{var_name} = '{wrong_path}'",
+                            f"{var_name} = '{required_path}'",
+                        ).replace(
+                            f'{var_name} = "{wrong_path}"',
+                            f'{var_name} = "{required_path}"',
+                        )
+                        print(
+                            f"SAFETY_FIX: Patched output path {var_name}: "
+                            f"'{wrong_path}' -> '{required_path}'"
+                        )
+                        fixed = True
+                        break
+
+            if not fixed:
+                # Fallback: look for .to_csv('wrong.csv') where the wrong path
+                # shares the same basename concept but different directory
+                req_basename = os.path.basename(required_path)
+                # e.g. required='data/submission.csv', look for to_csv('submission.csv')
+                # but only if 'data/submission.csv' is not already written elsewhere
+                if "/" in required_path:
+                    bare = required_path.split("/")[-1]
+                    # Check if code writes to bare name but not to full path
+                    bare_pattern = r"\.to_csv\s*\(\s*['\"]" + re.escape(bare) + r"['\"]"
+                    full_pattern = r"\.to_csv\s*\(\s*['\"]" + re.escape(required_path) + r"['\"]"
+                    if re.search(bare_pattern, code) and not re.search(full_pattern, code):
+                        # Don't patch — there might be a legitimate reason to write
+                        # both 'submission.csv' and 'data/submission.csv'
+                        # Instead just log the gap
+                        print(
+                            f"SAFETY_FIX_WARNING: Required output '{required_path}' not found "
+                            f"in code but '{bare}' is written. LLM may have missed the data/ prefix."
+                        )
+
+        return code
+
     def _build_universal_prologue(
         self,
         csv_sep: str,
@@ -4871,8 +4951,9 @@ class MLEngineerAgent:
                 if is_syntax_valid(completed):
                     code = completed
 
-            # Post-processing: Inject correct data_path if LLM used wrong path
+            # Post-processing: Inject correct paths if LLM used wrong ones
             code = self._fix_data_path_in_code(code, data_path)
+            code = self._fix_output_paths_in_code(code, required_deliverables)
             code = self._apply_universal_script_guards(
                 code,
                 csv_sep=csv_sep,
@@ -4922,6 +5003,7 @@ class MLEngineerAgent:
                         reasons = ["syntax_invalid_after_guardrail"]
                         continue
                     repaired = self._fix_data_path_in_code(repaired, data_path)
+                    repaired = self._fix_output_paths_in_code(repaired, required_deliverables)
                     repaired = self._apply_universal_script_guards(
                         repaired,
                         csv_sep=csv_sep,
@@ -4993,6 +5075,7 @@ class MLEngineerAgent:
                 repaired_valid = is_syntax_valid(repaired)
                 if repaired_valid:
                     repaired = self._fix_data_path_in_code(repaired, data_path)
+                    repaired = self._fix_output_paths_in_code(repaired, required_deliverables)
                     repaired = self._apply_universal_script_guards(
                         repaired,
                         csv_sep=csv_sep,
@@ -5023,6 +5106,7 @@ class MLEngineerAgent:
                     print("ML_TRAINING_POLICY_WARNING: " + json.dumps(self.last_training_policy_warnings))
                     code = fallback_code
             code = self._fix_data_path_in_code(code, data_path)
+            code = self._fix_output_paths_in_code(code, required_deliverables)
             code = self._apply_universal_script_guards(
                 code,
                 csv_sep=csv_sep,
