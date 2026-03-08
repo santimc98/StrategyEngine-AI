@@ -29,9 +29,11 @@ from src.utils.run_workspace import recover_orphaned_workspace_cwd
 from src.utils.run_status import (
     get_active_run_id as _get_active_run_id,
     is_process_alive as _is_process_alive,
+    kill_worker as _kill_worker,
     read_final_state as _read_final_state,
     read_log_entries as _read_log_entries,
     read_status as _read_run_status,
+    request_run_abort as _request_run_abort,
     write_worker_input as _write_worker_input,
 )
 
@@ -1312,6 +1314,16 @@ def _start_terminal_log_tail(run_id: str) -> None:
 def _run_polling_ui(run_id: str) -> None:
     """Poll background worker status files and update Streamlit UI in real time."""
     progress_header_placeholder = st.empty()
+    abort_col1, abort_col2, abort_col3 = st.columns([3, 1, 3])
+    with abort_col2:
+        if st.button("Cancelar ejecucion", type="secondary", use_container_width=True):
+            _request_run_abort(run_id)
+            _kill_worker(run_id)
+            st.session_state.pop("active_run_id", None)
+            st.warning("Ejecucion cancelada.")
+            time.sleep(1)
+            st.rerun()
+            return
     progress_bar = st.progress(0)
     pipeline_placeholder = st.empty()
     log_placeholder = st.empty()
@@ -1438,9 +1450,12 @@ def _run_polling_ui(run_id: str) -> None:
             st.rerun()
             return
 
-        if run_status == "error":
-            error = status.get("error", "Error desconocido")
-            st.error(f"Error en la ejecucion: {error}")
+        if run_status in ("error", "aborted"):
+            if run_status == "aborted":
+                st.warning("Ejecucion cancelada por el usuario.")
+            else:
+                error = status.get("error", "Error desconocido")
+                st.error(f"Error en la ejecucion: {error}")
             final = _read_final_state(run_id)
             if final:
                 st.session_state["analysis_result"] = final
@@ -1486,6 +1501,12 @@ elif start_btn:
         st.session_state["analysis_complete"] = False
         st.session_state["analysis_result"] = None
         clear_abort()
+
+        # Kill any previously running worker before starting a new one
+        prev_run = _get_active_run_id()
+        if prev_run:
+            _request_run_abort(prev_run)
+            _kill_worker(prev_run)
 
         if os.path.exists("static/plots"):
             files = glob.glob("static/plots/*")

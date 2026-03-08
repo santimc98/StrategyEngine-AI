@@ -200,6 +200,58 @@ def get_active_run_id() -> Optional[str]:
     return None
 
 
+def _abort_flag_path(run_id: str) -> str:
+    return os.path.join(RUNS_DIR, run_id, "abort_requested")
+
+
+def request_run_abort(run_id: str) -> None:
+    """Signal the background worker to abort by creating a flag file."""
+    path = _abort_flag_path(run_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(time.time()))
+
+
+def is_run_abort_requested(run_id: str) -> bool:
+    """Check if an abort has been requested for this run."""
+    return os.path.exists(_abort_flag_path(run_id))
+
+
+def kill_worker(run_id: str) -> bool:
+    """Kill the worker process for a run. Returns True if killed."""
+    status = read_status(run_id)
+    if not status:
+        return False
+    pid = status.get("pid")
+    if not pid:
+        return False
+    if not is_process_alive(pid):
+        return False
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        proc.terminate()
+        proc.wait(timeout=5)
+        return True
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    # Fallback: OS kill
+    try:
+        if os.name == "nt":
+            import subprocess as _sp
+            _sp.run(["taskkill", "/F", "/PID", str(pid)],
+                    capture_output=True, timeout=5)
+            return True
+        else:
+            import signal as _sig
+            os.kill(pid, _sig.SIGTERM)
+            return True
+    except Exception:
+        return False
+
+
 def is_process_alive(pid: int) -> bool:
     """Check if a process with the given PID is still running."""
     try:

@@ -26,6 +26,7 @@ os.chdir(_PROJECT_ROOT)
 
 from src.utils.run_status import (
     append_log,
+    is_run_abort_requested,
     write_final_state,
     write_status,
 )
@@ -130,6 +131,23 @@ def main(run_id: str) -> None:
         for event in app_graph.stream(initial_state, config={"recursion_limit": 250}):
             if event is None:
                 continue
+
+            # Check file-based abort signal from Streamlit UI
+            if is_run_abort_requested(run_id):
+                from src.graph.graph import request_abort
+                request_abort(f"abort_requested via UI for run {run_id}")
+                append_log(run_id, "Sistema", "Ejecucion cancelada por el usuario.", "warn")
+                write_final_state(run_id, final_state)
+                _update_status(
+                    run_id, stage=active_step, progress=current_progress,
+                    completed_steps=completed_steps, iteration=ml_iteration,
+                    max_iterations=ml_max_iterations, metric_name=best_metric_name,
+                    metric_value=current_metric_value,
+                    status="aborted", error="Cancelado por el usuario",
+                    started_at=started_at,
+                )
+                print(f"WORKER: Run {run_id} aborted by user request")
+                return
 
             for key, value in event.items():
                 if value is not None:
