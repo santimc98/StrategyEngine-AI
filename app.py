@@ -1266,6 +1266,46 @@ _STAGE_NAMES = {
     None: "Completado",
 }
 
+def _start_terminal_log_tail(run_id: str) -> None:
+    """Stream worker stdout.log to Streamlit's terminal (tail -f style).
+
+    Runs as a daemon thread — if Streamlit dies, the thread dies silently
+    but the worker process keeps running independently (stdout goes to file).
+    """
+    log_path = os.path.join("runs", run_id, "worker_stdout.log")
+
+    def _tail(tail_log_path, tail_run_id):
+        try:
+            for _ in range(30):
+                if os.path.exists(tail_log_path):
+                    break
+                time.sleep(0.5)
+            pid = 0
+            for _ in range(20):
+                status = _read_run_status(tail_run_id)
+                if isinstance(status, dict) and status.get("pid"):
+                    pid = int(status["pid"])
+                    break
+                time.sleep(0.5)
+            with open(tail_log_path, "r", encoding="utf-8", errors="replace") as f:
+                while True:
+                    line = f.readline()
+                    if line:
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
+                    else:
+                        if pid and not _is_process_alive(pid):
+                            for remaining in f:
+                                sys.stderr.write(remaining)
+                                sys.stderr.flush()
+                            break
+                        time.sleep(0.3)
+        except Exception:
+            pass
+
+    threading.Thread(target=_tail, args=(log_path, run_id), daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # Background Worker Polling UI
 # ---------------------------------------------------------------------------
@@ -1434,6 +1474,7 @@ def _run_polling_ui(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 if st.session_state.get("active_run_id") and not st.session_state.get("analysis_complete"):
     # Resume polling an active background worker (survives session reconnect)
+    _start_terminal_log_tail(st.session_state["active_run_id"])
     _run_polling_ui(st.session_state["active_run_id"])
 
 elif start_btn:
@@ -1469,6 +1510,8 @@ elif start_btn:
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         worker_stdout.close()  # child process has inherited the handle
+
+        _start_terminal_log_tail(run_id)
 
         st.session_state["active_run_id"] = run_id
         _run_polling_ui(run_id)
