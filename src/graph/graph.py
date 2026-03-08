@@ -1521,6 +1521,16 @@ def _enforce_review_packet_contract_consistency(
     if not normalized or not isinstance(contract, dict):
         return normalized
 
+    # If the reviewer explicitly approved with no failed gates, trust the
+    # explicit evaluation over heuristic text-based implied-failure detection.
+    # The heuristic can produce false positives when positive evidence text
+    # (e.g. "used without stacking") contains failure-language keywords.
+    explicit_status = _normalize_review_status(str(normalized.get("status") or ""))
+    explicit_failed = [item for item in (normalized.get("failed_gates") or []) if item]
+    explicit_hard = [item for item in (normalized.get("hard_failures") or []) if item]
+    if explicit_status in {"APPROVED", "APPROVE_WITH_WARNINGS"} and not explicit_failed and not explicit_hard:
+        return normalized
+
     implied_failures = _packet_implied_hard_gate_failures(normalized, contract)
     if not implied_failures:
         return normalized
