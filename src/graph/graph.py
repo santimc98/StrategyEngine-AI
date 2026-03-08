@@ -23548,6 +23548,11 @@ def _metric_improvement_skip_reason(state: Dict[str, Any], contract: Dict[str, A
     if _is_data_limited_mode_active(state, contract):
         return "data_limited_mode_active"
     rounds, _, _ = _metric_improvement_policy(contract)
+    # Respect dynamically adjusted rounds (e.g. from DYNAMIC_PATIENCE blueprint
+    # scaling) stored in state — same logic as _bootstrap_metric_improvement_round.
+    state_rounds = state.get("ml_improvement_rounds_allowed")
+    if isinstance(state_rounds, (int, float)) and int(state_rounds) > rounds:
+        rounds = int(state_rounds)
     if rounds <= 0:
         return "metric_rounds_disabled"
     done = int(state.get("ml_improvement_round_count", 0) or 0)
