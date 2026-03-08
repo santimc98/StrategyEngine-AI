@@ -174,3 +174,27 @@ def test_extract_primary_metric_for_board_supports_string_numeric_metrics(tmp_pa
 
     assert primary.get("value") == pytest.approx(0.9342, abs=1e-12)
     assert primary.get("source") != "contract.primary_metric_missing"
+
+
+def test_extract_primary_metric_for_board_resolves_contract_alias_to_nested_auc_key(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state = {
+        "execution_contract": {
+            "validation_requirements": {
+                "primary_metric": "ROC-AUC",
+            }
+        }
+    }
+    metrics_report = {
+        "source": "data/metrics.json",
+        "model_performance": {
+            "cv_results.overall_oof_auc": 0.9160376006743025,
+            "cv_results.std_fold_auc": 0.0009317617858213929,
+        },
+    }
+
+    primary = graph_mod._extract_primary_metric_for_board(state, metrics_report)
+
+    assert primary.get("name") == "ROC-AUC"
+    assert primary.get("value") == pytest.approx(0.9160376006743025, abs=1e-12)
+    assert primary.get("source") != "contract.primary_metric_missing"

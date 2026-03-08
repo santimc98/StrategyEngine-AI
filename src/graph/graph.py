@@ -218,7 +218,9 @@ from src.graph.steps.handoff_utils import (
     extract_preflight_gate_tail,
 )
 from src.utils.metric_eval import (
+    canonicalize_metric_name as metric_eval_canonicalize_metric_name,
     extract_primary_metric as metric_eval_extract_primary_metric,
+    resolve_metric_value as metric_eval_resolve_metric_value,
     extract_stability_signals as metric_eval_extract_stability_signals,
     stability_ok as metric_eval_stability_ok,
     select_incumbent as metric_eval_select_incumbent,
@@ -939,10 +941,198 @@ def _resolve_metric_from_entry(entry: Any, source: str) -> Dict[str, Any] | None
             higher_is_better = _coerce_optional_bool(entry.get("higher_is_better"))
         return {
             "name": metric_name,
+            "canonical_name": metric_eval_canonicalize_metric_name(metric_name),
             "higher_is_better": higher_is_better,
             "source": source + "." + key,
         }
     return None
+
+
+def _metric_canonical_name(metric_name: Any) -> str:
+    return metric_eval_canonicalize_metric_name(str(metric_name or ""))
+
+
+def _load_primary_metric_state(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    payload = state.get("primary_metric_state")
+    if isinstance(payload, dict) and payload:
+        return dict(payload)
+    loaded = _load_json_safe("data/metric_state.json")
+    if isinstance(loaded, dict) and loaded:
+        return loaded
+    snapshot = state.get("primary_metric_snapshot")
+    if isinstance(snapshot, dict) and snapshot:
+        return dict(snapshot)
+    return {}
+
+
+def _persist_primary_metric_state(
+    metric_state: Dict[str, Any] | None,
+    *,
+    existing_index: Any = None,
+) -> List[Dict[str, Any]]:
+    metric_state = metric_state if isinstance(metric_state, dict) else {}
+    if not metric_state:
+        return existing_index if isinstance(existing_index, list) else []
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/metric_state.json", metric_state)
+        normalized_existing = existing_index if isinstance(existing_index, list) else []
+        additions = _build_artifact_index(["data/metric_state.json"], None)
+        merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+        dump_json("data/produced_artifact_index.json", merged_index)
+        return merged_index
+    except Exception as metric_err:
+        print(f"Warning: failed to persist metric_state.json: {metric_err}")
+        return existing_index if isinstance(existing_index, list) else []
+
+
+def _resolve_metric_payload(
+    metrics_report: Dict[str, Any] | None,
+    metric_name: str | None,
+    *,
+    source_hint: str = "",
+) -> Dict[str, Any]:
+    metric_name = str(metric_name or "").strip()
+    payload = metrics_report if isinstance(metrics_report, dict) else {}
+    if not metric_name or not payload:
+        return {}
+    resolved = metric_eval_resolve_metric_value(payload, metric_name)
+    if not isinstance(resolved, dict) or resolved.get("value") is None:
+        return {}
+    source = str(source_hint or payload.get("source") or "metrics.resolve_metric")
+    matched_key = str(resolved.get("matched_key") or metric_name).strip()
+    return {
+        "name": metric_name,
+        "canonical_name": str(resolved.get("canonical_name") or _metric_canonical_name(metric_name)),
+        "value": float(resolved.get("value")),
+        "matched_key": matched_key,
+        "score": int(resolved.get("score", 0) or 0),
+        "source": source,
+    }
+
+
+def _build_primary_metric_state(
+    state: Dict[str, Any],
+    metrics_report: Dict[str, Any] | None,
+    weights_report: Dict[str, Any] | None,
+    objective_type: str | None,
+    evaluation_spec: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    payload = metrics_report if isinstance(metrics_report, dict) else {}
+    if isinstance(payload, dict):
+        normalized_metrics = _normalize_metrics_report_payload(payload)
+        if isinstance(normalized_metrics, dict) and normalized_metrics:
+            payload = normalized_metrics
+    weights_payload = weights_report if isinstance(weights_report, dict) else {}
+    target = _resolve_contract_metric_target(state if isinstance(state, dict) else {}, contract if isinstance(contract, dict) else {})
+    target_name = str(target.get("name") or "").strip()
+    target_canonical_name = str(target.get("canonical_name") or _metric_canonical_name(target_name))
+    resolved_primary = _resolve_metric_payload(
+        payload,
+        target_name,
+        source_hint=str(payload.get("source") or "metrics.resolve_metric") if isinstance(payload, dict) else "metrics.resolve_metric",
+    )
+
+    candidates = _collect_metric_candidates(payload if isinstance(payload, dict) else {}, weights_payload)
+    primary: Dict[str, Any] | None = None
+    if resolved_primary:
+        primary = {
+            "name": target_name or resolved_primary.get("matched_key"),
+            "canonical_name": resolved_primary.get("canonical_name") or target_canonical_name,
+            "value": resolved_primary.get("value"),
+            "matched_key": resolved_primary.get("matched_key"),
+            "source": resolved_primary.get("source"),
+            "ci_lower": None,
+            "ci_upper": None,
+        }
+        matched_key = str(resolved_primary.get("matched_key") or "")
+        matched_norm = _normalize_metric_key(matched_key)
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            cand_name = str(cand.get("name") or "")
+            if matched_key and (
+                _metric_name_matches(matched_key, cand_name)
+                or _normalize_metric_key(cand_name) == matched_norm
+            ):
+                primary["ci_lower"] = _coerce_float(cand.get("ci_lower"))
+                primary["ci_upper"] = _coerce_float(cand.get("ci_upper"))
+                break
+    elif target_name:
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            cand_name = str(cand.get("name") or "").strip()
+            cand_value = _coerce_float(cand.get("value"))
+            if not cand_name or cand_value is None:
+                continue
+            if not _metric_name_matches(target_name, cand_name):
+                continue
+            primary = {
+                "name": target_name,
+                "canonical_name": target_canonical_name or _metric_canonical_name(cand_name),
+                "value": float(cand_value),
+                "matched_key": cand_name,
+                "source": str(payload.get("source") or "metrics.normalized") if isinstance(payload, dict) else "metrics.normalized",
+                "ci_lower": _coerce_float(cand.get("ci_lower")),
+                "ci_upper": _coerce_float(cand.get("ci_upper")),
+            }
+            break
+    else:
+        heuristic_primary = _pick_primary_metric_candidate(candidates, objective_type or "unknown")
+        if isinstance(heuristic_primary, dict):
+            primary_value = _coerce_float(heuristic_primary.get("value"))
+            if primary_value is not None:
+                primary = {
+                    "name": str(heuristic_primary.get("name") or target_name or ""),
+                    "canonical_name": _metric_canonical_name(heuristic_primary.get("name") or target_name),
+                    "value": float(primary_value),
+                    "matched_key": str(heuristic_primary.get("name") or ""),
+                    "source": str(payload.get("source") or "metrics.normalized") if isinstance(payload, dict) else "metrics.normalized",
+                    "ci_lower": _coerce_float(heuristic_primary.get("ci_lower")),
+                    "ci_upper": _coerce_float(heuristic_primary.get("ci_upper")),
+                }
+
+    if not isinstance(primary, dict) or not _is_number(primary.get("value")):
+        return {}
+
+    baseline = None
+    primary_canonical = str(primary.get("canonical_name") or "")
+    for cand in candidates:
+        if not isinstance(cand, dict) or not cand.get("is_baseline"):
+            continue
+        cand_name = str(cand.get("name") or "")
+        cand_canonical = _metric_canonical_name(cand_name)
+        if primary_canonical and cand_canonical and primary_canonical == cand_canonical:
+            baseline = cand
+            break
+    if baseline is None:
+        baseline = next((cand for cand in candidates if isinstance(cand, dict) and cand.get("is_baseline")), None)
+
+    baseline_value = _coerce_float(baseline.get("value")) if isinstance(baseline, dict) else None
+    higher_is_better = target.get("higher_is_better")
+    if not isinstance(higher_is_better, bool):
+        higher_is_better = _metric_higher_is_better(str(primary.get("name") or target_name))
+
+    return {
+        "target_metric_name": target_name or primary.get("name"),
+        "target_metric_canonical_name": target_canonical_name or primary_canonical,
+        "target_metric_source": str(target.get("source") or "unavailable"),
+        "primary_metric_name": primary.get("name"),
+        "primary_metric_canonical_name": primary_canonical,
+        "primary_metric_value": float(primary.get("value")),
+        "primary_metric_source": str(primary.get("source") or "metrics.normalized"),
+        "primary_metric_path": str(primary.get("matched_key") or primary.get("name") or ""),
+        "higher_is_better": bool(higher_is_better),
+        "baseline_metric_name": baseline.get("name") if isinstance(baseline, dict) else None,
+        "baseline_value": baseline_value,
+        "lift": _calc_lift(baseline_value, primary.get("value"), bool(higher_is_better)) if baseline_value is not None else None,
+        "ci_lower": _coerce_float(primary.get("ci_lower")),
+        "ci_upper": _coerce_float(primary.get("ci_upper")),
+        "eval_signature": _build_eval_signature(objective_type, evaluation_spec, contract),
+    }
 
 
 def _resolve_contract_metric_target(state: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -960,7 +1150,7 @@ def _resolve_contract_metric_target(state: Dict[str, Any], contract: Dict[str, A
         resolved = _resolve_metric_from_entry(entry, source)
         if isinstance(resolved, dict) and resolved.get("name"):
             return resolved
-    return {"name": None, "higher_is_better": None, "source": "unavailable"}
+    return {"name": None, "canonical_name": "", "higher_is_better": None, "source": "unavailable"}
 
 
 def _resolve_contract_primary_metric_name(state: Dict[str, Any], contract: Dict[str, Any]) -> str | None:
@@ -974,12 +1164,19 @@ def _resolve_contract_primary_metric_name(state: Dict[str, Any], contract: Dict[
 def _metric_name_matches(expected: str, candidate: str) -> bool:
     expected_norm = _normalize_metric_key(expected)
     candidate_norm = _normalize_metric_key(candidate)
+    expected_canonical = _metric_canonical_name(expected)
+    candidate_canonical = _metric_canonical_name(candidate)
     if not expected_norm or not candidate_norm:
         return False
     return (
         expected_norm == candidate_norm
         or expected_norm in candidate_norm
         or candidate_norm in expected_norm
+        or (
+            bool(expected_canonical)
+            and bool(candidate_canonical)
+            and expected_canonical == candidate_canonical
+        )
     )
 
 
@@ -992,7 +1189,34 @@ def _extract_primary_metric_for_board(
         if isinstance(normalized_metrics, dict) and normalized_metrics:
             metrics_report = normalized_metrics
     contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
-    contract_metric = _resolve_contract_primary_metric_name(state, contract)
+    metric_target = _resolve_contract_metric_target(state, contract)
+    contract_metric = str(metric_target.get("name") or "").strip()
+    contract_canonical_name = str(metric_target.get("canonical_name") or _metric_canonical_name(contract_metric))
+
+    metric_state = _load_primary_metric_state(state)
+    if isinstance(metric_state, dict) and metric_state:
+        primary_name = str(metric_state.get("primary_metric_name") or "")
+        primary_canonical_name = str(
+            metric_state.get("primary_metric_canonical_name") or _metric_canonical_name(primary_name)
+        )
+        target_canonical_name = str(
+            metric_state.get("target_metric_canonical_name") or _metric_canonical_name(metric_state.get("target_metric_name"))
+        )
+        if (
+            not contract_metric
+            or _metric_name_matches(contract_metric, primary_name)
+            or (contract_canonical_name and contract_canonical_name in {primary_canonical_name, target_canonical_name})
+        ):
+            value = _coerce_float(metric_state.get("primary_metric_value"))
+            if value is not None:
+                return {
+                    "name": contract_metric or primary_name,
+                    "canonical_name": contract_canonical_name or primary_canonical_name,
+                    "value": float(value),
+                    "baseline_value": _coerce_float(metric_state.get("baseline_value")),
+                    "matched_key": str(metric_state.get("primary_metric_path") or ""),
+                    "source": str(metric_state.get("primary_metric_source") or "primary_metric_state"),
+                }
 
     snapshot = state.get("primary_metric_snapshot")
     if isinstance(snapshot, dict) and snapshot and (
@@ -1001,9 +1225,15 @@ def _extract_primary_metric_for_board(
     ):
         return {
             "name": snapshot.get("primary_metric_name") or contract_metric,
+            "canonical_name": str(
+                snapshot.get("primary_metric_canonical_name")
+                or snapshot.get("canonical_name")
+                or _metric_canonical_name(snapshot.get("primary_metric_name") or contract_metric)
+            ),
             "value": snapshot.get("primary_metric_value"),
             "baseline_value": snapshot.get("baseline_value"),
-            "source": "primary_metric_snapshot",
+            "matched_key": snapshot.get("primary_metric_path") or snapshot.get("matched_key"),
+            "source": str(snapshot.get("primary_metric_source") or snapshot.get("source") or "primary_metric_snapshot"),
         }
 
     weights_report = _load_json_safe("data/weights.json")
@@ -1012,6 +1242,20 @@ def _extract_primary_metric_for_board(
 
     candidates = _collect_metric_candidates(metrics_report if isinstance(metrics_report, dict) else {}, weights_report)
     if contract_metric:
+        resolved_primary = _resolve_metric_payload(
+            metrics_report if isinstance(metrics_report, dict) else {},
+            contract_metric,
+            source_hint=str((metrics_report or {}).get("source") or "metrics.resolve_metric"),
+        )
+        if resolved_primary:
+            return {
+                "name": contract_metric,
+                "canonical_name": str(resolved_primary.get("canonical_name") or contract_canonical_name),
+                "value": float(resolved_primary.get("value")),
+                "baseline_value": None,
+                "matched_key": str(resolved_primary.get("matched_key") or ""),
+                "source": str(resolved_primary.get("source") or "metrics.resolve_metric"),
+            }
         for cand in candidates:
             if not isinstance(cand, dict):
                 continue
@@ -1023,7 +1267,9 @@ def _extract_primary_metric_for_board(
                 continue
             return {
                 "name": cand_name or contract_metric,
+                "canonical_name": _metric_canonical_name(cand_name or contract_metric),
                 "value": float(value),
+                "matched_key": cand_name or contract_metric,
                 "source": str((metrics_report or {}).get("source") or "metrics.normalized"),
             }
         direct_value = _extract_primary_metric(
@@ -1037,11 +1283,14 @@ def _extract_primary_metric_for_board(
         if direct_value is not None:
             return {
                 "name": contract_metric,
+                "canonical_name": contract_canonical_name,
                 "value": float(direct_value),
+                "matched_key": contract_metric,
                 "source": str((metrics_report or {}).get("source") or "data/metrics.json.direct_scan"),
             }
         return {
             "name": contract_metric,
+            "canonical_name": contract_canonical_name,
             "value": None,
             "source": "contract.primary_metric_missing",
         }
@@ -8370,39 +8619,31 @@ def _extract_primary_metric_snapshot(
     evaluation_spec: Dict[str, Any] | None,
     contract: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
-    metrics_report = metrics_report or {}
-    weights_report = weights_report or {}
-    candidates = _collect_metric_candidates(metrics_report, weights_report)
-    primary = _pick_primary_metric_candidate(candidates, objective_type or "unknown")
-    if not primary:
+    primary_state = _build_primary_metric_state(
+        state={"evaluation_spec": evaluation_spec or {}, "execution_contract": contract or {}},
+        metrics_report=metrics_report if isinstance(metrics_report, dict) else {},
+        weights_report=weights_report if isinstance(weights_report, dict) else {},
+        objective_type=objective_type,
+        evaluation_spec=evaluation_spec,
+        contract=contract,
+    )
+    if not primary_state:
         return {}
-    baseline = None
-    primary_norm = _normalize_metric_key(primary.get("name", ""))
-    for cand in candidates:
-        if not cand.get("is_baseline"):
-            continue
-        cand_norm = _normalize_metric_key(cand.get("name", ""))
-        if primary_norm and primary_norm in cand_norm:
-            baseline = cand
-            break
-    if baseline is None:
-        baseline = next((cand for cand in candidates if cand.get("is_baseline")), None)
-    baseline_value = baseline.get("value") if baseline else None
-    primary_value = primary.get("value")
-    metric_name = primary.get("name")
-    higher_is_better = True
-    if metric_name:
-        higher_is_better = _metric_higher_is_better(metric_name)
-    lift = _calc_lift(baseline_value, primary_value, higher_is_better) if baseline_value is not None else None
     return {
-        "primary_metric_name": metric_name,
-        "primary_metric_value": primary_value,
-        "baseline_metric_name": baseline.get("name") if baseline else None,
-        "baseline_value": baseline_value,
-        "lift": lift,
-        "ci_lower": primary.get("ci_lower"),
-        "ci_upper": primary.get("ci_upper"),
-        "eval_signature": _build_eval_signature(objective_type, evaluation_spec, contract),
+        "primary_metric_name": primary_state.get("primary_metric_name"),
+        "primary_metric_canonical_name": primary_state.get("primary_metric_canonical_name"),
+        "primary_metric_value": primary_state.get("primary_metric_value"),
+        "primary_metric_source": primary_state.get("primary_metric_source"),
+        "primary_metric_path": primary_state.get("primary_metric_path"),
+        "baseline_metric_name": primary_state.get("baseline_metric_name"),
+        "baseline_value": primary_state.get("baseline_value"),
+        "lift": primary_state.get("lift"),
+        "ci_lower": primary_state.get("ci_lower"),
+        "ci_upper": primary_state.get("ci_upper"),
+        "higher_is_better": primary_state.get("higher_is_better"),
+        "eval_signature": primary_state.get("eval_signature") or _build_eval_signature(objective_type, evaluation_spec, contract),
+        "source": primary_state.get("primary_metric_source"),
+        "matched_key": primary_state.get("primary_metric_path"),
     }
 
 def _detect_metric_plateau(
@@ -9770,7 +10011,7 @@ def _build_iteration_handoff(
     )
     qa_feedback = _truncate_handoff_text(qa_result.get("feedback"), max_len=900)
 
-    metric_snapshot = state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {}
+    metric_snapshot = _load_primary_metric_state(state)
     metric_name = str(metric_snapshot.get("primary_metric_name") or "")
     metric_value = metric_snapshot.get("primary_metric_value")
     baseline_value = metric_snapshot.get("baseline_value")
@@ -10015,10 +10256,17 @@ def _persist_iteration_handoff_state(state: Dict[str, Any] | None) -> None:
         dump_json("data/iteration_handoff.json", handoff)
         persisted_paths = ["data/iteration_handoff.json"]
 
+        metric_state = _load_primary_metric_state(state)
+        if isinstance(metric_state, dict) and metric_state:
+            dump_json("data/metric_state.json", metric_state)
+            persisted_paths.append("data/metric_state.json")
+
         review_stack = state.get("ml_review_stack")
         if isinstance(review_stack, dict) and review_stack:
             updated_stack = copy.deepcopy(review_stack)
             updated_stack["iteration_handoff"] = copy.deepcopy(handoff)
+            if metric_state:
+                updated_stack["metric_state"] = copy.deepcopy(metric_state)
             metric_context = (
                 dict(updated_stack.get("metric_improvement_context"))
                 if isinstance(updated_stack.get("metric_improvement_context"), dict)
@@ -10946,6 +11194,9 @@ class AgentState(TypedDict):
     ml_journal_written_ids: List[str]
     metrics_signature: str
     weights_signature: str
+    primary_metric_state: Dict[str, Any]
+    primary_metric_snapshot: Dict[str, Any]
+    metric_history: List[Dict[str, Any]]
     execution_output_stale: bool
     sandbox_failed: bool
     e2b_memory_failure_detected: bool
@@ -11629,6 +11880,9 @@ def run_steward(state: AgentState) -> AgentState:
         "attempt_ledger": [],
         "phase_cycle_counts": {"compliance": 0, "metric": 0, "runtime": 0, "other": 0},
         "ml_journal_written_ids": [],
+        "primary_metric_state": {},
+        "primary_metric_snapshot": {},
+        "metric_history": [],
         "feedback_history": [],
         "has_partial_visuals": False,
         "plots_local": [],
@@ -21212,6 +21466,31 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         evaluation_spec=evaluation_spec if isinstance(evaluation_spec, dict) else None,
         contract=contract if isinstance(contract, dict) else None,
     )
+    primary_metric_state = _build_primary_metric_state(
+        state=state if isinstance(state, dict) else {},
+        metrics_report=metrics_report if isinstance(metrics_report, dict) else {},
+        weights_report=weights_report if isinstance(weights_report, dict) else {},
+        objective_type=objective_type,
+        evaluation_spec=evaluation_spec if isinstance(evaluation_spec, dict) else None,
+        contract=contract if isinstance(contract, dict) else None,
+    )
+    if primary_metric_state and not primary_metric_snapshot:
+        primary_metric_snapshot = {
+            "primary_metric_name": primary_metric_state.get("primary_metric_name"),
+            "primary_metric_canonical_name": primary_metric_state.get("primary_metric_canonical_name"),
+            "primary_metric_value": primary_metric_state.get("primary_metric_value"),
+            "primary_metric_source": primary_metric_state.get("primary_metric_source"),
+            "primary_metric_path": primary_metric_state.get("primary_metric_path"),
+            "baseline_metric_name": primary_metric_state.get("baseline_metric_name"),
+            "baseline_value": primary_metric_state.get("baseline_value"),
+            "lift": primary_metric_state.get("lift"),
+            "ci_lower": primary_metric_state.get("ci_lower"),
+            "ci_upper": primary_metric_state.get("ci_upper"),
+            "higher_is_better": primary_metric_state.get("higher_is_better"),
+            "eval_signature": primary_metric_state.get("eval_signature"),
+            "source": primary_metric_state.get("primary_metric_source"),
+            "matched_key": primary_metric_state.get("primary_metric_path"),
+        }
     metric_history = list(state.get("metric_history", []) or [])
     if primary_metric_snapshot:
         primary_metric_snapshot = dict(primary_metric_snapshot)
@@ -21876,6 +22155,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "data_adequacy_threshold": adequacy_threshold,
         "data_adequacy_status": adequacy_status,
         "data_adequacy_report": data_adequacy_report,
+        "primary_metric_state": primary_metric_state,
         "primary_metric_snapshot": primary_metric_snapshot,
         "metric_history": metric_history,
         "hard_qa_gate_reject": hard_qa_gate_reject,
@@ -21937,6 +22217,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "review_verdict": normalized_review_status,
             "metrics": metrics_report,
             "metric_history": metric_history,
+            "primary_metric_state": primary_metric_state,
             "primary_metric_snapshot": primary_metric_snapshot,
             "evaluation_spec": evaluation_spec if isinstance(evaluation_spec, dict) else None,
             "execution_contract": contract if isinstance(contract, dict) else None,
@@ -22066,6 +22347,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "reviewer": reviewer_packet,
         "qa_reviewer": qa_packet,
         "results_advisor": results_packet,
+        "metric_state": primary_metric_state if isinstance(primary_metric_state, dict) else {},
         "metric_improvement_context": {
             "active": bool(metric_improvement_round_active),
             "review_mode": metric_round_review_mode if metric_improvement_round_active else None,
@@ -22083,11 +22365,16 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     }
     try:
         os.makedirs("data", exist_ok=True)
+        if isinstance(primary_metric_state, dict) and primary_metric_state:
+            dump_json("data/metric_state.json", primary_metric_state)
         dump_json("data/ml_review_stack.json", review_stack)
         dump_json("data/iteration_handoff.json", iteration_handoff)
         existing_index = _load_json_any("data/produced_artifact_index.json")
         normalized_existing = existing_index if isinstance(existing_index, list) else []
-        additions = _build_artifact_index(["data/ml_review_stack.json", "data/iteration_handoff.json"], None)
+        persisted_metric_paths = ["data/ml_review_stack.json", "data/iteration_handoff.json"]
+        if isinstance(primary_metric_state, dict) and primary_metric_state:
+            persisted_metric_paths.insert(0, "data/metric_state.json")
+        additions = _build_artifact_index(persisted_metric_paths, None)
         merged_index = _merge_artifact_index_entries(normalized_existing, additions)
         dump_json("data/produced_artifact_index.json", merged_index)
         result_state["artifact_index"] = merged_index
@@ -24851,17 +25138,24 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
 
     baseline_value = _extract_primary_metric(baseline_metrics, metric_name)
     if baseline_value is None:
-        snapshot = state.get("primary_metric_snapshot")
-        if isinstance(snapshot, dict):
-            baseline_value = _coerce_float(snapshot.get("primary_metric_value"))
-            snap_name = snapshot.get("primary_metric_name")
+        metric_state = _load_primary_metric_state(state)
+        if isinstance(metric_state, dict):
+            baseline_value = _coerce_float(metric_state.get("primary_metric_value"))
+            snap_name = metric_state.get("primary_metric_name")
             if isinstance(snap_name, str) and snap_name.strip():
                 metric_name = snap_name.strip()
-                metric_higher_is_better = bool(_metric_higher_is_better(metric_name))
+                metric_higher_is_better = bool(
+                    metric_state.get("higher_is_better")
+                    if isinstance(metric_state.get("higher_is_better"), bool)
+                    else _metric_higher_is_better(metric_name)
+                )
                 metric_target = {
                     "name": metric_name,
+                    "canonical_name": str(
+                        metric_state.get("primary_metric_canonical_name") or _metric_canonical_name(metric_name)
+                    ),
                     "higher_is_better": metric_higher_is_better,
-                    "source": "primary_metric_snapshot",
+                    "source": str(metric_state.get("primary_metric_source") or "primary_metric_state"),
                 }
     if baseline_value is None:
         if run_id:
@@ -25589,9 +25883,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         current_metrics = {}
     improved_value = _extract_primary_metric(current_metrics, metric_name)
     if improved_value is None:
-        snapshot = state.get("primary_metric_snapshot")
-        if isinstance(snapshot, dict):
-            improved_value = _coerce_float(snapshot.get("primary_metric_value"))
+        metric_state = _load_primary_metric_state(state)
+        if isinstance(metric_state, dict):
+            improved_value = _coerce_float(metric_state.get("primary_metric_value"))
 
     active_gates_context = _collect_active_gate_names(contract if isinstance(contract, dict) else {})
     baseline_metrics_payload = (
@@ -25792,6 +26086,47 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     final_metric_value = _extract_primary_metric(final_metrics_payload, metric_name)
     if final_metric_value is None:
         final_metric_value = improved_value if improved else baseline_value
+    evaluation_spec_state = state.get("evaluation_spec") if isinstance(state.get("evaluation_spec"), dict) else {}
+    if not evaluation_spec_state and isinstance(contract, dict):
+        evaluation_spec_state = contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {}
+    objective_type_state = (
+        evaluation_spec_state.get("objective_type")
+        if isinstance(evaluation_spec_state, dict)
+        else None
+    ) or (state.get("selected_strategy") or {}).get("analysis_type")
+    final_primary_metric_state = _build_primary_metric_state(
+        state=state if isinstance(state, dict) else {},
+        metrics_report=final_metrics_payload,
+        weights_report=_load_json_safe("data/weights.json") or {},
+        objective_type=objective_type_state,
+        evaluation_spec=evaluation_spec_state if isinstance(evaluation_spec_state, dict) else None,
+        contract=contract if isinstance(contract, dict) else None,
+    )
+    if isinstance(final_primary_metric_state, dict) and final_primary_metric_state:
+        state["primary_metric_state"] = final_primary_metric_state
+        state["primary_metric_snapshot"] = {
+            "primary_metric_name": final_primary_metric_state.get("primary_metric_name"),
+            "primary_metric_canonical_name": final_primary_metric_state.get("primary_metric_canonical_name"),
+            "primary_metric_value": final_primary_metric_state.get("primary_metric_value"),
+            "primary_metric_source": final_primary_metric_state.get("primary_metric_source"),
+            "primary_metric_path": final_primary_metric_state.get("primary_metric_path"),
+            "baseline_metric_name": final_primary_metric_state.get("baseline_metric_name"),
+            "baseline_value": final_primary_metric_state.get("baseline_value"),
+            "lift": final_primary_metric_state.get("lift"),
+            "ci_lower": final_primary_metric_state.get("ci_lower"),
+            "ci_upper": final_primary_metric_state.get("ci_upper"),
+            "higher_is_better": final_primary_metric_state.get("higher_is_better"),
+            "eval_signature": final_primary_metric_state.get("eval_signature"),
+            "source": final_primary_metric_state.get("primary_metric_source"),
+            "matched_key": final_primary_metric_state.get("primary_metric_path"),
+        }
+        merged_index = _persist_primary_metric_state(
+            final_primary_metric_state,
+            existing_index=state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else state.get("produced_artifact_index"),
+        )
+        if isinstance(merged_index, list) and merged_index:
+            state["artifact_index"] = merged_index
+            state["produced_artifact_index"] = merged_index
     _sync_review_board_verdict_after_metric_round(
         state,
         metric_name=metric_name,
@@ -26254,7 +26589,7 @@ def run_metric_improvement_finalize(state: AgentState) -> AgentState:
 
 
 def _log_metric_round_retry_decision(state: AgentState, reason: str) -> None:
-    snapshot = state.get("primary_metric_snapshot") if isinstance(state.get("primary_metric_snapshot"), dict) else {}
+    snapshot = _load_primary_metric_state(state if isinstance(state, dict) else {})
     metric_name = snapshot.get("primary_metric_name", "unknown")
     metric_value = snapshot.get("primary_metric_value", "N/A")
     best_value = snapshot.get("baseline_value", "N/A")
@@ -26409,7 +26744,7 @@ def check_finalize_metric_improvement_route(state: AgentState) -> str:
 def check_evaluation(state: AgentState):
     # Helper to get metric info for logging
     def _get_metric_info():
-        snapshot = state.get("primary_metric_snapshot") or {}
+        snapshot = _load_primary_metric_state(state if isinstance(state, dict) else {})
         metric_name = snapshot.get("primary_metric_name", "unknown")
         metric_value = snapshot.get("primary_metric_value", "N/A")
         best_value = snapshot.get("baseline_value", "N/A")

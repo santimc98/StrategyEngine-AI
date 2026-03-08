@@ -4,6 +4,9 @@ from src.graph.graph import AgentState
 def test_agent_state_declares_metric_improvement_persistence_keys() -> None:
     annotations = getattr(AgentState, "__annotations__", {})
     required_keys = [
+        "primary_metric_state",
+        "primary_metric_snapshot",
+        "metric_history",
         "ml_improvement_round_active",
         "ml_improvement_continue",
         "ml_improvement_loop_complete",

@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from src.graph.graph import (
     _build_hybrid_bundle_signature,
     _metric_round_has_deterministic_blockers,
@@ -76,6 +78,91 @@ def test_should_run_metric_improvement_round_ignores_nonblocking_needs_improveme
     }
 
     assert _should_run_metric_improvement_round(state, {}) is True
+
+
+def test_bootstrap_metric_improvement_round_supports_nested_metric_aliases(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("data/metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "cv_results": {
+                    "overall_oof_auc": 0.9160376006743025,
+                    "std_fold_auc": 0.0009317617858213929,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod, "log_run_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_critique_packet",
+        lambda _ctx: {
+            "metric_comparison": {
+                "baseline_value": 0.9160376006743025,
+                "candidate_value": 0.9160376006743025,
+                "meets_min_delta": False,
+            },
+            "validation_signals": {"validation_mode": "cv"},
+            "error_modes": [],
+            "analysis_summary": "Baseline available for improvement loop bootstrap.",
+        },
+    )
+    monkeypatch.setattr(
+        graph_mod.strategist,
+        "generate_iteration_hypothesis",
+        lambda _ctx: {
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "feature_interactions",
+                "objective": "Test one bounded improvement.",
+                "target_columns": ["ALL_NUMERIC"],
+                "feature_scope": "model_features",
+                "params": {},
+                "expected_effect": {"target_error_modes": ["metric_stagnation"], "direction": "positive"},
+            },
+            "tracker_context": {"signature": "hyp_nested_auc_alias", "is_duplicate": False, "duplicate_of": None},
+            "success_criteria": {"primary_metric_name": "ROC-AUC", "min_delta": 0.0005, "must_pass_active_gates": True},
+        },
+    )
+    monkeypatch.setattr(graph_mod.results_advisor, "last_critique_meta", {"mode": "deterministic", "source": "deterministic", "provider": "none", "model": None})
+    monkeypatch.setattr(graph_mod.strategist, "last_iteration_meta", {"mode": "deterministic", "source": "deterministic", "model": None})
+
+    contract = {
+        "validation_requirements": {"primary_metric": "ROC-AUC"},
+        "iteration_policy": {"metric_improvement_rounds": 1, "metric_min_delta": 0.0005},
+        "feature_engineering_plan": {"techniques": [{"technique": "feature_interactions"}], "derived_columns": [], "notes": ""},
+        "artifact_requirements": {"required_files": [{"path": "data/metrics.json"}]},
+        "required_outputs": ["data/metrics.json"],
+        "column_roles": {},
+    }
+    state = {
+        "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_attempted": False,
+        "iteration_count": 0,
+        "generated_code": "def train():\n    return None\n",
+        "data_summary": "Summary ready",
+        "steward_context_ready": True,
+        "steward_context_quality": {"ready": True, "reasons": [], "warnings": []},
+        "feedback_history": [],
+    }
+
+    activated = graph_mod._bootstrap_metric_improvement_round(state, contract)
+
+    assert activated is True
+    assert state.get("ml_improvement_round_active") is True
+    assert state.get("ml_improvement_primary_metric_name") == "ROC-AUC"
+    assert state.get("ml_improvement_round_baseline_metric") == pytest.approx(0.9160376006743025, abs=1e-12)
+    handoff = state.get("iteration_handoff", {})
+    assert handoff.get("optimization_focus", {}).get("primary_metric_name") == "ROC-AUC"
 
 
 def test_is_improvement_respects_min_delta_threshold() -> None:
