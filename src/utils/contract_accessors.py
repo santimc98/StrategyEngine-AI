@@ -520,7 +520,44 @@ _GATE_PARAM_KEYS = (
     "direction",
     "condition",
 )
-_GATE_EXTRA_KEYS = ("condition", "evidence_required", "action_if_fail")
+_GATE_PHASE_KEYS = (
+    "applies_to",
+    "phase_scope",
+    "active_in_phases",
+    "phases",
+    "review_phases",
+    "stage_scope",
+)
+_GATE_EXTRA_KEYS = ("condition", "evidence_required", "action_if_fail") + _GATE_PHASE_KEYS
+_BASELINE_ONLY_REVIEWER_GATES = {
+    "baseline_simplicity_enforcement",
+    "model_selection_priority",
+    "baseline_dummy_presence",
+    "canonical_baseline_enforcement",
+    "single_model_baseline",
+}
+_BASELINE_ONLY_QA_GATES = {
+    "baseline_feature_set_enforcement",
+}
+_ALWAYS_ON_PHASE_TOKENS = {"always", "always_on", "all", "*", "global", "any"}
+_BASELINE_PHASE_TOKENS = {
+    "baseline",
+    "baseline_only",
+    "bootstrap",
+    "initial",
+    "initial_baseline",
+    "canonical_baseline",
+    "compliance",
+}
+_METRIC_PHASE_TOKENS = {
+    "metric",
+    "metric_round",
+    "metric_improvement",
+    "optimization",
+    "optimize",
+    "candidate_review",
+    "improvement",
+}
 
 
 def _extract_gate_name(gate: Dict[str, Any]) -> str:
@@ -587,6 +624,86 @@ def _normalize_gate_list(raw_gates: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _normalize_gate_phase(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    if not token:
+        return ""
+    token = token.replace("-", "_").replace(" ", "_")
+    if token in _ALWAYS_ON_PHASE_TOKENS:
+        return "always_on"
+    if token in _BASELINE_PHASE_TOKENS:
+        return "baseline_only"
+    if token in _METRIC_PHASE_TOKENS:
+        return "metric_round"
+    return ""
+
+
+def _coerce_gate_phase_values(value: Any) -> List[str]:
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, (tuple, set)):
+        items = list(value)
+    elif isinstance(value, str):
+        items = [part.strip() for part in value.split(",")]
+    else:
+        items = [value]
+    phases: List[str] = []
+    for item in items:
+        normalized = _normalize_gate_phase(item)
+        if normalized and normalized not in phases:
+            phases.append(normalized)
+    return phases
+
+
+def _extract_gate_phase_scope(gate: Dict[str, Any], actor: str = "") -> List[str]:
+    if not isinstance(gate, dict):
+        return []
+
+    for key in _GATE_PHASE_KEYS:
+        phases = _coerce_gate_phase_values(gate.get(key))
+        if phases:
+            if "always_on" in phases:
+                return ["always_on"]
+            return phases
+
+    actor_key = str(actor or "").strip().lower()
+    name = str(gate.get("name") or "").strip().lower()
+    params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+
+    baseline_only_names = (
+        _BASELINE_ONLY_REVIEWER_GATES if actor_key == "reviewer" else _BASELINE_ONLY_QA_GATES
+    )
+    if name in baseline_only_names:
+        return ["baseline_only"]
+    if name.startswith("baseline_") or name.startswith("canonical_baseline_"):
+        return ["baseline_only"]
+    if name.endswith("_baseline") or name.endswith("_simplicity_enforcement"):
+        return ["baseline_only"]
+    if actor_key == "reviewer" and name == "model_selection_priority":
+        preferred = [
+            str(params.get("primary") or "").strip(),
+            str(params.get("secondary") or "").strip(),
+            str(params.get("fallback") or "").strip(),
+        ]
+        if any(preferred):
+            return ["baseline_only"]
+    return ["always_on"]
+
+
+def filter_gate_list_for_phase(raw_gates: Any, phase: Any, *, actor: str = "") -> List[Dict[str, Any]]:
+    gates = _normalize_gate_list(raw_gates)
+    normalized_phase = _normalize_gate_phase(phase)
+    if normalized_phase != "metric_round":
+        return gates
+
+    filtered: List[Dict[str, Any]] = []
+    for gate in gates:
+        scope = _extract_gate_phase_scope(gate, actor=actor)
+        if "always_on" in scope or "metric_round" in scope:
+            filtered.append(gate)
+    return filtered
+
+
 def get_qa_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Return the list of QA gate specifications.
@@ -597,6 +714,12 @@ def get_qa_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(contract, dict):
         return []
     return _normalize_gate_list(contract.get("qa_gates"))
+
+
+def get_qa_gates_for_phase(contract: Dict[str, Any], phase: Any) -> List[Dict[str, Any]]:
+    if not isinstance(contract, dict):
+        return []
+    return filter_gate_list_for_phase(contract.get("qa_gates"), phase, actor="qa")
 
 
 def get_cleaning_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -621,6 +744,12 @@ def get_reviewer_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(contract, dict):
         return []
     return _normalize_gate_list(contract.get("reviewer_gates"))
+
+
+def get_reviewer_gates_for_phase(contract: Dict[str, Any], phase: Any) -> List[Dict[str, Any]]:
+    if not isinstance(contract, dict):
+        return []
+    return filter_gate_list_for_phase(contract.get("reviewer_gates"), phase, actor="reviewer")
 
 
 def get_data_engineer_runbook(contract: Dict[str, Any]) -> Dict[str, Any]:

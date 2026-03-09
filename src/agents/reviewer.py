@@ -54,6 +54,36 @@ def _normalize_reviewer_gate_name(item: Any) -> str:
     return str(item).strip()
 
 
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        return token in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _extract_metric_round_context(
+    evaluation_spec: Dict[str, Any] | None,
+    reviewer_view: Dict[str, Any] | None,
+) -> bool:
+    for block in (evaluation_spec, reviewer_view):
+        if not isinstance(block, dict):
+            continue
+        for key in ("metric_improvement_round_active", "ml_improvement_round_active"):
+            if _coerce_bool(block.get(key)):
+                return True
+        handoff = block.get("iteration_handoff")
+        if isinstance(handoff, dict):
+            source = str(handoff.get("source") or "").strip().lower()
+            mode = str(handoff.get("mode") or "").strip().lower()
+            if "metric_improvement" in source or mode == "optimize":
+                return True
+    return False
+
+
 _REVIEWER_INVARIANT_GATES: List[str] = [
     "reviewer_syntax_validity",
     "runtime_failure",
@@ -679,6 +709,7 @@ class ReviewerAgent:
         strategy_summary = reviewer_view.get("strategy_summary") or strategy_context
         objective_type = reviewer_view.get("objective_type") or analysis_type
         expected_metrics = reviewer_view.get("expected_metrics") or []
+        metric_round_active = _extract_metric_round_context(evaluation_spec, reviewer_view)
         deterministic_prechecks_json = json.dumps(deterministic_prechecks, indent=2)
 
         SYSTEM_PROMPT_TEMPLATE = """
@@ -696,6 +727,7 @@ class ReviewerAgent:
         - ACTIVE_REVIEWER_GATES (names only): $active_reviewer_gates_json
         - Allowed Columns (if provided): $allowed_columns_json
         - Expected Metrics (if provided): $expected_metrics_json
+        - Metric Improvement Round Active: $metric_round_active
         - Execution Diagnostics (JSON): $execution_diagnostics_json
         - Deterministic Prechecks (JSON): $deterministic_prechecks_json
         
@@ -705,7 +737,8 @@ class ReviewerAgent:
            - No malicious code, no external network calls (except sanctioned APIs), no file system deletions outside `data/`.
            
         2. **METHODOLOGY VERIFICATION (Results-Based, Not Syntax-Based):**
-           - **Baseline Check:** Does the code establish a baseline? (e.g., Dummy Classifier)? PREFERRED but not required.
+           - **Baseline Check:** If Metric Improvement Round Active=false, a simple baseline is preferred but not required.
+             If Metric Improvement Round Active=true, baseline-establishment and baseline-simplicity preferences are out of scope unless explicitly listed in ACTIVE_REVIEWER_GATES.
            - **Validation Rigor:**
              * WARN (not REJECT) if a predictive model uses a single `train_test_split` on a small dataset.
              * Cross-Validation is PREFERRED but holdout is ACCEPTABLE if metrics.json shows reasonable results.
@@ -739,6 +772,7 @@ class ReviewerAgent:
         - failed_gates/hard_failures MUST be an exact subset of ACTIVE_REVIEWER_GATES.
         - Never invent reviewer gates; non-active findings are warning-only feedback.
         - If Reviewer Gates is empty, fall back to the general criteria but prefer APPROVE_WITH_WARNINGS when uncertain.
+        - If Metric Improvement Round Active=true, do NOT emit warnings about canonical baseline simplicity, single-model baseline establishment, or preferred baseline model family unless those constraints are present in ACTIVE_REVIEWER_GATES.
 
         ### EVIDENCE REQUIREMENT
         - Any REJECT or warning must cite evidence from the provided artifacts or code.
@@ -763,6 +797,7 @@ class ReviewerAgent:
             active_reviewer_gates_json=json.dumps(active_reviewer_gates, indent=2),
             allowed_columns_json=json.dumps(allowed_columns, indent=2),
             expected_metrics_json=json.dumps(expected_metrics, indent=2),
+            metric_round_active=str(bool(metric_round_active)).lower(),
             execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2),
             deterministic_prechecks_json=deterministic_prechecks_json,
             output_format_instructions=output_format_instructions,

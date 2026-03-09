@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from src.graph.graph import (
+    _build_metric_round_contract_lock,
     _build_hybrid_bundle_signature,
     _metric_round_has_deterministic_blockers,
     _promote_best_attempt,
@@ -163,6 +164,111 @@ def test_bootstrap_metric_improvement_round_supports_nested_metric_aliases(tmp_p
     assert state.get("ml_improvement_round_baseline_metric") == pytest.approx(0.9160376006743025, abs=1e-12)
     handoff = state.get("iteration_handoff", {})
     assert handoff.get("optimization_focus", {}).get("primary_metric_name") == "ROC-AUC"
+
+
+def test_metric_round_contract_lock_filters_baseline_only_reviewer_gates() -> None:
+    contract = {
+        "validation_requirements": {"primary_metric": "roc_auc"},
+        "allowed_feature_sets": {"forbidden_features": ["target"], "model_features": ["f1", "f2"]},
+        "qa_gates": [
+            {"name": "leakage_prevention_feature_exclusion", "severity": "HARD"},
+            {"name": "probability_output_validation", "severity": "HARD"},
+        ],
+        "reviewer_gates": [
+            {"name": "baseline_simplicity_enforcement", "severity": "HARD", "params": {"forbidden_techniques": ["stacking"]}},
+            {"name": "model_selection_priority", "severity": "SOFT", "params": {"primary": "CatBoostClassifier"}},
+            {"name": "submission_schema_compliance", "severity": "HARD"},
+        ],
+    }
+
+    lock = _build_metric_round_contract_lock(contract, ["data/metrics.json"], "roc_auc")
+
+    assert lock["qa_gates"] == [
+        "leakage_prevention_feature_exclusion",
+        "probability_output_validation",
+    ]
+    assert lock["reviewer_gates"] == ["submission_schema_compliance"]
+
+
+def test_bootstrap_metric_round_active_gates_context_excludes_baseline_only_gates(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("data/metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps({"roc_auc": 0.916}), encoding="utf-8")
+
+    captured = {}
+
+    def _capture_critique(ctx):
+        captured.update(ctx if isinstance(ctx, dict) else {})
+        return {
+            "metric_comparison": {
+                "baseline_value": 0.916,
+                "candidate_value": 0.916,
+                "meets_min_delta": False,
+            },
+            "validation_signals": {"validation_mode": "cv"},
+            "error_modes": [],
+            "analysis_summary": "Baseline available for improvement loop bootstrap.",
+        }
+
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod, "log_run_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod.results_advisor, "generate_critique_packet", _capture_critique)
+    monkeypatch.setattr(graph_mod.results_advisor, "last_critique_meta", {"mode": "deterministic", "source": "deterministic", "provider": "none", "model": None})
+    monkeypatch.setattr(
+        graph_mod.strategist,
+        "generate_iteration_hypothesis",
+        lambda _ctx: {
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "feature_interactions",
+                "objective": "Test one bounded improvement.",
+                "target_columns": ["ALL_NUMERIC"],
+                "feature_scope": "model_features",
+                "params": {},
+                "expected_effect": {"target_error_modes": ["metric_stagnation"], "direction": "positive"},
+            },
+            "tracker_context": {"signature": "hyp_filtered_active_gates", "is_duplicate": False, "duplicate_of": None},
+            "success_criteria": {"primary_metric_name": "roc_auc", "min_delta": 0.0005, "must_pass_active_gates": True},
+        },
+    )
+    monkeypatch.setattr(graph_mod.strategist, "last_iteration_meta", {"mode": "deterministic", "source": "deterministic", "model": None})
+
+    contract = {
+        "validation_requirements": {"primary_metric": "roc_auc"},
+        "iteration_policy": {"metric_improvement_rounds": 1, "metric_min_delta": 0.0005},
+        "feature_engineering_plan": {"techniques": [{"technique": "feature_interactions"}], "derived_columns": [], "notes": ""},
+        "artifact_requirements": {"required_files": [{"path": "data/metrics.json"}]},
+        "required_outputs": ["data/metrics.json"],
+        "column_roles": {},
+        "qa_gates": [{"name": "leakage_prevention_feature_exclusion", "severity": "HARD"}],
+        "reviewer_gates": [
+            {"name": "baseline_simplicity_enforcement", "severity": "HARD", "params": {"forbidden_techniques": ["stacking"]}},
+            {"name": "submission_schema_compliance", "severity": "HARD"},
+        ],
+    }
+    state = {
+        "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_attempted": False,
+        "iteration_count": 0,
+        "generated_code": "def train():\n    return None\n",
+        "data_summary": "Summary ready",
+        "steward_context_ready": True,
+        "steward_context_quality": {"ready": True, "reasons": [], "warnings": []},
+        "feedback_history": [],
+    }
+
+    activated = graph_mod._bootstrap_metric_improvement_round(state, contract)
+
+    assert activated is True
+    assert captured.get("active_gates_context") == [
+        "leakage_prevention_feature_exclusion",
+        "submission_schema_compliance",
+    ]
 
 
 def test_is_improvement_respects_min_delta_threshold() -> None:

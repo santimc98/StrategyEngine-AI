@@ -97,8 +97,11 @@ from src.utils.contract_accessors import (
     get_column_roles,
     get_validation_requirements,
     get_qa_gates,
+    get_qa_gates_for_phase,
     get_reviewer_gates,
+    get_reviewer_gates_for_phase,
     get_decision_columns,
+    filter_gate_list_for_phase,
 )
 from src.utils.contract_validator import (
     normalize_contract_scope,
@@ -1770,17 +1773,13 @@ def _enforce_review_packet_contract_consistency(
     if not normalized or not isinstance(contract, dict):
         return normalized
 
-    # If the reviewer explicitly approved with no failed gates, trust the
-    # explicit evaluation over heuristic text-based implied-failure detection.
-    # The heuristic can produce false positives when positive evidence text
-    # (e.g. "used without stacking") contains failure-language keywords.
     explicit_status = _normalize_review_status(str(normalized.get("status") or ""))
     explicit_failed = [item for item in (normalized.get("failed_gates") or []) if item]
     explicit_hard = [item for item in (normalized.get("hard_failures") or []) if item]
-    if explicit_status in {"APPROVED", "APPROVE_WITH_WARNINGS"} and not explicit_failed and not explicit_hard:
-        return normalized
 
     implied_failures = _packet_implied_hard_gate_failures(normalized, contract)
+    if explicit_status in {"APPROVED", "APPROVE_WITH_WARNINGS"} and not explicit_failed and not explicit_hard and not implied_failures:
+        return normalized
     if not implied_failures:
         return normalized
 
@@ -5430,6 +5429,76 @@ def _merge_qa_gate_specs(*gate_lists: Any) -> List[Dict[str, Any]]:
             seen.add(key)
             merged.append(gate)
     return merged
+
+
+def _normalize_review_gate_phase(raw: Any) -> str:
+    token = str(raw or "").strip().lower()
+    if not token:
+        return "baseline"
+    token = token.replace("-", "_").replace(" ", "_")
+    if token in {
+        "metric",
+        "metric_round",
+        "metric_improvement",
+        "optimization",
+        "optimize",
+        "candidate_review",
+        "improvement",
+    }:
+        return "metric_round"
+    return "baseline"
+
+
+def _build_phase_scoped_contract(contract: Dict[str, Any] | None, phase: Any) -> Dict[str, Any]:
+    contract = contract if isinstance(contract, dict) else {}
+    normalized_phase = _normalize_review_gate_phase(phase)
+    if normalized_phase != "metric_round":
+        return contract
+
+    scoped = copy.deepcopy(contract)
+    scoped["qa_gates"] = get_qa_gates_for_phase(contract, normalized_phase)
+    scoped["reviewer_gates"] = get_reviewer_gates_for_phase(contract, normalized_phase)
+    evaluation_spec = scoped.get("evaluation_spec")
+    if isinstance(evaluation_spec, dict):
+        scoped_eval = copy.deepcopy(evaluation_spec)
+        if "qa_gates" in scoped_eval:
+            scoped_eval["qa_gates"] = filter_gate_list_for_phase(
+                scoped_eval.get("qa_gates"),
+                normalized_phase,
+                actor="qa",
+            )
+        if "gates" in scoped_eval:
+            scoped_eval["gates"] = filter_gate_list_for_phase(
+                scoped_eval.get("gates"),
+                normalized_phase,
+                actor="qa",
+            )
+        if "reviewer_gates" in scoped_eval:
+            scoped_eval["reviewer_gates"] = filter_gate_list_for_phase(
+                scoped_eval.get("reviewer_gates"),
+                normalized_phase,
+                actor="reviewer",
+            )
+        scoped["evaluation_spec"] = scoped_eval
+    return scoped
+
+
+def _build_phase_scoped_evaluation_spec(evaluation_spec: Dict[str, Any] | None, phase: Any) -> Dict[str, Any]:
+    scoped = copy.deepcopy(evaluation_spec) if isinstance(evaluation_spec, dict) else {}
+    normalized_phase = _normalize_review_gate_phase(phase)
+    if normalized_phase != "metric_round" or not scoped:
+        return scoped
+    if "qa_gates" in scoped:
+        scoped["qa_gates"] = filter_gate_list_for_phase(scoped.get("qa_gates"), normalized_phase, actor="qa")
+    if "gates" in scoped:
+        scoped["gates"] = filter_gate_list_for_phase(scoped.get("gates"), normalized_phase, actor="qa")
+    if "reviewer_gates" in scoped:
+        scoped["reviewer_gates"] = filter_gate_list_for_phase(
+            scoped.get("reviewer_gates"),
+            normalized_phase,
+            actor="reviewer",
+        )
+    return scoped
 
 def _evaluate_column_presence_gates(
     qa_gates: List[Dict[str, Any]],
@@ -10108,7 +10177,11 @@ def _build_iteration_handoff(
     hypothesis_technique = str(_extract_hypothesis_technique(hypothesis_packet) or "").strip()
 
     # Block hypotheses that use techniques explicitly forbidden by HARD contract gates.
-    _forbidden_set = _collect_forbidden_techniques(contract)
+    forbidden_contract = _build_phase_scoped_contract(
+        contract if isinstance(contract, dict) else {},
+        "metric_round" if bool(state.get("ml_improvement_round_active")) else "baseline",
+    )
+    _forbidden_set = _collect_forbidden_techniques(forbidden_contract)
     _forbidden_match = _technique_matches_forbidden(hypothesis_technique, _forbidden_set)
     if _forbidden_match and hypothesis_action == "APPLY":
         print(
@@ -20992,6 +21065,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         log_run_event(run_id, "result_evaluator_start", {})
     contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     metric_improvement_round_active = bool(state.get("ml_improvement_round_active"))
+    review_phase = _normalize_review_gate_phase("metric_round" if metric_improvement_round_active else "baseline")
+    review_contract = _build_phase_scoped_contract(contract if isinstance(contract, dict) else {}, review_phase)
     metric_round_review_mode = _resolve_metric_round_review_mode(contract if isinstance(contract, dict) else {})
     metric_round_review_guarded = metric_improvement_round_active and metric_round_review_mode in {
         "hybrid_guarded",
@@ -21103,10 +21178,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     governance_context = {}
     if decisioning_warning:
         governance_context["decisioning_warning"] = decisioning_warning
-    evaluation_spec_for_review = dict(evaluation_spec or {})
+    evaluation_spec_for_review = _build_phase_scoped_evaluation_spec(evaluation_spec, review_phase)
     if governance_context:
         evaluation_spec_for_review = dict(evaluation_spec_for_review)
         evaluation_spec_for_review["governance_context"] = governance_context
+    evaluation_spec_for_review["metric_improvement_round_active"] = bool(metric_improvement_round_active)
+    iteration_handoff_ctx = state.get("iteration_handoff")
+    if isinstance(iteration_handoff_ctx, dict) and iteration_handoff_ctx:
+        evaluation_spec_for_review["iteration_handoff"] = iteration_handoff_ctx
 
     metrics_report = _resolve_metrics_report_for_facts(state if isinstance(state, dict) else {})
     oc_report_for_eval = _resolve_output_contract_report_for_facts(state if isinstance(state, dict) else {})
@@ -21601,11 +21680,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if isinstance(qa_view, dict) and qa_view:
         qa_context = dict(qa_view)
         qa_context["_contract_source"] = "qa_view"
-    elif isinstance(contract, dict) and contract:
-        qa_context = dict(contract)
+    elif isinstance(review_contract, dict) and review_contract:
+        qa_context = dict(review_contract)
         qa_context["_contract_source"] = "execution_contract"
     else:
         qa_context = {"_contract_source": "fallback"}
+    if isinstance(qa_context, dict):
+        qa_context["qa_gates"] = get_qa_gates(review_contract) if isinstance(review_contract, dict) else []
     ml_data_path = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
     if ml_data_path:
         qa_context["ml_data_path"] = ml_data_path
@@ -21630,16 +21711,16 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     qa_context_prompt = compress_long_lists(qa_context)[0] if isinstance(qa_context, dict) else qa_context
 
     qa_gate_specs = _merge_qa_gate_specs(
-        (evaluation_spec or {}).get("qa_gates") if isinstance(evaluation_spec, dict) else None,
-        (evaluation_spec or {}).get("gates") if isinstance(evaluation_spec, dict) else None,
-        get_qa_gates(contract) if isinstance(contract, dict) else None,
+        evaluation_spec_for_review.get("qa_gates") if isinstance(evaluation_spec_for_review, dict) else None,
+        evaluation_spec_for_review.get("gates") if isinstance(evaluation_spec_for_review, dict) else None,
+        get_qa_gates(review_contract) if isinstance(review_contract, dict) else None,
         qa_context.get("qa_gates") if isinstance(qa_context, dict) else None,
     )
     qa_active_gate_names = _extract_gate_names(
-        get_qa_gates(contract) if isinstance(contract, dict) else []
+        get_qa_gates(review_contract) if isinstance(review_contract, dict) else []
     )
     reviewer_active_gate_names = _extract_gate_names(
-        get_reviewer_gates(contract) if isinstance(contract, dict) else []
+        get_reviewer_gates(review_contract) if isinstance(review_contract, dict) else []
     )
     hard_qa_gates: set[str] = {
         str(gate.get("name")).lower()
@@ -21688,12 +21769,17 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
                     if not isinstance(reviewer_view, dict) or not reviewer_view:
                         projected_views = build_contract_views_projection(
-                            contract,
+                            review_contract,
                             state.get("artifact_index") or [],
                         )
                         reviewer_view = projected_views.get("reviewer_view") or {}
+                    elif metric_improvement_round_active:
+                        reviewer_view = dict(reviewer_view)
+                        reviewer_view["reviewer_gates"] = (
+                            get_reviewer_gates(review_contract) if isinstance(review_contract, dict) else []
+                        )
                     reviewer_view, evaluation_spec_code_audit = _apply_ml_reviewer_output_scope(
-                        contract if isinstance(contract, dict) else {},
+                        review_contract if isinstance(review_contract, dict) else {},
                         state if isinstance(state, dict) else {},
                         reviewer_view if isinstance(reviewer_view, dict) else {},
                         evaluation_spec_code_audit if isinstance(evaluation_spec_code_audit, dict) else None,
@@ -21726,7 +21812,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     if metric_round_review_guarded:
                         review_result = _coerce_review_packet_to_nonblocking(
                             review_result, "reviewer",
-                            hard_gate_names=_collect_hard_gate_names(contract),
+                            hard_gate_names=_collect_hard_gate_names(review_contract),
                         )
                     if run_id:
                         log_agent_snapshot(
@@ -21815,7 +21901,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     if metric_round_review_guarded:
                         qa_result = _coerce_review_packet_to_nonblocking(
                             qa_result, "qa_reviewer",
-                            hard_gate_names=_collect_hard_gate_names(contract),
+                            hard_gate_names=_collect_hard_gate_names(review_contract),
                         )
                     if run_id:
                         log_agent_snapshot(
@@ -24042,12 +24128,23 @@ def _coerce_review_packet_to_nonblocking(
     return patched
 
 
-def _collect_active_gate_names(contract: Dict[str, Any]) -> List[str]:
+def _collect_active_gate_names(contract: Dict[str, Any], phase: Any = None) -> List[str]:
+    normalized_phase = _normalize_review_gate_phase(phase)
     active: List[str] = []
-    for gate in (get_qa_gates(contract) or []):
+    qa_gates = (
+        get_qa_gates_for_phase(contract, normalized_phase)
+        if normalized_phase == "metric_round"
+        else (get_qa_gates(contract) or [])
+    )
+    reviewer_gates = (
+        get_reviewer_gates_for_phase(contract, normalized_phase)
+        if normalized_phase == "metric_round"
+        else (get_reviewer_gates(contract) or [])
+    )
+    for gate in qa_gates:
         if isinstance(gate, dict) and gate.get("name"):
             active.append(str(gate.get("name")))
-    for gate in (get_reviewer_gates(contract) or []):
+    for gate in reviewer_gates:
         if isinstance(gate, dict) and gate.get("name"):
             active.append(str(gate.get("name")))
     return list(dict.fromkeys(active))
@@ -25018,8 +25115,8 @@ def _build_metric_round_contract_lock(
     contract = contract if isinstance(contract, dict) else {}
     validation = contract.get("validation_requirements") if isinstance(contract.get("validation_requirements"), dict) else {}
     allowed_sets = contract.get("allowed_feature_sets") if isinstance(contract.get("allowed_feature_sets"), dict) else {}
-    qa_gates = get_qa_gates(contract)
-    reviewer_gates = get_reviewer_gates(contract)
+    qa_gates = get_qa_gates_for_phase(contract, "metric_round")
+    reviewer_gates = get_reviewer_gates_for_phase(contract, "metric_round")
     qa_gate_names = [str(item.get("name")) for item in qa_gates if isinstance(item, dict) and str(item.get("name") or "").strip()]
     reviewer_gate_names = [str(item.get("name")) for item in reviewer_gates if isinstance(item, dict) and str(item.get("name") or "").strip()]
     return {
@@ -25382,7 +25479,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     advisor_context["min_delta"] = float(min_delta)
     advisor_context["phase"] = "baseline_review"
     advisor_context["candidate_metrics"] = baseline_metrics
-    advisor_context["active_gates_context"] = _collect_active_gate_names(contract)
+    advisor_context["active_gates_context"] = _collect_active_gate_names(contract, phase="metric_round")
 
     critique_packet = results_advisor.generate_critique_packet(advisor_context)
     critique_meta = (
@@ -25991,7 +26088,10 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         if isinstance(metric_state, dict):
             improved_value = _coerce_float(metric_state.get("primary_metric_value"))
 
-    active_gates_context = _collect_active_gate_names(contract if isinstance(contract, dict) else {})
+    active_gates_context = _collect_active_gate_names(
+        contract if isinstance(contract, dict) else {},
+        phase="metric_round",
+    )
     baseline_metrics_payload = (
         state.get("ml_improvement_round_baseline_metrics")
         if isinstance(state.get("ml_improvement_round_baseline_metrics"), dict)

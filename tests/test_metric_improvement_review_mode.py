@@ -29,6 +29,31 @@ class _StubQARejecting:
         }
 
 
+class _StubReviewerBaselineGateReject:
+    def evaluate_results(self, *_args, **_kwargs):
+        return {"status": "APPROVED", "feedback": "Baseline evaluator ok."}
+
+    def review_code(self, *_args, **_kwargs):
+        return {
+            "status": "REJECTED",
+            "feedback": "Baseline simplicity violated during optimization.",
+            "failed_gates": ["baseline_simplicity_enforcement"],
+            "required_fixes": ["Remove blending from optimization round."],
+            "hard_failures": ["baseline_simplicity_enforcement"],
+        }
+
+
+class _StubQAApproved:
+    def review_code(self, *_args, **_kwargs):
+        return {
+            "status": "APPROVED",
+            "feedback": "QA passed.",
+            "failed_gates": [],
+            "required_fixes": [],
+            "hard_failures": [],
+        }
+
+
 def test_metric_round_hybrid_guarded_keeps_reviewer_qa_nonblocking(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     Path("data").mkdir(parents=True, exist_ok=True)
@@ -135,3 +160,51 @@ def test_finalize_metric_round_uses_candidate_review_critique(tmp_path, monkeypa
     assert restored.get("roc_auc") == 0.8
     assert captured.get("phase") == "candidate_review"
 
+
+def test_metric_round_reviewer_cannot_block_on_baseline_only_gate(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path("data/metrics.json").write_text(json.dumps({"roc_auc": 0.801}), encoding="utf-8")
+
+    monkeypatch.setattr(graph_mod, "reviewer", _StubReviewerBaselineGateReject())
+    monkeypatch.setattr(graph_mod, "qa_reviewer", _StubQAApproved())
+
+    state = {
+        "execution_output": "OK",
+        "selected_strategy": {},
+        "business_objective": "",
+        "generated_code": "print('ok')",
+        "execution_contract": {
+            "iteration_policy": {"metric_round_review_mode": "hybrid_guarded"},
+            "spec_extraction": {"case_taxonomy": []},
+            "reviewer_gates": [
+                {
+                    "name": "baseline_simplicity_enforcement",
+                    "severity": "HARD",
+                    "params": {"forbidden_techniques": ["stacking", "blending"]},
+                },
+                {"name": "submission_schema_compliance", "severity": "HARD"},
+            ],
+        },
+        "evaluation_spec": {
+            "reviewer_gates": [
+                {
+                    "name": "baseline_simplicity_enforcement",
+                    "severity": "HARD",
+                    "params": {"forbidden_techniques": ["stacking", "blending"]},
+                },
+                {"name": "submission_schema_compliance", "severity": "HARD"},
+            ]
+        },
+        "iteration_count": 0,
+        "feedback_history": [],
+        "ml_improvement_round_active": True,
+    }
+
+    result = graph_mod.run_result_evaluator(state)
+
+    stack = result.get("ml_review_stack") if isinstance(result.get("ml_review_stack"), dict) else {}
+    reviewer_packet = stack.get("reviewer") if isinstance(stack.get("reviewer"), dict) else {}
+    assert reviewer_packet.get("status") == "APPROVE_WITH_WARNINGS"
+    assert reviewer_packet.get("failed_gates") == []
+    assert reviewer_packet.get("hard_failures") == []
