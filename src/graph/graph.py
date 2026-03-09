@@ -10106,6 +10106,23 @@ def _build_iteration_handoff(
     hypothesis_packet = _resolve_metric_round_hypothesis_packet(state)
     hypothesis_action = str(hypothesis_packet.get("action") or "NO_OP").strip().upper()
     hypothesis_technique = str(_extract_hypothesis_technique(hypothesis_packet) or "").strip()
+
+    # Block hypotheses that use techniques explicitly forbidden by HARD contract gates.
+    _forbidden_set = _collect_forbidden_techniques(contract)
+    _forbidden_match = _technique_matches_forbidden(hypothesis_technique, _forbidden_set)
+    if _forbidden_match and hypothesis_action == "APPLY":
+        print(
+            f"HYPOTHESIS_BLOCKED: technique '{hypothesis_technique}' "
+            f"matches forbidden keyword '{_forbidden_match}' — forcing NO_OP"
+        )
+        hypothesis_action = "NO_OP"
+        if isinstance(hypothesis_packet, dict):
+            hypothesis_packet["action"] = "NO_OP"
+            hypothesis_packet["blocked_reason"] = (
+                f"Technique '{hypothesis_technique}' blocked: "
+                f"contains forbidden keyword '{_forbidden_match}' from HARD contract gate"
+            )
+
     enforce_apply_hypothesis = bool(
         bool(state.get("ml_improvement_round_active"))
         and hypothesis_action == "APPLY"
@@ -23940,6 +23957,38 @@ def _collect_hard_gate_names(contract: Dict[str, Any] | None) -> set[str]:
             if name:
                 hard.add(name)
     return hard
+
+
+def _collect_forbidden_techniques(contract: Dict[str, Any] | None) -> set[str]:
+    """Return lowercase forbidden technique names from all HARD contract gates."""
+    forbidden: set[str] = set()
+    if not isinstance(contract, dict):
+        return forbidden
+    for gate in (get_qa_gates(contract) or []) + (get_reviewer_gates(contract) or []):
+        if not isinstance(gate, dict):
+            continue
+        if str(gate.get("severity", "")).strip().upper() != "HARD":
+            continue
+        ft = gate.get("forbidden_techniques")
+        if not ft:
+            ft = (gate.get("params") or {}).get("forbidden_techniques")
+        if isinstance(ft, list):
+            for item in ft:
+                text = str(item or "").strip().lower()
+                if text:
+                    forbidden.add(text)
+    return forbidden
+
+
+def _technique_matches_forbidden(technique: str, forbidden: set[str]) -> str | None:
+    """Check if a technique name contains any forbidden keyword. Returns the match or None."""
+    if not forbidden or not technique:
+        return None
+    technique_lower = technique.lower()
+    for kw in forbidden:
+        if kw in technique_lower:
+            return kw
+    return None
 
 
 def _coerce_review_packet_to_nonblocking(
