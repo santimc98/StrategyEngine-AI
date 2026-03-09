@@ -6616,6 +6616,92 @@ class ExecutionPlannerAgent:
 
             return contract
 
+        def _repair_deliverable_invariants(
+            contract: Dict[str, Any],
+            errors: List[Dict[str, Any]],
+        ) -> Dict[str, Any]:
+            """Auto-repair deliverable invariant violations.
+
+            For each error that specifies expected_kind and expected_owner, try to
+            promote an existing optional deliverable to required.  If none exists,
+            synthesise a minimal one with a conventional path.
+            """
+            artifacts = contract.get("required_output_artifacts")
+            if not isinstance(artifacts, list):
+                artifacts = []
+                contract["required_output_artifacts"] = artifacts
+
+            required_outputs = contract.get("required_outputs")
+            if not isinstance(required_outputs, list):
+                required_outputs = []
+                contract["required_outputs"] = required_outputs
+
+            _KIND_DEFAULT_PATH: Dict[str, str] = {
+                "dataset": "data/cleaned_data.csv",
+                "metrics": "data/metrics.json",
+                "predictions": "data/predictions.csv",
+                "submission": "data/submission.csv",
+                "report": "reports/report.json",
+            }
+
+            for err in errors:
+                expected_kind_raw = str(err.get("expected_kind") or "")
+                expected_owner = str(err.get("expected_owner") or "")
+                if not expected_kind_raw or not expected_owner:
+                    continue
+
+                # expected_kind may be "predictions|submission" — accept any
+                candidate_kinds = [
+                    k.strip() for k in expected_kind_raw.split("|") if k.strip()
+                ]
+
+                # Try to find an existing optional deliverable to promote
+                promoted = False
+                for art in artifacts:
+                    if not isinstance(art, dict):
+                        continue
+                    if (art.get("kind") in candidate_kinds
+                            and art.get("owner") == expected_owner
+                            and not art.get("required")):
+                        art["required"] = True
+                        path = art.get("path") or ""
+                        if path and path not in required_outputs:
+                            required_outputs.append(path)
+                        print(
+                            f"DELIVERABLE_REPAIR: promoted '{art.get('id', path)}' "
+                            f"(kind={art.get('kind')}) to required"
+                        )
+                        promoted = True
+                        break
+
+                if promoted:
+                    continue
+
+                # No existing deliverable — synthesise a minimal one
+                chosen_kind = candidate_kinds[0] if candidate_kinds else "predictions"
+                default_path = _KIND_DEFAULT_PATH.get(chosen_kind, f"data/{chosen_kind}.csv")
+                new_entry = {
+                    "id": f"auto_{chosen_kind}",
+                    "path": default_path,
+                    "required": True,
+                    "kind": chosen_kind,
+                    "description": f"Auto-generated to satisfy {err.get('invariant', 'unknown')} invariant.",
+                    "owner": expected_owner,
+                }
+                artifacts.append(new_entry)
+                required_outputs.append(default_path)
+                print(
+                    f"DELIVERABLE_REPAIR: created '{new_entry['id']}' "
+                    f"(kind={chosen_kind}, path={default_path}) for invariant {err.get('invariant')}"
+                )
+
+            # Sync spec_extraction.deliverables as well
+            spec = contract.get("spec_extraction")
+            if isinstance(spec, dict):
+                spec["deliverables"] = artifacts
+
+            return contract
+
         def _lint_deliverable_invariants(contract: Dict[str, Any], objective_type: str) -> List[Dict[str, Any]]:
             """Validate deliverable invariants by kind/owner.
 
@@ -9051,7 +9137,17 @@ class ExecutionPlannerAgent:
                         contract = _apply_deliverables(contract)
                         final_errors = _lint_deliverable_invariants(contract, obj_type)
                         if final_errors:
-                            print(f"DELIVERABLE_LINT: {len(final_errors)} errors persist after replan")
+                            final_error_items = [e for e in final_errors if e.get("severity") == "error"]
+                            if final_error_items:
+                                contract = _repair_deliverable_invariants(contract, final_error_items)
+                                post_repair = _lint_deliverable_invariants(contract, obj_type)
+                                post_repair_errors = [e for e in post_repair if e.get("severity") == "error"]
+                                if post_repair_errors:
+                                    print(f"DELIVERABLE_LINT: {len(post_repair_errors)} errors persist after auto-repair")
+                                    for err in post_repair_errors:
+                                        print(f"  - {err['invariant']}: {err['message']}")
+                                else:
+                                    print(f"DELIVERABLE_LINT: auto-repair resolved {len(final_error_items)} invariant(s)")
                 contract = apply_contract_schema_registry_repairs(contract)
                 contract = normalize_artifact_requirements(contract)
 
