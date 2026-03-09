@@ -1432,33 +1432,24 @@ def _apply_review_consistency_guard(
     *,
     actor: str,
 ) -> Dict[str, Any]:
-    """Inject deterministic blocker context into reviewer packets."""
+    """Attach deterministic blocker context without overriding the LLM verdict."""
     packet: Dict[str, Any] = dict(result or {})
     blockers = [str(x) for x in ((diagnostics or {}).get("hard_blockers") or []) if x]
     if not blockers:
         return packet
 
-    blocker_text = ", ".join(blockers)
-    note = f"CONTEXT_GUARD: deterministic hard blockers detected ({blocker_text})."
-    feedback = str(packet.get("feedback") or "").strip()
-    packet["feedback"] = f"{note}\n{feedback}".strip() if feedback else note
-
-    if str(packet.get("status") or "").strip().upper() == "APPROVED":
-        packet["status"] = "REJECTED"
-
-        failed_gates = [str(item) for item in (packet.get("failed_gates") or []) if item]
-        for blocker in blockers:
-            if blocker not in failed_gates:
-                failed_gates.append(blocker)
-        packet["failed_gates"] = failed_gates
-
-        hard_failures = [str(item) for item in (packet.get("hard_failures") or []) if item]
-        for blocker in blockers:
-            if blocker not in hard_failures:
-                hard_failures.append(blocker)
-        packet["hard_failures"] = hard_failures
-
-    return packet
+    blocker_text = ", ".join(blockers[:6])
+    note = (
+        f"{str(actor or 'reviewer').upper()}_CONTEXT_GUARD: deterministic blockers detected "
+        f"outside the reviewer packet ({blocker_text}). LLM verdict preserved for board adjudication."
+    )
+    return _attach_review_consistency_signal(
+        packet,
+        signal_key="deterministic_blockers",
+        note=note,
+        source=f"{str(actor or 'reviewer').lower()}_context_guard",
+        hard_blockers=blockers,
+    )
 
 
 def _harmonize_review_packets_with_final_eval(
@@ -1471,9 +1462,8 @@ def _harmonize_review_packets_with_final_eval(
     eval_required_fixes: List[str] | None,
 ) -> tuple[Dict[str, Any], Dict[str, Any], List[str]]:
     """
-    Keep reviewer/QA packets semantically aligned with the final evaluator signal.
-    This does not force deterministic rejection; it only downgrades to warnings
-    when evaluator reports unresolved issues but packets are clean approvals.
+    Keep reviewer/QA packets aligned with the evaluator without rewriting LLM verdicts.
+    Final evaluator discrepancies are attached as advisory context for the board.
     """
     trigger_statuses = {"NEEDS_IMPROVEMENT", "REJECTED", "FAIL", "FAILED", "ERROR", "CRASH"}
     status_norm = str(eval_raw_status or "").strip().upper()
@@ -1496,50 +1486,25 @@ def _harmonize_review_packets_with_final_eval(
         if status != "APPROVED" or failed or hard:
             return patched
 
-        if blocking_eval:
-            patched["status"] = "REJECTED"
-            message = (
-                f"{label.upper()}_CROSS_REVIEW_ALIGNMENT: deterministic/blocking issues reported by "
-                "result_evaluator; approval converted to REJECTED."
-            )
-        else:
-            patched["status"] = "APPROVE_WITH_WARNINGS"
-            message = (
-                f"{label.upper()}_CROSS_REVIEW_ALIGNMENT: result_evaluator reported unresolved "
-                "contract/business coverage issues; approval downgraded to warning-only context."
-            )
-        feedback = str(patched.get("feedback") or "").strip()
+        message = (
+            f"{label.upper()}_CROSS_REVIEW_ALIGNMENT: result_evaluator reported unresolved issues "
+            "outside the clean reviewer packet. LLM verdict preserved for board adjudication."
+        )
         if eval_feedback_trimmed:
             message = f"{message} evaluator_feedback={eval_feedback_trimmed[:320]}"
-        patched["feedback"] = f"{feedback}\n{message}".strip() if feedback else message
-
-        if "cross_review_alignment_gap" not in failed:
-            failed.append("cross_review_alignment_gap")
-        for gate in advisory_gates:
-            if gate not in failed:
-                failed.append(gate)
-        patched["failed_gates"] = failed
-
-        required = [str(item) for item in (patched.get("required_fixes") or []) if item]
-        for fix in advisory_fixes:
-            if fix not in required:
-                required.append(fix)
-        if blocking_eval and not required:
-            required.append("Resolve deterministic blockers before requesting approval again.")
-        if required:
-            patched["required_fixes"] = required
-        if blocking_eval:
-            hard_failures = [str(item) for item in (patched.get("hard_failures") or []) if item]
-            for blocker in advisory_gates:
-                if _looks_blocking_retry_signal(blocker) and blocker not in hard_failures:
-                    hard_failures.append(blocker)
-            if "cross_review_alignment_gap" not in hard_failures:
-                hard_failures.append("cross_review_alignment_gap")
-            patched["hard_failures"] = hard_failures
-            notes.append(f"{label}: escalated APPROVED -> REJECTED due to blocking evaluator status {status_norm}")
-        else:
-            notes.append(f"{label}: downgraded APPROVED -> APPROVE_WITH_WARNINGS due to evaluator status {status_norm}")
-        return patched
+        notes.append(
+            f"{label}: preserved {status} while attaching evaluator_alignment signal from {status_norm}"
+        )
+        return _attach_review_consistency_signal(
+            patched,
+            signal_key="evaluator_alignment",
+            note=message,
+            source="result_evaluator",
+            failed_gates=advisory_gates,
+            required_fixes=advisory_fixes,
+            evaluator_status=status_norm,
+            blocking_eval=blocking_eval,
+        )
 
     return _patch_packet(dict(reviewer_packet or {}), "reviewer"), _patch_packet(dict(qa_packet or {}), "qa_reviewer"), notes
 
@@ -1784,36 +1749,21 @@ def _enforce_review_packet_contract_consistency(
         return normalized
     if not implied_failures:
         return normalized
+    if explicit_failed or explicit_hard or explicit_status in {"REJECTED", "NEEDS_IMPROVEMENT"}:
+        return normalized
 
-    gate_lookup = {str(gate.get("name") or "").strip().lower(): gate for gate in _collect_active_hard_gate_specs(contract)}
-    failed_gates = [str(item) for item in (_normalize_handoff_items(normalized.get("failed_gates"), max_items=20, max_len=180)) if item]
-    hard_failures = [str(item) for item in (_normalize_handoff_items(normalized.get("hard_failures"), max_items=15, max_len=180)) if item]
-    required_fixes = [str(item) for item in (_normalize_handoff_items(normalized.get("required_fixes"), max_items=20, max_len=220)) if item]
-
-    for gate_name in implied_failures:
-        if gate_name not in failed_gates:
-            failed_gates.append(gate_name)
-        if gate_name not in hard_failures:
-            hard_failures.append(gate_name)
-        gate_spec = gate_lookup.get(gate_name.lower())
-        if gate_spec:
-            fix = _build_gate_resolution_fix(gate_spec)
-            if fix not in required_fixes:
-                required_fixes.append(fix)
-
-    status = _normalize_review_status(str(normalized.get("status") or "UNKNOWN"))
-    if status in {"APPROVED", "APPROVE_WITH_WARNINGS", "UNKNOWN"}:
-        normalized["status"] = "REJECTED"
-    feedback = str(normalized.get("feedback") or "").strip()
     consistency_note = (
-        f"{str(actor or 'reviewer').upper()}_CONTRACT_CONSISTENCY: "
-        f"evidence implies unresolved HARD gate failure(s): {', '.join(implied_failures[:6])}."
+        f"{str(actor or 'reviewer').upper()}_CONTRACT_CONSISTENCY: text/evidence implies "
+        f"possible HARD gate tension(s): {', '.join(implied_failures[:6])}. "
+        "LLM verdict preserved; board should adjudicate the conflict."
     )
-    normalized["feedback"] = f"{feedback}\n{consistency_note}".strip() if feedback else consistency_note
-    normalized["failed_gates"] = failed_gates[:20]
-    normalized["hard_failures"] = hard_failures[:15]
-    normalized["required_fixes"] = required_fixes[:20]
-    return normalized
+    return _attach_review_consistency_signal(
+        normalized,
+        signal_key="contract_consistency",
+        note=consistency_note,
+        source=f"{str(actor or 'reviewer').lower()}_contract_consistency",
+        implied_hard_gate_failures=implied_failures,
+    )
 
 
 _RUN_FACTS_BLOCK_RE = re.compile(
@@ -8782,15 +8732,119 @@ def _append_feedback_history(state: Dict[str, Any], message: str) -> None:
     state["feedback_history"] = history
 
 
+def _normalize_review_consistency_signals(signals: Any) -> Dict[str, Any]:
+    if not isinstance(signals, dict):
+        return {}
+    normalized: Dict[str, Any] = {}
+    for raw_key, raw_value in signals.items():
+        key = str(raw_key or "").strip()
+        payload = raw_value if isinstance(raw_value, dict) else {}
+        if not key or not payload:
+            continue
+        signal: Dict[str, Any] = {}
+        note = str(payload.get("note") or "").strip()
+        if note:
+            signal["note"] = _truncate_handoff_text(note, max_len=400)
+        source = str(payload.get("source") or "").strip()
+        if source:
+            signal["source"] = source
+        if "preserve_llm_status" in payload:
+            signal["preserve_llm_status"] = bool(payload.get("preserve_llm_status"))
+        if "blocking_eval" in payload:
+            signal["blocking_eval"] = bool(payload.get("blocking_eval"))
+        evaluator_status = str(payload.get("evaluator_status") or "").strip()
+        if evaluator_status:
+            signal["evaluator_status"] = evaluator_status
+        for list_key in (
+            "implied_hard_gate_failures",
+            "hard_blockers",
+            "failed_gates",
+            "required_fixes",
+        ):
+            values = _normalize_handoff_items(payload.get(list_key), max_items=12, max_len=220)
+            if values:
+                signal[list_key] = values
+        if signal:
+            normalized[key] = signal
+    return normalized
+
+
+def _attach_review_consistency_signal(
+    packet: Dict[str, Any] | None,
+    *,
+    signal_key: str,
+    note: str,
+    source: str,
+    implied_hard_gate_failures: List[str] | None = None,
+    hard_blockers: List[str] | None = None,
+    failed_gates: List[str] | None = None,
+    required_fixes: List[str] | None = None,
+    evaluator_status: str = "",
+    blocking_eval: bool | None = None,
+) -> Dict[str, Any]:
+    normalized = dict(packet or {})
+    warnings = _normalize_handoff_items(normalized.get("warnings"), max_items=12, max_len=220)
+    warning_note = _truncate_handoff_text(note, max_len=220)
+    if warning_note and warning_note not in warnings:
+        warnings.append(warning_note)
+    if warnings:
+        normalized["warnings"] = warnings[:12]
+
+    signals = _normalize_review_consistency_signals(normalized.get("consistency_signals"))
+    signal_payload = dict(signals.get(signal_key) or {})
+    if warning_note:
+        signal_payload["note"] = warning_note
+    signal_payload["source"] = str(source or signal_key)
+    signal_payload["preserve_llm_status"] = True
+    if implied_hard_gate_failures:
+        signal_payload["implied_hard_gate_failures"] = _normalize_handoff_items(
+            implied_hard_gate_failures,
+            max_items=10,
+            max_len=180,
+        )
+    if hard_blockers:
+        signal_payload["hard_blockers"] = _normalize_handoff_items(
+            hard_blockers,
+            max_items=10,
+            max_len=180,
+        )
+    if failed_gates:
+        signal_payload["failed_gates"] = _normalize_handoff_items(
+            failed_gates,
+            max_items=10,
+            max_len=180,
+        )
+    if required_fixes:
+        signal_payload["required_fixes"] = _normalize_handoff_items(
+            required_fixes,
+            max_items=10,
+            max_len=220,
+        )
+    if evaluator_status:
+        signal_payload["evaluator_status"] = str(evaluator_status)
+    if blocking_eval is not None:
+        signal_payload["blocking_eval"] = bool(blocking_eval)
+    signals[signal_key] = signal_payload
+    normalized["consistency_signals"] = signals
+    return normalized
+
+
 def _build_feedback_packet_snapshot(packet: Dict[str, Any] | None) -> Dict[str, Any]:
     packet = packet if isinstance(packet, dict) else {}
-    return {
+    snapshot = {
         "status": str(packet.get("status") or "UNKNOWN"),
         "feedback": _truncate_handoff_text(packet.get("feedback"), max_len=1400),
         "failed_gates": _normalize_handoff_items(packet.get("failed_gates"), max_items=12, max_len=180),
         "required_fixes": _normalize_handoff_items(packet.get("required_fixes"), max_items=12, max_len=220),
         "hard_failures": _normalize_handoff_items(packet.get("hard_failures"), max_items=12, max_len=180),
     }
+    warnings = _normalize_handoff_items(packet.get("warnings"), max_items=10, max_len=220)
+    if warnings:
+        snapshot["warnings"] = warnings
+    consistency_signals = _normalize_review_consistency_signals(packet.get("consistency_signals"))
+    if consistency_signals:
+        snapshot["consistency_signals"] = consistency_signals
+    return snapshot
 
 
 def _normalize_review_packet_for_state(

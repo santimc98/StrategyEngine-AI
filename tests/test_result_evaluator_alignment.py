@@ -30,6 +30,29 @@ class _QaWarningsStub:
         }
 
 
+class _ReviewerGateMentionStub:
+    def evaluate_results(self, *_args, **_kwargs):
+        return {"status": "APPROVED", "feedback": "ok", "retry_worth_it": False}
+
+    def review_code(self, *_args, **_kwargs):
+        return {
+            "status": "APPROVED",
+            "feedback": (
+                "The JSON parsing logic is comprehensive, including numeric casting and "
+                "the creation of missingness indicators as required by the gates."
+            ),
+            "failed_gates": [],
+            "required_fixes": [],
+            "hard_failures": [],
+            "evidence": [
+                {
+                    "claim": "JSON parsing includes numeric casting and missing-indicator creation.",
+                    "source": "script_path:192",
+                }
+            ],
+        }
+
+
 def test_result_evaluator_persists_qa_and_reviewer_packets_with_warnings(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)
@@ -60,6 +83,46 @@ def test_result_evaluator_persists_qa_and_reviewer_packets_with_warnings(tmp_pat
     merged_state = dict(state)
     merged_state.update(result)
     assert graph_mod._has_real_baseline_reviewer_approval(merged_state) is True
+
+
+def test_result_evaluator_preserves_reviewer_approval_when_consistency_signal_is_implied(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump({"roc_auc": 0.81}, f)
+
+    state = {
+        "execution_output": "OK",
+        "selected_strategy": {"title": "test"},
+        "business_objective": "test objective",
+        "generated_code": "print('ok')\n",
+        "execution_contract": {
+            "spec_extraction": {"case_taxonomy": []},
+            "reviewer_gates": [
+                {
+                    "name": "json_parsing_verification",
+                    "severity": "HARD",
+                    "params": {"requirement": "Verify json parsing and missing indicators."},
+                }
+            ],
+        },
+        "evaluation_spec": {},
+        "iteration_count": 0,
+        "feedback_history": [],
+    }
+
+    monkeypatch.setattr(graph_mod, "reviewer", _ReviewerGateMentionStub())
+    monkeypatch.setattr(graph_mod, "qa_reviewer", _QaWarningsStub())
+
+    result = graph_mod.run_result_evaluator(state)
+    reviewer_packet = result.get("reviewer_last_result") or {}
+
+    assert reviewer_packet.get("status") == "APPROVED"
+    assert not reviewer_packet.get("failed_gates")
+    assert not reviewer_packet.get("hard_failures")
+    signal = (reviewer_packet.get("consistency_signals") or {}).get("contract_consistency") or {}
+    assert "json_parsing_verification" in (signal.get("implied_hard_gate_failures") or [])
+    assert signal.get("preserve_llm_status") is True
 
 
 def test_has_real_baseline_reviewer_approval_falls_back_to_review_stack() -> None:

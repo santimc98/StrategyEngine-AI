@@ -363,7 +363,7 @@ def test_run_review_board_switches_to_repair_first_handoff_when_blocking_retry(t
     assert handoff.get("deferred_optimization", {}).get("resume_condition")
 
 
-def test_contract_consistency_promotes_implied_hard_gate_failure() -> None:
+def test_contract_consistency_preserves_llm_status_and_records_signal() -> None:
     packet = graph_mod._normalize_review_packet_for_state(
         {
             "status": "APPROVE_WITH_WARNINGS",
@@ -399,9 +399,12 @@ def test_contract_consistency_promotes_implied_hard_gate_failure() -> None:
         actor="qa_reviewer",
     )
 
-    assert enforced.get("status") == "REJECTED"
-    assert "target_encoding_leakage_guard" in (enforced.get("failed_gates") or [])
-    assert "target_encoding_leakage_guard" in (enforced.get("hard_failures") or [])
+    assert enforced.get("status") == "APPROVE_WITH_WARNINGS"
+    signal = (enforced.get("consistency_signals") or {}).get("contract_consistency") or {}
+    assert "target_encoding_leakage_guard" in (signal.get("implied_hard_gate_failures") or [])
+    assert signal.get("preserve_llm_status") is True
+    assert not enforced.get("failed_gates")
+    assert not enforced.get("hard_failures")
 
 
 def test_contract_consistency_keeps_advisory_gate_suggestion_non_blocking() -> None:
@@ -434,6 +437,7 @@ def test_contract_consistency_keeps_advisory_gate_suggestion_non_blocking() -> N
     assert enforced.get("status") == "APPROVE_WITH_WARNINGS"
     assert not enforced.get("failed_gates")
     assert not enforced.get("hard_failures")
+    assert not enforced.get("consistency_signals")
 
 
 def test_contract_consistency_ignores_positive_gate_mentions_when_failure_is_elsewhere() -> None:
@@ -466,6 +470,7 @@ def test_contract_consistency_ignores_positive_gate_mentions_when_failure_is_els
     assert enforced.get("status") == "APPROVE_WITH_WARNINGS"
     assert not enforced.get("failed_gates")
     assert not enforced.get("hard_failures")
+    assert not enforced.get("consistency_signals")
 
 
 def test_blocking_signal_ignores_advisory_leakage_wording() -> None:
@@ -489,3 +494,29 @@ def test_normalize_reason_tags_avoids_positive_baseline_and_leakage_mentions() -
     assert "leakage" not in positive_tags
     assert "baseline_missing" in negative_tags
     assert "leakage" in negative_tags
+
+
+def test_collect_board_deterministic_blockers_ignores_advisory_consistency_signals() -> None:
+    board_context = {
+        "runtime": {"status": "OK", "runtime_fix_terminal": False, "sandbox_failed": False},
+        "deterministic_facts": {
+            "output_contract": {"overall_status": "ok", "missing_required_artifacts": [], "schema_issues": []}
+        },
+        "reviewer": {
+            "status": "APPROVED",
+            "failed_gates": [],
+            "hard_failures": [],
+            "consistency_signals": {
+                "contract_consistency": {
+                    "implied_hard_gate_failures": ["json_parsing_verification"],
+                    "preserve_llm_status": True,
+                }
+            },
+        },
+        "qa_reviewer": {"status": "APPROVED", "failed_gates": [], "hard_failures": []},
+        "result_evaluator": {"status": "APPROVED", "failed_gates": [], "hard_failures": []},
+    }
+
+    blockers = graph_mod._collect_board_deterministic_blockers(board_context)
+
+    assert blockers == []

@@ -1,7 +1,7 @@
 from src.graph import graph as graph_mod
 
 
-def test_harmonize_review_packets_downgrades_clean_approvals_when_eval_needs_improvement():
+def test_harmonize_review_packets_preserves_clean_approvals_when_eval_needs_improvement():
     reviewer_packet = {"status": "APPROVED", "feedback": "Code quality good.", "failed_gates": [], "hard_failures": []}
     qa_packet = {"status": "APPROVED", "feedback": "QA passed.", "failed_gates": [], "hard_failures": []}
 
@@ -14,10 +14,14 @@ def test_harmonize_review_packets_downgrades_clean_approvals_when_eval_needs_imp
         eval_required_fixes=["Add segmented report by required business dimensions."],
     )
 
-    assert reviewer_adj.get("status") == "APPROVE_WITH_WARNINGS"
-    assert qa_adj.get("status") == "APPROVE_WITH_WARNINGS"
-    assert "cross_review_alignment_gap" in (reviewer_adj.get("failed_gates") or [])
-    assert "cross_review_alignment_gap" in (qa_adj.get("failed_gates") or [])
+    assert reviewer_adj.get("status") == "APPROVED"
+    assert qa_adj.get("status") == "APPROVED"
+    reviewer_signal = (reviewer_adj.get("consistency_signals") or {}).get("evaluator_alignment") or {}
+    qa_signal = (qa_adj.get("consistency_signals") or {}).get("evaluator_alignment") or {}
+    assert "business_objective_coverage" in (reviewer_signal.get("failed_gates") or [])
+    assert "business_objective_coverage" in (qa_signal.get("failed_gates") or [])
+    assert reviewer_signal.get("preserve_llm_status") is True
+    assert qa_signal.get("preserve_llm_status") is True
     assert notes
 
 
