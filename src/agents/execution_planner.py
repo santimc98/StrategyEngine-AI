@@ -49,6 +49,11 @@ from src.utils.contract_schema_registry import (
     apply_contract_schema_registry_repairs,
 )
 from src.utils.contract_response_schema import EXECUTION_CONTRACT_V42_MIN_SCHEMA
+from src.utils.problem_capabilities import (
+    infer_problem_capabilities,
+    is_problem_family,
+    resolve_problem_capabilities_from_contract,
+)
 
 load_dotenv()
 
@@ -1648,16 +1653,29 @@ def _infer_requires_target(strategy: Dict[str, Any], contract: Dict[str, Any]) -
                 return True
             if isinstance(val, str) and val.strip() and val.lower() != "unknown":
                 return True
-    obj_analysis = contract.get("objective_analysis")
-    if isinstance(obj_analysis, dict):
-        problem_type = str(obj_analysis.get("problem_type") or "").lower()
-        if problem_type:
-            if any(token in problem_type for token in ("predict", "prescript", "regress", "classif", "forecast", "rank")):
-                return True
-    analysis_type = str(strategy.get("analysis_type") or strategy.get("problem_type") or "").lower()
-    if analysis_type:
-        if any(token in analysis_type for token in ("predict", "prescript", "regress", "classif", "forecast", "rank")):
-            return True
+    capabilities = infer_problem_capabilities(
+        objective_text=str(contract.get("business_objective") or ""),
+        objective_type=contract.get("objective_type"),
+        problem_type=(contract.get("objective_analysis") or {}).get("problem_type")
+        if isinstance(contract.get("objective_analysis"), dict)
+        else None,
+        evaluation_spec=contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {},
+        validation_requirements=contract.get("validation_requirements")
+        if isinstance(contract.get("validation_requirements"), dict)
+        else {},
+        required_outputs=contract.get("required_outputs") if isinstance(contract.get("required_outputs"), list) else [],
+        strategy=strategy,
+    )
+    if is_problem_family(
+        capabilities,
+        "classification",
+        "regression",
+        "forecasting",
+        "ranking",
+        "optimization",
+        "survival_analysis",
+    ):
+        return True
     return False
 
 
@@ -3847,9 +3865,12 @@ def build_contract_min(
     required_any_of_groups.append(prediction_synonyms)
     required_any_of_group_severity.append("fail")  # Prediction/score is critical (fail)
 
-    # Group 3 (ranking/prioridad) SOLO si objective_type sugiere ranking/triage/targeting
-    obj_lower = str(objective_type).lower()
-    if any(kw in obj_lower for kw in ["ranking", "triage", "targeting", "priorit", "segment"]):
+    # Group 3 (ranking/prioridad) solo si la familia del problema lo requiere.
+    capabilities = resolve_problem_capabilities_from_contract(
+        contract,
+        objective_text=str(contract.get("business_objective") or ""),
+    )
+    if is_problem_family(capabilities, "ranking"):
         required_any_of_groups.append(["priority", "rank", "ranking", "triage_priority"])
         required_any_of_group_severity.append("fail")  # Ranking is critical when required
 
@@ -4808,9 +4829,20 @@ def build_contract_min(
     objective_analysis = contract.get("objective_analysis")
     if not isinstance(objective_analysis, dict) or not objective_analysis:
         objective_analysis = {}
-    if not str(objective_analysis.get("problem_type") or "").strip():
+    current_problem_type = str(objective_analysis.get("problem_type") or "").strip()
+    current_caps = infer_problem_capabilities(problem_type=current_problem_type)
+    if not current_problem_type or str(current_caps.get("family") or "unknown") == "unknown":
         objective_analysis = dict(objective_analysis)
-        objective_analysis["problem_type"] = str(objective_type or "unspecified").strip() or "unspecified"
+        normalized_caps = infer_problem_capabilities(
+            objective_text=str(contract.get("business_objective") or ""),
+            objective_type=objective_type,
+            problem_type=current_problem_type,
+            evaluation_spec=contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {},
+            validation_requirements=validation_requirements if isinstance(validation_requirements, dict) else {},
+            required_outputs=contract.get("required_outputs") if isinstance(contract.get("required_outputs"), list) else [],
+            strategy=strategy if isinstance(strategy, dict) else {},
+        )
+        objective_analysis["problem_type"] = str(normalized_caps.get("family") or "unspecified").strip() or "unspecified"
 
     evaluation_spec = contract.get("evaluation_spec")
     if not isinstance(evaluation_spec, dict) or not evaluation_spec:
@@ -5288,7 +5320,11 @@ def build_dataset_profile(data_summary: str, column_inventory: List[str] | None 
 
 
 def build_execution_plan(objective_type: str, dataset_profile: Dict[str, Any]) -> Dict[str, Any]:
-    objective = (objective_type or "unknown").lower()
+    capabilities = infer_problem_capabilities(
+        objective_text=str(objective_type or ""),
+        objective_type=objective_type,
+    )
+    objective = str(capabilities.get("family") or "unknown").lower()
     gates = [
         {"id": "data_ok", "description": "Data availability and basic quality checks pass.", "required": True},
         {"id": "target_ok", "description": "Target is valid with sufficient variation.", "required": True},
@@ -5320,10 +5356,28 @@ def build_execution_plan(objective_type: str, dataset_profile: Dict[str, Any]) -
             {"artifact_type": "forecast", "required": True, "description": "Forecast outputs."},
             {"artifact_type": "backtest", "required": False, "description": "Historical forecast evaluation."},
         ],
+        "survival_analysis": [
+            {"artifact_type": "metrics", "required": True, "description": "Survival metrics."},
+            {"artifact_type": "predictions", "required": True, "description": "Risk scores or survival probabilities."},
+            {"artifact_type": "calibration", "required": False, "description": "Survival calibration diagnostics."},
+        ],
         "ranking": [
             {"artifact_type": "metrics", "required": True, "description": "Ranking metrics."},
             {"artifact_type": "ranking_scores", "required": True, "description": "Ranked scores output."},
             {"artifact_type": "ranking_report", "required": False, "description": "Ranking diagnostics."},
+        ],
+        "clustering": [
+            {"artifact_type": "metrics", "required": True, "description": "Clustering diagnostics."},
+            {"artifact_type": "segments", "required": True, "description": "Cluster or segment assignments."},
+            {"artifact_type": "cluster_report", "required": False, "description": "Cluster interpretation artifact."},
+        ],
+        "optimization": [
+            {"artifact_type": "metrics", "required": True, "description": "Optimization objective metrics."},
+            {"artifact_type": "recommendations", "required": True, "description": "Decision recommendations or actions."},
+            {"artifact_type": "policy_report", "required": False, "description": "Optimization policy diagnostics."},
+        ],
+        "descriptive": [
+            {"artifact_type": "report", "required": True, "description": "Descriptive report artifact."},
         ],
     }
     optional_common = [
@@ -5339,6 +5393,7 @@ def build_execution_plan(objective_type: str, dataset_profile: Dict[str, Any]) -
     return {
         "schema_version": "1",
         "objective_type": objective,
+        "problem_capabilities": capabilities,
         "dataset_profile": dataset_profile or {},
         "gates": gates,
         "outputs": outputs,
@@ -5458,14 +5513,17 @@ def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
         return "unknown"
 
     objective_type = _infer_objective_type().lower()
-    eval_spec = contract.get("evaluation_spec") if isinstance(contract, dict) else None
-    target_type = str(eval_spec.get("target_type") or "").lower() if isinstance(eval_spec, dict) else ""
+    capabilities = resolve_problem_capabilities_from_contract(
+        contract,
+        objective_text=str(contract.get("business_objective") or ""),
+    )
 
-    is_ranking = any(tok in objective_type for tok in ["rank", "scor", "priorit"])
-    is_forecast = "forecast" in objective_type
-    is_segmentation = any(tok in objective_type for tok in ["segment", "cluster"])
-    is_classification = any(tok in target_type for tok in ["class", "binary", "multiclass"]) or "classif" in objective_type
-    is_regression = any(tok in target_type for tok in ["regress", "continuous", "numeric"]) or "regress" in objective_type
+    is_ranking = is_problem_family(capabilities, "ranking")
+    is_forecast = is_problem_family(capabilities, "forecasting")
+    is_segmentation = is_problem_family(capabilities, "clustering")
+    is_classification = is_problem_family(capabilities, "classification")
+    is_regression = is_problem_family(capabilities, "regression")
+    is_survival = is_problem_family(capabilities, "survival_analysis")
 
     canonical_columns = get_canonical_columns(contract)
     canonical_set = set(canonical_columns)
@@ -5630,6 +5688,19 @@ def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
             required_all=[outcome_cols[0]],
             compute={"x": "PREDICTION", "y": outcome_cols[0]},
             caption_template="Predicted vs actual values.",
+        )
+
+    if has_scored_rows and outcome_cols and pred_candidates and is_survival:
+        _add_plot(
+            "survival_risk_vs_time",
+            "Risk vs event time",
+            "Contrast predicted risk against observed event time on labeled rows.",
+            "scatter",
+            ["data/scored_rows.csv"],
+            required_any=pred_candidates,
+            required_all=[outcome_cols[0]],
+            compute={"x": "PREDICTION", "y": outcome_cols[0], "color": "AUTO_EVENT"},
+            caption_template="Predicted survival risk versus observed event time.",
         )
 
     if has_weights or has_metrics:

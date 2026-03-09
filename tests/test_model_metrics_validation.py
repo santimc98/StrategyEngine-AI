@@ -70,3 +70,35 @@ def test_validate_metrics_none_values():
     }
     result = validate_model_metrics_consistency(metrics)
     assert result["passed"] is True
+
+
+def test_validate_metrics_supports_primary_metric_consistency_for_survival():
+    metrics = {
+        "model_performance": {
+            "best_model_name": "CoxPH",
+            "primary_metric": "concordance_index",
+            "primary_metric_value": 0.73,
+            "baseline_concordance_index": 0.68,
+        }
+    }
+
+    result = validate_model_metrics_consistency(metrics)
+
+    assert result["passed"] is True
+    assert result["details"]["metric_name"] == "concordance_index"
+
+
+def test_validate_metrics_uses_direction_for_lower_is_better_primary_metric():
+    metrics = {
+        "model_performance": {
+            "best_model_name": "ElasticNet",
+            "primary_metric": "mae",
+            "primary_metric_value": 1.25,
+            "baseline_mae": 0.8,
+        }
+    }
+
+    result = validate_model_metrics_consistency(metrics)
+
+    assert result["passed"] is False
+    assert "significantly worse than baseline metric" in result["error_message"]

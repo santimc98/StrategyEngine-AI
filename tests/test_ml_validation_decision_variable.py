@@ -106,6 +106,28 @@ model.fit(X, y)
         assert "allocation_amount" in result["violated_variables"]
         assert "CAUSAL_VIOLATION" in result["error_message"]
 
+    def test_prescriptive_problem_alias_still_detects_decision_var_violation(self):
+        code = """
+features = ['customer_value', 'allocation_amount']
+X = df[features]
+"""
+        contract = {
+            "business_objective": "Use prescriptive decisioning to maximize success",
+            "column_roles": {
+                "decision": ["allocation_amount"],
+                "pre_decision": ["customer_value"],
+            },
+            "objective_analysis": {
+                "problem_type": "decisioning",
+                "success_criteria": "maximize success rate through resource allocation",
+            },
+        }
+
+        result = validate_decision_variable_isolation(code, contract)
+
+        assert result["passed"] is False
+        assert "allocation_amount" in result["violated_variables"]
+
     def test_optimization_without_decision_var_in_features_passes(self):
         """Optimization that correctly excludes decision variable passes."""
         code = """

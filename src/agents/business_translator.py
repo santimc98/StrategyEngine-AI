@@ -848,7 +848,7 @@ def _coerce_float(value: Any) -> Optional[float]:
 def _extract_lift_value(data_adequacy_report: Dict[str, Any], metrics_payload: Dict[str, Any]) -> Optional[float]:
     if isinstance(data_adequacy_report, dict):
         signals = data_adequacy_report.get("signals", {})
-        for key in ("classification_lift", "regression_lift", "f1_lift", "mae_lift"):
+        for key in ("metric_lift", "classification_lift", "regression_lift", "f1_lift", "mae_lift"):
             lift = _coerce_float(signals.get(key)) if isinstance(signals, dict) else None
             if lift is not None:
                 return lift

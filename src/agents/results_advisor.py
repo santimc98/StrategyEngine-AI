@@ -18,6 +18,7 @@ from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_wi
 from src.utils.results_advisor_response_schema import (
     build_results_advisor_critique_response_schema,
 )
+from src.utils.problem_capabilities import infer_problem_capabilities, is_problem_family, normalize_problem_family
 
 load_dotenv()
 
@@ -1343,14 +1344,24 @@ class ResultsAdvisorAgent:
             risks.append("Leakage risk signal detected in reviewer/alignment evidence.")
             recommendations.append("Audit feature availability timing and exclude post-outcome fields.")
 
-        if objective_type == "classification":
+        capabilities = infer_problem_capabilities(
+            objective_text=str(objective_type or ""),
+            objective_type=objective_type,
+        )
+        if is_problem_family(capabilities, "classification"):
             recommendations.append("Check class balance and calibrate thresholds if needed.")
-        elif objective_type == "regression":
+        elif is_problem_family(capabilities, "regression"):
             recommendations.append("Inspect residuals and consider robust loss if heavy tails exist.")
-        elif objective_type == "forecasting":
+        elif is_problem_family(capabilities, "forecasting"):
             recommendations.append("Validate forecast horizon and compare against naive baselines.")
-        elif objective_type == "ranking":
+        elif is_problem_family(capabilities, "ranking"):
             recommendations.append("Validate ordering metrics and consider pairwise loss if rankings are unstable.")
+        elif is_problem_family(capabilities, "survival_analysis"):
+            recommendations.append("Validate censoring handling and horizon calibration for survival risk outputs.")
+        elif is_problem_family(capabilities, "clustering"):
+            recommendations.append("Stress-test cluster stability and interpretability before using segments operationally.")
+        elif is_problem_family(capabilities, "optimization"):
+            recommendations.append("Verify constraint satisfaction and compare objective lift against simple baseline policies.")
 
         # PR4: ResultsAdvisor is a pure critic; loop control belongs to graph policy.
         iteration_recommendation: Dict[str, Any] = {}
@@ -1956,15 +1967,21 @@ class ResultsAdvisorAgent:
         return flat
 
     def _objective_metric_priority(self, objective_type: str) -> List[str]:
-        objective = str(objective_type or "unknown").lower()
-        if objective == "classification":
+        family = normalize_problem_family(objective_type)
+        if family == "classification":
             return ["roc_auc", "auc", "f1", "precision", "recall", "accuracy", "balanced_accuracy", "pr_auc"]
-        if objective == "regression":
+        if family == "regression":
             return ["rmse", "mae", "mse", "r2", "mape", "smape"]
-        if objective == "forecasting":
+        if family == "forecasting":
             return ["mape", "smape", "rmse", "mae", "coverage", "pinball"]
-        if objective == "ranking":
+        if family == "survival_analysis":
+            return ["concordance_index", "concordance", "integrated_brier_score", "ibs", "mae_uncensored"]
+        if family == "ranking":
             return ["spearman", "kendall", "ndcg", "map", "mrr", "gini"]
+        if family == "clustering":
+            return ["silhouette", "davies_bouldin", "calinski_harabasz", "ari", "nmi"]
+        if family == "optimization":
+            return ["objective_value", "expected_value", "revenue", "cost", "constraint_violation_rate"]
         return ["roc_auc", "f1", "rmse", "mae", "r2", "spearman"]
 
     def _pick_column(self, columns: List[str], candidates: List[str]) -> Optional[str]:

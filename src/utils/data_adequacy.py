@@ -11,6 +11,16 @@ import pandas as pd
 from src.utils.json_sanitize import dump_json
 
 from src.utils.contract_accessors import get_outcome_columns, get_column_roles
+from src.utils.problem_capabilities import (
+    infer_problem_capabilities,
+    metric_family_for_metric,
+    metric_higher_is_better as capability_metric_higher_is_better,
+    metric_preference_tokens,
+    problem_metric_families,
+    problem_prefers_baseline_metric,
+    problem_requires_primary_metric,
+    resolve_problem_capabilities_from_contract,
+)
 
 
 def _safe_load_json(path: str) -> Dict[str, Any]:
@@ -205,42 +215,16 @@ def _normalize_key(name: str) -> str:
 
 
 def _metric_category(metric_name: str) -> str:
-    key = _normalize_key(metric_name)
-    if any(token in key for token in ["spearman", "kendall", "rank", "corr", "correlation"]):
-        return "ranking"
-    if any(
-        token in key
-        for token in [
-            "f1",
-            "roc",
-            "auc",
-            "pr_auc",
-            "average_precision",
-            "precision",
-            "recall",
-            "accuracy",
-            "balanced_accuracy",
-            "log_loss",
-            "logloss",
-            "brier",
-        ]
-    ):
-        return "classification"
-    if any(token in key for token in ["mae", "rmse", "mse", "mape", "smape", "r2", "r_squared"]):
-        return "regression"
-    return "other"
+    category = metric_family_for_metric(metric_name)
+    return "other" if category == "generic" else category
 
 
 def _infer_objective_family_from_metrics(metric_keys: List[str]) -> str | None:
-    counts: Dict[str, int] = {}
-    for key in metric_keys:
-        category = _metric_category(key)
-        if category == "other":
-            continue
-        counts[category] = counts.get(category, 0) + 1
-    if not counts:
-        return None
-    return max(counts.items(), key=lambda item: item[1])[0]
+    capabilities = infer_problem_capabilities(
+        validation_requirements={"metrics_to_report": [str(key) for key in metric_keys if key]}
+    )
+    family = str(capabilities.get("family") or "").strip()
+    return family or None
 
 
 def _infer_objective_family(
@@ -260,16 +244,24 @@ def _infer_objective_family(
     if not metric_keys:
         metric_pool = _extract_metric_pool(weights, metrics_report)
         metric_keys = list(metric_pool.keys())
+    capabilities = infer_problem_capabilities(
+        objective_text=str(contract.get("business_objective") or "") if isinstance(contract, dict) else "",
+        objective_type=contract.get("objective_type") if isinstance(contract, dict) else None,
+        problem_type=(contract.get("objective_analysis") or {}).get("problem_type")
+        if isinstance(contract.get("objective_analysis"), dict)
+        else None,
+        evaluation_spec=contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {},
+        validation_requirements={"metrics_to_report": metric_keys},
+        required_outputs=contract.get("required_outputs") if isinstance(contract.get("required_outputs"), list) else [],
+    )
+    family = str(capabilities.get("family") or "").strip()
+    if family and family != "unknown":
+        return family
     return _infer_objective_family_from_metrics(metric_keys)
 
 
 def _metric_higher_is_better(metric_name: str) -> bool:
-    key = _normalize_key(metric_name)
-    if any(token in key for token in ["loss", "error", "mae", "rmse", "mse", "mape", "smape", "brier"]):
-        return False
-    if "r2" in key or "r_squared" in key:
-        return True
-    return True
+    return capability_metric_higher_is_better(metric_name)
 
 
 def _is_baseline_metric(metric_name: str) -> bool:
@@ -302,6 +294,12 @@ def _extract_metric_pool(weights: Dict[str, Any], metrics_report: Dict[str, Any]
                 pool[str(metric_key)] = float(metric_val)
     if isinstance(metrics_report, dict):
         _collect_metric_entries(metrics_report, "", pool)
+        model_perf = metrics_report.get("model_performance")
+        if isinstance(model_perf, dict):
+            primary_metric_name = str(model_perf.get("primary_metric") or "").strip()
+            primary_metric_value = model_perf.get("primary_metric_value")
+            if primary_metric_name and _is_number(primary_metric_value):
+                pool.setdefault(primary_metric_name, float(primary_metric_value))
     return pool
 
 
@@ -324,11 +322,65 @@ def _select_metric(
         return None, None
     normalized = {key: _normalize_key(key) for key in candidates}
     for token in preference:
-        for key, norm in normalized.items():
-            if token in norm:
-                return key, candidates[key]
+        token_norm = _normalize_key(token)
+        exact_matches = [key for key, norm in normalized.items() if norm == token_norm]
+        if exact_matches:
+            chosen = sorted(exact_matches)[0]
+            return chosen, candidates[chosen]
+        suffix_matches = [key for key, norm in normalized.items() if norm.endswith(token_norm)]
+        if suffix_matches:
+            chosen = sorted(suffix_matches)[0]
+            return chosen, candidates[chosen]
+        contains_matches = [key for key, norm in normalized.items() if token_norm in norm]
+        if contains_matches:
+            chosen = sorted(contains_matches)[0]
+            return chosen, candidates[chosen]
     chosen = sorted(candidates.keys())[0]
     return chosen, candidates[chosen]
+
+
+def _resolve_primary_metric_bundle(
+    metric_pool: Dict[str, float],
+    objective_family: str,
+) -> Tuple[str | None, str | None, float | None, str | None, float | None]:
+    for metric_family in problem_metric_families(objective_family):
+        if metric_family == "generic":
+            continue
+        preference = list(metric_preference_tokens(metric_family))
+        metric_name, metric_value = _select_metric(metric_pool, metric_family, preference, baseline_only=False)
+        if metric_name is None:
+            continue
+        baseline_name, baseline_value = (None, None)
+        if problem_prefers_baseline_metric(objective_family):
+            baseline_name, baseline_value = _select_metric(metric_pool, metric_family, preference, baseline_only=True)
+        return metric_family, metric_name, metric_value, baseline_name, baseline_value
+    return None, None, None, None, None
+
+
+def _missing_metric_reason(objective_family: str) -> str:
+    if objective_family == "classification":
+        return "classification_metric_missing"
+    if objective_family in {"regression", "forecasting"}:
+        return "regression_metric_missing"
+    if objective_family == "ranking":
+        return "ranking_metric_missing"
+    return "primary_metric_missing"
+
+
+def _missing_baseline_reason(objective_family: str) -> str:
+    if objective_family == "classification":
+        return "classification_baseline_missing"
+    if objective_family in {"regression", "forecasting"}:
+        return "regression_baseline_missing"
+    return "baseline_metric_missing"
+
+
+def _low_lift_reason(objective_family: str) -> str:
+    if objective_family == "classification":
+        return "classification_lift_low"
+    if objective_family in {"regression", "forecasting"}:
+        return "regression_lift_low"
+    return "metric_lift_low"
 
 
 def _align_quality_gates(
@@ -577,37 +629,29 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     cleaned_read_failed = cleaned is None and cleaned_err not in (None, "file_missing")
     metric_pool_probe = _extract_metric_pool(weights, metrics_report)
     base_missing = (cleaned is None and not cleaned_read_failed) or (not metric_pool_probe)
-    objective_type = (
-        state.get("objective_type")
-        or (contract.get("evaluation_spec") or {}).get("objective_type")
-        or contract.get("objective_type")
-        or ""
-    )
-    objective_key = str(objective_type or "unknown").lower()
-    objective_map = {
-        "classification": "classification",
-        "classifier": "classification",
-        "binary": "classification",
-        "binary_classification": "classification",
-        "multiclass": "classification",
-        "multiclass_classification": "classification",
-        "multi_class_classification": "classification",
-        "propensity": "classification",
-        "propensity_scoring": "classification",
-        "risk_scoring": "classification",
-        "regression": "regression",
-        "forecasting": "forecasting",
-        "forecast": "forecasting",
-        "time_series": "forecasting",
-        "ranking": "ranking",
-        "prioritization": "ranking",
-        "calibration": "ranking",
-    }
-    objective_family = objective_map.get(objective_key, "unknown")
+    required_outputs = contract.get("required_outputs") if isinstance(contract, dict) and isinstance(contract.get("required_outputs"), list) else []
+    capabilities = resolve_problem_capabilities_from_contract(contract if isinstance(contract, dict) else {})
+    objective_family = str(capabilities.get("family") or "unknown")
+    if objective_family == "unknown":
+        inferred_caps = infer_problem_capabilities(
+            objective_text=str(state.get("business_objective") or contract.get("business_objective") or ""),
+            objective_type=state.get("objective_type") or contract.get("objective_type"),
+            problem_type=(state.get("objective_analysis") or {}).get("problem_type")
+            if isinstance(state.get("objective_analysis"), dict)
+            else None,
+            evaluation_spec=contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {},
+            validation_requirements=contract.get("validation_requirements")
+            if isinstance(contract.get("validation_requirements"), dict)
+            else {},
+            required_outputs=required_outputs,
+        )
+        objective_family = str(inferred_caps.get("family") or "unknown")
+        capabilities = inferred_caps
     if objective_family == "unknown":
         inferred = _infer_objective_family(contract, metrics_report, weights)
         if inferred:
             objective_family = inferred
+            capabilities = infer_problem_capabilities(problem_type=inferred)
 
     if objective_family == "unknown":
         output_report = _safe_load_json("data/output_contract_report.json")
@@ -685,30 +729,33 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     use_classification = objective_family == "classification"
     use_regression = objective_family in {"regression", "forecasting"}
     use_ranking = objective_family == "ranking"
+    use_survival = objective_family == "survival_analysis"
 
-    cls_preference = ["f1", "roc_auc", "auc", "pr_auc", "average_precision", "accuracy", "precision", "recall"]
-    reg_preference = ["mae", "rmse", "mse", "mape", "smape", "r2"]
-    rank_preference = ["spearman", "kendall", "ndcg", "map", "mrr", "gini"]
+    selected_metric_family, primary_metric_name, primary_metric, baseline_metric_name, baseline_metric = _resolve_primary_metric_bundle(
+        metric_pool,
+        objective_family,
+    )
+    primary_metric_higher = _metric_higher_is_better(primary_metric_name) if primary_metric_name else True
+    metric_lift = (
+        _calc_lift(baseline_metric, primary_metric, higher_is_better=primary_metric_higher)
+        if primary_metric_name is not None and baseline_metric_name is not None
+        else None
+    )
 
-    cls_metric_name, cls_metric = (None, None)
-    cls_baseline_name, cls_baseline = (None, None)
-    reg_metric_name, reg_metric = (None, None)
-    reg_baseline_name, reg_baseline = (None, None)
-    rank_metric_name, rank_metric = (None, None)
+    cls_metric_name = cls_metric = cls_baseline_name = cls_baseline = None
+    reg_metric_name = reg_metric = reg_baseline_name = reg_baseline = None
+    rank_metric_name = rank_metric = None
+    if selected_metric_family == "classification":
+        cls_metric_name, cls_metric = primary_metric_name, primary_metric
+        cls_baseline_name, cls_baseline = baseline_metric_name, baseline_metric
+    elif selected_metric_family in {"regression", "forecasting"}:
+        reg_metric_name, reg_metric = primary_metric_name, primary_metric
+        reg_baseline_name, reg_baseline = baseline_metric_name, baseline_metric
+    elif selected_metric_family == "ranking":
+        rank_metric_name, rank_metric = primary_metric_name, primary_metric
 
-    if use_classification:
-        cls_metric_name, cls_metric = _select_metric(metric_pool, "classification", cls_preference, baseline_only=False)
-        cls_baseline_name, cls_baseline = _select_metric(metric_pool, "classification", cls_preference, baseline_only=True)
-    if use_regression:
-        reg_metric_name, reg_metric = _select_metric(metric_pool, "regression", reg_preference, baseline_only=False)
-        reg_baseline_name, reg_baseline = _select_metric(metric_pool, "regression", reg_preference, baseline_only=True)
-    if use_ranking:
-        rank_metric_name, rank_metric = _select_metric(metric_pool, "ranking", rank_preference, baseline_only=False)
-
-    cls_higher = _metric_higher_is_better(cls_metric_name) if cls_metric_name else True
-    reg_higher = _metric_higher_is_better(reg_metric_name) if reg_metric_name else False
-    cls_lift = _calc_lift(cls_baseline, cls_metric, higher_is_better=cls_higher) if use_classification else None
-    reg_lift = _calc_lift(reg_baseline, reg_metric, higher_is_better=reg_higher) if use_regression else None
+    cls_lift = metric_lift if selected_metric_family == "classification" else None
+    reg_lift = metric_lift if selected_metric_family in {"regression", "forecasting"} else None
 
     f1 = cls_metric if cls_metric_name and "f1" in _normalize_key(cls_metric_name) else None
     f1_baseline = cls_baseline if cls_baseline_name and "f1" in _normalize_key(cls_baseline_name) else None
@@ -781,6 +828,8 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
 
     if base_missing:
         metric_pool = {}
+        selected_metric_family = primary_metric_name = baseline_metric_name = None
+        primary_metric = baseline_metric = metric_lift = None
         cls_metric_name = cls_metric = cls_baseline_name = cls_baseline = None
         reg_metric_name = reg_metric = reg_baseline_name = reg_baseline = None
         rank_metric_name = rank_metric = None
@@ -807,6 +856,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         reasons.append("pipeline_aborted_before_metrics")
     signals: Dict[str, Any] = {
         "objective_type": objective_family,
+        "problem_capabilities": capabilities,
         "row_count": row_count,
         "feature_count": feature_count,
         "rows_per_feature": rows_per_feature,
@@ -814,6 +864,12 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "small_segment_fraction": small_segment_frac,
         "small_segment_count": small_segment_count,
         "target_kind": target_kind,
+        "primary_metric_family": selected_metric_family,
+        "primary_metric_name": primary_metric_name,
+        "primary_metric": primary_metric,
+        "baseline_metric_name": baseline_metric_name,
+        "baseline_metric": baseline_metric,
+        "metric_lift": metric_lift,
         "signal_ceiling_auc_proxy": auc_proxy.get("best_auc"),
         "signal_ceiling_auc_feature": auc_proxy.get("best_feature"),
         "signal_ceiling_abs_spearman": reg_proxy.get("best_abs_spearman"),
@@ -842,21 +898,17 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "cleaned_data_candidates": cleaned_candidates[:5],
     }
 
-    if use_classification and not base_missing and cls_metric is None:
-        reasons.append("classification_metric_missing")
-    if use_regression and not base_missing and reg_metric is None:
-        reasons.append("regression_metric_missing")
-    if use_ranking and not base_missing and rank_metric is None:
-        reasons.append("ranking_metric_missing")
-    if use_classification and not base_missing and cls_metric is not None and cls_baseline is None:
-        reasons.append("classification_baseline_missing")
-    if use_regression and not base_missing and reg_metric is not None and reg_baseline is None:
-        reasons.append("regression_baseline_missing")
+    if problem_requires_primary_metric(objective_family) and not base_missing and primary_metric is None:
+        reasons.append(_missing_metric_reason(objective_family))
+    if problem_prefers_baseline_metric(objective_family) and not base_missing and primary_metric is not None and baseline_metric is None:
+        reasons.append(_missing_baseline_reason(objective_family))
 
     if use_classification and not base_missing and cls_lift is not None and cls_lift < 0.05:
-        reasons.append("classification_lift_low")
+        reasons.append(_low_lift_reason(objective_family))
     if use_regression and not base_missing and reg_lift is not None and reg_lift < 0.1:
-        reasons.append("regression_lift_low")
+        reasons.append(_low_lift_reason(objective_family))
+    if use_survival and not base_missing and metric_lift is not None and metric_lift < 0.02:
+        reasons.append(_low_lift_reason(objective_family))
     if not base_missing and rows_per_feature is not None and rows_per_feature < 10:
         reasons.append("high_dimensionality_low_sample")
     if use_classification and not base_missing and class_balance is not None and (class_balance < 0.1 or class_balance > 0.9):
@@ -892,6 +944,8 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         recommendations.append("Collect more labeled outcomes or refine the success label definition.")
     if "regression_lift_low" in reasons:
         recommendations.append("Increase the number of successful contracts with reliable 1stYearAmount values.")
+    if "metric_lift_low" in reasons:
+        recommendations.append("Current lift over baseline is marginal; review whether the objective needs richer labels, stronger signals, or a more appropriate baseline.")
     if "high_dimensionality_low_sample" in reasons:
         recommendations.append("Increase sample size or reduce feature dimensionality through aggregation.")
     if "class_imbalance" in reasons:
@@ -902,9 +956,9 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         recommendations.append("Increase feature richness or improve data capture to raise the achievable signal ceiling.")
     if "signal_ceiling_reached" in reasons:
         recommendations.append("Current performance is near the data signal ceiling; improvements likely require better data, not tuning.")
-    if "classification_metric_missing" in reasons or "regression_metric_missing" in reasons or "ranking_metric_missing" in reasons:
+    if any(reason in reasons for reason in ("classification_metric_missing", "regression_metric_missing", "ranking_metric_missing", "primary_metric_missing")):
         recommendations.append("Persist model performance metrics alongside weights.json for data adequacy checks.")
-    if "classification_baseline_missing" in reasons or "regression_baseline_missing" in reasons:
+    if any(reason in reasons for reason in ("classification_baseline_missing", "regression_baseline_missing", "baseline_metric_missing")):
         recommendations.append("Include baseline metrics (dummy/naive) to quantify lift over trivial models.")
 
     if cleaned_read_failed:
@@ -913,11 +967,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         status = "insufficient_signal"
     else:
         status = "data_limited" if data_limited else "sufficient_signal"
-        if use_classification and cls_metric is None:
-            status = "insufficient_signal"
-        if use_regression and reg_metric is None:
-            status = "insufficient_signal"
-        if use_ranking and rank_metric is None:
+        if problem_requires_primary_metric(objective_family) and primary_metric is None:
             status = "insufficient_signal"
     threshold = int(state.get("data_adequacy_threshold", 3) or 3)
     consecutive = int(state.get("data_adequacy_consecutive", 0) or 0)

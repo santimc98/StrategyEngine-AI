@@ -61,3 +61,43 @@ def test_data_adequacy_reads_evaluation_metrics_artifact(tmp_path, monkeypatch):
 
     reasons = [str(item) for item in (report.get("reasons") or [])]
     assert "pipeline_aborted_before_metrics" not in reasons
+
+
+def test_data_adequacy_supports_survival_metrics_without_regression_fallback(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "cleaned_data.csv"), "w", encoding="utf-8") as handle:
+        handle.write("feature,time_to_event,event\n1,10,1\n2,12,0\n")
+    with open(os.path.join("data", "metrics.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "model_performance": {
+                    "primary_metric": "concordance_index",
+                    "primary_metric_value": 0.71,
+                    "best_model_concordance_index": 0.71,
+                }
+            },
+            handle,
+        )
+
+    report = build_data_adequacy_report(
+        {
+            "execution_contract": {
+                "business_objective": "Estimate time to event under censoring",
+                "objective_analysis": {"problem_type": "survival_analysis"},
+                "evaluation_spec": {
+                    "survival_time_col": "time_to_event",
+                    "survival_event_col": "event",
+                },
+                "validation_requirements": {"primary_metric": "concordance_index"},
+            }
+        }
+    )
+
+    reasons = [str(item) for item in (report.get("reasons") or [])]
+    signals = report.get("signals") or {}
+
+    assert signals.get("objective_type") == "survival_analysis"
+    assert signals.get("primary_metric_name") == "concordance_index"
+    assert "primary_metric_missing" not in reasons
+    assert "regression_metric_missing" not in reasons

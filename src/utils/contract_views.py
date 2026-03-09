@@ -17,6 +17,7 @@ from src.utils.contract_accessors import (
     get_required_outputs,
     get_validation_requirements,
 )
+from src.utils.problem_capabilities import infer_problem_capabilities, resolve_problem_capabilities_from_contract
 
 # Shared helper for decisioning requirements extraction
 def _get_decisioning_requirements(contract_full: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any]:
@@ -702,6 +703,12 @@ def _normalize_artifact_index(entries: Any) -> List[Dict[str, Any]]:
 
 
 def _resolve_objective_type(contract_min: Dict[str, Any], contract_full: Dict[str, Any], required_outputs: List[str]) -> str:
+    for source in (contract_full, contract_min):
+        capabilities = resolve_problem_capabilities_from_contract(source if isinstance(source, dict) else {})
+        family = str(capabilities.get("family") or "").strip()
+        if family and family != "unknown":
+            return family
+
     # V4.1: Check objective_analysis.problem_type first (primary source)
     for source in (contract_min, contract_full):
         obj_analysis = source.get("objective_analysis") if isinstance(source, dict) else None
@@ -721,15 +728,13 @@ def _resolve_objective_type(contract_min: Dict[str, Any], contract_full: Dict[st
 
 
 def _infer_objective_from_outputs(required_outputs: List[str]) -> str:
+    capabilities = infer_problem_capabilities(required_outputs=required_outputs or [])
+    family = str(capabilities.get("family") or "").strip()
+    if family and family != "unknown":
+        return family
     tokens = " ".join([str(p).lower() for p in required_outputs or []])
-    if "forecast" in tokens:
-        return "forecasting"
-    if "segment" in tokens or "cluster" in tokens:
-        return "segmentation"
-    if "weight" in tokens or "optimization" in tokens:
-        return "optimization"
-    if "score" in tokens or "predict" in tokens:
-        return "prediction"
+    if "report" in tokens or "summary" in tokens:
+        return "descriptive"
     return "unknown"
 
 

@@ -86,6 +86,7 @@ from src.utils.sandbox_deps import (
     cloudrun_imports_from_code,
     classify_dependency_support,
 )
+from src.utils.problem_capabilities import infer_problem_capabilities
 from src.utils.case_alignment import build_case_alignment_report
 # REMOVED: from src.utils.contract_validation import ensure_role_runbooks  # V4.1 cutover
 from src.utils.data_engineer_preflight import data_engineer_preflight
@@ -12714,99 +12715,24 @@ def _infer_problem_type_for_heavy(
     data_profile: Dict[str, Any],
     target_col: str,
 ) -> str:
-    objective_hints: List[str] = []
-    problem_hints: List[str] = []
-    if isinstance(evaluation_spec, dict):
-        objective = evaluation_spec.get("objective_type")
-        if objective:
-            objective_hints.append(str(objective))
-        problem_type = evaluation_spec.get("problem_type")
-        if problem_type:
-            problem_hints.append(str(problem_type))
-    if isinstance(contract, dict):
-        objective = contract.get("objective_type")
-        if objective:
-            objective_hints.append(str(objective))
-        obj_analysis = contract.get("objective_analysis")
-        if isinstance(obj_analysis, dict) and obj_analysis.get("problem_type"):
-            problem_hints.append(str(obj_analysis.get("problem_type")))
-        contract_eval = contract.get("evaluation_spec")
-        if isinstance(contract_eval, dict):
-            objective = contract_eval.get("objective_type")
-            if objective:
-                objective_hints.append(str(objective))
-            problem_type = contract_eval.get("problem_type")
-            if problem_type:
-                problem_hints.append(str(problem_type))
-
-    objective_norm = " ".join(objective_hints).lower()
-    problem_norm = " ".join(problem_hints).lower()
-    combined_norm = " ".join([problem_norm, objective_norm]).strip()
-    if any(
-        token in combined_norm
-        for token in ("survival", "time-to-event", "time_to_event", "hazard", "censor")
-    ):
-        return "survival_analysis"
-    if any(token in combined_norm for token in ("ranking", "rank", "recommend")):
-        return "ranking"
-    if any(token in combined_norm for token in ("clustering", "cluster", "segmentation")):
-        return "clustering"
-    if any(token in combined_norm for token in ("optimization", "prescriptive")):
-        return "optimization"
-    if any(token in objective_norm for token in ("classification", "classifier", "binary", "multiclass")):
-        return "classification"
-    if any(token in objective_norm for token in ("regression", "forecast", "timeseries")):
-        return "regression"
-
-    metrics: List[str] = []
-    validation = contract.get("validation_requirements") if isinstance(contract, dict) else {}
-    if isinstance(validation, dict):
-        primary = validation.get("primary_metric")
-        if primary:
-            metrics.append(str(primary))
-        metrics.extend([str(m) for m in (validation.get("metrics_to_report") or []) if m])
-    if isinstance(evaluation_spec, dict):
-        metrics.extend([str(m) for m in (evaluation_spec.get("metrics_to_report") or []) if m])
-        if evaluation_spec.get("primary_metric"):
-            metrics.append(str(evaluation_spec.get("primary_metric")))
-    metrics_norm = {_normalize_metric_key(m) for m in metrics if m}
-    cls_metric_tokens = (
-        "accuracy",
-        "rocauc",
-        "auc",
-        "f1",
-        "precision",
-        "recall",
-        "balancedaccuracy",
-        "logloss",
-        "averageprecision",
-        "prauc",
-        "brierscore",
-        "gini",
-        "normalizedgini",
-        "lift",
+    capabilities = infer_problem_capabilities(
+        objective_text=str((contract or {}).get("business_objective") or ""),
+        objective_type=(contract or {}).get("objective_type"),
+        problem_type=((contract or {}).get("objective_analysis") or {}).get("problem_type")
+        if isinstance((contract or {}).get("objective_analysis"), dict)
+        else None,
+        evaluation_spec=evaluation_spec if isinstance(evaluation_spec, dict) else {},
+        validation_requirements=(contract or {}).get("validation_requirements")
+        if isinstance((contract or {}).get("validation_requirements"), dict)
+        else {},
+        required_outputs=(contract or {}).get("required_outputs")
+        if isinstance((contract or {}).get("required_outputs"), list)
+        else [],
     )
-    reg_metric_tokens = ("rmse", "mse", "mae", "r2", "rmsle", "mape", "smape")
-    survival_metric_tokens = (
-        "concordanceindex",
-        "concordance",
-        "integratedbrierscore",
-        "ibs",
-        "censored",
-        "uncensored",
-    )
-    ranking_metric_tokens = ("ndcg", "map", "mrr", "hitrate", "precisionatk", "recallatk")
-    cluster_metric_tokens = ("silhouette", "daviesbouldin", "calinskiharabasz", "ari", "nmi")
-    if any(any(tok in metric for tok in survival_metric_tokens) for metric in metrics_norm):
-        return "survival_analysis"
-    if any(any(tok in metric for tok in ranking_metric_tokens) for metric in metrics_norm):
-        return "ranking"
-    if any(any(tok in metric for tok in cluster_metric_tokens) for metric in metrics_norm):
-        return "clustering"
-    if any(any(tok in metric for tok in cls_metric_tokens) for metric in metrics_norm):
-        return "classification"
-    if any(any(tok in metric for tok in reg_metric_tokens) for metric in metrics_norm):
-        return "regression"
+    family = str(capabilities.get("family") or "")
+    if family and family != "unknown":
+        return family
+
     target_stats = (data_profile or {}).get("numeric_summary", {}).get(target_col) if target_col else None
     if isinstance(target_stats, dict):
         n_unique = target_stats.get("n_unique") or target_stats.get("unique")
