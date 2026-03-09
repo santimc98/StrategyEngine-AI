@@ -651,6 +651,11 @@ class MLEngineerAgent:
         )
         repair_policy = raw.get("repair_policy") if isinstance(raw.get("repair_policy"), dict) else {}
         retry_context = raw.get("retry_context") if isinstance(raw.get("retry_context"), dict) else {}
+        repair_ground_truth = (
+            raw.get("repair_ground_truth")
+            if isinstance(raw.get("repair_ground_truth"), dict)
+            else {}
+        )
         deferred_optimization = (
             raw.get("deferred_optimization")
             if isinstance(raw.get("deferred_optimization"), dict)
@@ -808,6 +813,7 @@ class MLEngineerAgent:
             "repair_policy": repair_policy if isinstance(repair_policy, dict) else {},
             "deferred_optimization": deferred_optimization if isinstance(deferred_optimization, dict) else {},
             "retry_context": retry_context if isinstance(retry_context, dict) else {},
+            "repair_ground_truth": repair_ground_truth if isinstance(repair_ground_truth, dict) else {},
             "must_preserve": must_preserve[:8],
             "patch_objectives": patch_objectives[:8],
             "critic_packet": critic_packet if isinstance(critic_packet, dict) else {},
@@ -1268,6 +1274,11 @@ class MLEngineerAgent:
         handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
         quality_focus = handoff_payload.get("quality_focus")
         quality_focus = quality_focus if isinstance(quality_focus, dict) else {}
+        repair_ground_truth = (
+            handoff_payload.get("repair_ground_truth")
+            if isinstance(handoff_payload.get("repair_ground_truth"), dict)
+            else {}
+        )
 
         failed_tokens: List[str] = []
         for values in (
@@ -1338,6 +1349,19 @@ class MLEngineerAgent:
             "persist",
             "write artifact",
         ]
+        root_cause_type = str(repair_ground_truth.get("root_cause_type") or "").strip().lower()
+        repair_focus = str(repair_ground_truth.get("repair_focus") or "").strip().lower()
+        if repair_focus == "runtime" or root_cause_type in {
+            "runtime_api_misuse",
+            "runtime_error",
+            "timeout",
+            "oom",
+            "import_error",
+            "shape_or_dtype",
+        }:
+            return "runtime_repair"
+        if repair_focus == "persistence" or root_cause_type in {"artifact_io", "output_missing"}:
+            return "persistence"
         if self._is_repair_first_context(
             gate_context=gate_context,
             handoff_payload=handoff_payload,
@@ -4231,6 +4255,9 @@ class MLEngineerAgent:
         ITERATION_HANDOFF (authoritative patch context):
         $iteration_handoff_json
 
+        REPAIR GROUND TRUTH (verified environment facts, authoritative):
+        $repair_ground_truth
+
         PATCH OBJECTIVES (apply in order):
         $patch_objectives
 
@@ -4253,6 +4280,8 @@ class MLEngineerAgent:
         $fixes_bullets
         - Diagnose the smallest coherent edit set that resolves the active blocker.
         - If a traceback exists, fix its root cause before optional improvements.
+        - Treat REPAIR GROUND TRUTH as higher priority than heuristic summaries when they conflict.
+        - If REPAIR GROUND TRUTH includes callable signatures, accepted args, return-type facts, or sandbox facts, obey them.
         - Preserve verified logic that already works.
         - Ensure required outputs are still written at exact contract paths.
         - Do not generate synthetic data.
@@ -4286,6 +4315,9 @@ class MLEngineerAgent:
         ITERATION HANDOFF:
         $iteration_handoff_json
 
+        REPAIR GROUND TRUTH (verified environment facts, authoritative):
+        $repair_ground_truth
+
         STRUCTURED CRITIQUE PACKET:
         $critic_packet_json
 
@@ -4309,6 +4341,7 @@ class MLEngineerAgent:
         - Keep script structure and apply the smallest coherent edits required by patch objectives and enforcement.
         - Keep strategy/objective/contract paths unchanged.
         - Treat phase as the current focus, not as a pre-scripted recipe.
+        - Treat REPAIR GROUND TRUTH as environment truth; do not override it with guessed library behavior.
         - If phase is "runtime_repair", restore runnable behavior and required outputs before deferred metric-improvement work.
           If the failure is a timeout or OOM, reduce compute cost within the same model family before changing strategy.
         - If phase is "persistence", keep training/model selection logic stable unless a contract violation forces a broader fix.
@@ -4506,6 +4539,14 @@ class MLEngineerAgent:
                 max_list_items=30,
             )
             editor_enforcement_block = self._build_editor_enforcement_block(handoff_payload)
+            repair_ground_truth_block = self._serialize_json_for_prompt(
+                handoff_payload.get("repair_ground_truth")
+                if isinstance(handoff_payload.get("repair_ground_truth"), dict)
+                else {},
+                max_chars=2600,
+                max_str_len=260,
+                max_list_items=24,
+            )
             if optimization_editor_mode:
                 optimization_focus = (
                     handoff_payload.get("optimization_focus")
@@ -4614,6 +4655,7 @@ class MLEngineerAgent:
                     last_run_memory=last_run_memory_block,
                     strategy_lock=strategy_lock_block,
                     iteration_handoff_json=handoff_payload_json,
+                    repair_ground_truth=repair_ground_truth_block or "{}",
                     critic_packet_json=critic_packet_block,
                     hypothesis_packet_json=hypothesis_packet_block,
                     patch_objectives=patch_objectives_block,
@@ -4706,6 +4748,14 @@ class MLEngineerAgent:
                 USER_PATCH_TEMPLATE,
                 gate_source=str(gate_ctx.get('source', 'QA Reviewer')).upper(),
                 iteration_handoff_json=handoff_payload_json,
+                repair_ground_truth=self._serialize_json_for_prompt(
+                    handoff_payload.get("repair_ground_truth")
+                    if isinstance(handoff_payload.get("repair_ground_truth"), dict)
+                    else {},
+                    max_chars=2600,
+                    max_str_len=260,
+                    max_list_items=24,
+                ) or "{}",
                 patch_objectives=patch_objectives_block,
                 must_preserve=must_preserve_block,
                 feedback_text=feedback_text,

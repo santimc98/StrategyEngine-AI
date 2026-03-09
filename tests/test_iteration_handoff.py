@@ -121,3 +121,64 @@ def test_iteration_handoff_defers_metric_optimization_when_runtime_blockers_exis
     assert handoff["retry_context"]["error_type"] == "timeout"
     assert handoff["retry_context"]["cost_reduction_required"] is True
     assert handoff["deferred_optimization"]["active_technique"] == "multi_seed_catboost_averaging"
+
+
+def test_iteration_handoff_builds_repair_ground_truth_for_runtime_api_misuse():
+    generated_code = (
+        "import pathlib\n"
+        "\n"
+        "def run():\n"
+        "    path = pathlib.Path('missing.txt')\n"
+        "    return path.read_text(extra=True)\n"
+        "\n"
+        "run()\n"
+    )
+    runtime_output = (
+        "Traceback (most recent call last)\n"
+        "  File \"script.py\", line 7, in <module>\n"
+        "    run()\n"
+        "  File \"script.py\", line 5, in run\n"
+        "    return path.read_text(extra=True)\n"
+        "TypeError: Path.read_text() got an unexpected keyword argument 'extra'\n"
+    )
+
+    state = {
+        "iteration_count": 1,
+        "execution_contract": {"required_outputs": ["data/metrics.json", "data/submission.csv"]},
+        "generated_code": generated_code,
+        "execution_output": runtime_output,
+        "last_runtime_error_tail": runtime_output,
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["runtime_failure", "output_contract"],
+            "required_fixes": ["Remove unsupported kwargs from the failing call."],
+            "feedback": "Runtime crash before outputs were written.",
+        },
+        oc_report={"present": [], "missing": ["data/metrics.json", "data/submission.csv"]},
+        review_result={"feedback": "Runtime failed before scoring."},
+        qa_result={"feedback": "Missing required outputs."},
+        evaluation_spec={"primary_metric": "accuracy"},
+    )
+
+    assert handoff["retry_context"]["error_type"] == "runtime_api_misuse"
+    assert handoff["repair_policy"]["primary_focus"] == "runtime"
+    repair_ground_truth = handoff["repair_ground_truth"]
+    assert repair_ground_truth["root_cause_type"] == "runtime_api_misuse"
+    assert any(
+        fact.get("fact") == "unexpected_keyword_argument" and fact.get("value") == "extra"
+        for fact in repair_ground_truth["verified_facts"]
+    )
+    assert any(
+        site.get("expression") == "path.read_text" and "read_text" in str(site.get("resolved_symbol") or "")
+        for site in repair_ground_truth["candidate_call_sites"]
+    )
+    assert any(
+        env.get("fact") == "callable_signature"
+        and "read_text" in str(env.get("resolved_symbol") or "")
+        and "encoding" in str(env.get("value") or "")
+        for env in repair_ground_truth["environment_facts"]
+    )

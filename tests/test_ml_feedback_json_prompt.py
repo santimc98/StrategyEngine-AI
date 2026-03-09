@@ -156,3 +156,59 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
     assert "OPTIMIZATION CONTEXT (authoritative current round):" in prompt
     assert "FEATURE ENGINEERING PLAN (contract):" in prompt
     assert "HYPOTHESIS_PACKET_JSON" in prompt
+
+
+def test_editor_prompt_includes_authoritative_repair_ground_truth(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={"title": "Repair Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        previous_code="import pathlib\nprint('previous')\n",
+        gate_context={
+            "source": "Execution Runtime",
+            "status": "REJECTED",
+            "feedback": "Traceback (most recent call last): TypeError",
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Fix the failing API call."],
+        },
+        iteration_handoff={
+            "mode": "patch",
+            "repair_policy": {"repair_first": True, "primary_focus": "runtime"},
+            "retry_context": {"error_type": "runtime_api_misuse", "repair_focus": "runtime"},
+            "repair_ground_truth": {
+                "root_cause_type": "runtime_api_misuse",
+                "repair_focus": "runtime",
+                "failure_signature": "TypeError: Path.read_text() got an unexpected keyword argument 'extra'",
+                "environment_facts": [
+                    {
+                        "fact": "callable_signature",
+                        "resolved_symbol": "pathlib.Path.read_text",
+                        "value": "(self, encoding=None, errors=None, newline=None)",
+                    }
+                ],
+                "verified_facts": [
+                    {"fact": "unexpected_keyword_argument", "value": "extra", "source": "runtime_traceback"}
+                ],
+            },
+        },
+        execution_contract={"required_outputs": ["data/metrics.json"], "canonical_columns": []},
+        ml_view={"required_outputs": ["data/metrics.json"]},
+        editor_mode=True,
+    )
+
+    prompt = str(agent.last_prompt or "")
+    assert "REPAIR GROUND TRUTH (verified environment facts, authoritative):" in prompt
+    assert "pathlib.Path.read_text" in prompt
+    assert "unexpected_keyword_argument" in prompt

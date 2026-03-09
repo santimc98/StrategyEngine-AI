@@ -14,6 +14,8 @@ import threading
 import time
 import fnmatch
 import traceback
+import inspect
+import importlib
 import importlib.util
 from pathlib import Path
 from datetime import datetime, timezone
@@ -9690,6 +9692,444 @@ def _build_retry_context(
     }
 
 
+def _extract_runtime_exception_signature(text: Any) -> Tuple[str, str]:
+    lines = [str(line).strip() for line in str(text or "").splitlines() if str(line).strip()]
+    for line in reversed(lines):
+        if line.lower().startswith("traceback"):
+            continue
+        if ":" not in line:
+            continue
+        exc_type, _, message = line.partition(":")
+        exc_type = exc_type.strip()
+        if not exc_type:
+            continue
+        compact = exc_type.replace(".", "").replace("_", "")
+        if exc_type.endswith("Error") or exc_type.endswith("Exception") or compact.isidentifier():
+            return exc_type, message.strip()
+    return "", lines[-1] if lines else ""
+
+
+def _extract_runtime_traceback_line_number(text: Any) -> int | None:
+    matches = re.findall(r'File\s+"[^"]+",\s+line\s+(\d+)', str(text or ""))
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except Exception:
+        return None
+
+
+def _get_code_line_at(code: Any, line_number: int | None) -> str:
+    if not isinstance(line_number, int) or line_number <= 0:
+        return ""
+    lines = str(code or "").splitlines()
+    if 1 <= line_number <= len(lines):
+        return lines[line_number - 1].rstrip()
+    return ""
+
+
+def _ast_expr_to_dotted_name(node: ast.AST | None) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _ast_expr_to_dotted_name(node.value)
+        if parent:
+            return f"{parent}.{node.attr}"
+    return ""
+
+
+def _parse_script_import_aliases(code: Any) -> Dict[str, Dict[str, str]]:
+    script = str(code or "")
+    if not script.strip():
+        return {}
+    try:
+        tree = ast.parse(script)
+    except Exception:
+        return {}
+    aliases: Dict[str, Dict[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound_name = alias.asname or alias.name.split(".")[0]
+                module_name = alias.name if alias.asname else alias.name.split(".")[0]
+                aliases[bound_name] = {"module": module_name, "attribute": ""}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                bound_name = alias.asname or alias.name
+                aliases[bound_name] = {"module": node.module, "attribute": alias.name}
+    return aliases
+
+
+def _collect_constructor_assignments(code: Any) -> Dict[str, List[Dict[str, Any]]]:
+    script = str(code or "")
+    if not script.strip():
+        return {}
+    try:
+        tree = ast.parse(script)
+    except Exception:
+        return {}
+    assignments: Dict[str, List[Dict[str, Any]]] = {}
+    for node in ast.walk(tree):
+        call_node = None
+        targets: List[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            call_node = node.value if isinstance(node.value, ast.Call) else None
+            targets = list(node.targets or [])
+        elif isinstance(node, ast.AnnAssign):
+            call_node = node.value if isinstance(node.value, ast.Call) else None
+            targets = [node.target]
+        if not isinstance(call_node, ast.Call):
+            continue
+        callee = _ast_expr_to_dotted_name(call_node.func)
+        if not callee:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assignments.setdefault(target.id, []).append(
+                    {
+                        "callee": callee,
+                        "lineno": int(getattr(node, "lineno", 0) or 0),
+                    }
+                )
+    return assignments
+
+
+def _collect_call_expressions_for_line(code: Any, line_number: int | None) -> List[str]:
+    script = str(code or "")
+    if not script.strip() or not isinstance(line_number, int) or line_number <= 0:
+        return []
+    try:
+        tree = ast.parse(script)
+    except Exception:
+        return []
+    expressions: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if int(getattr(node, "lineno", 0) or 0) != line_number:
+            continue
+        dotted = _ast_expr_to_dotted_name(node.func)
+        if dotted and dotted not in expressions:
+            expressions.append(dotted)
+    return expressions[:6]
+
+
+def _safe_import_module_for_probe(module_name: str) -> Tuple[Any | None, str]:
+    token = str(module_name or "").strip()
+    if not token:
+        return None, ""
+    try:
+        spec = importlib.util.find_spec(token)
+    except Exception:
+        return None, ""
+    if spec is None:
+        return None, ""
+    origin = str(getattr(spec, "origin", "") or "")
+    origin_norm = os.path.normcase(os.path.abspath(origin)) if origin and origin not in {"built-in", "frozen"} else ""
+    project_root = os.path.normcase(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+    in_project = bool(origin_norm) and origin_norm.startswith(project_root)
+    safe_external = ".venv" in origin_norm or "site-packages" in origin_norm
+    if in_project and not safe_external:
+        return None, origin
+    try:
+        return importlib.import_module(token), origin
+    except Exception:
+        return None, origin
+
+
+def _resolve_probe_object_from_imports(
+    dotted_name: str,
+    import_aliases: Dict[str, Dict[str, str]],
+) -> Tuple[Any | None, str, str]:
+    expression = str(dotted_name or "").strip()
+    if not expression:
+        return None, "", ""
+    segments = [segment for segment in expression.split(".") if segment]
+    if not segments:
+        return None, "", ""
+
+    first = segments[0]
+    info = import_aliases.get(first)
+    origin = ""
+    if info:
+        module_obj, origin = _safe_import_module_for_probe(str(info.get("module") or ""))
+        if module_obj is None:
+            return None, "", origin
+        obj = module_obj
+        resolved_name = str(info.get("module") or first)
+        attribute = str(info.get("attribute") or "").strip()
+        if attribute:
+            obj = getattr(obj, attribute, None)
+            if obj is None:
+                return None, "", origin
+            resolved_name = f"{resolved_name}.{attribute}"
+        remaining = segments[1:]
+    else:
+        module_obj, origin = _safe_import_module_for_probe(first)
+        if module_obj is None:
+            return None, "", origin
+        obj = module_obj
+        resolved_name = first
+        remaining = segments[1:]
+
+    for segment in remaining:
+        obj = getattr(obj, segment, None)
+        if obj is None:
+            return None, "", origin
+        resolved_name = f"{resolved_name}.{segment}"
+    return obj, resolved_name, origin
+
+
+def _resolve_probe_object_from_expression(
+    dotted_name: str,
+    import_aliases: Dict[str, Dict[str, str]],
+    constructor_assignments: Dict[str, List[Dict[str, Any]]],
+    line_number: int | None,
+    *,
+    depth: int = 0,
+) -> Tuple[Any | None, str, str]:
+    if depth >= 4:
+        return None, "", ""
+    expression = str(dotted_name or "").strip()
+    if not expression:
+        return None, "", ""
+    segments = [segment for segment in expression.split(".") if segment]
+    if not segments:
+        return None, "", ""
+
+    first = segments[0]
+    if first in constructor_assignments:
+        candidates = [
+            item
+            for item in (constructor_assignments.get(first) or [])
+            if isinstance(item, dict)
+            and str(item.get("callee") or "").strip()
+            and (
+                not isinstance(line_number, int)
+                or int(item.get("lineno", 0) or 0) <= int(line_number)
+            )
+        ]
+        if candidates:
+            candidate = sorted(candidates, key=lambda item: int(item.get("lineno", 0) or 0))[-1]
+            base_obj, resolved_name, origin = _resolve_probe_object_from_expression(
+                str(candidate.get("callee") or ""),
+                import_aliases,
+                constructor_assignments,
+                int(candidate.get("lineno", 0) or 0),
+                depth=depth + 1,
+            )
+            if base_obj is not None:
+                current = base_obj
+                current_name = resolved_name
+                for segment in segments[1:]:
+                    current = getattr(current, segment, None)
+                    if current is None:
+                        return None, "", origin
+                    current_name = f"{current_name}.{segment}"
+                return current, current_name, origin
+
+    return _resolve_probe_object_from_imports(expression, import_aliases)
+
+
+def _build_candidate_call_site_facts(runtime_output: Any, code: Any) -> List[Dict[str, Any]]:
+    line_number = _extract_runtime_traceback_line_number(runtime_output)
+    if not isinstance(line_number, int) or line_number <= 0:
+        return []
+    call_expressions = _collect_call_expressions_for_line(code, line_number)
+    if not call_expressions:
+        return []
+    import_aliases = _parse_script_import_aliases(code)
+    constructor_assignments = _collect_constructor_assignments(code)
+    facts: List[Dict[str, Any]] = []
+    for expression in call_expressions:
+        obj, resolved_symbol, origin = _resolve_probe_object_from_expression(
+            expression,
+            import_aliases,
+            constructor_assignments,
+            line_number,
+        )
+        if obj is None:
+            continue
+        try:
+            signature = str(inspect.signature(obj))
+        except Exception:
+            signature = ""
+        if not signature:
+            continue
+        facts.append(
+            {
+                "expression": expression,
+                "resolved_symbol": resolved_symbol or expression,
+                "signature": signature,
+                "source": "inspect.signature",
+                "origin": origin or None,
+            }
+        )
+        if len(facts) >= 4:
+            break
+    return facts
+
+
+def _build_repair_ground_truth(
+    *,
+    state: Dict[str, Any],
+    retry_context: Dict[str, Any] | None,
+    runtime_output: Any,
+    missing_outputs: List[str] | None,
+    present_outputs: List[str] | None,
+    failed_gates: List[str] | None,
+    required_fixes: List[str] | None,
+) -> Dict[str, Any]:
+    retry_context = retry_context if isinstance(retry_context, dict) else {}
+    runtime_text = str(runtime_output or "").strip()
+    error_type = str(retry_context.get("error_type") or "").strip().lower()
+    repair_focus = str(retry_context.get("repair_focus") or "").strip().lower()
+    specific_error = str(retry_context.get("specific_error") or "").strip()
+    exception_type, exception_message = _extract_runtime_exception_signature(runtime_text)
+    line_number = _extract_runtime_traceback_line_number(runtime_text)
+    generated_code = (
+        state.get("generated_code")
+        or state.get("last_generated_code")
+        or state.get("last_successful_generated_code")
+        or ""
+    )
+    failing_line = _get_code_line_at(generated_code, line_number)
+    keyword_match = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", runtime_text, re.IGNORECASE)
+    attr_match = re.search(
+        r"'([^']+)' object has no attribute ['\"]([^'\"]+)['\"]",
+        runtime_text,
+        re.IGNORECASE,
+    )
+    missing_arg_match = re.search(
+        r"missing\s+\d+\s+required positional argument[s]?:\s*['\"]([^'\"]+)['\"]",
+        runtime_text,
+        re.IGNORECASE,
+    )
+    takes_no_kw_match = re.search(
+        r"got an unexpected keyword argument ['\"]([^'\"]+)['\"]",
+        runtime_text,
+        re.IGNORECASE,
+    )
+    if error_type == "runtime_error" and (
+        keyword_match or attr_match or missing_arg_match or takes_no_kw_match
+    ):
+        error_type = "runtime_api_misuse"
+        repair_focus = "runtime"
+
+    candidate_call_sites = _build_candidate_call_site_facts(runtime_text, generated_code)
+    verified_facts: List[Dict[str, Any]] = []
+    environment_facts: List[Dict[str, Any]] = []
+    repair_directives: List[str] = []
+    do_not_change: List[str] = []
+
+    if exception_type:
+        verified_facts.append({"fact": "exception_type", "value": exception_type, "source": "runtime_traceback"})
+    if exception_message:
+        verified_facts.append({"fact": "exception_message", "value": exception_message[:280], "source": "runtime_traceback"})
+    if isinstance(line_number, int) and line_number > 0:
+        verified_facts.append({"fact": "failing_line_number", "value": line_number, "source": "runtime_traceback"})
+    if failing_line:
+        verified_facts.append({"fact": "failing_line_code", "value": failing_line[:280], "source": "generated_code"})
+    if missing_outputs:
+        verified_facts.append(
+            {
+                "fact": "missing_outputs",
+                "value": [str(path) for path in (missing_outputs or [])[:8]],
+                "source": "output_contract",
+            }
+        )
+    if keyword_match:
+        verified_facts.append(
+            {
+                "fact": "unexpected_keyword_argument",
+                "value": keyword_match.group(1),
+                "source": "runtime_traceback",
+            }
+        )
+        repair_directives.append(
+            "Remove or replace unsupported keyword arguments only after matching the verified callable signature."
+        )
+    if attr_match:
+        verified_facts.append(
+            {
+                "fact": "missing_attribute",
+                "value": {"object_type": attr_match.group(1), "attribute": attr_match.group(2)},
+                "source": "runtime_traceback",
+            }
+        )
+        repair_directives.append(
+            "Do not assume method/attribute chains. Use the verified object type and available signatures to patch the failing access."
+        )
+    if missing_arg_match:
+        verified_facts.append(
+            {
+                "fact": "missing_required_argument",
+                "value": missing_arg_match.group(1),
+                "source": "runtime_traceback",
+            }
+        )
+    for call_site in candidate_call_sites:
+        environment_facts.append(
+            {
+                "fact": "callable_signature",
+                "expression": call_site.get("expression"),
+                "resolved_symbol": call_site.get("resolved_symbol"),
+                "value": call_site.get("signature"),
+                "origin": call_site.get("origin"),
+                "source": call_site.get("source"),
+            }
+        )
+    for path in (present_outputs or [])[:6]:
+        do_not_change.append(f"Keep artifact generation for {path} unchanged unless the failing block directly requires it.")
+    if error_type == "runtime_api_misuse":
+        do_not_change.append("Do not refactor unrelated modeling logic before the verified failing API call is corrected.")
+    if error_type in {"output_missing", "artifact_io"}:
+        do_not_change.append("Keep working training logic stable while restoring contract outputs at exact paths.")
+
+    for action in retry_context.get("recommended_actions") or []:
+        text = str(action or "").strip()
+        if text and text not in repair_directives:
+            repair_directives.append(text)
+    for fix in required_fixes or []:
+        text = str(fix or "").strip()
+        if text and text not in repair_directives:
+            repair_directives.append(text)
+        if len(repair_directives) >= 8:
+            break
+    for gate in failed_gates or []:
+        label = str(gate or "").strip()
+        if not label:
+            continue
+        verified_facts.append({"fact": "failed_gate", "value": label[:180], "source": "review_pipeline"})
+        if len([item for item in verified_facts if item.get("fact") == "failed_gate"]) >= 6:
+            break
+
+    failure_signature = specific_error or ""
+    if exception_type or exception_message:
+        failure_signature = ": ".join([part for part in [exception_type, exception_message] if part]).strip()
+    failure_signature = failure_signature[:320]
+    if not error_type and missing_outputs:
+        error_type = "output_missing"
+    if not repair_focus and error_type in {"runtime_api_misuse", "runtime_error", "timeout", "oom", "import_error", "shape_or_dtype"}:
+        repair_focus = "runtime"
+    if not repair_focus and error_type in {"artifact_io", "output_missing"}:
+        repair_focus = "persistence"
+
+    if not (error_type or verified_facts or environment_facts or repair_directives):
+        return {}
+    return {
+        "version": "v1",
+        "root_cause_type": error_type or "unknown",
+        "repair_focus": repair_focus or "runtime",
+        "failure_signature": failure_signature or None,
+        "verified_facts": verified_facts[:12],
+        "environment_facts": environment_facts[:8],
+        "repair_directives": repair_directives[:8],
+        "candidate_call_sites": candidate_call_sites[:4],
+        "do_not_change": do_not_change[:8],
+    }
+
+
 def _classify_runtime_failure_details(
     output: Any,
     *,
@@ -9729,6 +10169,14 @@ def _classify_runtime_failure_details(
         "to_csv",
         "write artifact",
     )
+    api_misuse_tokens = (
+        "unexpected keyword argument",
+        "has no attribute",
+        "missing 1 required positional argument",
+        "missing 2 required positional arguments",
+        "takes no keyword arguments",
+        "got multiple values for argument",
+    )
     shape_tokens = (
         "shape mismatch",
         "length mismatch",
@@ -9762,6 +10210,14 @@ def _classify_runtime_failure_details(
         recommended_actions = [
             "Use only runtime-compatible dependencies and imports allowed by the contract.",
             "Replace unavailable imports with declared fallbacks before changing model logic.",
+        ]
+    elif any(token in lower for token in api_misuse_tokens):
+        failure_type = "runtime_api_misuse"
+        repair_focus = "runtime"
+        recommended_actions = [
+            "Verify the failing callable signature, accepted arguments, and return type against the installed environment before editing.",
+            "Patch only the failing API usage first and keep the broader modeling strategy stable.",
+            "Regenerate required artifacts only after the verified runtime API issue is resolved.",
         ]
     elif any(token in lower for token in io_tokens):
         failure_type = "artifact_io"
@@ -9814,7 +10270,7 @@ def _resolve_repair_first_focus(
     retry_error_type = str(retry_context.get("error_type") or "").strip().lower()
     retry_specific = str(retry_context.get("specific_error") or "").strip().lower()
     runtime_markers = ("runtime", "traceback", "exception", "timeout", "sandbox", "memory", "oom")
-    if retry_error_type in {"timeout", "oom", "import_error", "shape_or_dtype"}:
+    if retry_error_type in {"timeout", "oom", "import_error", "shape_or_dtype", "runtime_api_misuse"}:
         return "runtime"
     if retry_error_type == "runtime_error" and any(token in retry_specific for token in runtime_markers):
         return "runtime"
@@ -10300,6 +10756,15 @@ def _build_iteration_handoff(
         required_fixes=required_fixes,
         state=state,
     )
+    repair_ground_truth = _build_repair_ground_truth(
+        state=state,
+        retry_context=retry_context,
+        runtime_output=state.get("execution_output") or runtime_tail,
+        missing_outputs=missing_outputs,
+        present_outputs=present_outputs,
+        failed_gates=failed_gates,
+        required_fixes=required_fixes,
+    )
     repair_first_focus = _resolve_repair_first_focus(
         retry_context=retry_context,
         failed_gates=failed_gates,
@@ -10375,6 +10840,7 @@ def _build_iteration_handoff(
             "patch_intensity": "aggressive" if enforce_apply_hypothesis and not repair_first_focus else "incremental",
         },
         "retry_context": retry_context,
+        "repair_ground_truth": repair_ground_truth if isinstance(repair_ground_truth, dict) else {},
     }
     if repair_first_focus:
         handoff = _apply_repair_first_handoff(
@@ -10407,12 +10873,24 @@ def _persist_iteration_handoff_state(state: Dict[str, Any] | None) -> None:
             dump_json("data/metric_state.json", metric_state)
             persisted_paths.append("data/metric_state.json")
 
+        repair_ground_truth = (
+            handoff.get("repair_ground_truth")
+            if isinstance(handoff.get("repair_ground_truth"), dict)
+            else {}
+        )
+        if repair_ground_truth:
+            dump_json("data/repair_ground_truth.json", repair_ground_truth)
+            state["repair_ground_truth"] = copy.deepcopy(repair_ground_truth)
+            persisted_paths.append("data/repair_ground_truth.json")
+
         review_stack = state.get("ml_review_stack")
         if isinstance(review_stack, dict) and review_stack:
             updated_stack = copy.deepcopy(review_stack)
             updated_stack["iteration_handoff"] = copy.deepcopy(handoff)
             if metric_state:
                 updated_stack["metric_state"] = copy.deepcopy(metric_state)
+            if repair_ground_truth:
+                updated_stack["repair_ground_truth"] = copy.deepcopy(repair_ground_truth)
             metric_context = (
                 dict(updated_stack.get("metric_improvement_context"))
                 if isinstance(updated_stack.get("metric_improvement_context"), dict)
