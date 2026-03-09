@@ -122,3 +122,9 @@ auditoria_*.md
 
 # Kaggle submissions
 kaggle_submission/
+
+# Local WiDS 2026 prep workspace
+tools/wids_2026_prep/input/*
+!tools/wids_2026_prep/input/.gitkeep
+tools/wids_2026_prep/output/*
+!tools/wids_2026_prep/output/.gitkeep
