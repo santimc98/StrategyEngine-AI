@@ -1356,8 +1356,10 @@ def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(value, (int, float, str, bool)) and len(model_perf_compact) < 15:
                 model_perf_compact[str(key)] = value
 
+    authoritative_runtime = _resolve_authoritative_runtime_text(state=state)
     runtime_status = "FAILED_RUNTIME" if (
         bool(state.get("sandbox_failed"))
+        or bool(authoritative_runtime)
         or _has_runtime_failure_marker(state.get("execution_output"))
     ) else "OK"
     gate_context = state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
@@ -9189,9 +9191,9 @@ def _clear_runtime_blockers() -> Dict[str, Any]:
 
 
 def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
-    if not output:
+    text = _resolve_authoritative_runtime_text(output)
+    if not text:
         return None
-    text = str(output)
     line = text.strip().splitlines()[-1] if text.strip() else ""
     details = _classify_runtime_failure_details(text)
     if "Traceback" in text:
@@ -9651,11 +9653,15 @@ def _build_retry_context(
     Build a structured retry_context for targeted error recovery.
     Classifies the error type so downstream agents know exactly what to fix.
     """
-    runtime_details = _classify_runtime_failure_details(runtime_tail, missing_outputs=missing_outputs)
+    authoritative_runtime = _resolve_authoritative_runtime_text(runtime_tail, state=state)
+    runtime_details = _classify_runtime_failure_details(
+        authoritative_runtime or runtime_tail,
+        missing_outputs=missing_outputs,
+    )
     error_type = str(runtime_details.get("failure_type") or "unknown")
     specific_error = str(runtime_details.get("summary") or "")
     blocked_imports: List[str] = []
-    runtime_lower = (runtime_tail or "").lower()
+    runtime_lower = str(authoritative_runtime or runtime_tail or "").lower()
     if not specific_error and failed_gates:
         specific_error = f"Failed gates: {', '.join(failed_gates[:5])}"
 
@@ -9707,6 +9713,131 @@ def _extract_runtime_exception_signature(text: Any) -> Tuple[str, str]:
         if exc_type.endswith("Error") or exc_type.endswith("Exception") or compact.isidentifier():
             return exc_type, message.strip()
     return "", lines[-1] if lines else ""
+
+
+def _is_wrapper_exception_type(exc_type: Any) -> bool:
+    token = re.sub(r"[^A-Za-z0-9_]+", "", str(exc_type or "").strip().upper())
+    return token in {
+        "",
+        "HEAVYRUNNER",
+        "LOCALRUNNER",
+        "JOBERRORDETAIL",
+        "STATUS",
+        "EXECUTION",
+        "EXECUTIONERROR",
+    }
+
+
+def _score_runtime_text_candidate(text: Any) -> int:
+    payload = str(text or "").strip()
+    if not payload:
+        return -10_000
+    score = 0
+    if "Traceback (most recent call last)" in payload:
+        score += 120
+    if "HEAVY_RUNNER_ERROR_CONTEXT:" in payload:
+        score += 90
+    if "HEAVY_RUNNER_ERROR:" in payload:
+        score += 70
+    exc_type, _ = _extract_runtime_exception_signature(payload)
+    if exc_type and not _is_wrapper_exception_type(exc_type):
+        score += 80
+    if "AssertionError" in payload:
+        score += 30
+    if re.search(r"^HEAVY_RUNNER:\s*status=success\b", payload, re.IGNORECASE):
+        score -= 150
+    score += min(len(payload), 4000) // 120
+    return score
+
+
+def _extract_traceback_tail(text: Any, max_chars: int = 4000) -> str:
+    payload = str(text or "").strip()
+    if not payload or "Traceback (most recent call last)" not in payload:
+        return ""
+    idx = payload.rfind("Traceback (most recent call last)")
+    if idx < 0:
+        return ""
+    return payload[idx:][-max_chars:].strip()
+
+
+def _sanitize_runtime_text_candidate(text: Any) -> str:
+    payload = str(text or "").strip()
+    if not payload:
+        return ""
+    candidates: List[str] = []
+    traceback_tail = _extract_traceback_tail(payload)
+    if traceback_tail:
+        candidates.append(traceback_tail)
+    for marker in ("HEAVY_RUNNER_ERROR_CONTEXT:", "HEAVY_RUNNER_ERROR:"):
+        if marker not in payload:
+            continue
+        parts = payload.split(marker)
+        for part in parts[1:]:
+            segment = str(part or "").strip()
+            if not segment:
+                continue
+            tb_segment = _extract_traceback_tail(segment)
+            candidates.append(tb_segment or segment[-4000:].strip())
+    if not candidates:
+        exc_type, _ = _extract_runtime_exception_signature(payload)
+        if re.search(r"^HEAVY_RUNNER:\s*status=success\b", payload, re.IGNORECASE) and (
+            not exc_type or _is_wrapper_exception_type(exc_type)
+        ):
+            return ""
+        candidates.append(payload[-4000:].strip())
+    best = ""
+    best_score = -10_000
+    for candidate in candidates:
+        score = _score_runtime_text_candidate(candidate)
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
+def _resolve_authoritative_runtime_text(
+    *texts: Any,
+    state: Dict[str, Any] | None = None,
+) -> str:
+    raw_candidates: List[Any] = list(texts)
+    if isinstance(state, dict):
+        gate_context = state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+        runtime_error = gate_context.get("runtime_error") if isinstance(gate_context.get("runtime_error"), dict) else {}
+        raw_candidates.extend(
+            [
+                state.get("last_runtime_error_tail"),
+                state.get("execution_output"),
+                state.get("heavy_runner_error_context"),
+                gate_context.get("traceback"),
+                gate_context.get("execution_output_tail"),
+                runtime_error.get("summary"),
+            ]
+        )
+
+    best = ""
+    best_score = -10_000
+    seen: set[str] = set()
+    for raw in raw_candidates:
+        if isinstance(raw, dict):
+            expanded_values = [
+                raw.get("stacktrace"),
+                raw.get("traceback"),
+                raw.get("error"),
+                raw.get("message"),
+                raw.get("summary"),
+            ]
+        else:
+            expanded_values = [raw]
+        for expanded in expanded_values:
+            candidate = _sanitize_runtime_text_candidate(expanded)
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            score = _score_runtime_text_candidate(candidate)
+            if score > best_score:
+                best = candidate
+                best_score = score
+    return best
 
 
 def _extract_runtime_traceback_line_number(text: Any) -> int | None:
@@ -10135,13 +10266,15 @@ def _classify_runtime_failure_details(
     *,
     missing_outputs: List[str] | None = None,
 ) -> Dict[str, Any]:
-    text = str(output or "").strip()
+    text = _resolve_authoritative_runtime_text(output) or str(output or "").strip()
     lower = text.lower()
     last_line = text.splitlines()[-1].strip() if text else ""
     failure_type = "runtime_error"
     repair_focus = "runtime"
     cost_reduction_required = False
     recommended_actions: List[str] = []
+    exception_type, exception_message = _extract_runtime_exception_signature(text)
+    has_explicit_runtime_exception = bool(exception_type) and not _is_wrapper_exception_type(exception_type)
 
     timeout_tokens = (
         "timeout",
@@ -10176,6 +10309,12 @@ def _classify_runtime_failure_details(
         "missing 2 required positional arguments",
         "takes no keyword arguments",
         "got multiple values for argument",
+    )
+    assertion_tokens = (
+        "assertionerror",
+        "row count mismatch",
+        "expected_row_count",
+        "contract requires",
     )
     shape_tokens = (
         "shape mismatch",
@@ -10219,6 +10358,17 @@ def _classify_runtime_failure_details(
             "Patch only the failing API usage first and keep the broader modeling strategy stable.",
             "Regenerate required artifacts only after the verified runtime API issue is resolved.",
         ]
+    elif "assertionerror" in lower or (
+        has_explicit_runtime_exception
+        and str(exception_type).strip() == "AssertionError"
+    ) or any(token in lower for token in assertion_tokens):
+        failure_type = "runtime_contract_assertion"
+        repair_focus = "runtime"
+        recommended_actions = [
+            "Fix the failing contract assertion or subset-selection logic before any further optimization work.",
+            "Use contract row rules and artifact schemas as the source of truth for the failing assertion.",
+            "Regenerate required artifacts only after the assertion-causing logic is corrected.",
+        ]
     elif any(token in lower for token in io_tokens):
         failure_type = "artifact_io"
         repair_focus = "persistence"
@@ -10226,19 +10376,19 @@ def _classify_runtime_failure_details(
             "Fix artifact writing/serialization/path handling first.",
             "Preserve valid training logic unless the contract explicitly requires a modeling change.",
         ]
-    elif missing_outputs:
-        failure_type = "output_missing"
-        repair_focus = "persistence"
-        recommended_actions = [
-            "Regenerate missing contract outputs at the exact required paths.",
-            "Keep the rest of the pipeline stable while restoring artifact completeness.",
-        ]
     elif any(token in lower for token in shape_tokens):
         failure_type = "shape_or_dtype"
         repair_focus = "runtime"
         recommended_actions = [
             "Fix shape/dtype/root-cause issues before further optimization changes.",
             "Preserve the broader pipeline and contract outputs while patching the failing block.",
+        ]
+    elif missing_outputs and not has_explicit_runtime_exception:
+        failure_type = "output_missing"
+        repair_focus = "persistence"
+        recommended_actions = [
+            "Regenerate missing contract outputs at the exact required paths.",
+            "Keep the rest of the pipeline stable while restoring artifact completeness.",
         ]
     else:
         recommended_actions = [
@@ -10270,7 +10420,7 @@ def _resolve_repair_first_focus(
     retry_error_type = str(retry_context.get("error_type") or "").strip().lower()
     retry_specific = str(retry_context.get("specific_error") or "").strip().lower()
     runtime_markers = ("runtime", "traceback", "exception", "timeout", "sandbox", "memory", "oom")
-    if retry_error_type in {"timeout", "oom", "import_error", "shape_or_dtype", "runtime_api_misuse"}:
+    if retry_error_type in {"timeout", "oom", "import_error", "shape_or_dtype", "runtime_api_misuse", "runtime_contract_assertion"}:
         return "runtime"
     if retry_error_type == "runtime_error" and any(token in retry_specific for token in runtime_markers):
         return "runtime"
@@ -10561,8 +10711,9 @@ def _build_iteration_handoff(
     if not isinstance(evidence_focus, list):
         evidence_focus = []
 
+    authoritative_runtime = _resolve_authoritative_runtime_text(state=state)
     runtime_tail = _truncate_handoff_text(
-        state.get("last_runtime_error_tail") or state.get("execution_output"),
+        authoritative_runtime or state.get("last_runtime_error_tail") or state.get("execution_output"),
         max_len=520,
     )
     execution_output_text = str(state.get("execution_output") or "")
@@ -10759,7 +10910,7 @@ def _build_iteration_handoff(
     repair_ground_truth = _build_repair_ground_truth(
         state=state,
         retry_context=retry_context,
-        runtime_output=state.get("execution_output") or runtime_tail,
+        runtime_output=authoritative_runtime or runtime_tail,
         missing_outputs=missing_outputs,
         present_outputs=present_outputs,
         failed_gates=failed_gates,
@@ -23550,7 +23701,7 @@ def run_review_board(state: AgentState) -> AgentState:
     }
     iteration_handoff["quality_focus"] = handoff_quality
     repair_retry_context = _build_retry_context(
-        runtime_tail=str(state.get("last_runtime_error_tail") or state.get("execution_output") or ""),
+        runtime_tail=_resolve_authoritative_runtime_text(state=state),
         hard_failures=[str(x) for x in (gate_context.get("hard_failures") or []) if str(x).strip()],
         failed_gates=[str(x) for x in current_failed if str(x).strip()],
         missing_outputs=_normalize_handoff_items(
@@ -23831,6 +23982,7 @@ def check_execution_status(state: AgentState):
 def prepare_runtime_fix(state: AgentState) -> AgentState:
     print("--- [!] Preparing Runtime Fix Context ---")
     output = state.get("execution_output", "")
+    authoritative_runtime = _resolve_authoritative_runtime_text(output, state=state) or str(output or "")
     base_fix_count = int(state.get("runtime_fix_count", 0))
     terminal_fix = bool(state.get("runtime_fix_terminal"))
     fix_attempt = base_fix_count if terminal_fix else base_fix_count + 1
@@ -23839,7 +23991,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     output_contract_report = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
     missing_outputs = _normalize_handoff_items(output_contract_report.get("missing"), max_items=12, max_len=180)
     runtime_details = _classify_runtime_failure_details(
-        state.get("last_runtime_error_tail") or output,
+        authoritative_runtime,
         missing_outputs=missing_outputs,
     )
     runtime_failure_type = str(runtime_details.get("failure_type") or "runtime_error")
@@ -23854,7 +24006,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
         "status": "REJECTED",
         "feedback": (
             f"RUNTIME FAILURE [{runtime_failure_type}]: {runtime_summary}\n"
-            f"RUNTIME ERROR trace:\n{output[-2000:]}\n\n"
+            f"RUNTIME ERROR trace:\n{authoritative_runtime[-2000:]}\n\n"
             "Apply repair-first handling and keep the rest of the pipeline stable."
         ),
         "failed_gates": list(dict.fromkeys(["Runtime Stability", "runtime_failure", runtime_failure_type]))[:6],
@@ -23890,7 +24042,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
         )
         feedback_history.append(target_nan_feedback)
     try:
-        error_details = state.get("last_runtime_error_tail") or output
+        error_details = authoritative_runtime
         code = state.get("generated_code") or state.get("last_generated_code") or ""
         expl_ctx = state.get("ml_context_snapshot") or {}
         expl_text = failure_explainer.explain_ml_failure(
@@ -23915,7 +24067,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     except Exception as expl_err:
         print(f"Warning: ML failure explainer failed during runtime fix: {expl_err}")
 
-    runtime_tail_for_hints = str(state.get("last_runtime_error_tail") or output or "")
+    runtime_tail_for_hints = authoritative_runtime
     runtime_feedback = str(error_context.get("feedback") or "")
     enriched_feedback, repair_hints = append_repair_hints(
         feedback=runtime_feedback,
@@ -24013,7 +24165,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     )
     existing_handoff = state.get("iteration_handoff") if isinstance(state.get("iteration_handoff"), dict) else {}
     runtime_retry_context = _build_retry_context(
-        runtime_tail=str(state.get("last_runtime_error_tail") or output or ""),
+        runtime_tail=authoritative_runtime,
         hard_failures=[],
         failed_gates=[str(item) for item in (error_context.get("failed_gates") or []) if str(item).strip()],
         missing_outputs=missing_outputs,
@@ -24036,13 +24188,13 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
         "evidence": [],
     }
     feedback_block = iteration_handoff.get("feedback") if isinstance(iteration_handoff.get("feedback"), dict) else {}
-    feedback_block["runtime_error_tail"] = str(state.get("last_runtime_error_tail") or output or "")[-2000:]
+    feedback_block["runtime_error_tail"] = authoritative_runtime[-2000:]
     iteration_handoff["feedback"] = feedback_block
 
     return {
         "last_gate_context": error_context,
          # We add error to history so it persists
-        "feedback_history": feedback_history + [f"RUNTIME ERROR (Attempt {fix_attempt}/{max_runtime_fixes}):\n{output[-500:]}"],
+        "feedback_history": feedback_history + [f"RUNTIME ERROR (Attempt {fix_attempt}/{max_runtime_fixes}):\n{authoritative_runtime[-500:]}"],
         "ml_engineer_audit_override": ml_override,
         "runtime_fix_count": base_fix_count if terminal_fix else fix_attempt,
         "runtime_fix_terminal_reason": str(state.get("runtime_fix_terminal_reason") or ""),

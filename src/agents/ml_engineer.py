@@ -1353,6 +1353,7 @@ class MLEngineerAgent:
         repair_focus = str(repair_ground_truth.get("repair_focus") or "").strip().lower()
         if repair_focus == "runtime" or root_cause_type in {
             "runtime_api_misuse",
+            "runtime_contract_assertion",
             "runtime_error",
             "timeout",
             "oom",

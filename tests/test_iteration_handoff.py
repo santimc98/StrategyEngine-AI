@@ -182,3 +182,75 @@ def test_iteration_handoff_builds_repair_ground_truth_for_runtime_api_misuse():
         and "encoding" in str(env.get("value") or "")
         for env in repair_ground_truth["environment_facts"]
     )
+
+
+def test_iteration_handoff_prefers_real_traceback_over_heavy_runner_success_wrapper():
+    runtime_tail = (
+        "Traceback (most recent call last)\n"
+        "  File \"script.py\", line 42, in <module>\n"
+        "    main()\n"
+        "  File \"script.py\", line 35, in main\n"
+        "    assert len(submission_df) == EXPECTED_TEST_ROWS, 'submission mismatch'\n"
+        "AssertionError: submission.csv row count mismatch: 316 vs 95\n"
+    )
+    state = {
+        "iteration_count": 2,
+        "execution_contract": {"required_outputs": ["data/metrics.json", "data/submission.csv"]},
+        "execution_output": "HEAVY_RUNNER: status=success reason=local_runner_mode",
+        "last_runtime_error_tail": runtime_tail,
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["output_row_count_consistency"],
+            "required_fixes": ["Filter submission rows to scoring subset only."],
+        },
+        oc_report={"present": [], "missing": ["data/metrics.json", "data/submission.csv"]},
+        review_result={},
+        qa_result={},
+        evaluation_spec={"primary_metric": "roc_auc"},
+    )
+
+    assert handoff["retry_context"]["specific_error"].endswith("316 vs 95")
+    assert handoff["repair_ground_truth"]["failure_signature"] == "AssertionError: submission.csv row count mismatch: 316 vs 95"
+    assert not handoff["repair_ground_truth"]["failure_signature"].startswith("HEAVY_RUNNER")
+
+
+def test_iteration_handoff_keeps_assertion_runtime_root_cause_even_with_missing_outputs():
+    runtime_tail = (
+        "Traceback (most recent call last)\n"
+        "  File \"script.py\", line 42, in <module>\n"
+        "    main()\n"
+        "  File \"script.py\", line 35, in main\n"
+        "    assert len(submission_df) == EXPECTED_TEST_ROWS, 'submission mismatch'\n"
+        "AssertionError: submission.csv row count mismatch: 316 vs 95\n"
+    )
+    state = {
+        "iteration_count": 3,
+        "execution_contract": {"required_outputs": ["data/metrics.json", "data/scored_rows.csv", "data/submission.csv"]},
+        "execution_output": runtime_tail,
+        "last_runtime_error_tail": runtime_tail,
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["output_row_count_consistency", "contract_required_artifacts_missing"],
+            "required_fixes": ["Regenerate outputs after fixing row filtering."],
+        },
+        oc_report={"present": [], "missing": ["data/metrics.json", "data/scored_rows.csv", "data/submission.csv"]},
+        review_result={},
+        qa_result={},
+        evaluation_spec={"primary_metric": "official_kaggle_metric"},
+    )
+
+    assert handoff["retry_context"]["error_type"] == "runtime_contract_assertion"
+    assert handoff["repair_policy"]["primary_focus"] == "runtime"
+    assert handoff["repair_ground_truth"]["root_cause_type"] == "runtime_contract_assertion"
+    assert any(
+        fact.get("fact") == "exception_type" and fact.get("value") == "AssertionError"
+        for fact in handoff["repair_ground_truth"]["verified_facts"]
+    )
