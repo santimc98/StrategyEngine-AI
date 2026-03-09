@@ -11490,11 +11490,15 @@ def _normalize_runtime_model_name(raw_value: Any) -> str:
 
 
 def get_runtime_agent_models() -> Dict[str, str]:
-    return {
+    models = {
         "strategist": _normalize_runtime_model_name(getattr(strategist, "model_name", "")),
         "data_engineer": _normalize_runtime_model_name(getattr(data_engineer, "model_name", "")),
         "ml_engineer": _normalize_runtime_model_name(getattr(ml_engineer, "model_name", "")),
     }
+    editor_model = _normalize_runtime_model_name(getattr(ml_engineer, "editor_model_name", ""))
+    if editor_model:
+        models["ml_engineer_editor"] = editor_model
+    return models
 
 
 def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
@@ -11530,6 +11534,9 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
     if ml_engineer_model:
         ml_engineer.model_name = ml_engineer_model
         ml_engineer.last_model_used = None
+    ml_engineer_editor_model = normalized.get("ml_engineer_editor")
+    if ml_engineer_editor_model:
+        ml_engineer.editor_model_name = ml_engineer_editor_model
 
     return get_runtime_agent_models()
 
@@ -18374,10 +18381,12 @@ def run_engineer(state: AgentState) -> AgentState:
         editor_mode_active = False
 
     if editor_mode_active:
+        _effective_editor_model = getattr(ml_engineer, "editor_model_name", None)
+        _editor_model_label = f" model={_effective_editor_model}" if _effective_editor_model else ""
         if metric_round_active:
-            print("ML_EDITOR_MODE_OPTIMIZATION: reusing previous code for metric improvement round.")
+            print(f"ML_EDITOR_MODE_OPTIMIZATION: reusing previous code for metric improvement round.{_editor_model_label}")
         else:
-            print("ML_EDITOR_MODE: reusing previous code with iterative feedback.")
+            print(f"ML_EDITOR_MODE: reusing previous code with iterative feedback.{_editor_model_label}")
         if run_id:
             payload = {"attempt": ml_attempt, "iteration": iter_id, "metric_round_active": bool(metric_round_active)}
             log_run_event(run_id, "ml_editor_mode", payload)

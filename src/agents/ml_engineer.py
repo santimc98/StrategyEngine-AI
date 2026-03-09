@@ -146,14 +146,19 @@ class MLEngineerAgent:
             os.getenv("OPENROUTER_ML_FALLBACK_MODEL")
             or "minimax/minimax-m2.5"
         ).strip()
+        # Editor model: used for REPAIR/editor mode iterations (when previous
+        # code exists). Falls back to primary model when not configured.
+        _editor_raw = (os.getenv("OPENROUTER_ML_EDITOR_MODEL") or "").strip()
+        self.editor_model_name = _editor_raw if _editor_raw else None
         if not self.model_name:
             self.model_name = "moonshotai/kimi-k2.5"
         if not self.fallback_model_name:
             self.fallback_model_name = "minimax/minimax-m2.5"
         self.logger.info(
-            "ML_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s",
+            "ML_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s editor=%s",
             self.model_name,
             self.fallback_model_name,
+            self.editor_model_name or "(same as primary)",
         )
         self.last_prompt = None
         self.last_response = None
@@ -4789,15 +4794,27 @@ class MLEngineerAgent:
 
             def _call_openrouter():
                 self.last_prompt = system_prompt + "\n\nUSER:\n" + user_message
+                # Select primary model: use editor model for repair/editor
+                # iterations when configured, otherwise use the build model.
+                effective_primary = (
+                    self.editor_model_name
+                    if editor_mode_active and self.editor_model_name
+                    else self.model_name
+                )
+                effective_fallback = (
+                    self.model_name
+                    if effective_primary != self.model_name
+                    else self.fallback_model_name
+                )
                 response, model_used = call_chat_with_fallback(
                     self.client,
                     messages,
-                    [self.model_name, self.fallback_model_name],
+                    [effective_primary, effective_fallback],
                     call_kwargs={"temperature": current_temp},
                     logger=self.logger,
                     context_tag="ml_engineer",
                 )
-                if model_used != self.model_name:
+                if model_used != effective_primary:
                     self.last_fallback_reason = "fallback_used"
                 self.last_model_used = model_used
                 self.logger.info("ML_ENGINEER_MODEL_USED: %s", model_used)
