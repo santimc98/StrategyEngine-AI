@@ -21707,7 +21707,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                         actor="reviewer",
                     )
                     if metric_round_review_guarded:
-                        review_result = _coerce_review_packet_to_nonblocking(review_result, "reviewer")
+                        review_result = _coerce_review_packet_to_nonblocking(
+                            review_result, "reviewer",
+                            hard_gate_names=_collect_hard_gate_names(contract),
+                        )
                     if run_id:
                         log_agent_snapshot(
                             run_id,
@@ -21793,7 +21796,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                         actor="qa_reviewer",
                     )
                     if metric_round_review_guarded:
-                        qa_result = _coerce_review_packet_to_nonblocking(qa_result, "qa_reviewer")
+                        qa_result = _coerce_review_packet_to_nonblocking(
+                            qa_result, "qa_reviewer",
+                            hard_gate_names=_collect_hard_gate_names(contract),
+                        )
                     if run_id:
                         log_agent_snapshot(
                             run_id,
@@ -23918,22 +23924,71 @@ def _build_results_advisor_feedback_for_improvement(
     return " | ".join(lines[:3])
 
 
-def _coerce_review_packet_to_nonblocking(packet: Dict[str, Any], actor: str) -> Dict[str, Any]:
+def _collect_hard_gate_names(contract: Dict[str, Any] | None) -> set[str]:
+    """Return lowercase names of gates with HARD severity from the contract."""
+    hard: Set[str] = set()
+    if not isinstance(contract, dict):
+        return hard
+    for gate in (get_qa_gates(contract) or []):
+        if isinstance(gate, dict) and str(gate.get("severity", "")).strip().upper() == "HARD":
+            name = str(gate.get("name") or "").strip().lower()
+            if name:
+                hard.add(name)
+    for gate in (get_reviewer_gates(contract) or []):
+        if isinstance(gate, dict) and str(gate.get("severity", "")).strip().upper() == "HARD":
+            name = str(gate.get("name") or "").strip().lower()
+            if name:
+                hard.add(name)
+    return hard
+
+
+def _coerce_review_packet_to_nonblocking(
+    packet: Dict[str, Any], actor: str, *, hard_gate_names: set[str] | None = None,
+) -> Dict[str, Any]:
     patched = dict(packet) if isinstance(packet, dict) else {}
-    original_status = str(patched.get("status") or "").strip().upper()
-    if original_status not in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
-        patched["status"] = "APPROVE_WITH_WARNINGS"
-    elif not original_status:
-        patched["status"] = "APPROVE_WITH_WARNINGS"
-    patched["failed_gates"] = []
-    patched["required_fixes"] = []
-    patched["hard_failures"] = []
+    hard_set = hard_gate_names or set()
+
+    def _is_hard_gate(item: Any) -> bool:
+        if not hard_set:
+            return False
+        if isinstance(item, dict):
+            for k in ("gate", "gate_name", "name", "id", "rule", "check"):
+                v = item.get(k)
+                if v and str(v).strip().lower() in hard_set:
+                    return True
+            return False
+        return str(item or "").strip().lower() in hard_set
+
+    kept_failed = [g for g in (patched.get("failed_gates") or []) if _is_hard_gate(g)]
+    kept_hard = [g for g in (patched.get("hard_failures") or []) if _is_hard_gate(g)]
+    kept_fixes = [f for f in (patched.get("required_fixes") or []) if _is_hard_gate(f)]
+
+    has_hard_blockers = bool(kept_failed or kept_hard)
+
+    if not has_hard_blockers:
+        original_status = str(patched.get("status") or "").strip().upper()
+        if original_status not in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+            patched["status"] = "APPROVE_WITH_WARNINGS"
+        elif not original_status:
+            patched["status"] = "APPROVE_WITH_WARNINGS"
+
+    patched["failed_gates"] = kept_failed
+    patched["required_fixes"] = kept_fixes
+    patched["hard_failures"] = kept_hard
+
     feedback = str(patched.get("feedback") or "").strip()
-    note = (
-        "METRIC_IMPROVEMENT_REVIEW_MODE: "
-        + str(actor or "reviewer")
-        + " findings are advisory-only in this round."
-    )
+    if has_hard_blockers:
+        note = (
+            "METRIC_IMPROVEMENT_REVIEW_MODE: "
+            + str(actor or "reviewer")
+            + " soft findings are advisory-only; HARD contract gates preserved."
+        )
+    else:
+        note = (
+            "METRIC_IMPROVEMENT_REVIEW_MODE: "
+            + str(actor or "reviewer")
+            + " findings are advisory-only in this round."
+        )
     patched["feedback"] = f"{feedback}\n{note}".strip() if feedback else note
     return patched
 
@@ -26069,11 +26124,12 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             state["qa_last_result"] = dict(baseline_qa_packet)
         if baseline_value is not None:
             state["ml_improvement_incumbent_metric"] = float(baseline_value)
-        # Runtime failures (timeout/crash) should not count toward no-improve streak
-        # because the technique was never actually evaluated — only true metric
-        # stagnation (technique ran but didn't improve) should inflate the streak.
-        if not runtime_failed:
-            no_improve_streak = int(no_improve_streak) + 1
+        # Both runtime failures and metric stagnation count toward the
+        # no-improve streak.  A runtime failure means all execution retries
+        # were exhausted without producing viable results — the technique
+        # is effectively unviable and should consume patience just like a
+        # technique that ran but failed to improve the metric.
+        no_improve_streak = int(no_improve_streak) + 1
     else:
         state["ml_improvement_kept"] = "improved"
         state["stop_reason"] = "IMPROVEMENT_ROUND_KEPT_IMPROVED"
