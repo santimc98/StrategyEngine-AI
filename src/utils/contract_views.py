@@ -1928,7 +1928,7 @@ def build_contract_views_projection(
     if not isinstance(objective_analysis, dict):
         objective_analysis = {}
     ml_engineer_runbook = contract_full.get("ml_engineer_runbook")
-    if not isinstance(ml_engineer_runbook, (dict, list)):
+    if not isinstance(ml_engineer_runbook, (dict, list, str)):
         ml_engineer_runbook = {}
     allowed_feature_sets = contract_full.get("allowed_feature_sets")
     if not isinstance(allowed_feature_sets, dict):

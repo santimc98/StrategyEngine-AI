@@ -3860,8 +3860,9 @@ class MLEngineerAgent:
 
         # V4.1: Use ml_engineer_runbook directly, no legacy role_runbooks
         ml_runbook_source = execution_contract_input.get("ml_engineer_runbook")
-        if not isinstance(ml_runbook_source, dict):
-            ml_runbook_source = ml_view.get("ml_engineer_runbook") if isinstance(ml_view.get("ml_engineer_runbook"), dict) else {}
+        if not isinstance(ml_runbook_source, (dict, list, str)):
+            ml_view_runbook = ml_view.get("ml_engineer_runbook")
+            ml_runbook_source = ml_view_runbook if isinstance(ml_view_runbook, (dict, list, str)) else {}
         ml_runbook_json = self._serialize_json_for_prompt(
             ml_runbook_source,
             max_chars=5000,

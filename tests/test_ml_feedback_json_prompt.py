@@ -52,6 +52,45 @@ def test_editor_mode_prompt_includes_structured_feedback_json(monkeypatch):
     assert "submission_format_validation" in prompt
 
 
+def test_generate_code_prompt_preserves_string_runbook(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    runbook_text = (
+        "Parse target_json, extract time_to_hit_hours and event, "
+        "then train a discrete-time hazard baseline."
+    )
+
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={"title": "Survival Strategy", "analysis_type": "survival_analysis", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        execution_contract={
+            "required_outputs": ["data/metrics.json"],
+            "canonical_columns": ["features_json", "target_json"],
+            "ml_engineer_runbook": runbook_text,
+        },
+        ml_view={
+            "required_outputs": ["data/metrics.json"],
+            "canonical_columns": ["features_json", "target_json"],
+            "ml_engineer_runbook": runbook_text,
+        },
+    )
+
+    prompt = str(agent.last_prompt or "")
+    assert "discrete-time hazard baseline" in prompt
+    assert "time_to_hit_hours" in prompt
+
+
 def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
