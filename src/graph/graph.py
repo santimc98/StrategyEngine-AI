@@ -22207,7 +22207,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         qa_packet_for_state["status"] = "UNKNOWN"
     qa_packet_for_state = _enforce_review_packet_contract_consistency(
         qa_packet_for_state,
-        contract=contract if isinstance(contract, dict) else {},
+        contract=review_contract if isinstance(review_contract, dict) else (contract if isinstance(contract, dict) else {}),
         actor="qa_reviewer",
     )
     if qa_packet_for_state.get("hard_failures"):
@@ -22239,7 +22239,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         reviewer_packet_for_state["status"] = "UNKNOWN"
     reviewer_packet_for_state = _enforce_review_packet_contract_consistency(
         reviewer_packet_for_state,
-        contract=contract if isinstance(contract, dict) else {},
+        contract=review_contract if isinstance(review_contract, dict) else (contract if isinstance(contract, dict) else {}),
         actor="reviewer",
     )
     if reviewer_packet_for_state.get("hard_failures"):
