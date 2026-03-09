@@ -65,6 +65,13 @@ def test_projection_ml_view_includes_contract_context_blocks():
         "ml_engineer_runbook": {"steps": ["train", "validate"]},
         "validation_requirements": {"primary_metric": "accuracy"},
         "artifact_requirements": {"clean_dataset": {"output_path": "data/cleaned_data.csv", "manifest_path": "data/cleaning_manifest.json"}},
+        "task_semantics": {
+            "problem_family": "classification",
+            "objective_type": "classification",
+            "primary_target": "target",
+            "target_columns": ["target"],
+            "multi_target": False,
+        },
     }
     projected = build_contract_views_projection(contract, artifact_index=[])
     ml_view = projected.get("ml_view") or {}
@@ -74,6 +81,33 @@ def test_projection_ml_view_includes_contract_context_blocks():
     assert isinstance(ml_view.get("qa_gates"), list)
     assert isinstance(ml_view.get("reviewer_gates"), list)
     assert isinstance(ml_view.get("ml_engineer_runbook"), dict)
+    assert (ml_view.get("task_semantics") or {}).get("primary_target") == "target"
+
+
+def test_projection_uses_task_semantics_objective_when_objective_analysis_is_unknown():
+    contract = {
+        "scope": "full_pipeline",
+        "canonical_columns": ["feature_a", "label_12h", "label_24h"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "outcome": ["label_12h", "label_24h"],
+        },
+        "objective_analysis": {"problem_type": "unknown"},
+        "evaluation_spec": {"objective_type": "unknown"},
+        "required_outputs": ["data/submission.csv"],
+        "task_semantics": {
+            "problem_family": "multi_output_classification",
+            "objective_type": "multi_output_classification",
+            "primary_target": "label_12h",
+            "target_columns": ["label_12h", "label_24h"],
+            "multi_target": True,
+        },
+    }
+
+    projected = build_contract_views_projection(contract, artifact_index=[])
+
+    assert (projected.get("ml_view") or {}).get("objective_type") == "multi_output_classification"
+    assert (projected.get("reviewer_view") or {}).get("objective_type") == "multi_output_classification"
 
 
 def test_projection_de_view_includes_gates_and_runbook():

@@ -379,3 +379,90 @@ def test_contract_min_infers_expected_rows_from_required_outputs_paths_only() ->
     file_schemas = contract_min.get("artifact_requirements", {}).get("file_schemas", {})
     assert file_schemas.get("data/submission.csv", {}).get("expected_row_count") == 270000
     assert file_schemas.get("data/scored_rows.csv", {}).get("expected_row_count") == 900000
+
+
+def test_contract_min_preserves_multi_output_targets_and_declared_selectors() -> None:
+    inventory = [
+        "event_id",
+        "__split",
+        "label_12h",
+        "label_24h",
+        "label_48h",
+        "label_72h",
+        "feature_a",
+        "feature_b",
+    ]
+    strategy = {
+        "required_columns": inventory,
+        "target_columns": ["label_24h"],
+        "title": "Probabilidades 12h 24h 48h 72h",
+    }
+    full_contract = {
+        "business_objective": (
+            "Predecir probabilidades de impacto a 12h, 24h, 48h y 72h "
+            "en el formato oficial de submission."
+        ),
+        "evaluation_spec": {"objective_type": "multi_output_classification"},
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_feature_selectors": [
+                    {
+                        "type": "all_numeric_except",
+                        "value": [
+                            "event_id",
+                            "__split",
+                            "label_12h",
+                            "label_24h",
+                            "label_48h",
+                            "label_72h",
+                        ],
+                    }
+                ]
+            }
+        },
+    }
+    data_profile = {
+        "dataset_semantics": {
+            "primary_target": "label_24h",
+            "notes": [
+                "The analytical task requires predicting all four label horizons."
+            ],
+        }
+    }
+
+    contract_min = build_contract_min(
+        full_contract,
+        strategy,
+        inventory,
+        inventory,
+        data_profile=data_profile,
+        business_objective_hint=full_contract["business_objective"],
+    )
+
+    expected_targets = ["label_12h", "label_24h", "label_48h", "label_72h"]
+    assert contract_min.get("outcome_columns") == expected_targets
+    assert contract_min.get("target_columns") == expected_targets
+    assert contract_min.get("target_column") == "label_24h"
+    task_semantics = contract_min.get("task_semantics") or {}
+    assert task_semantics.get("problem_family") == "classification"
+    assert task_semantics.get("multi_target") is True
+    assert task_semantics.get("target_columns") == expected_targets
+    assert (task_semantics.get("prediction_unit") or {}).get("kind") == "row"
+    selectors = (
+        contract_min.get("artifact_requirements", {})
+        .get("clean_dataset", {})
+        .get("required_feature_selectors", [])
+    )
+    assert selectors == [
+        {
+            "type": "all_numeric_except",
+            "except_columns": [
+                "event_id",
+                "__split",
+                "label_12h",
+                "label_24h",
+                "label_48h",
+                "label_72h",
+            ],
+        }
+    ]

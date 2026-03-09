@@ -2229,6 +2229,74 @@ def _coerce_list(value: Any) -> List[str]:
     return []
 
 
+_MULTI_TARGET_MARKERS = (
+    "multi_output",
+    "multioutput",
+    "multi_target",
+    "multitarget",
+    "multi_label",
+    "multilabel",
+    "multi_horizon",
+    "multihorizon",
+    "one_vs_rest_targets",
+    "one_vs_rest_labels",
+)
+_TARGET_NAME_MARKERS = ("target", "label", "outcome", "response", "y_")
+_TRAILING_TARGET_BUCKET_RE = re.compile(
+    r"(?:[_\-\s]?(?:t\d+|\d+(?:h|hr|hrs|hour|hours|d|day|days|w|week|weeks|m|min|mins|month|months)))+$",
+    flags=re.IGNORECASE,
+)
+
+
+def _collect_targetish_columns(values: Any) -> List[str]:
+    cols: List[str] = []
+    for value in _coerce_list(values):
+        token = str(value or "").strip()
+        if token and token not in cols:
+            cols.append(token)
+    return cols
+
+
+def _target_family_signature(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    if not token:
+        return ""
+    token = _TRAILING_TARGET_BUCKET_RE.sub("", token)
+    token = re.sub(r"[_\-\s]+$", "", token)
+    token = re.sub(r"[_\-\s]+", "_", token)
+    return token
+
+
+def _looks_like_target_semantic_column(value: Any) -> bool:
+    token = str(value or "").strip().lower()
+    if not token:
+        return False
+    normalized = re.sub(r"[^a-z0-9_]+", "_", token).strip("_")
+    if any(marker in normalized for marker in _TARGET_NAME_MARKERS):
+        return True
+    return bool(_target_family_signature(normalized)) and normalized.startswith(("y_", "label_", "target_", "outcome_"))
+
+
+def _has_multi_target_signal(*values: Any) -> bool:
+    for value in values:
+        if isinstance(value, dict):
+            if _has_multi_target_signal(*value.values()):
+                return True
+            continue
+        if isinstance(value, list):
+            if _has_multi_target_signal(*value):
+                return True
+            continue
+        text = str(value or "").strip().lower()
+        if not text:
+            continue
+        if any(marker in text for marker in _MULTI_TARGET_MARKERS):
+            return True
+        if "12h" in text and "24h" in text:
+            return True
+    return False
+
+
 def _collect_strategy_feature_family_hints(strategy_dict: Dict[str, Any]) -> List[str]:
     """
     Collect compact feature-family hints from strategy output.
@@ -2689,11 +2757,11 @@ def _selector_key_for_dtype_targets(selector: Dict[str, Any]) -> str:
         if isinstance(cols, list) and cols:
             return f"selector:list:{len(cols)}"
         return "selector:list"
-    if stype == "all_columns_except":
-        cols = selector.get("except_columns")
+    if stype in {"all_columns_except", "all_numeric_except"}:
+        cols = selector.get("except_columns") or selector.get("value")
         if isinstance(cols, list) and cols:
-            return f"selector:all_columns_except:{len(cols)}"
-        return "selector:all_columns_except"
+            return f"selector:{stype}:{len(cols)}"
+        return f"selector:{stype}"
     family = selector.get("family_id") or selector.get("name") or selector.get("family")
     if family:
         return f"selector:family:{str(family).strip()}"
@@ -2834,6 +2902,8 @@ def _infer_selector_type_from_payload(selector: Dict[str, Any]) -> str:
         return "list"
     if isinstance(selector.get("except_columns"), list):
         return "all_columns_except"
+    if isinstance(selector.get("value"), list):
+        return "all_numeric_except"
     return ""
 
 
@@ -3012,8 +3082,12 @@ def _deterministic_repair_required_feature_selectors(contract: Dict[str, Any]) -
             if not columns:
                 continue
             selector_obj["columns"] = list(dict.fromkeys(columns))
-        elif selector_type == "all_columns_except":
+        elif selector_type in {"all_columns_except", "all_numeric_except"}:
             cols = selector_obj.get("except_columns")
+            if cols is None:
+                cols = selector_obj.get("value")
+            if cols is None:
+                cols = selector_obj.get("columns")
             if isinstance(cols, str):
                 cols = [cols]
             if not isinstance(cols, list):
@@ -3022,6 +3096,7 @@ def _deterministic_repair_required_feature_selectors(contract: Dict[str, Any]) -
             if not excluded:
                 continue
             selector_obj["except_columns"] = list(dict.fromkeys(excluded))
+            selector_obj.pop("value", None)
         elif selector_type == "prefix_numeric_range":
             prefix = str(selector_obj.get("prefix") or "").strip()
             start = selector_obj.get("start")
@@ -3173,12 +3248,249 @@ def _deep_merge_contract_override(
     return result
 
 
+def _synthesize_task_semantics(contract: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+
+    outcome_columns = _collect_targetish_columns(contract.get("outcome_columns"))
+    target_columns = list(outcome_columns)
+    for col in _collect_contract_target_candidates(contract):
+        if col not in target_columns:
+            target_columns.append(col)
+    primary_target = ""
+    for source in (
+        contract.get("primary_target"),
+        contract.get("target_column"),
+        (contract.get("task_semantics") or {}).get("primary_target") if isinstance(contract.get("task_semantics"), dict) else None,
+        target_columns,
+    ):
+        values = _collect_targetish_columns(source)
+        if values:
+            primary_target = values[0]
+            break
+
+    column_roles = contract.get("column_roles")
+    identifier_columns: List[str] = []
+    if isinstance(column_roles, dict):
+        identifier_columns = _collect_targetish_columns(
+            column_roles.get("identifiers") or column_roles.get("id")
+        )
+
+    split_spec = contract.get("split_spec") if isinstance(contract.get("split_spec"), dict) else {}
+    split_column = str(
+        split_spec.get("split_column")
+        or (contract.get("evaluation_spec") or {}).get("split_column")
+        or ""
+    ).strip()
+    training_rows_rule = str(
+        contract.get("training_rows_rule")
+        or split_spec.get("training_rows_rule")
+        or ""
+    ).strip()
+    scoring_rows_rule = str(
+        contract.get("scoring_rows_rule")
+        or split_spec.get("scoring_rows_rule")
+        or ""
+    ).strip()
+    training_rows_policy = str(split_spec.get("training_rows_policy") or "").strip()
+    if not training_rows_policy:
+        training_rows_policy = "only_rows_with_label" if training_rows_rule else "use_all_rows"
+
+    artifact_requirements = (
+        contract.get("artifact_requirements")
+        if isinstance(contract.get("artifact_requirements"), dict)
+        else {}
+    )
+    required_outputs = []
+    for item in contract.get("required_outputs") or []:
+        if isinstance(item, str) and item.strip():
+            required_outputs.append(item.strip())
+        elif isinstance(item, dict):
+            path = item.get("path") or item.get("output") or item.get("artifact")
+            if isinstance(path, str) and path.strip():
+                required_outputs.append(path.strip())
+    prediction_artifact = ""
+    artifact_candidates = list(required_outputs)
+    required_files = artifact_requirements.get("required_files")
+    if isinstance(required_files, list):
+        for entry in required_files:
+            if isinstance(entry, dict):
+                path = entry.get("path") or entry.get("output") or entry.get("artifact")
+            else:
+                path = entry
+            if isinstance(path, str) and path.strip():
+                artifact_candidates.append(path.strip())
+    preferred_tokens = ("submission", "scored_rows", "prediction", "predictions", "forecast")
+    for token in preferred_tokens:
+        for path in artifact_candidates:
+            if token in path.lower():
+                prediction_artifact = path
+                break
+        if prediction_artifact:
+            break
+    if not prediction_artifact and artifact_candidates:
+        prediction_artifact = artifact_candidates[0]
+
+    required_prediction_columns: List[str] = []
+    scored_schema = artifact_requirements.get("scored_rows_schema")
+    if isinstance(scored_schema, dict):
+        required_prediction_columns = [
+            str(col).strip()
+            for col in (scored_schema.get("required_columns") or [])
+            if str(col).strip()
+        ]
+    if not required_prediction_columns:
+        file_schemas = artifact_requirements.get("file_schemas")
+        if isinstance(file_schemas, dict) and prediction_artifact:
+            schema = file_schemas.get(prediction_artifact)
+            if isinstance(schema, dict):
+                required_prediction_columns = [
+                    str(col).strip()
+                    for col in (schema.get("required_columns") or [])
+                    if str(col).strip()
+                ]
+
+    capabilities = resolve_problem_capabilities_from_contract(contract)
+    objective_type = str(
+        (contract.get("evaluation_spec") or {}).get("objective_type")
+        or (contract.get("objective_analysis") or {}).get("problem_type")
+        or ""
+    ).strip()
+
+    return {
+        "problem_family": str(capabilities.get("family") or "unknown"),
+        "objective_type": objective_type or str(capabilities.get("family") or "unknown"),
+        "target_semantics": str(capabilities.get("target_semantics") or "unknown"),
+        "output_mode": str(capabilities.get("output_mode") or "generic"),
+        "primary_target": primary_target or None,
+        "target_columns": list(target_columns),
+        "multi_target": len(target_columns) > 1,
+        "prediction_unit": {
+            "kind": "row",
+            "identifier_columns": list(identifier_columns),
+        },
+        "partitioning": {
+            "split_column": split_column or None,
+            "training_rows_rule": training_rows_rule or None,
+            "training_rows_policy": training_rows_policy or None,
+            "scoring_rows_rule": scoring_rows_rule or None,
+            "secondary_scoring_subset": contract.get("secondary_scoring_subset"),
+        },
+        "output_schema": {
+            "prediction_artifact": prediction_artifact or None,
+            "required_outputs": list(dict.fromkeys(required_outputs)),
+            "identifier_columns": list(identifier_columns),
+            "required_prediction_columns": [
+                col for col in required_prediction_columns if col not in set(identifier_columns)
+            ],
+        },
+    }
+
+
+def _deterministic_repair_target_semantics(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+
+    repaired = contract
+    outcome_columns = _collect_targetish_columns(repaired.get("outcome_columns"))
+    column_roles = repaired.get("column_roles")
+    if isinstance(column_roles, dict):
+        for key in ("outcome", "target", "label"):
+            for col in _collect_targetish_columns(column_roles.get(key)):
+                if col not in outcome_columns:
+                    outcome_columns.append(col)
+
+    explicit_targets = _collect_contract_target_candidates(repaired)
+    for col in explicit_targets:
+        if col not in outcome_columns and _looks_like_target_semantic_column(col):
+            outcome_columns.append(col)
+
+    multi_target = len(outcome_columns) > 1 or _has_multi_target_signal(
+        repaired.get("business_objective"),
+        repaired.get("strategy_title"),
+        repaired.get("objective_analysis"),
+        repaired.get("evaluation_spec"),
+        repaired.get("validation_requirements"),
+    )
+    primary_target = ""
+    for source in (
+        repaired.get("target_column"),
+        repaired.get("primary_target"),
+        (column_roles or {}).get("outcome") if isinstance(column_roles, dict) else None,
+        repaired.get("outcome_columns"),
+    ):
+        values = _collect_targetish_columns(source)
+        if values:
+            primary_target = values[0]
+            break
+    if not primary_target and explicit_targets:
+        primary_target = explicit_targets[0]
+    if not primary_target and outcome_columns:
+        primary_target = outcome_columns[0]
+
+    if multi_target and outcome_columns:
+        repaired["target_columns"] = list(outcome_columns)
+        if primary_target:
+            repaired["primary_target"] = primary_target
+        for container_key in ("objective_analysis", "evaluation_spec", "validation_requirements"):
+            container = repaired.get(container_key)
+            if not isinstance(container, dict):
+                container = {}
+            else:
+                container = dict(container)
+            container["target_columns"] = list(outcome_columns)
+            container["primary_targets"] = list(outcome_columns)
+            container["label_columns"] = list(outcome_columns)
+            if primary_target:
+                container["primary_target"] = primary_target
+                container["target_column"] = primary_target
+                container["label_column"] = primary_target
+            repaired[container_key] = container
+        if isinstance(column_roles, dict):
+            role_copy = dict(column_roles)
+            role_copy["outcome"] = list(outcome_columns)
+            repaired["column_roles"] = role_copy
+        else:
+            repaired["column_roles"] = {"outcome": list(outcome_columns)}
+        repaired["outcome_columns"] = list(outcome_columns)
+        return repaired
+
+    if primary_target:
+        repaired["target_column"] = primary_target
+        repaired["primary_target"] = primary_target
+        if not outcome_columns:
+            repaired["outcome_columns"] = [primary_target]
+        for container_key in ("objective_analysis", "evaluation_spec", "validation_requirements"):
+            container = repaired.get(container_key)
+            if not isinstance(container, dict):
+                container = {}
+            else:
+                container = dict(container)
+            container.setdefault("primary_target", primary_target)
+            container.setdefault("target_column", primary_target)
+            container.setdefault("label_column", primary_target)
+            repaired[container_key] = container
+    return repaired
+
+
+def _deterministic_repair_task_semantics(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+    repaired = contract
+    task_semantics = _synthesize_task_semantics(repaired)
+    if task_semantics:
+        repaired["task_semantics"] = task_semantics
+    return repaired
+
+
 def _apply_deterministic_repairs(contract: Dict[str, Any] | None) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return {}
     repaired = copy.deepcopy(contract)
     repaired = apply_contract_schema_registry_repairs(repaired)
     repaired = _deterministic_repair_scope(repaired)
+    repaired = _deterministic_repair_target_semantics(repaired)
+    repaired = _deterministic_repair_task_semantics(repaired)
     repaired = _deterministic_repair_gate_lists(repaired)
     repaired = _deterministic_repair_required_feature_selectors(repaired)
     repaired = _deterministic_repair_column_dtype_targets(repaired)
@@ -3437,10 +3749,12 @@ def build_contract_min(
                      clean_dataset.required_columns. Columns marked as constant are
                      excluded from required_columns since they provide no information.
     """
-    contract = full_contract_or_partial if isinstance(full_contract_or_partial, dict) else {}
+    contract = copy.deepcopy(full_contract_or_partial) if isinstance(full_contract_or_partial, dict) else {}
+    contract = _deterministic_repair_target_semantics(contract)
     strategy_dict = strategy if isinstance(strategy, dict) else {}
     inventory = [str(col) for col in (column_inventory or []) if col is not None]
     inventory_norms = {_normalize_column_identifier(col): col for col in inventory}
+    canonical_order = {col: idx for idx, col in enumerate(inventory)}
 
     canonical_columns: List[str] = []
     contract_canonical = contract.get("canonical_columns")
@@ -3567,6 +3881,71 @@ def build_contract_min(
                 resolved_targets.append(resolved)
         return list(dict.fromkeys(resolved_targets))
 
+    def _collect_declared_target_refs() -> List[str]:
+        refs: List[str] = []
+
+        def _append(values: Any) -> None:
+            for col in _collect_targetish_columns(values):
+                if col not in refs:
+                    refs.append(col)
+
+        for source in (
+            strategy_dict.get("outcome_columns"),
+            strategy_dict.get("target_column"),
+            strategy_dict.get("target_columns"),
+            contract.get("outcome_columns"),
+            contract.get("target_column"),
+            contract.get("target_columns"),
+        ):
+            _append(source)
+        if isinstance(contract.get("column_roles"), dict):
+            _append((contract.get("column_roles") or {}).get("outcome"))
+        for container in ("objective_analysis", "evaluation_spec", "validation_requirements"):
+            payload = contract.get(container)
+            if not isinstance(payload, dict):
+                continue
+            for key in ("primary_target", "primary_targets", "target_column", "target_columns", "label_column", "label_columns"):
+                _append(payload.get(key))
+        return refs
+
+    declared_target_refs = _collect_declared_target_refs()
+
+    def _infer_multi_target_columns(anchor_targets: List[str]) -> List[str]:
+        candidates = list(dict.fromkeys([col for col in anchor_targets if col]))
+        target_like_columns = [col for col in canonical_columns if _looks_like_target_semantic_column(col)]
+        if len(candidates) > 1:
+            return sorted(candidates, key=lambda col: canonical_order.get(col, len(canonical_order)))
+        if not _has_multi_target_signal(
+            strategy_dict,
+            contract.get("business_objective"),
+            business_objective_hint,
+            contract.get("strategy_title"),
+            contract.get("evaluation_spec"),
+            contract.get("objective_analysis"),
+        ):
+            return candidates
+
+        anchor_families = {
+            _target_family_signature(col)
+            for col in candidates
+            if _target_family_signature(col)
+        }
+        for col in target_like_columns:
+            family = _target_family_signature(col)
+            if anchor_families and family not in anchor_families:
+                continue
+            if col not in candidates:
+                candidates.append(col)
+        if len(candidates) <= 1 and len(target_like_columns) >= 2:
+            shared_families = {
+                _target_family_signature(col)
+                for col in target_like_columns
+                if _target_family_signature(col)
+            }
+            if len(shared_families) == 1:
+                candidates = list(dict.fromkeys(target_like_columns))
+        return sorted(candidates, key=lambda col: canonical_order.get(col, len(canonical_order)))
+
     if roles_present:
         outcome_cols = list(role_outcome)
         decision_cols = list(role_decision)
@@ -3592,6 +3971,12 @@ def build_contract_min(
         decision_cols = _filter_to_canonical([col for col in decision_candidates if col])
         audit_only_cols = _filter_to_canonical([col for col in audit_candidates if col])
 
+    inferred_multi_targets = _filter_to_canonical(
+        _infer_multi_target_columns(outcome_cols or declared_target_refs or _resolve_candidate_targets())
+    )
+    if len(inferred_multi_targets) > len(outcome_cols):
+        outcome_cols = inferred_multi_targets
+
     # STEWARD-FIRST ROLE INFERENCE
     # Trust the Steward's dataset_semantics.json over regex heuristics.
     # Only fall back to regex if Steward didn't provide the information.
@@ -3605,27 +3990,36 @@ def build_contract_min(
     steward_identifiers = _coerce_list(steward_semantics.get("identifier_columns"))
     steward_time_cols = _coerce_list(steward_semantics.get("time_columns"))
     steward_categorical = _coerce_list(steward_semantics.get("categorical_columns"))
-    # Extract primary_target from Steward's dataset_semantics.  The Steward
-    # always stores the authoritative target column here; without it the
-    # contract ends up with outcome_columns=[] which cascades into
-    # heavy_runner "target column missing" failures.
+    steward_target_columns: List[str] = []
+    for source in (
+        steward_semantics.get("target_columns"),
+        steward_semantics.get("primary_targets"),
+        (steward_semantics.get("target_analysis") or {}).get("target_columns")
+        if isinstance(steward_semantics.get("target_analysis"), dict)
+        else None,
+        (steward_semantics.get("target_analysis") or {}).get("primary_targets")
+        if isinstance(steward_semantics.get("target_analysis"), dict)
+        else None,
+    ):
+        for col in _collect_targetish_columns(source):
+            if col not in steward_target_columns:
+                steward_target_columns.append(col)
+
     steward_primary_target: str | None = None
-    _spt = steward_semantics.get("primary_target")
-    if isinstance(_spt, str) and _spt.strip():
-        steward_primary_target = _spt.strip()
-    if not steward_primary_target:
-        _ta = steward_semantics.get("target_analysis")
-        if isinstance(_ta, dict):
-            _spt2 = _ta.get("primary_target")
-            if isinstance(_spt2, str) and _spt2.strip():
-                steward_primary_target = _spt2.strip()
-    # Also check data_profile top-level for backward compatibility
-    if not steward_primary_target and isinstance(data_profile, dict):
-        for _tkey in ("primary_target", "target_column", "target"):
-            _dpv = data_profile.get(_tkey)
-            if isinstance(_dpv, str) and _dpv.strip():
-                steward_primary_target = _dpv.strip()
-                break
+    for source in (
+        steward_semantics.get("primary_target"),
+        (steward_semantics.get("target_analysis") or {}).get("primary_target")
+        if isinstance(steward_semantics.get("target_analysis"), dict)
+        else None,
+        data_profile.get("primary_target") if isinstance(data_profile, dict) else None,
+        data_profile.get("target_column") if isinstance(data_profile, dict) else None,
+        data_profile.get("target") if isinstance(data_profile, dict) else None,
+        steward_target_columns,
+    ):
+        values = _collect_targetish_columns(source)
+        if values:
+            steward_primary_target = values[0]
+            break
     # split_candidates may contain dicts ({"column": "is_train", ...}) or strings.
     # Do NOT use _coerce_list here — it converts dicts to their str() repr, making
     # _resolve_split_column unable to extract the column name from dict entries.
@@ -3665,6 +4059,11 @@ def build_contract_min(
     # failed to populate it.  This is the single-point fix that prevents the
     # cascade: empty outcome_columns → missing target_col in heavy_runner →
     # "target column missing" abort → ML Engineer never executes.
+    if not outcome_cols and steward_target_columns:
+        resolved_steward_targets = _filter_to_canonical(steward_target_columns)
+        if resolved_steward_targets:
+            outcome_cols = resolved_steward_targets
+            print(f"STEWARD_TARGET_COLUMNS: Injected {resolved_steward_targets} into outcome_cols (was empty)")
     if not outcome_cols and steward_primary_target:
         if steward_primary_target in canonical_columns:
             outcome_cols = [steward_primary_target]
@@ -3694,6 +4093,10 @@ def build_contract_min(
     audit_only_cols = list(dict.fromkeys(audit_only_cols))
     identifiers = list(dict.fromkeys(identifiers))
     time_columns = list(dict.fromkeys(time_columns))
+
+    inferred_multi_targets = _filter_to_canonical(_infer_multi_target_columns(outcome_cols or declared_target_refs))
+    if len(inferred_multi_targets) > len(outcome_cols):
+        outcome_cols = inferred_multi_targets
 
     assigned = set(outcome_cols + decision_cols + audit_only_cols + identifiers + time_columns)
     if roles_present:
@@ -3823,6 +4226,41 @@ def build_contract_min(
         )
         if feature_selectors:
             print(f"FEATURE_SELECTORS: Inferred {len(feature_selectors)} selectors for {len(canonical_columns)} columns")
+
+    declared_feature_selectors: List[Dict[str, Any]] = []
+    full_clean_dataset = (
+        full_artifact_requirements.get("clean_dataset")
+        if isinstance(full_artifact_requirements, dict)
+        else None
+    )
+    if isinstance(full_clean_dataset, dict) and full_clean_dataset.get("required_feature_selectors") is not None:
+        selector_probe = {
+            "artifact_requirements": {
+                "clean_dataset": {
+                    "required_feature_selectors": copy.deepcopy(full_clean_dataset.get("required_feature_selectors"))
+                }
+            }
+        }
+        selector_probe = _deterministic_repair_required_feature_selectors(selector_probe)
+        declared_feature_selectors = (
+            selector_probe.get("artifact_requirements", {})
+            .get("clean_dataset", {})
+            .get("required_feature_selectors", [])
+        )
+        if not isinstance(declared_feature_selectors, list):
+            declared_feature_selectors = []
+    if declared_feature_selectors:
+        merged_selectors: List[Dict[str, Any]] = []
+        seen_selectors: set[str] = set()
+        for selector in declared_feature_selectors + (feature_selectors if isinstance(feature_selectors, list) else []):
+            if not isinstance(selector, dict):
+                continue
+            fingerprint = json.dumps(selector, sort_keys=True, ensure_ascii=False)
+            if fingerprint in seen_selectors:
+                continue
+            seen_selectors.add(fingerprint)
+            merged_selectors.append(selector)
+        feature_selectors = merged_selectors
 
     # P1.1: Determine scored_rows required columns based on objective type
     objective_type = contract.get("objective_type") or strategy_dict.get("objective_type") or ""
@@ -4851,6 +5289,45 @@ def build_contract_min(
         evaluation_spec = dict(evaluation_spec)
         evaluation_spec["objective_type"] = str(objective_type or "unspecified").strip() or "unspecified"
 
+    resolved_target_columns = list(dict.fromkeys([col for col in outcome_cols if str(col).strip()]))
+    resolved_primary_target = None
+    for source in (
+        contract.get("target_column"),
+        contract.get("primary_target"),
+        strategy_dict.get("target_column"),
+        strategy_dict.get("target_columns"),
+        contract.get("target_columns"),
+        steward_primary_target,
+        resolved_target_columns,
+    ):
+        values = _collect_targetish_columns(source)
+        for value in values:
+            if value in resolved_target_columns or not resolved_target_columns:
+                resolved_primary_target = value
+                break
+        if resolved_primary_target:
+            break
+    if resolved_target_columns:
+        validation_requirements = dict(validation_requirements)
+        objective_analysis = dict(objective_analysis)
+        evaluation_spec = dict(evaluation_spec)
+        if len(resolved_target_columns) > 1:
+            validation_requirements["target_columns"] = list(resolved_target_columns)
+            objective_analysis["target_columns"] = list(resolved_target_columns)
+            objective_analysis["primary_targets"] = list(resolved_target_columns)
+            objective_analysis["label_columns"] = list(resolved_target_columns)
+            evaluation_spec["target_columns"] = list(resolved_target_columns)
+            evaluation_spec["primary_targets"] = list(resolved_target_columns)
+            evaluation_spec["label_columns"] = list(resolved_target_columns)
+        if resolved_primary_target:
+            validation_requirements.setdefault("target_column", resolved_primary_target)
+            objective_analysis["primary_target"] = resolved_primary_target
+            objective_analysis["target_column"] = resolved_primary_target
+            objective_analysis["label_column"] = resolved_primary_target
+            evaluation_spec["primary_target"] = resolved_primary_target
+            evaluation_spec["target_column"] = resolved_primary_target
+            evaluation_spec["label_column"] = resolved_primary_target
+
     output_dialect = contract.get("output_dialect")
     if not isinstance(output_dialect, dict):
         output_dialect = {"sep": ",", "decimal": ".", "encoding": "utf-8"}
@@ -4894,6 +5371,8 @@ def build_contract_min(
         "output_dialect": output_dialect,
         "canonical_columns": canonical_columns,
         "outcome_columns": outcome_cols,
+        "target_column": resolved_primary_target,
+        "target_columns": resolved_target_columns,
         "decision_columns": decision_cols,
         "column_roles": column_roles,
         "allowed_feature_sets": {
@@ -4941,6 +5420,9 @@ def build_contract_min(
         contract_min["secondary_scoring_subset"] = secondary_scoring_subset
     if data_partitioning_notes:
         contract_min["data_partitioning_notes"] = data_partitioning_notes
+    task_semantics = _synthesize_task_semantics(contract_min)
+    if task_semantics:
+        contract_min["task_semantics"] = task_semantics
     return contract_min
 
 
@@ -7152,8 +7634,23 @@ class ExecutionPlannerAgent:
                 model_divergence = float(len(model_diff) / max(1, len(model_union))) if model_union else 0.0
 
                 extra_issues: List[Dict[str, Any]] = []
+                multi_target_context = _has_multi_target_signal(
+                    payload_for_validation.get("evaluation_spec"),
+                    payload_for_validation.get("objective_analysis"),
+                    payload_for_validation.get("business_objective"),
+                    list(llm_outcomes),
+                    list(min_outcomes),
+                )
+                anchor_subset_only = (
+                    multi_target_context
+                    and bool(llm_outcomes)
+                    and bool(min_outcomes)
+                    and min_outcomes.issubset(llm_outcomes)
+                    and all(_looks_like_target_semantic_column(col) for col in llm_outcomes | min_outcomes)
+                )
                 severe_outcome_divergence = (
                     bool(outcome_union)
+                    and not anchor_subset_only
                     and (
                         len(outcome_diff) >= 6
                         or (len(outcome_diff) >= 3 and outcome_divergence >= 0.75)
@@ -7176,7 +7673,7 @@ class ExecutionPlannerAgent:
                             },
                         }
                     )
-                elif bool(outcome_union) and outcome_divergence >= 0.34:
+                elif bool(outcome_union) and outcome_divergence >= 0.34 and not anchor_subset_only:
                     extra_issues.append(
                         {
                             "rule": "contract.llm_min_contract_divergence",
@@ -7320,8 +7817,8 @@ class ExecutionPlannerAgent:
                 if selector_type == "list":
                     cols, _ = _to_clean_str_list(selector.get("columns"))
                     return col in set(cols)
-                if selector_type == "all_columns_except":
-                    excluded, _ = _to_clean_str_list(selector.get("except_columns"))
+                if selector_type in {"all_columns_except", "all_numeric_except"}:
+                    excluded, _ = _to_clean_str_list(selector.get("except_columns") or selector.get("value"))
                     return col.lower() not in {c.lower() for c in excluded}
                 if selector_type == "prefix_numeric_range":
                     prefix = str(selector.get("prefix") or "").strip()

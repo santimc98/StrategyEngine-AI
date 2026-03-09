@@ -406,9 +406,19 @@ def build_column_metadata_for_strategist(
 
     # --- 1. Target ---
     primary_target = str(dataset_semantics.get("primary_target") or "").strip()
+    target_columns = [
+        str(col).strip()
+        for col in (dataset_semantics.get("target_columns") or dataset_semantics.get("primary_targets") or [])
+        if str(col).strip()
+    ]
+    if primary_target and primary_target not in target_columns:
+        target_columns.insert(0, primary_target)
     target_block: Dict[str, Any] = {}
     if primary_target:
         target_block["column"] = primary_target
+    if target_columns:
+        target_block["columns"] = target_columns[:8]
+    if primary_target:
         oa = outcome_analysis.get(primary_target)
         if isinstance(oa, dict):
             inferred = oa.get("inferred_type")
@@ -432,9 +442,7 @@ def build_column_metadata_for_strategist(
         elif isinstance(sc, str):
             split_cols.append(sc)
 
-    special = set(id_candidates) | set(split_cols)
-    if primary_target:
-        special.add(primary_target)
+    special = set(id_candidates) | set(split_cols) | set(target_columns)
 
     # --- 3. Column types (grouped) ---
     _LOW_CARDINALITY_THRESHOLD = 15
@@ -464,9 +472,10 @@ def build_column_metadata_for_strategist(
 
     # --- 4. Per-column stats (capped) ---
     priority_cols: List[str] = []
-    if primary_target and primary_target in columns:
-        priority_cols.append(primary_target)
-    remaining = [c for c in columns if c != primary_target]
+    for target_col in target_columns:
+        if target_col in columns and target_col not in priority_cols:
+            priority_cols.append(target_col)
+    remaining = [c for c in columns if c not in set(target_columns)]
     remaining.sort(key=lambda c: (-float(missingness.get(c, 0)), c))
     priority_cols.extend(remaining)
     priority_cols = priority_cols[:max_cols]

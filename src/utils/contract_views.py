@@ -15,6 +15,7 @@ from src.utils.contract_accessors import (
     get_qa_gates,
     get_reviewer_gates,
     get_required_outputs,
+    get_task_semantics,
     get_validation_requirements,
 )
 from src.utils.problem_capabilities import infer_problem_capabilities, resolve_problem_capabilities_from_contract
@@ -39,6 +40,7 @@ def _get_decisioning_requirements(contract_full: Dict[str, Any], contract_min: D
 
 class DEView(TypedDict, total=False):
     role: str
+    task_semantics: Dict[str, Any]
     required_columns: List[str]
     required_feature_selectors: List[Dict[str, Any]]
     optional_passthrough_columns: List[str]
@@ -59,6 +61,7 @@ class DEView(TypedDict, total=False):
 class MLView(TypedDict, total=False):
     role: str
     objective_type: str
+    task_semantics: Dict[str, Any]
     canonical_columns: List[str]
     derived_features: List[str]
     column_roles: Dict[str, List[str]]
@@ -89,6 +92,7 @@ class MLView(TypedDict, total=False):
 class ReviewerView(TypedDict, total=False):
     role: str
     objective_type: str
+    task_semantics: Dict[str, Any]
     reviewer_gates: List[Any]
     required_outputs: List[str]
     expected_metrics: List[str]
@@ -115,6 +119,7 @@ class ResultsAdvisorView(TypedDict, total=False):
 
 class CleaningView(TypedDict, total=False):
     role: str
+    task_semantics: Dict[str, Any]
     strategy_title: str
     business_objective: str
     required_columns: List[str]
@@ -131,6 +136,7 @@ class CleaningView(TypedDict, total=False):
 
 class QAView(TypedDict, total=False):
     role: str
+    task_semantics: Dict[str, Any]
     qa_gates: List[Dict[str, Any]]
     artifact_requirements: Dict[str, Any]
     allowed_feature_sets: Dict[str, Any]
@@ -145,6 +151,7 @@ class QAView(TypedDict, total=False):
 
 
 _PRESERVE_KEYS = {
+    "task_semantics",
     "required_columns",
     "optional_passthrough_columns",
     "required_feature_selectors",
@@ -703,6 +710,13 @@ def _normalize_artifact_index(entries: Any) -> List[Dict[str, Any]]:
 
 
 def _resolve_objective_type(contract_min: Dict[str, Any], contract_full: Dict[str, Any], required_outputs: List[str]) -> str:
+    for source in (contract_min, contract_full):
+        task_semantics = get_task_semantics(source if isinstance(source, dict) else {})
+        if isinstance(task_semantics, dict):
+            for key in ("objective_type", "problem_family"):
+                value = str(task_semantics.get(key) or "").strip()
+                if value and value.lower() != "unknown":
+                    return value
     for source in (contract_full, contract_min):
         capabilities = resolve_problem_capabilities_from_contract(source if isinstance(source, dict) else {})
         family = str(capabilities.get("family") or "").strip()
@@ -1257,6 +1271,7 @@ def build_de_view(
 ) -> Dict[str, Any]:
     contract_full = contract_full if isinstance(contract_full, dict) else {}
     contract_min = contract_min if isinstance(contract_min, dict) else {}
+    task_semantics = _resolve_task_semantics(contract_min, contract_full)
     required_outputs = _resolve_required_outputs(contract_min, contract_full)
     required_columns = _resolve_required_columns(contract_min, contract_full)
     required_feature_selectors = _resolve_required_feature_selectors(contract_min, contract_full)
@@ -1270,6 +1285,7 @@ def build_de_view(
     outlier_policy = _resolve_outlier_policy(contract_min, contract_full)
     view: DEView = {
         "role": "data_engineer",
+        "task_semantics": task_semantics,
         "required_columns": required_columns,
         "optional_passthrough_columns": passthrough_columns,
         "output_path": output_path or "",
@@ -1318,6 +1334,7 @@ def build_ml_view(
     contract_min = contract_min if isinstance(contract_min, dict) else {}
     required_outputs = _resolve_required_outputs(contract_min, contract_full)
     objective_type = _resolve_objective_type(contract_min, contract_full, required_outputs)
+    task_semantics = _resolve_task_semantics(contract_min, contract_full)
     canonical_columns = contract_min.get("canonical_columns")
     if not isinstance(canonical_columns, list):
         canonical_columns = get_canonical_columns(contract_full)
@@ -1523,6 +1540,7 @@ def build_ml_view(
     view: MLView = {
         "role": "ml_engineer",
         "objective_type": objective_type,
+        "task_semantics": task_semantics,
         "canonical_columns": canonical_columns,
         "derived_features": derived_features,
         "column_roles": column_roles,
@@ -1607,12 +1625,14 @@ def build_reviewer_view(
     contract_min = contract_min if isinstance(contract_min, dict) else {}
     required_outputs = _resolve_required_outputs(contract_min, contract_full)
     objective_type = _resolve_objective_type(contract_min, contract_full, required_outputs)
+    task_semantics = _resolve_task_semantics(contract_min, contract_full)
     reviewer_gates = _resolve_reviewer_gates(contract_min, contract_full)
     expected_metrics = _expected_metrics_from_objective(objective_type, reviewer_gates)
     strategy_summary = _summarize_strategy(contract_full, contract_min)
     view: ReviewerView = {
         "role": "reviewer",
         "objective_type": objective_type,
+        "task_semantics": task_semantics,
         "reviewer_gates": reviewer_gates,
         "required_outputs": required_outputs,
         "expected_metrics": expected_metrics,
@@ -1633,6 +1653,7 @@ def build_qa_view(
 ) -> Dict[str, Any]:
     contract_full = contract_full if isinstance(contract_full, dict) else {}
     contract_min = contract_min if isinstance(contract_min, dict) else {}
+    task_semantics = _resolve_task_semantics(contract_min, contract_full)
     required_outputs = _resolve_required_outputs(contract_min, contract_full)
     optional_outputs = _resolve_optional_outputs(contract_min, contract_full)
     qa_gates = _resolve_qa_gates(contract_min, contract_full)
@@ -1662,6 +1683,7 @@ def build_qa_view(
         reporting_policy = contract_min.get("reporting_policy")
     view: QAView = {
         "role": "qa_reviewer",
+        "task_semantics": task_semantics,
         "qa_gates": qa_gates,
         "artifact_requirements": artifact_payload,
         "allowed_feature_sets": allowed_feature_sets,
@@ -1770,6 +1792,7 @@ def build_cleaning_view(
     """
     contract_full = contract_full if isinstance(contract_full, dict) else {}
     contract_min = contract_min if isinstance(contract_min, dict) else {}
+    task_semantics = _resolve_task_semantics(contract_min, contract_full)
     required_columns = _resolve_required_columns(contract_min, contract_full)
     required_feature_selectors = _resolve_required_feature_selectors(contract_min, contract_full)
     column_roles = _resolve_column_roles(contract_min, contract_full)
@@ -1780,6 +1803,7 @@ def build_cleaning_view(
     outlier_policy = _resolve_outlier_policy(contract_min, contract_full)
     view: CleaningView = {
         "role": "cleaning_reviewer",
+        "task_semantics": task_semantics,
         "strategy_title": _first_value(contract_full.get("strategy_title"), contract_min.get("strategy_title")) or "",
         "business_objective": _first_value(
             contract_full.get("business_objective"), contract_min.get("business_objective")
@@ -1822,15 +1846,54 @@ def _project_decisioning_requirements(contract_full: Dict[str, Any]) -> Dict[str
 
 
 def _project_objective_type(contract_full: Dict[str, Any]) -> str:
+    task_semantics = get_task_semantics(contract_full)
+    if isinstance(task_semantics, dict):
+        for key in ("objective_type", "problem_family"):
+            value = str(task_semantics.get(key) or "").strip()
+            if value and value.lower() != "unknown":
+                return value
     objective_analysis = contract_full.get("objective_analysis")
-    if isinstance(objective_analysis, dict) and objective_analysis.get("problem_type"):
-        return str(objective_analysis.get("problem_type"))
+    if isinstance(objective_analysis, dict):
+        problem_type = str(objective_analysis.get("problem_type") or "").strip()
+        if problem_type and problem_type.lower() != "unknown":
+            return problem_type
     evaluation_spec = contract_full.get("evaluation_spec")
-    if isinstance(evaluation_spec, dict) and evaluation_spec.get("objective_type"):
-        return str(evaluation_spec.get("objective_type"))
+    if isinstance(evaluation_spec, dict):
+        objective_type = str(evaluation_spec.get("objective_type") or "").strip()
+        if objective_type and objective_type.lower() != "unknown":
+            return objective_type
+    capabilities = resolve_problem_capabilities_from_contract(contract_full if isinstance(contract_full, dict) else {})
+    family = str(capabilities.get("family") or "").strip()
+    if family and family != "unknown":
+        return family
     required_outputs = _project_required_outputs(contract_full)
     inferred = _infer_objective_from_outputs(required_outputs)
     return inferred or "unknown"
+
+
+def _resolve_task_semantics(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> Dict[str, Any]:
+    for source in (contract_min, contract_full):
+        task_semantics = get_task_semantics(source if isinstance(source, dict) else {})
+        if isinstance(task_semantics, dict) and task_semantics:
+            return task_semantics
+
+    objective_type = _resolve_objective_type(contract_min, contract_full, _resolve_required_outputs(contract_min, contract_full))
+    outcome_columns = get_outcome_columns(contract_min if isinstance(contract_min, dict) and contract_min else contract_full)
+    primary_target = outcome_columns[0] if outcome_columns else None
+    column_roles = get_column_roles(contract_min if isinstance(contract_min, dict) and contract_min else contract_full)
+    identifier_columns = []
+    if isinstance(column_roles, dict):
+        identifier_columns = [
+            str(col) for col in (column_roles.get("identifiers") or []) if str(col).strip()
+        ]
+    return {
+        "objective_type": objective_type,
+        "problem_family": objective_type,
+        "primary_target": primary_target,
+        "target_columns": outcome_columns,
+        "multi_target": len(outcome_columns) > 1,
+        "prediction_unit": {"kind": "row", "identifier_columns": identifier_columns},
+    }
 
 
 def _project_required_outputs(contract_full: Dict[str, Any]) -> List[str]:
@@ -1901,6 +1964,7 @@ def build_contract_views_projection(
     artifact_reqs = _project_artifact_requirements(contract_full)
     required_outputs = _project_required_outputs(contract_full)
     objective_type = _project_objective_type(contract_full)
+    task_semantics = _resolve_task_semantics(contract_full, contract_full)
     canonical_columns = [str(c) for c in get_canonical_columns(contract_full) if c]
     column_roles = get_column_roles(contract_full)
     decision_columns = [str(c) for c in get_column_roles(contract_full).get("decision", []) if c]
@@ -2082,6 +2146,7 @@ def build_contract_views_projection(
 
     de_view: DEView = {
         "role": "data_engineer",
+        "task_semantics": task_semantics,
         "required_columns": de_required_columns,
         "optional_passthrough_columns": de_passthrough,
         "output_path": output_path,
@@ -2119,6 +2184,7 @@ def build_contract_views_projection(
     ml_view: MLView = {
         "role": "ml_engineer",
         "objective_type": objective_type,
+        "task_semantics": task_semantics,
         "canonical_columns": canonical_columns,
         "derived_features": [c for c in derived_columns if c in set(model_features + segmentation_features)],
         "column_roles": column_roles,
@@ -2165,6 +2231,7 @@ def build_contract_views_projection(
     reviewer_view: ReviewerView = {
         "role": "reviewer",
         "objective_type": objective_type,
+        "task_semantics": task_semantics,
         "reviewer_gates": reviewer_gates if isinstance(reviewer_gates, list) else [],
         "required_outputs": required_outputs,
         "expected_metrics": expected_metrics,
@@ -2185,6 +2252,7 @@ def build_contract_views_projection(
         qa_artifact_payload["file_schemas"] = file_schemas
     qa_view: QAView = {
         "role": "qa_reviewer",
+        "task_semantics": task_semantics,
         "qa_gates": qa_gates if isinstance(qa_gates, list) else [],
         "artifact_requirements": qa_artifact_payload,
         "allowed_feature_sets": allowed_feature_sets,

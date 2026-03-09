@@ -89,7 +89,7 @@ def test_validate_contract_minimal_readonly_rejects_unknown_ml_objective():
 
     assert result.get("accepted") is False
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
-    assert "contract.ml_view_objective_type" in rules
+    assert {"contract.ml_view_objective_type", "contract.evaluation_spec"} & rules
 
 
 def test_validate_contract_minimal_readonly_accepts_executable_views_contract():
@@ -485,3 +485,88 @@ def test_validate_contract_minimal_readonly_allows_target_mapping_when_observed_
 
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.target_mapping_consistency" not in rules
+
+
+def test_validate_contract_minimal_readonly_allows_multi_output_outcomes_with_anchor_primary_target():
+    contract = _base_full_pipeline_contract()
+    contract["business_objective"] = (
+        "Predecir probabilidades de impacto a 12h, 24h, 48h y 72h "
+        "para el archivo oficial de submission."
+    )
+    contract["canonical_columns"] = [
+        "event_id",
+        "__split",
+        "label_12h",
+        "label_24h",
+        "label_48h",
+        "label_72h",
+        "feature_a",
+        "feature_b",
+    ]
+    labels = ["label_12h", "label_24h", "label_48h", "label_72h"]
+    contract["column_roles"] = {
+        "pre_decision": ["feature_a", "feature_b"],
+        "decision": [],
+        "outcome": labels,
+        "post_decision_audit_only": [],
+        "identifiers": ["event_id"],
+        "unknown": [],
+    }
+    contract["outcome_columns"] = labels
+    contract["target_column"] = "label_24h"
+    contract["evaluation_spec"] = {
+        "objective_type": "multi_output_classification",
+        "primary_metric": "average_roc_auc",
+    }
+    contract["allowed_feature_sets"] = {
+        "model_features": ["feature_a", "feature_b"],
+        "segmentation_features": ["feature_a", "feature_b"],
+        "forbidden_features": labels,
+        "audit_only_features": [],
+    }
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["event_id", "__split", *labels]
+    clean_dataset["required_feature_selectors"] = [
+        {
+            "type": "all_numeric_except",
+            "value": ["event_id", "__split", *labels],
+        }
+    ]
+    contract["column_dtype_targets"] = {
+        "event_id": {"target_dtype": "int64", "nullable": False},
+        "__split": {"target_dtype": "string", "nullable": False},
+        "label_12h": {"target_dtype": "float64", "nullable": True},
+        "label_24h": {"target_dtype": "float64", "nullable": True},
+        "label_48h": {"target_dtype": "float64", "nullable": True},
+        "label_72h": {"target_dtype": "float64", "nullable": True},
+    }
+
+    result = validate_contract_minimal_readonly(
+        contract,
+        column_inventory=contract["canonical_columns"],
+        steward_semantics={
+            "primary_target": "label_24h",
+            "notes": ["The analytical task requires predicting all four label horizons."],
+            "split_candidates": ["__split"],
+            "id_candidates": ["event_id"],
+        },
+    )
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.outcome_columns_sanity" not in rules
+    assert "contract.clean_dataset_ml_columns_missing" not in rules
+
+
+def test_validate_contract_minimal_readonly_uses_evaluation_spec_when_objective_analysis_is_unknown():
+    contract = _base_full_pipeline_contract()
+    contract["objective_analysis"] = {"problem_type": "unknown"}
+    contract["evaluation_spec"] = {
+        "objective_type": "multi_output_classification",
+        "primary_metric": "average_roc_auc",
+    }
+    contract["canonical_columns"] = ["id", "feature_a", "target"]
+
+    result = validate_contract_minimal_readonly(contract)
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.ml_view_objective_type" not in rules

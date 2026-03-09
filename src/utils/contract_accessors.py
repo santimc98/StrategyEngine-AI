@@ -81,6 +81,10 @@ ALLOWED_TOP_LEVEL_KEYS_V41: Set[str] = {
     "column_roles",
     "outcome_columns",
     "decision_columns",
+    "target_column",
+    "target_columns",
+    "primary_target",
+    "task_semantics",
     # Feature management
     "allowed_feature_sets",
     "feature_selectors",
@@ -337,6 +341,15 @@ def get_outcome_columns(contract: Dict[str, Any]) -> List[str]:
     if isinstance(explicit, str) and explicit.lower() != "unknown":
         return [explicit]
 
+    task_semantics = contract.get("task_semantics")
+    if isinstance(task_semantics, dict):
+        targets = task_semantics.get("target_columns")
+        if isinstance(targets, list) and targets:
+            return [str(v) for v in targets if v and str(v).lower() != "unknown"]
+        primary = task_semantics.get("primary_target")
+        if isinstance(primary, str) and primary.strip() and primary.lower() != "unknown":
+            return [primary.strip()]
+
     # First: try column_roles["outcome"]
     roles = get_column_roles(contract)
     outcome_cols_raw = roles.get("outcome", [])
@@ -398,6 +411,21 @@ def get_outcome_columns(contract: Dict[str, Any]) -> List[str]:
                     return [val]
 
     return []
+
+
+def get_task_semantics(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return canonical task semantics when present.
+
+    Returns:
+        task_semantics dict or empty dict.
+    """
+    if not isinstance(contract, dict):
+        return {}
+    task_semantics = contract.get("task_semantics")
+    if not isinstance(task_semantics, dict):
+        return {}
+    return task_semantics
 
 
 def get_decision_columns(contract: Dict[str, Any]) -> List[str]:

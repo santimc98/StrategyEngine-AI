@@ -19,6 +19,32 @@ def _extract_primary_target(semantics: Dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_target_columns(semantics: Dict[str, Any]) -> List[str]:
+    targets: List[str] = []
+
+    def _extend(values: Any) -> None:
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            return
+        for value in values:
+            token = str(value or "").strip()
+            if token and token not in targets:
+                targets.append(token)
+
+    _extend(semantics.get("target_columns"))
+    _extend(semantics.get("primary_targets"))
+    target_info = semantics.get("target_analysis")
+    if isinstance(target_info, dict):
+        _extend(target_info.get("target_columns"))
+        _extend(target_info.get("primary_targets"))
+
+    primary_target = _extract_primary_target(semantics)
+    if primary_target and primary_target not in targets:
+        targets.insert(0, primary_target)
+    return targets
+
+
 def summarize_dataset_semantics(
     semantics: Dict[str, Any],
     training_mask: Optional[Dict[str, Any]] = None,
@@ -28,6 +54,7 @@ def summarize_dataset_semantics(
     training_mask = training_mask if isinstance(training_mask, dict) else {}
 
     primary_target = _extract_primary_target(semantics)
+    target_columns = _extract_target_columns(semantics)
     target_info = semantics.get("target_analysis") if isinstance(semantics.get("target_analysis"), dict) else {}
     partial_labels = target_info.get("partial_label_detected") if isinstance(target_info, dict) else None
     null_frac_exact = target_info.get("target_null_frac_exact") if isinstance(target_info, dict) else None
@@ -43,6 +70,8 @@ def summarize_dataset_semantics(
     lines: List[str] = []
     lines.append("DATASET_SEMANTICS_SUMMARY:")
     lines.append(f"- primary_target: {primary_target or 'missing'}")
+    if target_columns:
+        lines.append(f"- target_columns: {target_columns[:8]}")
     if partial_labels is not None:
         lines.append(f"- partial_label_detected: {bool(partial_labels)}")
     if null_frac_exact is not None:

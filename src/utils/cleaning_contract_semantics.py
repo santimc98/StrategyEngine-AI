@@ -256,11 +256,14 @@ def expand_required_feature_selectors(
                 _add_many([col for col in values if col in candidate_set])
                 continue
 
-            if selector_type == "all_columns_except":
-                excluded, invalid_values = _normalize_nonempty_str_list(selector.get("except_columns"))
+            if selector_type in {"all_columns_except", "all_numeric_except"}:
+                raw_excluded = selector.get("except_columns")
+                if raw_excluded is None:
+                    raw_excluded = selector.get("value")
+                excluded, invalid_values = _normalize_nonempty_str_list(raw_excluded)
                 if invalid_values:
                     issues.append(
-                        f"required_feature_selectors[{idx}] all_columns_except.except_columns must be list[str]."
+                        f"required_feature_selectors[{idx}] {selector_type}.except_columns must be list[str]."
                     )
                 excluded_set = {col.lower() for col in excluded}
                 _add_many([col for col in candidates if col.lower() not in excluded_set])

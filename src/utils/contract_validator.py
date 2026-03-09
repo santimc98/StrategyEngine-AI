@@ -2783,6 +2783,18 @@ def _normalize_selector_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
             out["value"] = inner
             del out["selector"]
 
+    stype = str(out.get("type") or "").strip().lower()
+    if stype in {"all_columns_except", "all_numeric_except"}:
+        raw_excluded = out.get("except_columns")
+        if raw_excluded is None:
+            raw_excluded = out.get("value")
+        if raw_excluded is None:
+            raw_excluded = out.get("columns")
+        if isinstance(raw_excluded, str):
+            raw_excluded = [raw_excluded]
+        if isinstance(raw_excluded, list):
+            out["except_columns"] = raw_excluded
+
     return out
 
 
@@ -2862,10 +2874,12 @@ def _expand_required_feature_selectors(
                 _add_many([col for col in values if col in candidate_set])
                 continue
 
-            if selector_type == "all_columns_except":
+            if selector_type in {"all_columns_except", "all_numeric_except"}:
                 excluded, invalid_values = _normalize_nonempty_str_list(selector.get("except_columns"))
                 if invalid_values:
-                    issues.append(f"required_feature_selectors[{idx}] all_columns_except.except_columns must be list[str].")
+                    issues.append(
+                        f"required_feature_selectors[{idx}] {selector_type}.except_columns must be list[str]."
+                    )
                 excluded_set = {col.lower() for col in excluded}
                 _add_many([col for col in candidates if col.lower() not in excluded_set])
                 continue
@@ -2970,7 +2984,7 @@ def _selector_matches_column(selector: Dict[str, Any], column: str) -> bool:
         if selector_type == "list":
             values, _ = _normalize_nonempty_str_list(selector.get("columns"))
             return col in set(values)
-        if selector_type == "all_columns_except":
+        if selector_type in {"all_columns_except", "all_numeric_except"}:
             excluded, _ = _normalize_nonempty_str_list(selector.get("except_columns"))
             excluded_norm = {item.lower() for item in excluded}
             return col.lower() not in excluded_norm
@@ -3058,6 +3072,63 @@ def _collect_ml_required_columns(contract: Dict[str, Any]) -> Tuple[List[str], L
     return required, selector_hints
 
 
+_MULTI_TARGET_MARKERS = (
+    "multi_output",
+    "multioutput",
+    "multi_target",
+    "multitarget",
+    "multi_label",
+    "multilabel",
+    "multi_horizon",
+    "multihorizon",
+)
+_TARGET_NAME_MARKERS = ("target", "label", "outcome", "response", "y_")
+_TRAILING_TARGET_BUCKET_RE = re.compile(
+    r"(?:[_\-\s]?(?:t\d+|\d+(?:h|hr|hrs|hour|hours|d|day|days|w|week|weeks|m|min|mins|month|months)))+$",
+    flags=re.IGNORECASE,
+)
+
+
+def _target_family_signature(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    if not token:
+        return ""
+    token = _TRAILING_TARGET_BUCKET_RE.sub("", token)
+    token = re.sub(r"[_\-\s]+$", "", token)
+    token = re.sub(r"[_\-\s]+", "_", token)
+    return token
+
+
+def _looks_like_target_semantic_column(value: Any) -> bool:
+    token = str(value or "").strip().lower()
+    if not token:
+        return False
+    normalized = re.sub(r"[^a-z0-9_]+", "_", token).strip("_")
+    if any(marker in normalized for marker in _TARGET_NAME_MARKERS):
+        return True
+    return normalized.startswith(("y_", "label_", "target_", "outcome_"))
+
+
+def _has_multi_target_signal(*values: Any) -> bool:
+    for value in values:
+        if isinstance(value, dict):
+            if _has_multi_target_signal(*value.values()):
+                return True
+            continue
+        if isinstance(value, list):
+            if _has_multi_target_signal(*value):
+                return True
+            continue
+        text = str(value or "").strip().lower()
+        if not text:
+            continue
+        if any(marker in text for marker in _MULTI_TARGET_MARKERS):
+            return True
+        if "12h" in text and "24h" in text:
+            return True
+    return False
+
+
 def validate_contract_minimal_readonly(
     contract: Dict[str, Any],
     column_inventory: List[str] | None = None,
@@ -3117,6 +3188,8 @@ def validate_contract_minimal_readonly(
         _extend(steward_semantics.get("primary_targets"))
         _extend(steward_semantics.get("target_column"))
         _extend(steward_semantics.get("target_columns"))
+        _extend(steward_semantics.get("label_column"))
+        _extend(steward_semantics.get("label_columns"))
 
         _extend(contract.get("target_column"))
         _extend(contract.get("target_columns"))
@@ -3918,6 +3991,25 @@ def validate_contract_minimal_readonly(
         outcome_columns = _collect_outcome_columns()
         if target_candidates and outcome_columns:
             target_norm = {col.lower() for col in target_candidates if col}
+            if _has_multi_target_signal(
+                contract.get("evaluation_spec"),
+                contract.get("objective_analysis"),
+                contract.get("business_objective"),
+                outcome_columns,
+                target_candidates,
+                steward_semantics.get("notes") if isinstance(steward_semantics, dict) else None,
+            ):
+                target_families = {
+                    _target_family_signature(col)
+                    for col in target_candidates
+                    if _target_family_signature(col)
+                }
+                for col in outcome_columns:
+                    if not _looks_like_target_semantic_column(col):
+                        continue
+                    family = _target_family_signature(col)
+                    if family and (not target_families or family in target_families):
+                        target_norm.add(col.lower())
             unexpected_outcomes = [
                 col for col in outcome_columns
                 if col and col.lower() not in target_norm
@@ -4342,4 +4434,3 @@ def _is_selector_set_alias(feature: str, selectors: List[Dict]) -> bool:
     if not token:
         return False
     return bool(re.fullmatch(r"SET_\d+", token, flags=re.IGNORECASE))
-
