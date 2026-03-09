@@ -246,6 +246,26 @@ def test_resolve_dynamic_dependency_plan_detects_missing_torch(tmp_path, monkeyp
     assert "transformers" in (plan.get("pip_packages") or [])
 
 
+def test_resolve_dynamic_dependency_plan_detects_survival_dependencies(tmp_path, monkeypatch):
+    heavy_train = _load_heavy_train_module()
+    script_path = tmp_path / "ml_script.py"
+    script_path.write_text(
+        "import lifelines\nfrom sksurv.linear_model import CoxPHSurvivalAnalysis\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(heavy_train, "_module_available", lambda name: False)
+    plan = heavy_train._resolve_dynamic_dependency_plan(
+        {"required_dependencies": ["scikit-survival"]},
+        str(script_path),
+    )
+
+    assert "lifelines" in (plan.get("missing_roots") or [])
+    assert "sksurv" in (plan.get("missing_roots") or [])
+    assert "lifelines" in (plan.get("pip_packages") or [])
+    assert "scikit-survival" in (plan.get("pip_packages") or [])
+
+
 def test_install_dynamic_dependencies_invokes_pip(monkeypatch):
     heavy_train = _load_heavy_train_module()
     captured = {}

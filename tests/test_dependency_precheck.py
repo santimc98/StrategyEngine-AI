@@ -1,4 +1,8 @@
-from src.utils.sandbox_deps import check_dependency_precheck, cloudrun_imports_from_code
+from src.utils.sandbox_deps import (
+    check_dependency_precheck,
+    classify_dependency_support,
+    cloudrun_imports_from_code,
+)
 
 
 def test_dependency_precheck_blocks_banned_import():
@@ -67,3 +71,21 @@ def test_cloudrun_import_detection_handles_markdown_fences():
     imports = cloudrun_imports_from_code(code)
     assert "transformers" in imports
     assert "torch" in imports
+
+
+def test_dependency_precheck_allows_survival_libs_on_cloudrun():
+    code = "import lifelines\nfrom sksurv.linear_model import CoxPHSurvivalAnalysis\n"
+    result = check_dependency_precheck(code, required_dependencies=[], backend_profile="cloudrun")
+    assert result["blocked"] == []
+    assert result["banned"] == []
+
+
+def test_classify_dependency_support_normalizes_survival_aliases():
+    support = classify_dependency_support(
+        ["lifelines", "scikit-survival"],
+        backend_profile="cloudrun",
+    )
+    assert support["blocked"] == []
+    assert support["banned"] == []
+    assert "lifelines" in support["supported"]
+    assert "sksurv" in support["supported"]

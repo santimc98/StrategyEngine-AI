@@ -19,6 +19,7 @@ catboost
 category_encoders
 imbalanced-learn
 statsmodels
+lifelines
 joblib
 
 # --- Hyperparameter Tuning ---

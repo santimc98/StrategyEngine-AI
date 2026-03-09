@@ -85,7 +85,7 @@ def write_metrics():
         if node.func.value.id != "json" or node.func.attr != "dump":
             continue
         for kw in node.keywords:
-            if kw.arg == "default" and isinstance(kw.value, ast.Name) and kw.value.id == "json_default":
+            if kw.arg == "default" and isinstance(kw.value, ast.Name) and kw.value.id == "_json_default":
                 has_default_kw = True
                 break
     assert has_makedirs is True

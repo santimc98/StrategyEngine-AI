@@ -2636,14 +2636,14 @@ class MLEngineerAgent:
                 has_default = False
                 for kw in node.keywords:
                     if kw.arg == "default":
-                        kw.value = ast.Name(id="json_default", ctx=ast.Load())
+                        kw.value = ast.Name(id="_json_default", ctx=ast.Load())
                         has_default = True
                         break
                 if not has_default:
                     node.keywords.append(
                         ast.keyword(
                             arg="default",
-                            value=ast.Name(id="json_default", ctx=ast.Load()),
+                            value=ast.Name(id="_json_default", ctx=ast.Load()),
                         )
                     )
                 return node
@@ -4854,6 +4854,22 @@ class MLEngineerAgent:
             blocked_imports = dep_check.get("blocked") or []
             banned_imports = dep_check.get("banned") or []
             if blocked_imports or banned_imports:
+                contract_eval_spec = (
+                    execution_contract_input.get("evaluation_spec")
+                    if isinstance(execution_contract_input.get("evaluation_spec"), dict)
+                    else {}
+                )
+                objective_analysis = (
+                    execution_contract_input.get("objective_analysis")
+                    if isinstance(execution_contract_input.get("objective_analysis"), dict)
+                    else {}
+                )
+                problem_family = (
+                    str(contract_eval_spec.get("problem_type") or "").strip()
+                    or str(objective_analysis.get("problem_type") or "").strip()
+                    or str(strategy.get("analysis_type") or "").strip()
+                    or "unspecified"
+                )
                 dep_payload = {
                     "blocked": blocked_imports,
                     "banned": banned_imports,
@@ -4862,14 +4878,26 @@ class MLEngineerAgent:
                 }
                 dep_fix_system = (
                     "You are a senior ML engineer. "
-                    "Fix dependency compatibility only. "
-                    "Replace blocked/banned imports with runtime-compatible alternatives. "
+                    "Resolve dependency compatibility while preserving the analytical problem family. "
+                    "Do not degrade survival, ranking, time-series, clustering, or optimization tasks into generic "
+                    "classification/regression unless the contract explicitly changes the problem type. "
+                    "If a dependency is unavailable, switch to the nearest runtime-supported alternative in the same "
+                    "methodological family. "
                     "Keep contract outputs and logic intent intact. "
                     "Return full valid Python code only."
                 )
                 dep_fix_user = (
                     "DEPENDENCY_PREFLIGHT_FAILED. Patch the script to remove blocked/banned imports.\n"
                     + json.dumps(dep_payload, indent=2)
+                    + "\n\nCONTRACT PROBLEM FAMILY:\n"
+                    + problem_family
+                    + "\n\nRUNTIME DEPENDENCY CONTEXT:\n"
+                    + json.dumps(runtime_dependency_context, indent=2)
+                    + "\n\nDEPENDENCY REPAIR POLICY:\n"
+                    + "- Preserve the task family and evaluation method from the contract.\n"
+                    + "- Prefer supported libraries already allowed by the runtime.\n"
+                    + "- If the original library is unsupported, choose the closest supported alternative in the same family.\n"
+                    + "- Do not replace a formal method with an ad-hoc heuristic unless no formal supported fallback exists.\n"
                     + "\n\nCURRENT CODE:\n"
                     + self._truncate_code_for_patch(code)
                 )

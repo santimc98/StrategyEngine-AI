@@ -64,6 +64,15 @@ _DYNAMIC_DEPENDENCY_MAP: Dict[str, Tuple[str, str]] = {
     "pydantic": ("pydantic", "pydantic"),
     "pandera": ("pandera", "pandera"),
     "networkx": ("networkx", "networkx"),
+    "lifelines": ("lifelines", "lifelines"),
+    "sksurv": ("scikit-survival", "sksurv"),
+    "formulaic": ("formulaic", "formulaic"),
+    "pycox": ("pycox", "pycox"),
+    "torchtuples": ("torchtuples", "torchtuples"),
+    "mlxtend": ("mlxtend", "mlxtend"),
+    "umap": ("umap-learn", "umap"),
+    "statsforecast": ("statsforecast", "statsforecast"),
+    "mlforecast": ("mlforecast", "mlforecast"),
 }
 
 _DYNAMIC_DEP_ALIASES: Dict[str, str] = {
@@ -73,6 +82,10 @@ _DYNAMIC_DEP_ALIASES: Dict[str, str] = {
     "huggingface_hub": "huggingface_hub",
     "imbalanced-learn": "imblearn",
     "imblearn": "imblearn",
+    "scikit-survival": "sksurv",
+    "sksurv": "sksurv",
+    "umap-learn": "umap",
+    "umap": "umap",
 }
 
 

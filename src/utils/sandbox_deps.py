@@ -21,7 +21,15 @@ BASE_ALLOWLIST = [
     "tqdm",
     "yaml",
 ]
-EXTENDED_ALLOWLIST = ["rapidfuzz", "plotly", "pydantic", "pandera", "networkx"]
+EXTENDED_ALLOWLIST = [
+    "rapidfuzz",
+    "plotly",
+    "pydantic",
+    "pandera",
+    "networkx",
+    "mlxtend",
+    "umap",
+]
 CLOUDRUN_NATIVE_ALLOWLIST = [
     "torch",
     "transformers",
@@ -45,6 +53,15 @@ CLOUDRUN_OPTIONAL_ALLOWLIST = [
     "networkx",
     "sentencepiece",
     "huggingface_hub",
+    "lifelines",
+    "sksurv",
+    "formulaic",
+    "pycox",
+    "torchtuples",
+    "mlxtend",
+    "umap",
+    "statsforecast",
+    "mlforecast",
 ]
 # Unsupported regardless of backend (either incompatible or out-of-scope for this product runtime)
 BANNED_ALWAYS_ALLOWLIST = ["tensorflow", "keras", "pyspark", "spacy", "prophet", "cvxpy", "pulp", "fuzzywuzzy"]
@@ -75,6 +92,8 @@ PIP_EXTENDED = {
     "pydantic": "pydantic",
     "pandera": "pandera",
     "networkx": "networkx",
+    "mlxtend": "mlxtend",
+    "umap": "umap-learn",
 }
 PIP_CLOUDRUN_NATIVE = {
     "torch": "torch",
@@ -99,6 +118,28 @@ PIP_CLOUDRUN_OPTIONAL = {
     "networkx": "networkx",
     "sentencepiece": "sentencepiece",
     "huggingface_hub": "huggingface-hub",
+    "lifelines": "lifelines",
+    "sksurv": "scikit-survival",
+    "formulaic": "formulaic",
+    "pycox": "pycox",
+    "torchtuples": "torchtuples",
+    "mlxtend": "mlxtend",
+    "umap": "umap-learn",
+    "statsforecast": "statsforecast",
+    "mlforecast": "mlforecast",
+}
+
+_DEPENDENCY_ROOT_ALIASES = {
+    "sentence-transformers": "sentence_transformers",
+    "sentence_transformers": "sentence_transformers",
+    "huggingface-hub": "huggingface_hub",
+    "huggingface_hub": "huggingface_hub",
+    "imbalanced-learn": "imblearn",
+    "imblearn": "imblearn",
+    "scikit-survival": "sksurv",
+    "sksurv": "sksurv",
+    "umap-learn": "umap",
+    "umap": "umap",
 }
 
 _BACKEND_ALIASES = {
@@ -154,9 +195,31 @@ def normalize_backend_profile(profile: str | None) -> str:
 
 def normalize_required_dependencies(required_dependencies: Iterable[str] | None = None) -> Set[str]:
     return {
-        str(dep).strip().split(".")[0].lower()
+        _DEPENDENCY_ROOT_ALIASES.get(
+            str(dep).strip().replace("-", "_").split(".")[0].lower(),
+            _DEPENDENCY_ROOT_ALIASES.get(str(dep).strip().lower(), str(dep).strip().replace("-", "_").split(".")[0].lower()),
+        )
         for dep in (required_dependencies or [])
         if str(dep).strip()
+    }
+
+
+def classify_dependency_support(
+    required_dependencies: Iterable[str] | None = None,
+    backend_profile: str = "e2b",
+) -> Dict[str, List[str] | str]:
+    required = normalize_required_dependencies(required_dependencies)
+    backend = normalize_backend_profile(backend_profile)
+    banned = sorted(required & _banned_import_roots(backend))
+    allowed = _allowed_import_roots(required, backend)
+    blocked = sorted(dep for dep in required if dep not in allowed and dep not in banned)
+    supported = sorted(dep for dep in required if dep in allowed and dep not in banned)
+    return {
+        "required": sorted(required),
+        "supported": supported,
+        "blocked": blocked,
+        "banned": banned,
+        "backend_profile": backend,
     }
 
 
@@ -231,6 +294,15 @@ def check_dependency_precheck(
             "networkx",
             "sentencepiece",
             "huggingface_hub",
+            "lifelines",
+            "sksurv",
+            "formulaic",
+            "pycox",
+            "torchtuples",
+            "mlxtend",
+            "umap",
+            "statsforecast",
+            "mlforecast",
         }:
             if backend == "cloudrun":
                 suggestions[imp] = (

@@ -25,6 +25,7 @@ catboost
 category_encoders
 imbalanced-learn
 statsmodels
+lifelines
 
 # --- Deep Learning ---
 torch

@@ -84,6 +84,7 @@ from src.utils.sandbox_deps import (
     get_sandbox_install_packages,
     requires_cloudrun_backend,
     cloudrun_imports_from_code,
+    classify_dependency_support,
 )
 from src.utils.case_alignment import build_case_alignment_report
 # REMOVED: from src.utils.contract_validation import ensure_role_runbooks  # V4.1 cutover
@@ -12576,7 +12577,10 @@ _TECHNIQUE_PACKAGE_HINTS: Dict[str, List[str]] = {
     "prophet": ["prophet"],
     "arima": ["statsmodels"],
     "sarima": ["statsmodels"],
-    "survival": ["lifelines"],
+    "survival": ["lifelines", "sksurv"],
+    "cox": ["lifelines", "sksurv"],
+    "hazard": ["lifelines", "sksurv"],
+    "kaplan": ["lifelines"],
     "shap": ["shap"],
 }
 
@@ -12625,6 +12629,13 @@ def _required_packages_from_techniques(techniques: Any) -> List[str]:
     return packages
 
 
+def _resolve_dependency_backend_profile(runtime_mode: str) -> str:
+    mode = str(runtime_mode or "").strip().lower()
+    if mode in {"local", "cloudrun"}:
+        return "cloudrun"
+    return "e2b"
+
+
 def _validate_selected_strategy_executability(
     strategy: Dict[str, Any],
     *,
@@ -12661,12 +12672,27 @@ def _validate_selected_strategy_executability(
 
     runtime_mode = str(compute_constraints.get("runtime_mode") or "").strip().lower()
     required_packages = _required_packages_from_techniques(techniques)
-    if runtime_mode == "local" and required_packages:
-        missing_local = [pkg for pkg in required_packages if importlib.util.find_spec(pkg) is None]
-        if missing_local:
-            blockers.append(f"missing_local_dependencies:{','.join(missing_local[:8])}")
-    elif required_packages:
-        warnings.append(f"requires_dependencies:{','.join(required_packages[:8])}")
+    dependency_backend = _resolve_dependency_backend_profile(runtime_mode)
+    if required_packages:
+        support = classify_dependency_support(
+            required_packages,
+            backend_profile=dependency_backend,
+        )
+        unsupported = list(
+            dict.fromkeys(
+                [str(dep) for dep in (support.get("banned") or [])]
+                + [str(dep) for dep in (support.get("blocked") or [])]
+            )
+        )
+        if unsupported:
+            blockers.append(f"unsupported_runtime_dependencies:{','.join(unsupported[:8])}")
+        elif runtime_mode == "local":
+            # Local orchestration can still execute via heavy/local runner with dynamic installs.
+            missing_local = [pkg for pkg in required_packages if importlib.util.find_spec(pkg) is None]
+            if missing_local:
+                warnings.append(f"runtime_dependency_install:{','.join(missing_local[:8])}")
+        else:
+            warnings.append(f"requires_dependencies:{','.join(required_packages[:8])}")
 
     review_score = _safe_float(review.get("score"), 0.0) if isinstance(review, dict) else 0.0
     if review_score < 3.0:
@@ -12678,6 +12704,7 @@ def _validate_selected_strategy_executability(
         "warnings": warnings,
         "required_packages": required_packages,
         "runtime_mode": runtime_mode,
+        "dependency_backend": dependency_backend,
     }
 
 
@@ -12688,21 +12715,44 @@ def _infer_problem_type_for_heavy(
     target_col: str,
 ) -> str:
     objective_hints: List[str] = []
+    problem_hints: List[str] = []
     if isinstance(evaluation_spec, dict):
         objective = evaluation_spec.get("objective_type")
         if objective:
             objective_hints.append(str(objective))
+        problem_type = evaluation_spec.get("problem_type")
+        if problem_type:
+            problem_hints.append(str(problem_type))
     if isinstance(contract, dict):
         objective = contract.get("objective_type")
         if objective:
             objective_hints.append(str(objective))
+        obj_analysis = contract.get("objective_analysis")
+        if isinstance(obj_analysis, dict) and obj_analysis.get("problem_type"):
+            problem_hints.append(str(obj_analysis.get("problem_type")))
         contract_eval = contract.get("evaluation_spec")
         if isinstance(contract_eval, dict):
             objective = contract_eval.get("objective_type")
             if objective:
                 objective_hints.append(str(objective))
+            problem_type = contract_eval.get("problem_type")
+            if problem_type:
+                problem_hints.append(str(problem_type))
 
     objective_norm = " ".join(objective_hints).lower()
+    problem_norm = " ".join(problem_hints).lower()
+    combined_norm = " ".join([problem_norm, objective_norm]).strip()
+    if any(
+        token in combined_norm
+        for token in ("survival", "time-to-event", "time_to_event", "hazard", "censor")
+    ):
+        return "survival_analysis"
+    if any(token in combined_norm for token in ("ranking", "rank", "recommend")):
+        return "ranking"
+    if any(token in combined_norm for token in ("clustering", "cluster", "segmentation")):
+        return "clustering"
+    if any(token in combined_norm for token in ("optimization", "prescriptive")):
+        return "optimization"
     if any(token in objective_norm for token in ("classification", "classifier", "binary", "multiclass")):
         return "classification"
     if any(token in objective_norm for token in ("regression", "forecast", "timeseries")):
@@ -12737,6 +12787,22 @@ def _infer_problem_type_for_heavy(
         "lift",
     )
     reg_metric_tokens = ("rmse", "mse", "mae", "r2", "rmsle", "mape", "smape")
+    survival_metric_tokens = (
+        "concordanceindex",
+        "concordance",
+        "integratedbrierscore",
+        "ibs",
+        "censored",
+        "uncensored",
+    )
+    ranking_metric_tokens = ("ndcg", "map", "mrr", "hitrate", "precisionatk", "recallatk")
+    cluster_metric_tokens = ("silhouette", "daviesbouldin", "calinskiharabasz", "ari", "nmi")
+    if any(any(tok in metric for tok in survival_metric_tokens) for metric in metrics_norm):
+        return "survival_analysis"
+    if any(any(tok in metric for tok in ranking_metric_tokens) for metric in metrics_norm):
+        return "ranking"
+    if any(any(tok in metric for tok in cluster_metric_tokens) for metric in metrics_norm):
+        return "clustering"
     if any(any(tok in metric for tok in cls_metric_tokens) for metric in metrics_norm):
         return "classification"
     if any(any(tok in metric for tok in reg_metric_tokens) for metric in metrics_norm):
@@ -19687,7 +19753,14 @@ def execute_code(state: AgentState) -> AgentState:
             safe_mode = _env_flag("HEAVY_RUNNER_SAFE_MODE", default=safe_mode_default)
 
             model_type_env = os.getenv("HEAVY_RUNNER_MODEL_TYPE")
-            model_type = model_type_env or ("random_forest_classifier" if problem_type == "classification" else "random_forest_regressor")
+            if model_type_env:
+                model_type = model_type_env
+            elif problem_type == "classification":
+                model_type = "random_forest_classifier"
+            elif problem_type == "regression":
+                model_type = "random_forest_regressor"
+            else:
+                model_type = "custom_script"
             model_params = {}
             params_env = os.getenv("HEAVY_RUNNER_MODEL_PARAMS")
             if params_env:
