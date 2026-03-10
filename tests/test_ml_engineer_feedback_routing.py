@@ -10,32 +10,6 @@ def _agent() -> MLEngineerAgent:
     return MLEngineerAgent.__new__(MLEngineerAgent)
 
 
-def test_synthetic_fallback_detector_ignores_local_make_helpers():
-    agent = _agent()
-    code = """
-def make_plots():
-    return None
-
-def main():
-    make_plots()
-"""
-
-    assert agent._detect_forbidden_input_fallback(code, "data/cleaned_data.csv") == []
-
-
-def test_synthetic_fallback_detector_flags_sklearn_make_generators():
-    agent = _agent()
-    code = """
-from sklearn.datasets import make_classification
-
-X, y = make_classification(n_samples=100, n_features=4, random_state=42)
-"""
-
-    reasons = agent._detect_forbidden_input_fallback(code, "data/cleaned_data.csv")
-
-    assert "forbidden_sklearn_make_call:make_classification" in reasons
-
-
 def test_editor_phase_prioritizes_training_when_strategy_and_persistence_signals_coexist():
     agent = _agent()
     handoff = {
@@ -78,40 +52,6 @@ def test_editor_phase_stays_persistence_for_output_only_repairs():
     assert phase == "persistence"
 
 
-def test_guardrail_repair_context_preserves_active_patch_intent():
-    agent = _agent()
-    handoff = {
-        "patch_objectives": [
-            "Replace Logistic Regression with a boosting ensemble.",
-            "Implement stacking.",
-        ],
-        "must_preserve": ["Preserve artifact generation for data/metrics.json"],
-        "quality_focus": {
-            "required_fixes": ["Implement K-fold target encoding."],
-        },
-        "feedback": {
-            "reviewer": "Replace Logistic Regression with boosting and stacking.",
-            "qa": "Keep leakage guards intact.",
-        },
-    }
-    gate_context = {
-        "feedback": "Reviewer requires boosting plus stacking.",
-        "required_fixes": ["Implement K-fold target encoding."],
-    }
-
-    context = agent._build_guardrail_repair_context(
-        handoff_payload=handoff,
-        gate_context=gate_context,
-        feedback_history=["Previous run still used Logistic Regression."],
-    )
-
-    assert "ACTIVE_PATCH_OBJECTIVES" in context
-    assert "Replace Logistic Regression with a boosting ensemble." in context
-    assert "MUST_PRESERVE" in context
-    assert "Preserve artifact generation for data/metrics.json" in context
-    assert "ACTIVE_REVIEW_FEEDBACK" in context
-
-
 def test_editor_phase_prioritizes_runtime_repair_over_metric_optimization():
     agent = _agent()
     handoff = {
@@ -134,3 +74,47 @@ def test_editor_phase_prioritizes_runtime_repair_over_metric_optimization():
 
     assert phase == "runtime_repair"
     assert agent._is_metric_optimization_context(gate_context, handoff) is False
+
+
+class _FakeOpenAI:
+    def __init__(self, api_key=None, base_url=None, timeout=None, default_headers=None):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.timeout = timeout
+        self.default_headers = default_headers
+
+
+def test_generate_code_preserves_llm_output_without_system_rewrite(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    llm_script = (
+        "DATA_PATH = 'wrong.csv'\n"
+        "SUBMISSION_DATA_PATH = 'data/submission.csv'\n"
+        "if __name__ == '__main__':\n"
+        "    print('ok')\n"
+    )
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: llm_script,
+    )
+
+    agent = MLEngineerAgent()
+    agent._check_script_completeness = lambda code, required_outputs: []
+
+    code = agent.generate_code(
+        strategy={"title": "Base Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        execution_contract={"required_outputs": ["data/submission.csv"], "canonical_columns": []},
+        ml_view={"required_outputs": ["data/submission.csv"]},
+    )
+
+    assert code.strip() == llm_script.strip()
+    assert "data/submission.csv" in code
+    assert "wrong.csv" in code
+    assert [entry.get("stage") for entry in agent.last_prompt_trace] == ["build_generation"]
