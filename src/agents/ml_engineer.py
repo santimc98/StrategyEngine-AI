@@ -24,7 +24,6 @@ from src.utils.sandbox_deps import (
     CLOUDRUN_NATIVE_ALLOWLIST,
     CLOUDRUN_OPTIONAL_ALLOWLIST,
     BANNED_ALWAYS_ALLOWLIST,
-    check_dependency_precheck,
 )
 from src.utils.action_families import (
     classify_action_family,
@@ -4857,15 +4856,6 @@ class MLEngineerAgent:
                 raise ConnectionError("LLM Server Timeout (504 Received)")
             return content
 
-        def _syntax_error_message(candidate: str) -> str:
-            try:
-                ast.parse(candidate)
-                return ""
-            except SyntaxError as err:
-                return str(err)
-            except Exception as err:
-                return str(err)
-
         try:
             self.last_fallback_reason = None
             messages = [
@@ -4927,134 +4917,6 @@ class MLEngineerAgent:
             code = self._clean_code(content)
             if code.strip().startswith("{") or code.strip().startswith("["):
                 return "# Error: ML_CODE_REQUIRED"
-            if not is_syntax_valid(code):
-                syntax_err = _syntax_error_message(code)
-                repair_system = (
-                    "You are a senior Python engineer. Fix syntax errors ONLY. "
-                    "Do not change logic or remove required outputs. "
-                    "Return VALID PYTHON CODE ONLY."
-                )
-                repair_user = (
-                    "Fix syntax errors in the code below. Keep logic intact. "
-                    f"Syntax error: {syntax_err}\n\nCODE:\n{code}"
-                )
-                repaired = code
-                model_for_repairs = self.last_model_used or self.model_name
-                for _ in range(2):
-                    repaired = call_with_retries(
-                        lambda: _call_model_with_prompts(
-                            repair_system,
-                            repair_user,
-                            0.0,
-                            model_for_repairs,
-                            stage="syntax_repair",
-                        ),
-                        max_retries=2,
-                        backoff_factor=2,
-                        initial_delay=1,
-                    )
-                    repaired = self._clean_code(repaired)
-                    if is_syntax_valid(repaired):
-                        code = repaired
-                        break
-            dep_check = check_dependency_precheck(
-                code,
-                required_dependencies=required_dependencies,
-                backend_profile=(
-                    "cloudrun"
-                    if str(runtime_dependency_context.get("backend_profile") or "").lower() == "local"
-                    else str(runtime_dependency_context.get("backend_profile") or "e2b")
-                ),
-            )
-            blocked_imports = dep_check.get("blocked") or []
-            banned_imports = dep_check.get("banned") or []
-            if blocked_imports or banned_imports:
-                contract_eval_spec = (
-                    execution_contract_input.get("evaluation_spec")
-                    if isinstance(execution_contract_input.get("evaluation_spec"), dict)
-                    else {}
-                )
-                objective_analysis = (
-                    execution_contract_input.get("objective_analysis")
-                    if isinstance(execution_contract_input.get("objective_analysis"), dict)
-                    else {}
-                )
-                problem_family = (
-                    str(contract_eval_spec.get("problem_type") or "").strip()
-                    or str(objective_analysis.get("problem_type") or "").strip()
-                    or str(strategy.get("analysis_type") or "").strip()
-                    or "unspecified"
-                )
-                dep_payload = {
-                    "blocked": blocked_imports,
-                    "banned": banned_imports,
-                    "suggestions": dep_check.get("suggestions") or {},
-                    "backend_profile": dep_check.get("backend_profile"),
-                }
-                dep_fix_system = (
-                    "You are a senior ML engineer. "
-                    "Resolve dependency compatibility while preserving the analytical problem family. "
-                    "Do not degrade survival, ranking, time-series, clustering, or optimization tasks into generic "
-                    "classification/regression unless the contract explicitly changes the problem type. "
-                    "If a dependency is unavailable, switch to the nearest runtime-supported alternative in the same "
-                    "methodological family. "
-                    "Keep contract outputs and logic intent intact. "
-                    "Return full valid Python code only."
-                )
-                dep_fix_user = (
-                    "DEPENDENCY_PREFLIGHT_FAILED. Patch the script to remove blocked/banned imports.\n"
-                    + json.dumps(dep_payload, indent=2)
-                    + "\n\nCONTRACT PROBLEM FAMILY:\n"
-                    + problem_family
-                    + "\n\nRUNTIME DEPENDENCY CONTEXT:\n"
-                    + json.dumps(runtime_dependency_context, indent=2)
-                    + "\n\nDEPENDENCY REPAIR POLICY:\n"
-                    + "- Preserve the task family and evaluation method from the contract.\n"
-                    + "- Prefer supported libraries already allowed by the runtime.\n"
-                    + "- If the original library is unsupported, choose the closest supported alternative in the same family.\n"
-                    + "- Do not replace a formal method with an ad-hoc heuristic unless no formal supported fallback exists.\n"
-                    + "\n\nCURRENT CODE:\n"
-                    + self._truncate_code_for_patch(code)
-                )
-                repaired_deps = call_with_retries(
-                    lambda: _call_model_with_prompts(
-                        dep_fix_system,
-                        dep_fix_user,
-                        0.0,
-                        self.last_model_used or self.model_name,
-                        stage="dependency_repair",
-                    ),
-                    max_retries=2,
-                    backoff_factor=2,
-                    initial_delay=1,
-                )
-                repaired_deps = self._clean_code(repaired_deps)
-                if not is_syntax_valid(repaired_deps):
-                    raise RuntimeError(
-                        "ML_DEPENDENCY_PREFLIGHT_FAILED: repaired code invalid syntax after dependency fix."
-                    )
-                dep_check_after = check_dependency_precheck(
-                    repaired_deps,
-                    required_dependencies=required_dependencies,
-                    backend_profile=(
-                        "cloudrun"
-                        if str(runtime_dependency_context.get("backend_profile") or "").lower() == "local"
-                        else str(runtime_dependency_context.get("backend_profile") or "e2b")
-                    ),
-                )
-                if dep_check_after.get("blocked") or dep_check_after.get("banned"):
-                    raise RuntimeError(
-                        "ML_DEPENDENCY_PREFLIGHT_FAILED: "
-                        + json.dumps(
-                            {
-                                "blocked": dep_check_after.get("blocked") or [],
-                                "banned": dep_check_after.get("banned") or [],
-                                "suggestions": dep_check_after.get("suggestions") or {},
-                            },
-                            ensure_ascii=False,
-                        )
-                    )
-                code = repaired_deps
             completion_issues = self._check_script_completeness(code, required_deliverables)
             if completion_issues:
                 reprompt_context = self._build_incomplete_reprompt_context(
