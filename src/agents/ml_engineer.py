@@ -1592,6 +1592,217 @@ class MLEngineerAgent:
             "action_family_guidelines": action_family_guidelines,
         }
 
+    def _build_optimization_editor_briefs(
+        self,
+        handoff_payload: Dict[str, Any] | None,
+        optimization_inputs: Dict[str, Any] | None,
+        feedback_text: str,
+    ) -> Dict[str, str]:
+        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
+        optimization_inputs = optimization_inputs if isinstance(optimization_inputs, dict) else {}
+        optimization_focus = (
+            handoff_payload.get("optimization_focus")
+            if isinstance(handoff_payload.get("optimization_focus"), dict)
+            else {}
+        )
+        optimization_context = (
+            handoff_payload.get("optimization_context")
+            if isinstance(handoff_payload.get("optimization_context"), dict)
+            else {}
+        )
+        critic_packet = (
+            handoff_payload.get("critic_packet")
+            if isinstance(handoff_payload.get("critic_packet"), dict)
+            else {}
+        )
+        hypothesis_packet = (
+            handoff_payload.get("hypothesis_packet")
+            if isinstance(handoff_payload.get("hypothesis_packet"), dict)
+            else {}
+        )
+        hypothesis = (
+            hypothesis_packet.get("hypothesis")
+            if isinstance(hypothesis_packet.get("hypothesis"), dict)
+            else {}
+        )
+        policy = (
+            optimization_context.get("policy")
+            if isinstance(optimization_context.get("policy"), dict)
+            else {}
+        )
+        metric_snapshot = (
+            optimization_context.get("metric_snapshot")
+            if isinstance(optimization_context.get("metric_snapshot"), dict)
+            else {}
+        )
+        recent_tracker_raw = (
+            optimization_inputs.get("recent_tracker")
+            if isinstance(optimization_inputs.get("recent_tracker"), list)
+            else []
+        )
+        recent_tracker: List[Dict[str, Any]] = []
+        for item in recent_tracker_raw[-3:]:
+            if not isinstance(item, dict):
+                continue
+            recent_tracker.append(
+                {
+                    "iter": item.get("iter"),
+                    "attempt": item.get("attempt"),
+                    "event": item.get("event"),
+                    "phase": item.get("phase"),
+                    "metric_value": item.get("metric_value"),
+                    "delta": item.get("delta"),
+                    "error_signature": item.get("error_signature"),
+                    "changes_summary": item.get("changes_summary"),
+                }
+            )
+
+        error_modes: List[Dict[str, Any]] = []
+        critic_error_modes = critic_packet.get("error_modes")
+        if isinstance(critic_error_modes, list):
+            for item in critic_error_modes[:4]:
+                if not isinstance(item, dict):
+                    continue
+                error_modes.append(
+                    {
+                        "id": item.get("id"),
+                        "severity": item.get("severity"),
+                        "affected_scope": item.get("affected_scope"),
+                        "evidence": item.get("evidence"),
+                    }
+                )
+
+        round_brief = {
+            "phase": policy.get("phase") or optimization_focus.get("phase"),
+            "round_id": optimization_focus.get("round_id"),
+            "rounds_allowed": optimization_focus.get("rounds_allowed"),
+            "primary_metric_name": optimization_focus.get("primary_metric_name")
+            or metric_snapshot.get("primary_metric_name"),
+            "baseline_metric": optimization_focus.get("baseline_metric")
+            or metric_snapshot.get("baseline_metric"),
+            "current_metric": metric_snapshot.get("current_metric"),
+            "min_delta": optimization_focus.get("min_delta"),
+            "higher_is_better": optimization_focus.get("higher_is_better"),
+            "action_family": optimization_inputs.get("action_family"),
+            "active_technique": hypothesis.get("technique"),
+            "objective": hypothesis.get("objective"),
+            "missing_inputs": optimization_inputs.get("missing_inputs") or [],
+        }
+
+        active_hypothesis_brief = {
+            "action": hypothesis_packet.get("action"),
+            "technique": hypothesis.get("technique"),
+            "objective": hypothesis.get("objective"),
+            "target_columns": hypothesis.get("target_columns"),
+            "feature_scope": hypothesis.get("feature_scope"),
+            "params": hypothesis.get("params"),
+            "success_criteria": hypothesis_packet.get("success_criteria"),
+            "application_constraints": hypothesis_packet.get("application_constraints"),
+        }
+
+        evidence_brief = {
+            "analysis_summary": critic_packet.get("analysis_summary") or "",
+            "risk_flags": critic_packet.get("risk_flags") or [],
+            "top_error_modes": error_modes,
+            "recent_attempts": recent_tracker,
+        }
+
+        invariants_lock = dict(
+            optimization_inputs.get("invariants_lock")
+            if isinstance(optimization_inputs.get("invariants_lock"), dict)
+            else {}
+        )
+        primary_metric_name = str(round_brief.get("primary_metric_name") or "").strip()
+        if primary_metric_name:
+            invariants_lock.setdefault("primary_metric_name", primary_metric_name)
+        if active_hypothesis_brief.get("target_columns"):
+            invariants_lock.setdefault("target_columns", active_hypothesis_brief.get("target_columns"))
+        if (
+            primary_metric_name
+            and "mean" in primary_metric_name.lower()
+            and not any(
+                key in invariants_lock
+                for key in ("metric_weights", "weights", "horizon_weights")
+            )
+        ):
+            invariants_lock["metric_definition_rule"] = (
+                "Use a simple arithmetic mean across target horizons unless the contract explicitly provides weights."
+            )
+
+        blueprint_raw = (
+            handoff_payload.get("optimization_blueprint")
+            if isinstance(handoff_payload.get("optimization_blueprint"), dict)
+            else {}
+        )
+        blueprint_actions = (
+            blueprint_raw.get("improvement_actions")
+            if isinstance(blueprint_raw.get("improvement_actions"), list)
+            else []
+        )
+        blueprint_hint: List[Dict[str, Any]] = []
+        for item in blueprint_actions[:3]:
+            if not isinstance(item, dict):
+                continue
+            blueprint_hint.append(
+                {
+                    "technique": item.get("technique"),
+                    "rationale": item.get("rationale"),
+                    "concrete_params": item.get("concrete_params"),
+                    "code_change_hints": item.get("code_change_hints"),
+                }
+            )
+
+        feedback_brief = self._truncate_prompt_text(
+            str(
+                feedback_text
+                or critic_packet.get("analysis_summary")
+                or "No optimization feedback provided."
+            ),
+            max_len=1400,
+            head_len=900,
+            tail_len=300,
+        )
+
+        return {
+            "round_brief": self._serialize_json_for_prompt(
+                round_brief,
+                max_chars=1800,
+                max_str_len=220,
+                max_list_items=20,
+            ),
+            "active_hypothesis_brief": self._serialize_json_for_prompt(
+                active_hypothesis_brief,
+                max_chars=2200,
+                max_str_len=220,
+                max_list_items=25,
+            ),
+            "current_evidence_brief": self._serialize_json_for_prompt(
+                evidence_brief,
+                max_chars=2200,
+                max_str_len=220,
+                max_list_items=18,
+            ),
+            "invariants_lock": self._serialize_json_for_prompt(
+                invariants_lock,
+                max_chars=2200,
+                max_str_len=220,
+                max_list_items=24,
+            ),
+            "optimization_blueprint_hint": self._serialize_json_for_prompt(
+                blueprint_hint,
+                max_chars=1800,
+                max_str_len=220,
+                max_list_items=12,
+            ),
+            "recent_tracker": self._serialize_json_for_prompt(
+                recent_tracker,
+                max_chars=1600,
+                max_str_len=220,
+                max_list_items=10,
+            ),
+            "optimization_feedback_brief": feedback_brief or "No optimization feedback provided.",
+        }
+
     def _extract_decisioning_context(
         self,
         ml_view: Dict[str, Any] | None,
@@ -1652,6 +1863,75 @@ class MLEngineerAgent:
             }
         )
         return render_prompt(template, **merged)
+
+    def _build_optimization_system_prompt(
+        self,
+        render_kwargs: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None = None,
+        execution_contract: Dict[str, Any] | None = None,
+    ) -> str:
+        render_kwargs = render_kwargs if isinstance(render_kwargs, dict) else {}
+        merged = dict(render_kwargs)
+        merged.update(
+            {
+                "senior_reasoning_protocol": SENIOR_REASONING_PROTOCOL_GENERAL,
+                "senior_engineering_protocol": SENIOR_ENGINEERING_PROTOCOL,
+            }
+        )
+        template = """
+        You are a Senior ML Engineer editing an incumbent script during a metric-improvement round.
+
+        === SENIOR REASONING PROTOCOL ===
+        $senior_reasoning_protocol
+
+        === SENIOR ENGINEERING PROTOCOL ===
+        $senior_engineering_protocol
+
+        MISSION
+        - Improve the incumbent metric with one focused edit pass.
+        - Preserve the incumbent's valid behavior, contract paths, and runtime safety.
+        - Return one complete runnable Python script for "$data_path".
+
+        OPTIMIZATION EDITOR CONTRACT
+        - Treat the existing script as an approved incumbent unless the round evidence proves a local defect.
+        - Optimize by targeted edits, not by regenerating a new solution.
+        - Contract paths, train/test partitioning, target semantics, required outputs, and validation protocol are immutable unless the round context explicitly says otherwise.
+        - If the metric definition is a mean and the contract provides no explicit weights, use a simple arithmetic mean.
+
+        HARD CONSTRAINTS
+        - Output valid Python code only. No markdown, no code fences.
+        - Read input data only from "$data_path".
+        - Respect data/cleaning_manifest.json output_dialect for CSV reads and writes.
+        - Do not invent columns, synthetic rows, or fallback datasets.
+        - Do not overwrite input data.
+        - Respect required outputs exactly as contract paths.
+        - Avoid network, shell operations, filesystem discovery scans, and file deletion.
+        - Forbidden calls include os.remove, os.unlink, pathlib.Path.unlink, shutil.rmtree, os.rmdir.
+
+        EXECUTION INVARIANTS
+        - Keep row-subset rules exact: test-only artifacts must contain only scoring rows; all-row artifacts must contain all rows.
+        - Keep model family, CV protocol, and output contract stable unless the round invariants explicitly allow a local change.
+        - Preserve working artifact generation and only change the code regions needed for the active hypothesis.
+
+        CURRENT TASK CONTEXT
+        - Business Objective (compact): "$business_objective_digest"
+        - Strategy Title: $strategy_title
+        - Strategy Hypothesis: $hypothesis
+        - Strategy Techniques (compact): $strategy_techniques_compact
+        - Required Outputs: $deliverables_json
+        - ML Contract Summary: $ml_view_context
+        - Evaluation Spec Summary: $evaluation_spec_json
+        - Data Partitioning Context:
+        $data_partitioning_context
+
+        Return Python code only.
+        """
+        return self._build_system_prompt(
+            template,
+            merged,
+            ml_view=ml_view,
+            execution_contract=execution_contract,
+        )
 
     def _build_incomplete_reprompt_context(
         self,
@@ -3970,13 +4250,64 @@ class MLEngineerAgent:
                     else {}
                 )
             )
+            split_lock = (
+                ml_view.get("split_spec")
+                if isinstance(ml_view.get("split_spec"), dict)
+                else (
+                    execution_contract_input.get("split_spec")
+                    if isinstance(execution_contract_input.get("split_spec"), dict)
+                    else {}
+                )
+            )
+            artifact_requirements_lock = (
+                execution_contract_input.get("artifact_requirements")
+                if isinstance(execution_contract_input.get("artifact_requirements"), dict)
+                else (
+                    ml_view.get("artifact_requirements")
+                    if isinstance(ml_view.get("artifact_requirements"), dict)
+                    else {}
+                )
+            )
+            evaluation_lock = (
+                execution_contract_input.get("evaluation_spec")
+                if isinstance(execution_contract_input.get("evaluation_spec"), dict)
+                else (
+                    ml_view.get("evaluation_spec")
+                    if isinstance(ml_view.get("evaluation_spec"), dict)
+                    else {}
+                )
+            )
+            metric_name_lock = (
+                validation_lock.get("primary_metric")
+                or evaluation_lock.get("primary_metric")
+            )
+            metric_rule_lock = None
+            if isinstance(metric_name_lock, str) and "mean" in metric_name_lock.lower():
+                metric_rule_lock = (
+                    "Use a simple arithmetic mean unless the contract explicitly provides weights."
+                )
             ml_view_payload = {
                 "required_outputs": required_deliverables[:12],
+                "evaluation_spec": {
+                    "problem_type": evaluation_lock.get("problem_type"),
+                    "objective_type": evaluation_lock.get("objective_type"),
+                    "target_columns": evaluation_lock.get("target_columns"),
+                    "primary_metric": metric_name_lock,
+                    "metric_definition_rule": metric_rule_lock,
+                },
                 "validation_requirements": {
-                    "primary_metric": validation_lock.get("primary_metric"),
+                    "primary_metric": metric_name_lock,
                     "method": validation_lock.get("method"),
-                    "split_column": validation_lock.get("split_column"),
+                    "label_columns": validation_lock.get("label_columns"),
                     "params": validation_lock.get("params"),
+                },
+                "artifact_requirements": {
+                    "file_schemas": artifact_requirements_lock.get("file_schemas"),
+                    "scored_rows_required_columns": (
+                        artifact_requirements_lock.get("scored_rows_schema", {}).get("required_columns")
+                        if isinstance(artifact_requirements_lock.get("scored_rows_schema"), dict)
+                        else []
+                    ),
                 },
                 "allowed_feature_sets": {
                     "model_features": [
@@ -3990,26 +4321,21 @@ class MLEngineerAgent:
                         if str(item).strip()
                     ],
                 },
-                "column_roles": column_roles_lock,
-                "canonical_columns": [
-                    str(item) for item in (canonical_columns_hint or [])[:80] if str(item).strip()
-                ],
-                "split_spec": (
-                    ml_view.get("split_spec")
-                    if isinstance(ml_view.get("split_spec"), dict)
-                    else (
-                        execution_contract_input.get("split_spec")
-                        if isinstance(execution_contract_input.get("split_spec"), dict)
-                        else {}
-                    )
-                ),
+                "column_roles": {
+                    "identifiers": column_roles_lock.get("identifiers"),
+                    "outcome": column_roles_lock.get("outcome"),
+                    "pre_decision": column_roles_lock.get("pre_decision"),
+                    "post_decision_audit_only": column_roles_lock.get("post_decision_audit_only"),
+                },
+                "split_spec": split_lock,
                 "qa_gates": ml_view_payload.get("qa_gates") or [],
                 "reviewer_gates": ml_view_payload.get("reviewer_gates") or [],
+                "ml_engineer_runbook": ml_runbook_source,
             }
         ml_view_payload = compress_long_lists(ml_view_payload)[0]
         ml_view_json = self._serialize_json_for_prompt(
             ml_view_payload,
-            max_chars=11000,
+            max_chars=9000 if optimization_round_hint else 11000,
             max_str_len=700,
             max_list_items=100,
         )
@@ -4116,7 +4442,19 @@ class MLEngineerAgent:
         _techniques = strategy.get('techniques') or []
         _fallback_chain = strategy.get('fallback_chain') or []
         _strategy_techniques = json.dumps(_techniques, ensure_ascii=False) if _techniques else "N/A"
+        _strategy_techniques_compact = self._truncate_prompt_text(
+            _strategy_techniques,
+            max_len=1200,
+            head_len=800,
+            tail_len=200,
+        )
         _strategy_fallback_chain = "\n".join(f"  {item}" for item in _fallback_chain) if _fallback_chain else "N/A"
+        _business_objective_digest = self._truncate_prompt_text(
+            business_objective or "",
+            max_len=1600 if optimization_round_hint else 5000,
+            head_len=1000 if optimization_round_hint else 3000,
+            tail_len=300 if optimization_round_hint else 1200,
+        )
 
         # Build optional context block (Fix 4: skip empty fields)
         _optional_parts = []
@@ -4153,10 +4491,12 @@ class MLEngineerAgent:
 
         render_kwargs = dict(
             business_objective=business_objective,
+            business_objective_digest=_business_objective_digest,
             strategy_title=strategy.get('title', 'Unknown'),
             analysis_type=str(strategy.get('analysis_type', 'predictive')).upper(),
             hypothesis=strategy.get('hypothesis', 'N/A'),
             strategy_techniques=_strategy_techniques,
+            strategy_techniques_compact=_strategy_techniques_compact,
             strategy_fallback_chain=_strategy_fallback_chain,
             optional_context_block=_optional_context_block,
             required_columns=json.dumps(required_columns_payload),
@@ -4194,12 +4534,24 @@ class MLEngineerAgent:
             data_partitioning_context=data_partitioning_context,
         )
         # Safe Rendering for System Prompt
-        system_prompt, render_kwargs, prompt_budget_meta = self._build_system_prompt_with_budget(
-            SYSTEM_PROMPT_TEMPLATE,
-            render_kwargs,
-            ml_view=ml_view,
-            execution_contract=execution_contract_input,
-        )
+        if optimization_round_hint:
+            system_prompt = self._build_optimization_system_prompt(
+                render_kwargs,
+                ml_view=ml_view,
+                execution_contract=execution_contract_input,
+            )
+            prompt_budget_meta = {
+                "prompt_chars": len(system_prompt),
+                "budget_applied": False,
+                "mode": "optimization_editor",
+            }
+        else:
+            system_prompt, render_kwargs, prompt_budget_meta = self._build_system_prompt_with_budget(
+                SYSTEM_PROMPT_TEMPLATE,
+                render_kwargs,
+                ml_view=ml_view,
+                execution_contract=execution_contract_input,
+            )
         if isinstance(prompt_budget_meta, dict):
             prompt_chars = int(prompt_budget_meta.get("prompt_chars") or 0)
             budget_applied = bool(prompt_budget_meta.get("budget_applied"))
@@ -4210,6 +4562,7 @@ class MLEngineerAgent:
                         "prompt_chars": prompt_chars,
                         "budget_chars": 50000,
                         "budget_applied": budget_applied,
+                        "mode": prompt_budget_meta.get("mode") or "default",
                     }
                 )
             )
@@ -4342,55 +4695,35 @@ class MLEngineerAgent:
         MODE: OPTIMIZATION_MODE
         MODE: CODE_EDITOR_MODE_OPTIMIZATION
         You are editing an existing script for one focused optimization move.
+        Think like a senior engineer: keep the incumbent stable, use the round evidence, and change only what this round truly requires.
         Do not regenerate a new solution from zero and do not re-plan strategy.
 
-        PHASE CLASSIFICATION:
+        CURRENT PHASE:
         $phase_classification
 
-        OPTIMIZATION TARGET:
-        $optimization_target
+        CURRENT ROUND BRIEF:
+        $optimization_round_brief
 
-        OPTIMIZATION CONTEXT (authoritative current round):
-        $optimization_context
+        ACTIVE HYPOTHESIS BRIEF:
+        $active_hypothesis_brief
 
-        FEATURE ENGINEERING PLAN (contract):
-        $feature_engineering_plan
+        CURRENT EVIDENCE BRIEF:
+        $current_evidence_brief
 
-        ACTIVE ACTION FAMILY:
-        $action_family
+        PARAMETER / IMPLEMENTATION HINTS:
+        $optimization_blueprint_hint
+
+        LOCKED INVARIANTS:
+        $invariants_lock
 
         ACTION FAMILY GUIDELINES:
         $action_family_guidelines
 
-        INVARIANTS_LOCK (mandatory, immutable):
-        $invariants_lock
-
-        RECENT_TRACKER (mandatory evidence for this round):
+        RECENT ATTEMPT MEMORY:
         $recent_tracker
 
-        MISSING OPTIMIZATION INPUTS (must be resolved conservatively if non-empty):
-        $missing_optimization_inputs
-
-        OPTIMIZATION FEEDBACK:
-        $optimization_feedback
-
-        LAST RUN MEMORY (most recent attempts):
-        $last_run_memory
-
-        STRATEGY LOCK (immutable):
-        $strategy_lock
-
-        ITERATION HANDOFF:
-        $iteration_handoff_json
-
-        STRUCTURED CRITIQUE PACKET:
-        $critic_packet_json
-
-        STRUCTURED HYPOTHESIS PACKET (apply one hypothesis only):
-        $hypothesis_packet_json
-
-        OPTIMIZATION BLUEPRINT (full analysis from ModelAnalyst — use as reference for concrete params):
-        $optimization_blueprint
+        OPTIMIZATION FEEDBACK DIGEST:
+        $optimization_feedback_brief
 
         PATCH OBJECTIVES:
         $patch_objectives
@@ -4406,11 +4739,11 @@ class MLEngineerAgent:
 
         OPTIMIZATION TASK:
         - Return ONLY the full updated Python script. No markdown, no explanation.
-        - Apply one coherent optimization move that matches the active hypothesis and current round context.
-        - Prioritize optimization_context + hypothesis_packet over legacy reviewer text.
-        - If hypothesis_packet.params is empty, consult the optimization_blueprint for concrete_params matching the technique or action_family.
-        - Treat contract fields as immutable lock constraints (paths/split/CV/gates), not as re-planning input.
-        - Keep model family, CV/data-split protocol, and contract output paths stable.
+        - Apply one coherent optimization move that matches the active hypothesis.
+        - Treat the previous script as the incumbent and preserve working behavior by default.
+        - Keep contract paths, split logic, expected row counts, target semantics, and model family unchanged unless the invariant block explicitly allows otherwise.
+        - Use the evidence brief to target the weakest part of the incumbent instead of inventing a new plan.
+        - If the primary metric is defined as a mean and the contract does not provide explicit weights, compute a simple arithmetic mean.
         - Avoid unrelated refactors; edit only the regions needed for metric improvement.
         - Prefer the cheapest valid implementation that tests the idea without destabilizing working behavior.
         """
@@ -4547,100 +4880,30 @@ class MLEngineerAgent:
                 max_list_items=20,
             )
             if optimization_editor_mode:
-                optimization_focus = (
-                    handoff_payload.get("optimization_focus")
-                    if isinstance(handoff_payload.get("optimization_focus"), dict)
-                    else {}
-                )
-                optimization_target = self._serialize_json_for_prompt(
-                    optimization_focus,
-                    max_chars=2000,
-                    max_str_len=260,
-                    max_list_items=25,
-                )
-                optimization_context = (
-                    handoff_payload.get("optimization_context")
-                    if isinstance(handoff_payload.get("optimization_context"), dict)
-                    else {}
-                )
                 optimization_inputs = self._resolve_optimization_mode_inputs(
                     handoff_payload=handoff_payload,
                     last_run_memory=last_run_memory,
                 )
-                invariants_lock_block = self._serialize_json_for_prompt(
-                    optimization_inputs.get("invariants_lock"),
-                    max_chars=2200,
-                    max_str_len=260,
-                    max_list_items=30,
+                optimization_briefs = self._build_optimization_editor_briefs(
+                    handoff_payload=handoff_payload,
+                    optimization_inputs=optimization_inputs,
+                    feedback_text=feedback_text,
                 )
-                recent_tracker_block = self._serialize_json_for_prompt(
-                    optimization_inputs.get("recent_tracker"),
-                    max_chars=2200,
-                    max_str_len=260,
-                    max_list_items=20,
-                )
-                missing_inputs_block = self._serialize_json_for_prompt(
-                    optimization_inputs.get("missing_inputs"),
-                    max_chars=400,
-                    max_str_len=120,
-                    max_list_items=8,
-                )
-                action_family = str(optimization_inputs.get("action_family") or "feature_engineering")
                 action_family_guidelines = optimization_inputs.get("action_family_guidelines") or []
                 action_family_guidelines_block = "\n".join(
                     [f"- {str(item)}" for item in action_family_guidelines if str(item).strip()]
                 ) or "- Keep targeted edits with contract invariants preserved."
-                optimization_context_block = self._serialize_json_for_prompt(
-                    optimization_context,
-                    max_chars=2800,
-                    max_str_len=260,
-                    max_list_items=30,
-                )
-                feature_engineering_plan = (
-                    optimization_focus.get("feature_engineering_plan")
-                    if isinstance(optimization_focus.get("feature_engineering_plan"), dict)
-                    else {}
-                )
-                feature_engineering_plan_block = self._serialize_json_for_prompt(
-                    feature_engineering_plan,
-                    max_chars=2000,
-                    max_str_len=260,
-                    max_list_items=25,
-                )
-                # Optimization blueprint from ModelAnalyst — provides concrete
-                # params and code_change_hints even when the hypothesis_packet
-                # has generic/empty params (fallback techniques).
-                optimization_blueprint_raw = (
-                    handoff_payload.get("optimization_blueprint")
-                    if isinstance(handoff_payload.get("optimization_blueprint"), dict)
-                    else {}
-                )
-                optimization_blueprint_block = self._serialize_json_for_prompt(
-                    optimization_blueprint_raw.get("improvement_actions", [])[:6]
-                    if isinstance(optimization_blueprint_raw.get("improvement_actions"), list)
-                    else optimization_blueprint_raw,
-                    max_chars=3000,
-                    max_str_len=300,
-                    max_list_items=6,
-                )
                 user_message = render_prompt(
                     USER_EDITOR_OPTIMIZATION_TEMPLATE,
                     phase_classification=phase_classification,
-                    optimization_target=optimization_target or "{}",
-                    optimization_context=optimization_context_block or "{}",
-                    feature_engineering_plan=feature_engineering_plan_block or "{}",
-                    action_family=action_family,
+                    optimization_round_brief=optimization_briefs.get("round_brief") or "{}",
+                    active_hypothesis_brief=optimization_briefs.get("active_hypothesis_brief") or "{}",
+                    current_evidence_brief=optimization_briefs.get("current_evidence_brief") or "{}",
+                    optimization_blueprint_hint=optimization_briefs.get("optimization_blueprint_hint") or "[]",
+                    invariants_lock=optimization_briefs.get("invariants_lock") or "{}",
                     action_family_guidelines=action_family_guidelines_block,
-                    invariants_lock=invariants_lock_block or "{}",
-                    recent_tracker=recent_tracker_block or "[]",
-                    missing_optimization_inputs=missing_inputs_block or "[]",
-                    optimization_feedback=feedback_text or "No optimization feedback provided.",
-                    last_run_memory=last_run_memory_block,
-                    strategy_lock=strategy_lock_block,
-                    iteration_handoff_json=handoff_payload_json,
-                    critic_packet_json=critic_packet_block,
-                    hypothesis_packet_json=hypothesis_packet_block,
-                    optimization_blueprint=optimization_blueprint_block or "[]",
+                    recent_tracker=optimization_briefs.get("recent_tracker") or "[]",
+                    optimization_feedback_brief=optimization_briefs.get("optimization_feedback_brief") or "No optimization feedback provided.",
                     patch_objectives=patch_objectives_block,
                     must_preserve=must_preserve_block,
                     editor_enforcement=editor_enforcement_block,

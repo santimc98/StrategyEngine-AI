@@ -138,15 +138,15 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
             "optimization_focus": {
                 "round_id": 1,
                 "rounds_allowed": 1,
-                "primary_metric_name": "roc_auc",
+                "primary_metric_name": "mean_multi_horizon_log_loss",
                 "baseline_metric": 0.80,
                 "min_delta": 0.0005,
-                "higher_is_better": True,
+                "higher_is_better": False,
                 "feature_engineering_plan": {"techniques": [{"technique": "missing_indicators"}]},
             },
             "optimization_context": {
                 "policy": {"phase": "explore", "bundle_size": 1},
-                "metric_snapshot": {"primary_metric_name": "roc_auc", "baseline_metric": 0.80},
+                "metric_snapshot": {"primary_metric_name": "mean_multi_horizon_log_loss", "baseline_metric": 0.80},
                 "contract_lock": {"required_outputs": ["data/metrics.json"]},
             },
             "editor_constraints": {
@@ -167,10 +167,17 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
 
     prompt = str(agent.last_prompt or "")
     assert "MODE: CODE_EDITOR_MODE_OPTIMIZATION" in prompt
-    assert "OPTIMIZATION TARGET:" in prompt
-    assert "OPTIMIZATION CONTEXT (authoritative current round):" in prompt
-    assert "FEATURE ENGINEERING PLAN (contract):" in prompt
-    assert "HYPOTHESIS_PACKET_JSON" in prompt
+    assert "OPTIMIZATION EDITOR CONTRACT" in prompt
+    assert "CURRENT TASK CONTEXT" in prompt
+    assert "CURRENT ROUND BRIEF:" in prompt
+    assert "ACTIVE HYPOTHESIS BRIEF:" in prompt
+    assert "CURRENT EVIDENCE BRIEF:" in prompt
+    assert "LOCKED INVARIANTS:" in prompt
+    assert "simple arithmetic mean" in prompt
+    assert "STRUCTURED CRITIQUE PACKET:" not in prompt
+    assert "OPTIMIZATION CONTEXT (authoritative current round):" not in prompt
+    assert "CONTRACT-FIRST EXECUTION MAP (MANDATORY)" not in prompt
+    assert "FEATURE GOVERNANCE" not in prompt
 
 
 def test_editor_prompt_includes_authoritative_repair_ground_truth(monkeypatch):
