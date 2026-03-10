@@ -1,7 +1,7 @@
 import os
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -162,6 +162,46 @@ class MLEngineerAgent:
         )
         self.last_prompt = None
         self.last_response = None
+        self.last_prompt_trace: List[Dict[str, Any]] = []
+        self.last_prompt_trace_operation = None
+
+    def _reset_prompt_trace(self, operation: str) -> None:
+        self.last_prompt_trace = []
+        self.last_prompt_trace_operation = str(operation or "").strip() or None
+
+    def _record_prompt_trace_entry(
+        self,
+        *,
+        stage: str,
+        system_prompt: str,
+        user_prompt: str,
+        response: Any,
+        temperature: float,
+        model_requested: str | None = None,
+        model_used: str | None = None,
+        context_tag: str | None = None,
+        used_fallback: bool = False,
+        source: str = "openrouter",
+    ) -> None:
+        prompt_text = f"{system_prompt}\n\nUSER:\n{user_prompt}"
+        response_text = str(response or "")
+        self.last_prompt = prompt_text
+        self.last_response = response_text
+        self.last_prompt_trace.append(
+            {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                "operation": self.last_prompt_trace_operation,
+                "stage": str(stage or "unknown"),
+                "source": str(source or "openrouter"),
+                "context_tag": str(context_tag or "ml_engineer"),
+                "temperature": float(temperature),
+                "model_requested": str(model_requested or model_used or ""),
+                "model_used": str(model_used or model_requested or ""),
+                "used_fallback": bool(used_fallback),
+                "prompt": prompt_text,
+                "response": response_text,
+            }
+        )
 
     def _build_runtime_dependency_context(
         self,
@@ -3740,6 +3780,7 @@ class MLEngineerAgent:
         strategy_lock: Dict[str, Any] | None = None,
         editor_mode: bool = False,
     ) -> str:
+        self._reset_prompt_trace("generate_code")
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior ML and Deep Learning Engineer.
@@ -4883,14 +4924,25 @@ class MLEngineerAgent:
 
         from src.utils.retries import call_with_retries
         provider_label = "OpenRouter"
+        initial_generation_stage = (
+            "optimization_editor_generation"
+            if optimization_editor_mode
+            else "editor_generation"
+            if editor_mode_active
+            else "improve_generation"
+            if improve_mode_active
+            else "patch_generation"
+            if patch_mode_active
+            else "build_generation"
+        )
 
         def _call_model_with_prompts(
             sys_prompt: str,
             usr_prompt: str,
             temperature: float,
             model_name: str,
+            stage: str = "repair_subcall",
         ) -> str:
-            self.last_prompt = sys_prompt + "\n\nUSER:\n" + usr_prompt
             print(f"DEBUG: ML Engineer calling {provider_label} Model ({model_name})...")
             response = self.client.chat.completions.create(
                 model=model_name,
@@ -4901,7 +4953,18 @@ class MLEngineerAgent:
                 temperature=temperature,
             )
             content = response.choices[0].message.content
-            self.last_response = content
+            self._record_prompt_trace_entry(
+                stage=stage,
+                system_prompt=sys_prompt,
+                user_prompt=usr_prompt,
+                response=content,
+                temperature=temperature,
+                model_requested=model_name,
+                model_used=model_name,
+                context_tag="ml_engineer",
+                used_fallback=False,
+                source="openrouter_direct",
+            )
             
             # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
             if "504 Gateway Time-out" in content or "<html" in content.lower():
@@ -4925,7 +4988,6 @@ class MLEngineerAgent:
             ]
 
             def _call_openrouter():
-                self.last_prompt = system_prompt + "\n\nUSER:\n" + user_message
                 # Select primary model: use editor model for repair/editor
                 # iterations when configured, otherwise use the build model.
                 effective_primary = (
@@ -4953,7 +5015,18 @@ class MLEngineerAgent:
                 content = extract_response_text(response)
                 if not content:
                     raise ValueError("EMPTY_COMPLETION")
-                self.last_response = content
+                self._record_prompt_trace_entry(
+                    stage=initial_generation_stage,
+                    system_prompt=system_prompt,
+                    user_prompt=user_message,
+                    response=content,
+                    temperature=current_temp,
+                    model_requested=effective_primary,
+                    model_used=model_used,
+                    context_tag="ml_engineer",
+                    used_fallback=bool(model_used != effective_primary),
+                    source="openrouter_fallback_chain",
+                )
                 if "504 Gateway Time-out" in content or "<html" in content.lower():
                     raise ConnectionError("LLM Server Timeout (504 Received)")
                 return content
@@ -4983,7 +5056,13 @@ class MLEngineerAgent:
                 model_for_repairs = self.last_model_used or self.model_name
                 for _ in range(2):
                     repaired = call_with_retries(
-                        lambda: _call_model_with_prompts(repair_system, repair_user, 0.0, model_for_repairs),
+                        lambda: _call_model_with_prompts(
+                            repair_system,
+                            repair_user,
+                            0.0,
+                            model_for_repairs,
+                            stage="syntax_repair",
+                        ),
                         max_retries=2,
                         backoff_factor=2,
                         initial_delay=1,
@@ -5057,6 +5136,7 @@ class MLEngineerAgent:
                         dep_fix_user,
                         0.0,
                         self.last_model_used or self.model_name,
+                        stage="dependency_repair",
                     ),
                     max_retries=2,
                     backoff_factor=2,
@@ -5120,6 +5200,7 @@ class MLEngineerAgent:
                         completion_user,
                         0.0,
                         self.last_model_used or self.model_name,
+                        stage="completion_reprompt",
                     ),
                     max_retries=2,
                     backoff_factor=2,
@@ -5171,7 +5252,13 @@ class MLEngineerAgent:
                 repaired = code
                 for _ in range(2):
                     repaired = call_with_retries(
-                        lambda: _call_model_with_prompts(guard_system, guard_user, 0.0, model_for_repairs),
+                        lambda: _call_model_with_prompts(
+                            guard_system,
+                            guard_user,
+                            0.0,
+                            model_for_repairs,
+                            stage="guardrail_repair",
+                        ),
                         max_retries=2,
                         backoff_factor=2,
                         initial_delay=1,
@@ -5244,6 +5331,7 @@ class MLEngineerAgent:
                         compliance_user,
                         0.0,
                         self.last_model_used or self.model_name,
+                        stage="training_policy_repair",
                     ),
                     max_retries=2,
                     backoff_factor=2,

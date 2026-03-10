@@ -213,3 +213,44 @@ def test_log_agent_snapshot_supports_iteration_and_attempt_paths(tmp_path, monke
     assert (attempt_dir / "response.txt").exists()
     assert (attempt_dir / "context.json").exists()
     assert (attempt_dir / "script.py").exists()
+
+
+def test_log_agent_snapshot_persists_subcall_history(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run_id = "run_snapshot_subcalls_01"
+    run_dir = init_run_bundle(run_id, {}, base_dir=str(tmp_path / "runs"), enable_tee=False)
+
+    log_agent_snapshot(
+        run_id,
+        "ml_engineer",
+        prompt="final prompt",
+        response="final response",
+        iteration=1,
+        attempt=1,
+        prompt_trace=[
+            {
+                "stage": "build_generation",
+                "model_used": "model-a",
+                "prompt": "build prompt",
+                "response": "build response",
+            },
+            {
+                "stage": "guardrail_repair",
+                "model_used": "model-a",
+                "prompt": "guard prompt",
+                "response": "guard response",
+            },
+        ],
+    )
+
+    attempt_dir = Path(run_dir) / "agents" / "ml_engineer" / "iteration_1" / "attempt_1"
+    trace_path = attempt_dir / "subcalls.json"
+    assert trace_path.exists()
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert len(trace) == 2
+    assert trace[0]["stage"] == "build_generation"
+    assert trace[1]["stage"] == "guardrail_repair"
+    assert (attempt_dir / "subcalls" / "01_build_generation_prompt.txt").exists()
+    assert (attempt_dir / "subcalls" / "01_build_generation_response.txt").exists()
+    assert (attempt_dir / "subcalls" / "02_guardrail_repair_prompt.txt").exists()
+    assert (attempt_dir / "subcalls" / "02_guardrail_repair_response.txt").exists()

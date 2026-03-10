@@ -1,4 +1,5 @@
 from src.agents.ml_engineer import MLEngineerAgent
+from types import SimpleNamespace
 
 
 class _FakeOpenAI:
@@ -7,6 +8,20 @@ class _FakeOpenAI:
         self.base_url = base_url
         self.timeout = timeout
         self.default_headers = default_headers
+
+
+class _TraceOpenAI(_FakeOpenAI):
+    queued_outputs = []
+
+    def __init__(self, api_key=None, base_url=None, timeout=None, default_headers=None):
+        super().__init__(api_key=api_key, base_url=base_url, timeout=timeout, default_headers=default_headers)
+        self.chat = SimpleNamespace(completions=self)
+
+    def create(self, model=None, messages=None, temperature=None):
+        content = self.queued_outputs.pop(0)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
 
 
 def test_editor_mode_prompt_includes_structured_feedback_json(monkeypatch):
@@ -270,3 +285,47 @@ def test_editor_prompt_enforces_patch_only_repair_scope(monkeypatch):
     )
 
     prompt = str(agent.last_prompt or "")
+    assert "REPAIR SCOPE (authoritative edit boundaries):" in prompt
+    assert "patch_only" in prompt
+    assert "compliance_runtime patch-only mode is ACTIVE." in prompt
+    assert "Treat all regions outside REPAIR SCOPE as frozen" in prompt
+    assert "Editable targets: script_line:2; call_site:os.remove." in prompt
+
+
+def test_generate_code_records_subcall_trace_with_completion_reprompt(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _TraceOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "print('partial')\n",
+    )
+
+    _TraceOpenAI.queued_outputs = ["import json\nprint('completed')\n"]
+    agent = MLEngineerAgent()
+
+    checks = {"count": 0}
+
+    def _fake_completeness(code, required_outputs):
+        checks["count"] += 1
+        return ["missing outputs"] if checks["count"] == 1 else []
+
+    monkeypatch.setattr(agent, "_check_script_completeness", _fake_completeness)
+
+    _ = agent.generate_code(
+        strategy={"title": "Trace Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        execution_contract={"required_outputs": ["data/metrics.json"], "canonical_columns": []},
+        ml_view={"required_outputs": ["data/metrics.json"]},
+    )
+
+    trace = agent.last_prompt_trace
+    assert len(trace) == 2
+    assert trace[0]["stage"] == "build_generation"
+    assert trace[1]["stage"] == "completion_reprompt"
+    assert "Return a COMPLETE runnable Python script" in trace[1]["prompt"]
+    assert "print('completed')" in trace[1]["response"]

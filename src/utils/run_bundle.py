@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,13 @@ def _write_json(path: str, payload: Any) -> None:
     clean_payload = sanitize_text_payload(payload)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(clean_payload, f, indent=2, ensure_ascii=False)
+
+
+def _safe_trace_fragment(value: Any, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._")
+    if not text:
+        text = fallback
+    return text[:80]
 
 
 def _safe_load_json(path: str) -> Any:
@@ -312,6 +320,7 @@ def log_agent_snapshot(
     verdicts: Optional[Any] = None,
     attempt: Optional[int] = None,
     iteration: Optional[int] = None,
+    prompt_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     run_dir = get_run_dir(run_id)
     if not run_dir:
@@ -363,6 +372,33 @@ def log_agent_snapshot(
         _write_text(os.path.join(base, "script.py"), script)
     if verdicts is not None:
         _write_json(os.path.join(base, "verdicts.json"), verdicts)
+    if isinstance(prompt_trace, list) and prompt_trace:
+        subcalls_dir = os.path.join(base, "subcalls")
+        _ensure_dir(subcalls_dir)
+        subcall_index: List[Dict[str, Any]] = []
+        for idx, item in enumerate(prompt_trace, start=1):
+            if not isinstance(item, dict):
+                continue
+            clean_item = sanitize_text_payload(dict(item))
+            stage = _safe_trace_fragment(clean_item.get("stage"), f"subcall_{idx:02d}")
+            stem = f"{idx:02d}_{stage}"
+            prompt_body = clean_item.pop("prompt", None)
+            response_body = clean_item.pop("response", None)
+            if prompt_body is not None:
+                prompt_rel = os.path.join("subcalls", f"{stem}_prompt.txt").replace("\\", "/")
+                _write_text(os.path.join(base, prompt_rel), str(prompt_body))
+                clean_item["prompt_path"] = prompt_rel
+                clean_item["prompt_chars"] = len(str(prompt_body))
+            if response_body is not None:
+                response_rel = os.path.join("subcalls", f"{stem}_response.txt").replace("\\", "/")
+                _write_text(os.path.join(base, response_rel), str(response_body))
+                clean_item["response_path"] = response_rel
+                clean_item["response_chars"] = len(str(response_body))
+            clean_item.setdefault("index", idx)
+            clean_item.setdefault("stage", str(item.get("stage") or stage))
+            subcall_index.append(clean_item)
+        if subcall_index:
+            _write_json(os.path.join(base, "subcalls.json"), subcall_index)
 
 
 def log_sandbox_attempt(

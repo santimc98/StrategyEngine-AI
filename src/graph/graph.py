@@ -11209,6 +11209,8 @@ def _build_iteration_handoff(
             source="result_evaluator_repair_first",
             reason=f"repair_first:{repair_first_focus}",
         )
+        if repair_scope:
+            handoff["repair_scope"] = repair_scope
     if preflight_failures:
         handoff["preflight_gates"] = {
             "fails": preflight_failures[:10],
@@ -19797,6 +19799,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 script=code,
                 attempt=ml_attempt,
                 iteration=iter_id,
+                prompt_trace=getattr(ml_engineer, "last_prompt_trace", None),
             )
         try:
             iter_id = ml_attempt
