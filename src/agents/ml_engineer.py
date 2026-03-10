@@ -656,6 +656,7 @@ class MLEngineerAgent:
             if isinstance(raw.get("repair_ground_truth"), dict)
             else {}
         )
+        repair_scope = raw.get("repair_scope") if isinstance(raw.get("repair_scope"), dict) else {}
         deferred_optimization = (
             raw.get("deferred_optimization")
             if isinstance(raw.get("deferred_optimization"), dict)
@@ -670,7 +671,14 @@ class MLEngineerAgent:
             else {}
         )
         if isinstance(gate_enforcement, dict):
-            for key in ("must_apply_hypothesis", "forbid_noop", "patch_intensity"):
+            for key in (
+                "must_apply_hypothesis",
+                "forbid_noop",
+                "patch_intensity",
+                "scope_policy",
+                "allow_strategy_changes",
+                "freeze_unimplicated_regions",
+            ):
                 if key not in editor_constraints and key in gate_enforcement:
                     editor_constraints[key] = gate_enforcement.get(key)
         if "must_apply_hypothesis" not in editor_constraints:
@@ -814,6 +822,7 @@ class MLEngineerAgent:
             "deferred_optimization": deferred_optimization if isinstance(deferred_optimization, dict) else {},
             "retry_context": retry_context if isinstance(retry_context, dict) else {},
             "repair_ground_truth": repair_ground_truth if isinstance(repair_ground_truth, dict) else {},
+            "repair_scope": repair_scope if isinstance(repair_scope, dict) else {},
             "must_preserve": must_preserve[:8],
             "patch_objectives": patch_objectives[:8],
             "critic_packet": critic_packet if isinstance(critic_packet, dict) else {},
@@ -822,6 +831,9 @@ class MLEngineerAgent:
                 "must_apply_hypothesis": bool(editor_constraints.get("must_apply_hypothesis")),
                 "forbid_noop": bool(editor_constraints.get("forbid_noop")),
                 "patch_intensity": str(editor_constraints.get("patch_intensity") or "incremental"),
+                "scope_policy": str(editor_constraints.get("scope_policy") or "").strip(),
+                "allow_strategy_changes": bool(editor_constraints.get("allow_strategy_changes")),
+                "freeze_unimplicated_regions": bool(editor_constraints.get("freeze_unimplicated_regions")),
             },
         }
 
@@ -1355,11 +1367,14 @@ class MLEngineerAgent:
             "runtime_api_misuse",
             "runtime_contract_assertion",
             "runtime_error",
+            "security_violation",
             "timeout",
             "oom",
             "import_error",
             "shape_or_dtype",
         }:
+            return "runtime_repair"
+        if repair_focus == "compliance":
             return "runtime_repair"
         if repair_focus == "persistence" or root_cause_type in {"artifact_io", "output_missing"}:
             return "persistence"
@@ -1421,6 +1436,48 @@ class MLEngineerAgent:
         must_apply = bool(constraints.get("must_apply_hypothesis"))
         forbid_noop = bool(constraints.get("forbid_noop"))
         patch_intensity = str(constraints.get("patch_intensity") or "incremental").strip() or "incremental"
+        scope_policy = str(constraints.get("scope_policy") or "").strip().lower()
+        allow_strategy_changes = bool(constraints.get("allow_strategy_changes"))
+        freeze_unimplicated = bool(constraints.get("freeze_unimplicated_regions"))
+        repair_scope = (
+            handoff_payload.get("repair_scope")
+            if isinstance(handoff_payload.get("repair_scope"), dict)
+            else {}
+        )
+        if scope_policy == "patch_only":
+            phase = str(repair_scope.get("phase") or "compliance_runtime").strip() or "compliance_runtime"
+            editable_targets = [
+                str(item)
+                for item in (repair_scope.get("editable_targets") or [])
+                if str(item).strip()
+            ]
+            protected_regions = [
+                str(item)
+                for item in (repair_scope.get("protected_regions") or [])
+                if str(item).strip()
+            ]
+            invariants = [
+                str(item)
+                for item in (repair_scope.get("must_preserve_invariants") or [])
+                if str(item).strip()
+            ]
+            lines: List[str] = [
+                f"- {phase} patch-only mode is ACTIVE.",
+                "- Use the full script only as context. Do not redesign strategy, model family, or healthy pipeline sections.",
+                "- Edit only reviewer-audited findings and verified failing blocks from REPAIR SCOPE.",
+                f"- Patch intensity: {patch_intensity}.",
+            ]
+            if freeze_unimplicated:
+                lines.append("- Treat all regions outside REPAIR SCOPE as frozen unless new verified runtime evidence directly contradicts them.")
+            if not allow_strategy_changes:
+                lines.append("- Strategy changes are NOT allowed in this mode.")
+            if editable_targets:
+                lines.append("- Editable targets: " + "; ".join(editable_targets[:4]) + ".")
+            if protected_regions:
+                lines.append("- Protected regions: " + "; ".join(protected_regions[:4]) + ".")
+            if invariants:
+                lines.append("- Preserve invariants: " + "; ".join(invariants[:3]) + ".")
+            return "\n".join(lines)
         if not (must_apply or forbid_noop):
             return "- Standard editor mode. Apply patch objectives and keep minimal safe edits."
 
@@ -4259,6 +4316,9 @@ class MLEngineerAgent:
         REPAIR GROUND TRUTH (verified environment facts, authoritative):
         $repair_ground_truth
 
+        REPAIR SCOPE (authoritative edit boundaries):
+        $repair_scope
+
         PATCH OBJECTIVES (apply in order):
         $patch_objectives
 
@@ -4319,6 +4379,9 @@ class MLEngineerAgent:
         REPAIR GROUND TRUTH (verified environment facts, authoritative):
         $repair_ground_truth
 
+        REPAIR SCOPE (authoritative edit boundaries):
+        $repair_scope
+
         STRUCTURED CRITIQUE PACKET:
         $critic_packet_json
 
@@ -4343,6 +4406,7 @@ class MLEngineerAgent:
         - Keep strategy/objective/contract paths unchanged.
         - Treat phase as the current focus, not as a pre-scripted recipe.
         - Treat REPAIR GROUND TRUTH as environment truth; do not override it with guessed library behavior.
+        - If REPAIR SCOPE says patch_only, use the whole script only as context and edit only the scoped targets/findings unless new verified runtime evidence forces a narrow expansion.
         - If phase is "runtime_repair", restore runnable behavior and required outputs before deferred metric-improvement work.
           If the failure is a timeout or OOM, reduce compute cost within the same model family before changing strategy.
         - If phase is "persistence", keep training/model selection logic stable unless a contract violation forces a broader fix.
@@ -4548,6 +4612,14 @@ class MLEngineerAgent:
                 max_str_len=260,
                 max_list_items=24,
             )
+            repair_scope_block = self._serialize_json_for_prompt(
+                handoff_payload.get("repair_scope")
+                if isinstance(handoff_payload.get("repair_scope"), dict)
+                else {},
+                max_chars=2200,
+                max_str_len=220,
+                max_list_items=20,
+            )
             if optimization_editor_mode:
                 optimization_focus = (
                     handoff_payload.get("optimization_focus")
@@ -4657,6 +4729,7 @@ class MLEngineerAgent:
                     strategy_lock=strategy_lock_block,
                     iteration_handoff_json=handoff_payload_json,
                     repair_ground_truth=repair_ground_truth_block or "{}",
+                    repair_scope=repair_scope_block or "{}",
                     critic_packet_json=critic_packet_block,
                     hypothesis_packet_json=hypothesis_packet_block,
                     patch_objectives=patch_objectives_block,
@@ -4756,6 +4829,14 @@ class MLEngineerAgent:
                     max_chars=2600,
                     max_str_len=260,
                     max_list_items=24,
+                ) or "{}",
+                repair_scope=self._serialize_json_for_prompt(
+                    handoff_payload.get("repair_scope")
+                    if isinstance(handoff_payload.get("repair_scope"), dict)
+                    else {},
+                    max_chars=2200,
+                    max_str_len=220,
+                    max_list_items=20,
                 ) or "{}",
                 patch_objectives=patch_objectives_block,
                 must_preserve=must_preserve_block,

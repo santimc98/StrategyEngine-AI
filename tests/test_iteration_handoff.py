@@ -184,6 +184,55 @@ def test_iteration_handoff_builds_repair_ground_truth_for_runtime_api_misuse():
     )
 
 
+def test_iteration_handoff_builds_patch_only_repair_scope_for_runtime_repair():
+    generated_code = (
+        "def check_writable(path):\n"
+        "    os.remove(path)\n"
+        "\n"
+        "def main():\n"
+        "    check_writable('tmp.txt')\n"
+    )
+    runtime_output = (
+        "CRITICAL: Security Violations:\n"
+        "Calling 'os.remove' is not allowed.\n"
+    )
+
+    state = {
+        "iteration_count": 1,
+        "execution_contract": {"required_outputs": ["data/metrics.json", "data/submission.csv"]},
+        "generated_code": generated_code,
+        "execution_output": runtime_output,
+        "last_runtime_error_tail": runtime_output,
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["runtime_failure", "contract_required_artifacts_missing"],
+            "required_fixes": ["Remove os.remove from check_writable.", "Regenerate required outputs."],
+            "feedback": "Security violation in output writability check.",
+        },
+        oc_report={"present": [], "missing": ["data/metrics.json", "data/submission.csv"]},
+        review_result={
+            "feedback": "Remove the prohibited os.remove call in check_writable.",
+            "evidence": [{"claim": "Forbidden os.remove call.", "source": "script:2"}],
+        },
+        qa_result={},
+        evaluation_spec={"primary_metric": "accuracy"},
+    )
+
+    repair_scope = handoff["repair_scope"]
+    assert repair_scope["scope_policy"] == "patch_only"
+    assert repair_scope["phase"] == "compliance_runtime"
+    assert repair_scope["reviewer_guided"] is True
+    assert any("script_line:2" == item for item in repair_scope["editable_targets"])
+    assert any("training_strategy_and_model_family" == item for item in repair_scope["protected_regions"])
+    assert any("Do not widen scope" in item for item in repair_scope["must_preserve_invariants"])
+    assert handoff["editor_constraints"]["scope_policy"] == "patch_only"
+    assert handoff["editor_constraints"]["freeze_unimplicated_regions"] is True
+
+
 def test_iteration_handoff_prefers_real_traceback_over_heavy_runner_success_wrapper():
     runtime_tail = (
         "Traceback (most recent call last)\n"

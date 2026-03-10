@@ -212,3 +212,61 @@ def test_editor_prompt_includes_authoritative_repair_ground_truth(monkeypatch):
     assert "REPAIR GROUND TRUTH (verified environment facts, authoritative):" in prompt
     assert "pathlib.Path.read_text" in prompt
     assert "unexpected_keyword_argument" in prompt
+
+
+def test_editor_prompt_enforces_patch_only_repair_scope(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={"title": "Repair Scope Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        previous_code="def check_writable(path):\n    os.remove(path)\n",
+        gate_context={
+            "source": "Execution Runtime",
+            "status": "REJECTED",
+            "feedback": "Security violation in check_writable.",
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Remove os.remove from check_writable."],
+        },
+        iteration_handoff={
+            "mode": "patch",
+            "repair_policy": {"repair_first": True, "primary_focus": "runtime"},
+            "editor_constraints": {
+                "patch_intensity": "surgical",
+                "scope_policy": "patch_only",
+                "allow_strategy_changes": False,
+                "freeze_unimplicated_regions": True,
+            },
+            "repair_scope": {
+                "phase": "compliance_runtime",
+                "scope_policy": "patch_only",
+                "editable_targets": ["script_line:2", "call_site:os.remove"],
+                "protected_regions": ["training_strategy_and_model_family"],
+                "must_preserve_invariants": [
+                    "Use the full script as context, but treat unrelated regions as frozen by default.",
+                    "Do not widen scope unless new verified runtime evidence directly implicates another block.",
+                ],
+            },
+            "repair_ground_truth": {
+                "root_cause_type": "runtime_error",
+                "repair_focus": "runtime",
+                "failure_signature": "CRITICAL: Security Violations:",
+            },
+        },
+        execution_contract={"required_outputs": ["data/metrics.json"], "canonical_columns": []},
+        ml_view={"required_outputs": ["data/metrics.json"]},
+        editor_mode=True,
+    )
+
+    prompt = str(agent.last_prompt or "")

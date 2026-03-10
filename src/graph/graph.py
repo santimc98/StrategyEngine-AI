@@ -10285,6 +10285,138 @@ def _build_repair_ground_truth(
     }
 
 
+def _extract_repair_scope_targets_from_evidence(
+    evidence_focus: List[Dict[str, Any]] | None,
+) -> List[str]:
+    evidence_focus = evidence_focus if isinstance(evidence_focus, list) else []
+    targets: List[str] = []
+    for item in evidence_focus:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "").strip()
+        if not source:
+            continue
+        for match in re.finditer(r"script:(\d+)", source, re.IGNORECASE):
+            target = f"script_line:{match.group(1)}"
+            if target not in targets:
+                targets.append(target)
+        if len(targets) >= 6:
+            break
+    return targets[:6]
+
+
+def _build_repair_scope(
+    *,
+    repair_focus: str,
+    repair_ground_truth: Dict[str, Any] | None,
+    required_fixes: List[str] | None,
+    failed_gates: List[str] | None,
+    evidence_focus: List[Dict[str, Any]] | None,
+    must_preserve: List[str] | None,
+    missing_outputs: List[str] | None,
+) -> Dict[str, Any]:
+    repair_focus = str(repair_focus or "").strip().lower()
+    if repair_focus not in {"runtime", "persistence", "compliance"}:
+        return {}
+
+    repair_ground_truth = repair_ground_truth if isinstance(repair_ground_truth, dict) else {}
+    evidence_focus = evidence_focus if isinstance(evidence_focus, list) else []
+    must_preserve = [str(item) for item in (must_preserve or []) if str(item).strip()]
+    missing_outputs = [str(item) for item in (missing_outputs or []) if str(item).strip()]
+    phase = "compliance_runtime" if repair_focus in {"runtime", "compliance"} else "contract_persistence"
+
+    editable_targets: List[str] = []
+    protected_regions: List[str] = []
+    active_findings: List[str] = []
+    invariants: List[str] = [
+        "Use the full script as context, but treat unrelated regions as frozen by default.",
+        "Keep business objective, strategy lock, contract paths, and split rules unchanged.",
+        "Do not widen scope unless new verified runtime evidence directly implicates another block.",
+    ]
+
+    for fact in repair_ground_truth.get("verified_facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        name = str(fact.get("fact") or "").strip().lower()
+        value = fact.get("value")
+        if name == "failing_line_number" and isinstance(value, int) and value > 0:
+            target = f"failing_block_near_line:{value}"
+            if target not in editable_targets:
+                editable_targets.append(target)
+        elif name == "missing_outputs" and isinstance(value, list) and value:
+            target = "artifact_writers:" + ",".join([str(path) for path in value[:4]])
+            if target not in editable_targets:
+                editable_targets.append(target)
+        elif name == "failed_gate":
+            text = str(value or "").strip()
+            if text and text not in active_findings:
+                active_findings.append(text)
+        elif name in {"unexpected_keyword_argument", "missing_attribute", "missing_required_argument"}:
+            text = f"{name}:{value}"
+            if text not in active_findings:
+                active_findings.append(text)
+
+    for call_site in repair_ground_truth.get("candidate_call_sites") or []:
+        if not isinstance(call_site, dict):
+            continue
+        expression = str(call_site.get("expression") or "").strip()
+        if expression:
+            target = f"call_site:{expression}"
+            if target not in editable_targets:
+                editable_targets.append(target)
+        if len(editable_targets) >= 6:
+            break
+
+    for target in _extract_repair_scope_targets_from_evidence(evidence_focus):
+        if target not in editable_targets:
+            editable_targets.append(target)
+        if len(editable_targets) >= 6:
+            break
+
+    for fix in required_fixes or []:
+        text = str(fix or "").strip()
+        if text and text not in active_findings:
+            active_findings.append(text)
+        if len(active_findings) >= 8:
+            break
+
+    if repair_focus in {"runtime", "compliance"}:
+        protected_regions.extend(
+            [
+                "training_strategy_and_model_family",
+                "feature_selection_and_cv_logic_unless_directly_implicated",
+                "data_loading_and_split_semantics_unless_directly_implicated",
+            ]
+        )
+    else:
+        protected_regions.extend(
+            [
+                "training_strategy_and_metric_logic",
+                "validated_runtime_blocks_unless_output_persistence_requires_touching_them",
+            ]
+        )
+    if must_preserve:
+        protected_regions.extend(must_preserve[:4])
+    if missing_outputs:
+        invariants.append(
+            "If you touch output-writing logic, regenerate only the missing contract artifacts at exact paths: "
+            + ", ".join(missing_outputs[:4])
+            + "."
+        )
+
+    return {
+        "version": "v1",
+        "phase": phase,
+        "scope_policy": "patch_only",
+        "reviewer_guided": True,
+        "editable_targets": editable_targets[:6],
+        "protected_regions": protected_regions[:8],
+        "active_findings": active_findings[:8],
+        "must_preserve_invariants": invariants[:8],
+        "widen_scope_rule": "Only widen edit scope if new verified runtime evidence directly implicates another block.",
+    }
+
+
 def _classify_runtime_failure_details(
     output: Any,
     *,
@@ -10340,6 +10472,13 @@ def _classify_runtime_failure_details(
         "expected_row_count",
         "contract requires",
     )
+    security_tokens = (
+        "security violation",
+        "security violations",
+        "not allowed",
+        "sandbox",
+        "forbidden call",
+    )
     shape_tokens = (
         "shape mismatch",
         "length mismatch",
@@ -10381,6 +10520,14 @@ def _classify_runtime_failure_details(
             "Verify the failing callable signature, accepted arguments, and return type against the installed environment before editing.",
             "Patch only the failing API usage first and keep the broader modeling strategy stable.",
             "Regenerate required artifacts only after the verified runtime API issue is resolved.",
+        ]
+    elif any(token in lower for token in security_tokens):
+        failure_type = "security_violation"
+        repair_focus = "compliance"
+        recommended_actions = [
+            "Remove or replace prohibited sandbox/file-system operations first.",
+            "Patch only the compliance-blocking code path before changing any healthy training or scoring logic.",
+            "Regenerate required artifacts only after the compliance blocker is cleared.",
         ]
     elif "assertionerror" in lower or (
         has_explicit_runtime_exception
@@ -10444,8 +10591,17 @@ def _resolve_repair_first_focus(
     retry_error_type = str(retry_context.get("error_type") or "").strip().lower()
     retry_specific = str(retry_context.get("specific_error") or "").strip().lower()
     runtime_markers = ("runtime", "traceback", "exception", "timeout", "sandbox", "memory", "oom")
-    if retry_error_type in {"timeout", "oom", "import_error", "shape_or_dtype", "runtime_api_misuse", "runtime_contract_assertion"}:
+    if retry_error_type in {
+        "timeout",
+        "oom",
+        "import_error",
+        "shape_or_dtype",
+        "runtime_api_misuse",
+        "runtime_contract_assertion",
+    }:
         return "runtime"
+    if retry_error_type == "security_violation":
+        return "compliance"
     if retry_error_type == "runtime_error" and any(token in retry_specific for token in runtime_markers):
         return "runtime"
     if missing_outputs:
@@ -10553,8 +10709,23 @@ def _apply_repair_first_handoff(
     )
     editor_constraints["must_apply_hypothesis"] = False
     editor_constraints["forbid_noop"] = False
-    editor_constraints["patch_intensity"] = "incremental"
+    editor_constraints["patch_intensity"] = "surgical" if repair_focus in {"runtime", "compliance"} else "incremental"
+    editor_constraints["scope_policy"] = "patch_only"
+    editor_constraints["allow_strategy_changes"] = False
+    editor_constraints["freeze_unimplicated_regions"] = True
     repaired["editor_constraints"] = editor_constraints
+    repair_scope = (
+        copy.deepcopy(repaired.get("repair_scope"))
+        if isinstance(repaired.get("repair_scope"), dict)
+        else {}
+    )
+    repair_scope["phase"] = "compliance_runtime" if repair_focus in {"runtime", "compliance"} else "contract_persistence"
+    repair_scope["scope_policy"] = "patch_only"
+    repair_scope["reviewer_guided"] = True
+    repair_scope["widen_scope_rule"] = (
+        "Only widen edit scope if new verified runtime evidence directly implicates another block."
+    )
+    repaired["repair_scope"] = repair_scope
     repaired["patch_objectives"] = _prune_patch_objectives_for_repair_focus(
         repaired.get("patch_objectives"),
         focus=repair_focus,
@@ -11017,6 +11188,19 @@ def _build_iteration_handoff(
         "retry_context": retry_context,
         "repair_ground_truth": repair_ground_truth if isinstance(repair_ground_truth, dict) else {},
     }
+    if repair_first_focus:
+        repair_scope = _build_repair_scope(
+            repair_focus=repair_first_focus,
+            repair_ground_truth=repair_ground_truth,
+            required_fixes=required_fixes,
+            failed_gates=failed_gates,
+            evidence_focus=evidence_focus,
+            must_preserve=must_preserve,
+            missing_outputs=missing_outputs,
+        )
+    else:
+        repair_scope = {}
+
     if repair_first_focus:
         handoff = _apply_repair_first_handoff(
             handoff,
