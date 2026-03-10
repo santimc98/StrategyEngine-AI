@@ -5363,6 +5363,35 @@ def build_contract_min(
             scope = "full_pipeline"
 
     from src.utils.contract_accessors import CONTRACT_VERSION_V41, normalize_contract_version
+    # ------------------------------------------------------------------
+    # Gate-aware feature reconciliation
+    # ------------------------------------------------------------------
+    # When the LLM defines qa_gates that forbid specific columns at
+    # inference (e.g. leakage_prevention_auxiliary.forbidden_at_inference),
+    # the deterministic fallback for model_features must respect those
+    # constraints.  Without this, a column the LLM correctly marked as
+    # forbidden can still end up in model_features because the fallback
+    # initialises model_features from all pre_decision columns.
+    _gate_forbidden_at_inference: set[str] = set()
+    for gate in (qa_gates if isinstance(qa_gates, list) else []):
+        if not isinstance(gate, dict):
+            continue
+        params = gate.get("params")
+        if not isinstance(params, dict):
+            continue
+        for key in ("forbidden_at_inference", "forbidden_columns", "excluded_columns"):
+            forbidden_list = params.get(key)
+            if isinstance(forbidden_list, list):
+                _gate_forbidden_at_inference.update(str(c) for c in forbidden_list if c)
+    if _gate_forbidden_at_inference:
+        _removed_cols = [c for c in model_features if c in _gate_forbidden_at_inference]
+        if _removed_cols:
+            model_features = [c for c in model_features if c not in _gate_forbidden_at_inference]
+            print(
+                f"GATE_FEATURE_RECONCILIATION: removed {len(_removed_cols)} column(s) "
+                f"from model_features that are forbidden by qa_gates: {sorted(_removed_cols)}"
+            )
+
     contract_min = {
         "contract_version": normalize_contract_version(contract.get("contract_version")),
         "scope": scope,
