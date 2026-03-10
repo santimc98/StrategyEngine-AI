@@ -1356,12 +1356,32 @@ def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(value, (int, float, str, bool)) and len(model_perf_compact) < 15:
                 model_perf_compact[str(key)] = value
 
-    authoritative_runtime = _resolve_authoritative_runtime_text(state=state)
-    runtime_status = "FAILED_RUNTIME" if (
-        bool(state.get("sandbox_failed"))
-        or bool(authoritative_runtime)
-        or _has_runtime_failure_marker(state.get("execution_output"))
-    ) else "OK"
+    # Determine runtime status from the *current* execution outcome.
+    # Prior to this fix, residual error text from earlier failed attempts
+    # (stored in last_gate_context.traceback, heavy_runner_error_context, etc.)
+    # could cause _resolve_authoritative_runtime_text to return non-empty text
+    # even after a successful retry, producing a phantom FAILED_RUNTIME that
+    # blocked the review board from approving the iteration.
+    #
+    # The authoritative signal for "did the latest execution succeed?" is the
+    # combination of execution_error, sandbox_failed and the current
+    # execution_output.  We only fall through to the deeper heuristic search
+    # when the latest execution itself signals a problem.
+    _latest_exec_error = bool(state.get("execution_error"))
+    _latest_sandbox_failed = bool(state.get("sandbox_failed"))
+    _latest_output_has_failure = _has_runtime_failure_marker(state.get("execution_output"))
+
+    if not _latest_exec_error and not _latest_sandbox_failed and not _latest_output_has_failure:
+        # Latest execution completed cleanly — ignore residual text from
+        # previous failed attempts that may still linger in the state.
+        runtime_status = "OK"
+    else:
+        authoritative_runtime = _resolve_authoritative_runtime_text(state=state)
+        runtime_status = "FAILED_RUNTIME" if (
+            _latest_sandbox_failed
+            or bool(authoritative_runtime)
+            or _latest_output_has_failure
+        ) else "OK"
     gate_context = state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
     return {
         "contract": {
@@ -9187,6 +9207,10 @@ def _clear_runtime_blockers() -> Dict[str, Any]:
         "runtime_fix_terminal": False,
         "runtime_fix_terminal_reason": "",
         "last_runtime_error_tail": None,
+        # Clear residual error context from previous failed attempts so that
+        # _resolve_authoritative_runtime_text and _build_review_board_facts
+        # do not pick up stale tracebacks after a successful retry.
+        "heavy_runner_error_context": None,
     }
 
 
