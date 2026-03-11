@@ -318,7 +318,12 @@ def extract_selector_drop_reasons(
         if raw is None:
             return
         if isinstance(raw, str):
-            _add_reason(raw)
+            inferred = _infer_drop_reasons_from_text(raw)
+            if inferred:
+                for token in inferred:
+                    _add_reason(token)
+            else:
+                _add_reason(raw)
             return
         if isinstance(raw, list):
             for idx, item in enumerate(raw):

@@ -169,13 +169,17 @@ Scope-dependent required fields:
   - artifact_requirements.clean_dataset.output_manifest_path (or manifest_path): file path for cleaning manifest JSON
   - column_dtype_targets must include explicit dtype targets for anchor columns
     (target/split/identifier/time/decision) and selector-level dtype targets for wide families when applicable.
-  - If any column drop/scaling is requested, declare it explicitly in
-    artifact_requirements.clean_dataset.column_transformations with:
+- If any column drop/scaling is requested, declare it explicitly in
+  artifact_requirements.clean_dataset.column_transformations with:
     - drop_columns: list[str]
     - scale_columns: list[str]
     - drop_policy (optional but required for selector-based criteria drops): {
         "allow_selector_drops_when": list[str]  # e.g. ["constant","all_null","duplicate"]
       }
+    - when referring to a declared selector from scale_columns, use stable selector refs
+      like selector:<name>; do NOT emit selector:regex:... or selector:prefix:...
+    - if selector-drop policy is active, any required_columns / optional_passthrough_columns /
+      HARD-gate columns must remain outside selector coverage as non-droppable anchors
     (do not encode these decisions only in free-text runbook)
 - If scope includes ML ("ml_only" or "full_pipeline"):
   - qa_gates: list of gate objects
@@ -204,6 +208,8 @@ Hard rules:
 - For high-dimensional feature spaces, do not enumerate every feature column in narrative fields.
   Declare feature families with required_feature_selectors and keep explicit columns as anchors
   (target/split/ids/critical business fields).
+- Prefer named selectors when using required_feature_selectors so downstream transforms can
+  refer to them canonically via selector:<name>.
 - Keep contract coherent with strategy + business objective.
 - Treat strategy techniques as advisory hypotheses, not immutable requirements.
 - If strategy wording conflicts with direct data evidence (profile ranges/dtypes/semantics), prioritize data evidence
@@ -514,6 +520,21 @@ def normalize_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     artifact_requirements["required_files"] = normalized_required_files
     contract["artifact_requirements"] = artifact_requirements
     return contract
+
+
+def _apply_planner_structural_support(contract: Dict[str, Any] | None) -> Dict[str, Any]:
+    """
+    Apply only non-semantic structural support to planner output.
+
+    This helper is intentionally narrow: it may normalize contract shape and
+    artifact path plumbing, but it must not infer/repair scope, targets,
+    deliverables, gates, or other semantic choices that belong to the LLM.
+    """
+    if not isinstance(contract, dict):
+        return {}
+    supported = ensure_v41_schema(copy.deepcopy(contract))
+    supported = normalize_artifact_requirements(supported)
+    return supported
 
 
 def _normalize_strategy_feature_engineering_payload(strategy: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -3111,6 +3132,281 @@ def _deterministic_repair_required_feature_selectors(contract: Dict[str, Any]) -
     return contract
 
 
+def _collect_cleaning_inventory_candidates(contract: Dict[str, Any]) -> List[str]:
+    if not isinstance(contract, dict):
+        return []
+
+    candidates: List[str] = []
+
+    def _append(values: Any) -> None:
+        if isinstance(values, list):
+            for value in values:
+                text = str(value or "").strip()
+                if text and text not in candidates:
+                    candidates.append(text)
+
+    _append(contract.get("available_columns"))
+    _append(contract.get("canonical_columns"))
+
+    column_roles = contract.get("column_roles")
+    if isinstance(column_roles, dict):
+        for value in column_roles.values():
+            _append(value)
+
+    allowed_feature_sets = contract.get("allowed_feature_sets")
+    if isinstance(allowed_feature_sets, dict):
+        for value in allowed_feature_sets.values():
+            _append(value)
+
+    for key in ("outcome_columns", "target_columns", "decision_columns"):
+        _append(contract.get(key))
+
+    for key in ("target_column", "primary_target"):
+        value = str(contract.get(key) or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    return candidates
+
+
+def _collect_cleaning_hard_gate_columns(contract: Dict[str, Any]) -> List[str]:
+    gate_columns: List[str] = []
+
+    def _append(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                text = str(item or "").strip()
+                if text and text not in gate_columns:
+                    gate_columns.append(text)
+        elif isinstance(value, str):
+            text = value.strip()
+            if text and text not in gate_columns:
+                gate_columns.append(text)
+
+    def _consume_gate_container(gates: Any) -> None:
+        if not isinstance(gates, list):
+            return
+        for gate in gates:
+            if not isinstance(gate, dict):
+                continue
+            severity = str(gate.get("severity") or "").strip().upper()
+            if severity and severity != "HARD":
+                continue
+            params = gate.get("params")
+            if not isinstance(params, dict):
+                continue
+            for key in ("columns", "required_columns", "column", "target_column", "target_columns"):
+                _append(params.get(key))
+
+    _consume_gate_container(contract.get("cleaning_gates"))
+    artifact_requirements = contract.get("artifact_requirements")
+    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
+    if isinstance(clean_dataset, dict):
+        _consume_gate_container(clean_dataset.get("cleaning_gates"))
+    return gate_columns
+
+
+def _selector_stable_name(selector: Dict[str, Any], idx: int) -> str:
+    for key in ("name", "id", "family", "role", "selector_hint"):
+        value = str(selector.get(key) or "").strip()
+        if value:
+            return value
+    return f"required_selector_{idx + 1}"
+
+
+def _find_matching_declared_selector(ref: str, selectors: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    token = str(ref or "").strip()
+    if not token:
+        return None
+    for selector in selectors:
+        if selector_reference_matches_any(token, [selector]):
+            return selector
+        if token.lower().startswith("selector:"):
+            nested = token.split(":", 1)[1].strip()
+            if nested and selector_reference_matches_any(nested, [selector]):
+                return selector
+    return None
+
+
+def _expand_inline_selector_reference(ref: str, inventory: List[str]) -> List[str]:
+    token = str(ref or "").strip()
+    if not token:
+        return []
+    if token.lower().startswith("selector:"):
+        token = token.split(":", 1)[1].strip()
+    if not token:
+        return []
+
+    selector_obj: Dict[str, Any] | None = None
+    lower = token.lower()
+    if lower.startswith(("regex:", "pattern:")):
+        selector_obj = {"type": "regex", "pattern": token.split(":", 1)[1].strip()}
+    elif lower.startswith("prefix:"):
+        selector_obj = {"type": "prefix", "value": token.split(":", 1)[1].strip()}
+    elif lower.startswith("suffix:"):
+        selector_obj = {"type": "suffix", "value": token.split(":", 1)[1].strip()}
+    elif lower.startswith("contains:"):
+        selector_obj = {"type": "contains", "value": token.split(":", 1)[1].strip()}
+    if not isinstance(selector_obj, dict):
+        return []
+
+    columns, issues = expand_required_feature_selectors([selector_obj], inventory)
+    if issues:
+        return []
+    return columns
+
+
+def _deterministic_repair_clean_dataset_consistency(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return contract
+
+    artifact_requirements = contract.get("artifact_requirements")
+    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
+    if not isinstance(clean_dataset, dict):
+        return contract
+
+    selectors = clean_dataset.get("required_feature_selectors")
+    if not isinstance(selectors, list):
+        return contract
+
+    inventory = _collect_cleaning_inventory_candidates(contract)
+    if not inventory:
+        return contract
+
+    transforms = clean_dataset.get("column_transformations")
+    if not isinstance(transforms, dict):
+        transforms = {}
+        clean_dataset["column_transformations"] = transforms
+
+    normalized_selectors: List[Dict[str, Any]] = []
+    for idx, selector in enumerate(selectors):
+        if not isinstance(selector, dict):
+            continue
+        selector_obj = dict(selector)
+        selector_obj.setdefault("name", _selector_stable_name(selector_obj, idx))
+        normalized_selectors.append(selector_obj)
+    if normalized_selectors:
+        clean_dataset["required_feature_selectors"] = normalized_selectors
+        selectors = normalized_selectors
+
+    selector_drop_reasons, _ = extract_selector_drop_reasons(transforms)
+    if selector_drop_reasons:
+        drop_policy = transforms.get("drop_policy")
+        if not isinstance(drop_policy, dict):
+            drop_policy = {}
+        drop_policy["allow_selector_drops_when"] = list(selector_drop_reasons)
+        transforms["drop_policy"] = drop_policy
+        for alias in ("allow_selector_drops_when", "allowed_reasons", "drop_reasons"):
+            if alias in transforms:
+                transforms.pop(alias, None)
+
+    scale_columns = transforms.get("scale_columns")
+    if isinstance(scale_columns, list) and scale_columns:
+        normalized_scale: List[str] = []
+        seen_scale: set[str] = set()
+        for raw_entry in scale_columns:
+            entry = str(raw_entry or "").strip()
+            if not entry:
+                continue
+            selector = _find_matching_declared_selector(entry, selectors)
+            if selector is None and entry.lower().startswith("selector:"):
+                nested = entry.split(":", 1)[1].strip()
+                selector = _find_matching_declared_selector(nested, selectors)
+                if selector is not None:
+                    entry = nested
+            if selector is not None:
+                entry = f"selector:{_selector_stable_name(selector, selectors.index(selector))}"
+                if entry not in seen_scale:
+                    seen_scale.add(entry)
+                    normalized_scale.append(entry)
+                continue
+
+            expanded_cols = _expand_inline_selector_reference(entry, inventory)
+            if expanded_cols:
+                for col in expanded_cols:
+                    if col not in seen_scale:
+                        seen_scale.add(col)
+                        normalized_scale.append(col)
+                continue
+
+            if entry not in seen_scale:
+                seen_scale.add(entry)
+                normalized_scale.append(entry)
+        if normalized_scale:
+            transforms["scale_columns"] = normalized_scale
+
+    if selector_drop_reasons:
+        anchor_columns: List[str] = []
+        for bucket in (
+            clean_dataset.get("required_columns"),
+            clean_dataset.get("optional_passthrough_columns"),
+            _collect_cleaning_hard_gate_columns(contract),
+        ):
+            if isinstance(bucket, list):
+                for col in bucket:
+                    text = str(col or "").strip()
+                    if text and text not in anchor_columns:
+                        anchor_columns.append(text)
+        anchor_norms = {_normalize_column_identifier(col) for col in anchor_columns if col}
+        required_columns = [
+            str(col).strip()
+            for col in (clean_dataset.get("required_columns") or [])
+            if str(col).strip()
+        ]
+
+        repaired_selectors: List[Dict[str, Any]] = []
+        seen_repaired: set[str] = set()
+        for idx, selector in enumerate(selectors):
+            if not isinstance(selector, dict):
+                continue
+            matched_columns, selector_issues = expand_required_feature_selectors([selector], inventory)
+            if selector_issues:
+                fingerprint = json.dumps(selector, sort_keys=True, ensure_ascii=False)
+                if fingerprint not in seen_repaired:
+                    seen_repaired.add(fingerprint)
+                    repaired_selectors.append(selector)
+                continue
+
+            overlapping = [
+                col for col in matched_columns if _normalize_column_identifier(col) in anchor_norms
+            ]
+            if not overlapping:
+                fingerprint = json.dumps(selector, sort_keys=True, ensure_ascii=False)
+                if fingerprint not in seen_repaired:
+                    seen_repaired.add(fingerprint)
+                    repaired_selectors.append(selector)
+                continue
+
+            for col in overlapping:
+                if col not in required_columns:
+                    required_columns.append(col)
+
+            remaining = [
+                col for col in matched_columns if _normalize_column_identifier(col) not in anchor_norms
+            ]
+            if not remaining:
+                continue
+
+            materialized_selector = {
+                "type": "list",
+                "columns": remaining,
+                "name": _selector_stable_name(selector, idx),
+            }
+            for key in ("id", "family", "role", "selector_hint"):
+                value = selector.get(key)
+                if value not in (None, "", []):
+                    materialized_selector[key] = copy.deepcopy(value)
+            fingerprint = json.dumps(materialized_selector, sort_keys=True, ensure_ascii=False)
+            if fingerprint not in seen_repaired:
+                seen_repaired.add(fingerprint)
+                repaired_selectors.append(materialized_selector)
+
+        clean_dataset["required_columns"] = required_columns
+        clean_dataset["required_feature_selectors"] = repaired_selectors
+
+    return contract
+
+
 def _deterministic_repair_gate_lists(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return contract
@@ -3493,6 +3789,7 @@ def _apply_deterministic_repairs(contract: Dict[str, Any] | None) -> Dict[str, A
     repaired = _deterministic_repair_task_semantics(repaired)
     repaired = _deterministic_repair_gate_lists(repaired)
     repaired = _deterministic_repair_required_feature_selectors(repaired)
+    repaired = _deterministic_repair_clean_dataset_consistency(repaired)
     repaired = _deterministic_repair_column_dtype_targets(repaired)
     repaired = _deterministic_repair_derived_columns(repaired)
     return repaired
@@ -3672,8 +3969,7 @@ def _validate_repair_revalidate_loop(
 
     attempts = max(0, int(max_iterations)) + 1
     for attempt in range(1, attempts + 1):
-        working = apply_contract_schema_registry_repairs(working)
-        working = normalize_artifact_requirements(working)
+        working = _apply_planner_structural_support(working)
         if preserved_deliverables is not None:
             spec_obj = working.get("spec_extraction")
             if not isinstance(spec_obj, dict):
@@ -4826,16 +5122,67 @@ def build_contract_min(
                 if col_norm in constant_norms or col in constant_columns_set:
                     dropped_constant_columns.append(col)
 
-    # Compute clean_dataset_required_columns excluding constant columns
-    clean_dataset_required_columns = [
-        col for col in canonical_columns
-        if col not in dropped_constant_columns
-    ]
+    inherited_optional_passthrough: List[str] = []
+    inherited_required_columns: List[str] = []
+    inherited_column_transformations: Dict[str, Any] = {}
+    inherited_clean_output_path = "data/cleaned_data.csv"
+    inherited_clean_manifest_path = "data/cleaning_manifest.json"
+    if isinstance(full_clean_dataset, dict):
+        required_raw = full_clean_dataset.get("required_columns")
+        if isinstance(required_raw, list):
+            inherited_required_columns = [
+                str(col).strip() for col in required_raw if str(col).strip()
+            ]
+        optional_raw = full_clean_dataset.get("optional_passthrough_columns")
+        if isinstance(optional_raw, list):
+            inherited_optional_passthrough = [
+                str(col).strip() for col in optional_raw if str(col).strip()
+            ]
+        transforms_raw = full_clean_dataset.get("column_transformations")
+        if isinstance(transforms_raw, dict):
+            inherited_column_transformations = copy.deepcopy(transforms_raw)
+        output_path = str(full_clean_dataset.get("output_path") or "").strip()
+        if output_path:
+            inherited_clean_output_path = output_path
+        manifest_path = str(
+            full_clean_dataset.get("output_manifest_path")
+            or full_clean_dataset.get("manifest_path")
+            or ""
+        ).strip()
+        if manifest_path:
+            inherited_clean_manifest_path = manifest_path
+
+    # Compute clean_dataset.required_columns excluding constant columns.
+    # Prefer explicit anchors declared upstream; only fall back to full canonical
+    # coverage when the contract did not define anchors/selectors semantics.
+    dropped_constant_norms = {
+        _normalize_column_identifier(col) for col in dropped_constant_columns if col
+    }
+    canonical_norms = {_normalize_column_identifier(col): col for col in canonical_columns}
+    clean_dataset_required_columns: List[str] = []
+    if inherited_required_columns:
+        for col in inherited_required_columns:
+            resolved = canonical_norms.get(_normalize_column_identifier(col)) or col
+            if _normalize_column_identifier(resolved) in dropped_constant_norms:
+                continue
+            if resolved not in clean_dataset_required_columns:
+                clean_dataset_required_columns.append(resolved)
+        for col in identifiers + outcome_cols + decision_cols + _collect_cleaning_hard_gate_columns(contract):
+            resolved = canonical_norms.get(_normalize_column_identifier(col)) or ""
+            if not resolved or _normalize_column_identifier(resolved) in dropped_constant_norms:
+                continue
+            if resolved not in clean_dataset_required_columns:
+                clean_dataset_required_columns.append(resolved)
+    else:
+        clean_dataset_required_columns = [
+            col for col in canonical_columns
+            if _normalize_column_identifier(col) not in dropped_constant_norms
+        ]
 
     clean_dataset_cfg_for_dtypes = {
         "required_columns": clean_dataset_required_columns,
         "required_feature_selectors": feature_selectors if isinstance(feature_selectors, list) else [],
-        "optional_passthrough_columns": [],
+        "optional_passthrough_columns": inherited_optional_passthrough,
     }
     column_dtype_targets = _infer_column_dtype_targets(
         canonical_columns=canonical_columns,
@@ -4848,11 +5195,12 @@ def build_contract_min(
     artifact_requirements = {
         "clean_dataset": {
             "required_columns": clean_dataset_required_columns,
-            "output_path": "data/cleaned_data.csv",
-            "output_manifest_path": "data/cleaning_manifest.json",
+            "output_path": inherited_clean_output_path,
+            "output_manifest_path": inherited_clean_manifest_path,
             "excluded_constant_columns": dropped_constant_columns if dropped_constant_columns else [],
             "required_feature_selectors": feature_selectors if isinstance(feature_selectors, list) else [],
             "column_dtype_targets": column_dtype_targets,
+            "optional_passthrough_columns": inherited_optional_passthrough,
         },
         "metrics": {"required": True, "path": "data/metrics.json"},
         "alignment_check": {"required": True, "path": "data/alignment_check.json"},
@@ -4867,9 +5215,11 @@ def build_contract_min(
         },
         "schema_binding": {
             "required_columns": clean_dataset_required_columns,
-            "optional_passthrough_columns": [],
+            "optional_passthrough_columns": inherited_optional_passthrough,
         },
     }
+    if inherited_column_transformations:
+        artifact_requirements["clean_dataset"]["column_transformations"] = inherited_column_transformations
 
     data_engineer_runbook = "\n".join(
         [
@@ -5449,6 +5799,7 @@ def build_contract_min(
         contract_min["secondary_scoring_subset"] = secondary_scoring_subset
     if data_partitioning_notes:
         contract_min["data_partitioning_notes"] = data_partitioning_notes
+    contract_min = _deterministic_repair_clean_dataset_consistency(contract_min)
     task_semantics = _synthesize_task_semantics(contract_min)
     if task_semantics:
         contract_min["task_semantics"] = task_semantics
@@ -6687,7 +7038,6 @@ class ExecutionPlannerAgent:
         data_profile: Dict[str, Any] | None = None,
         run_id: str | None = None
     ) -> Dict[str, Any]:
-        deterministic_scaffold_contract: Dict[str, Any] = {}
 
         def _norm(name: str) -> str:
             return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -7281,20 +7631,6 @@ class ExecutionPlannerAgent:
         def _pattern_name(name: str) -> str:
             return re.sub(r"[^0-9a-zA-Z]+", "_", str(name).lower()).strip("_")
 
-        def _fallback(reason: str = "Planner LLM Failed") -> Dict[str, Any]:
-            d_sum = data_summary
-            if isinstance(d_sum, dict):
-                 d_sum = json.dumps(d_sum)
-            return _create_v41_skeleton(
-                strategy=strategy,
-                business_objective=business_objective,
-                column_inventory=column_inventory,
-                output_dialect=output_dialect,
-                reason=reason,
-                data_summary=str(d_sum)
-            )
-
-
         # Ensure data_summary is a string
         data_summary_str = ""
         if isinstance(data_summary, dict):
@@ -7560,10 +7896,8 @@ class ExecutionPlannerAgent:
             return "\n".join(lines) if lines else "No issues reported."
 
         def _validate_contract_quality(contract_payload: Dict[str, Any] | None) -> Dict[str, Any]:
-            payload_for_validation = _apply_deterministic_repairs(contract_payload if isinstance(contract_payload, dict) else {})
-            payload_for_validation = _sanitize_target_mapping_conflicts(
-                payload_for_validation,
-                data_profile if isinstance(data_profile, dict) else None,
+            payload_for_validation = _apply_planner_structural_support(
+                contract_payload if isinstance(contract_payload, dict) else {}
             )
             base_result: Dict[str, Any]
             steward_semantics_payload: Dict[str, Any] = {}
@@ -7611,135 +7945,6 @@ class ExecutionPlannerAgent:
                     ],
                     "summary": {"error_count": 1, "warning_count": 0},
                 }
-
-            try:
-                deterministic_comparison = build_contract_min(
-                    full_contract_or_partial=copy.deepcopy(payload_for_validation or {}),
-                    strategy=strategy if isinstance(strategy, dict) else {},
-                    column_inventory=column_inventory or [],
-                    relevant_columns=relevant_columns,
-                    target_candidates=target_candidates if isinstance(target_candidates, list) else [],
-                    data_profile=data_profile if isinstance(data_profile, dict) else {},
-                    business_objective_hint=business_objective,
-                )
-            except Exception:
-                deterministic_comparison = {}
-
-            if isinstance(deterministic_comparison, dict) and deterministic_comparison:
-                def _as_lower_set(values: Any) -> set[str]:
-                    if not isinstance(values, list):
-                        return set()
-                    out: set[str] = set()
-                    for item in values:
-                        text = str(item or "").strip()
-                        if text:
-                            out.add(text.lower())
-                    return out
-
-                def _extract_model_features(payload: Dict[str, Any]) -> set[str]:
-                    if not isinstance(payload, dict):
-                        return set()
-                    allowed = payload.get("allowed_feature_sets")
-                    if not isinstance(allowed, dict):
-                        return set()
-                    return _as_lower_set(allowed.get("model_features"))
-
-                llm_outcomes = _as_lower_set(payload_for_validation.get("outcome_columns"))
-                min_outcomes = _as_lower_set(deterministic_comparison.get("outcome_columns"))
-                if not llm_outcomes and isinstance(payload_for_validation.get("column_roles"), dict):
-                    llm_outcomes = _as_lower_set((payload_for_validation.get("column_roles") or {}).get("outcome"))
-                if not min_outcomes and isinstance(deterministic_comparison.get("column_roles"), dict):
-                    min_outcomes = _as_lower_set((deterministic_comparison.get("column_roles") or {}).get("outcome"))
-
-                llm_model_features = _extract_model_features(payload_for_validation)
-                min_model_features = _extract_model_features(deterministic_comparison)
-
-                outcome_union = llm_outcomes | min_outcomes
-                outcome_diff = llm_outcomes ^ min_outcomes
-                outcome_divergence = float(len(outcome_diff) / max(1, len(outcome_union)))
-
-                model_union = llm_model_features | min_model_features
-                model_diff = llm_model_features ^ min_model_features
-                model_divergence = float(len(model_diff) / max(1, len(model_union))) if model_union else 0.0
-
-                extra_issues: List[Dict[str, Any]] = []
-                multi_target_context = _has_multi_target_signal(
-                    payload_for_validation.get("evaluation_spec"),
-                    payload_for_validation.get("objective_analysis"),
-                    payload_for_validation.get("business_objective"),
-                    list(llm_outcomes),
-                    list(min_outcomes),
-                )
-                anchor_subset_only = (
-                    multi_target_context
-                    and bool(llm_outcomes)
-                    and bool(min_outcomes)
-                    and min_outcomes.issubset(llm_outcomes)
-                    and all(_looks_like_target_semantic_column(col) for col in llm_outcomes | min_outcomes)
-                )
-                severe_outcome_divergence = (
-                    bool(outcome_union)
-                    and not anchor_subset_only
-                    and (
-                        len(outcome_diff) >= 6
-                        or (len(outcome_diff) >= 3 and outcome_divergence >= 0.75)
-                    )
-                )
-                if severe_outcome_divergence:
-                    extra_issues.append(
-                        {
-                            "rule": "contract.llm_min_contract_divergence",
-                            "severity": "error",
-                            "message": (
-                                "LLM contract diverges materially from deterministic scaffold on outcome semantics. "
-                                "Repair outcome_columns/column_roles/model_features using strategy + steward evidence."
-                            ),
-                            "item": {
-                                "outcome_divergence_ratio": round(outcome_divergence, 4),
-                                "llm_only_outcomes": sorted(llm_outcomes - min_outcomes)[:20],
-                                "deterministic_only_outcomes": sorted(min_outcomes - llm_outcomes)[:20],
-                                "model_feature_divergence_ratio": round(model_divergence, 4),
-                            },
-                        }
-                    )
-                elif bool(outcome_union) and outcome_divergence >= 0.34 and not anchor_subset_only:
-                    extra_issues.append(
-                        {
-                            "rule": "contract.llm_min_contract_divergence",
-                            "severity": "warning",
-                            "message": (
-                                "LLM contract shows moderate divergence from deterministic scaffold; "
-                                "verify outcome/model feature semantics."
-                            ),
-                            "item": {
-                                "outcome_divergence_ratio": round(outcome_divergence, 4),
-                                "model_feature_divergence_ratio": round(model_divergence, 4),
-                            },
-                        }
-                    )
-
-                if extra_issues:
-                    issues = base_result.get("issues")
-                    if not isinstance(issues, list):
-                        issues = []
-                    issues.extend(extra_issues)
-                    error_count = sum(
-                        1 for issue in issues
-                        if str((issue or {}).get("severity") or "").lower() in {"error", "fail"}
-                    )
-                    warning_count = sum(
-                        1 for issue in issues
-                        if str((issue or {}).get("severity") or "").lower() == "warning"
-                    )
-                    base_result["issues"] = issues
-                    base_result["status"] = "error" if error_count > 0 else ("warning" if warning_count > 0 else "ok")
-                    base_result["accepted"] = error_count == 0
-                    summary = base_result.get("summary")
-                    if not isinstance(summary, dict):
-                        summary = {}
-                    summary["error_count"] = error_count
-                    summary["warning_count"] = warning_count
-                    base_result["summary"] = summary
 
             return base_result
 
@@ -8013,10 +8218,6 @@ class ExecutionPlannerAgent:
                     "Ensure allowed_feature_sets.model_features contains useful modeling features, "
                     "not only split/id structural columns."
                 ),
-                "contract.llm_min_contract_divergence": (
-                    "Reduce large semantic divergence versus deterministic scaffold: align outcome_columns, "
-                    "column_roles, and model_features with evidence from strategy + steward semantics."
-                ),
                 "contract.role_ontology": (
                     "Use canonical column_roles buckets only: pre_decision, decision, outcome, post_decision_audit_only, identifiers, time_columns, unknown."
                 ),
@@ -8149,26 +8350,6 @@ class ExecutionPlannerAgent:
                 + previous_payload_compact
             )
 
-        _SECTION_REQUIRED_TYPES: Dict[str, Any] = {
-            "scope": str,
-            "strategy_title": str,
-            "business_objective": str,
-            "output_dialect": dict,
-            "canonical_columns": list,
-            "column_roles": dict,
-            "artifact_requirements": dict,
-            "required_outputs": list,
-            "cleaning_gates": list,
-            "qa_gates": list,
-            "reviewer_gates": list,
-            "validation_requirements": dict,
-            "data_engineer_runbook": (dict, list, str),
-            "ml_engineer_runbook": (dict, list, str),
-            "objective_analysis": dict,
-            "evaluation_spec": dict,
-            "iteration_policy": (dict, str),
-            "outlier_policy": dict,
-        }
         _SCOPE_VALUES = {"cleaning_only", "ml_only", "full_pipeline"}
 
         def _scope_requires_cleaning(scope: str) -> bool:
@@ -8367,1134 +8548,6 @@ class ExecutionPlannerAgent:
                 return False
             return True
 
-        def _extract_section_payload(parsed: Any, keys: List[str]) -> Dict[str, Any]:
-            if not isinstance(parsed, dict):
-                return {}
-            payload: Dict[str, Any] = {}
-            for key in keys:
-                if key in parsed:
-                    payload[key] = parsed.get(key)
-            return payload
-
-        def _effective_required_keys(
-            section_id: str,
-            required_keys: List[str],
-            current_contract: Dict[str, Any] | None = None,
-            payload: Dict[str, Any] | None = None,
-        ) -> List[str]:
-            baseline = current_contract if isinstance(current_contract, dict) else {}
-            incoming = payload if isinstance(payload, dict) else {}
-            scope = _normalize_scope(incoming.get("scope") or baseline.get("scope"))
-            if section_id == "cleaning_contract" and not _scope_requires_cleaning(scope):
-                return []
-            if section_id == "ml_contract" and not _scope_requires_ml(scope):
-                return []
-            return [str(k) for k in required_keys if k]
-
-        def _validate_section_semantics(
-            section_id: str,
-            payload: Dict[str, Any],
-            current_contract: Dict[str, Any] | None = None,
-        ) -> List[str]:
-            errors: List[str] = []
-            baseline = current_contract if isinstance(current_contract, dict) else {}
-            candidate_scope = _normalize_scope(payload.get("scope") or baseline.get("scope"))
-
-            if section_id == "core":
-                scope_raw = payload.get("scope")
-                if not isinstance(scope_raw, str) or not scope_raw.strip():
-                    errors.append(f"{section_id}: scope must be provided as non-empty string")
-                elif _normalize_scope(scope_raw) not in _SCOPE_VALUES:
-                    errors.append(
-                        f"{section_id}: scope '{scope_raw}' is invalid; expected one of {sorted(_SCOPE_VALUES)}"
-                    )
-
-                canonical = payload.get("canonical_columns")
-                if isinstance(canonical, list) and not any(
-                    isinstance(col, str) and col.strip() for col in canonical
-                ):
-                    errors.append(f"{section_id}: canonical_columns must include at least one non-empty column")
-
-                outputs = payload.get("required_outputs")
-                if isinstance(outputs, list):
-                    invalid_outputs: List[Any] = []
-                    for item in outputs:
-                        if isinstance(item, str):
-                            output_path = item.strip()
-                        elif isinstance(item, dict):
-                            output_path = ""
-                            for key in ("path", "output", "artifact"):
-                                candidate = item.get(key)
-                                if isinstance(candidate, str) and candidate.strip():
-                                    output_path = candidate.strip()
-                                    break
-                        else:
-                            output_path = ""
-                        if not output_path or not is_file_path(output_path):
-                            invalid_outputs.append(item)
-                    if invalid_outputs:
-                        errors.append(
-                            f"{section_id}: required_outputs entries must be file paths; invalid={invalid_outputs[:5]}"
-                        )
-
-                column_roles = payload.get("column_roles")
-                if not isinstance(column_roles, dict) or not column_roles:
-                    errors.append(f"{section_id}: column_roles must be a non-empty object")
-                else:
-                    canonical_for_roles = payload.get("canonical_columns")
-                    if not isinstance(canonical_for_roles, list):
-                        canonical_for_roles = baseline.get("canonical_columns")
-                    if not isinstance(canonical_for_roles, list):
-                        canonical_for_roles = []
-                    normalized_roles, role_issues = _normalize_column_roles_payload(
-                        column_roles,
-                        canonical_columns=canonical_for_roles,
-                    )
-                    if not normalized_roles:
-                        errors.append(f"{section_id}: column_roles could not be normalized")
-                    for role_issue in role_issues:
-                        role_issue_text = str(role_issue or "").strip().lower()
-                        if (
-                            "must include outcome" in role_issue_text
-                            or "must include pre_decision" in role_issue_text
-                            or "must be an object" in role_issue_text
-                            or "cannot be empty" in role_issue_text
-                        ):
-                            errors.append(f"{section_id}: {role_issue}")
-
-                artifact_requirements = payload.get("artifact_requirements")
-                if not isinstance(artifact_requirements, dict) or not artifact_requirements:
-                    errors.append(f"{section_id}: artifact_requirements must be a non-empty object")
-
-                iteration_policy = payload.get("iteration_policy")
-                if isinstance(iteration_policy, str) and not iteration_policy.strip():
-                    errors.append(f"{section_id}: iteration_policy string cannot be blank")
-
-            if section_id == "cleaning_contract" and _scope_requires_cleaning(candidate_scope):
-                if not _gate_list_valid(payload.get("cleaning_gates"), "cleaning_gates"):
-                    errors.append(
-                        f"{section_id}: cleaning_gates must be a non-empty list of consumable gate objects "
-                        "(prefer name/severity/params)"
-                    )
-                if not _runbook_non_empty(payload.get("data_engineer_runbook")):
-                    errors.append(f"{section_id}: data_engineer_runbook must be non-empty")
-
-                artifact_requirements = payload.get("artifact_requirements")
-                if isinstance(artifact_requirements, dict):
-                    clean_dataset = artifact_requirements.get("clean_dataset")
-                else:
-                    clean_dataset = None
-                if not isinstance(clean_dataset, dict):
-                    errors.append(
-                        f"{section_id}: artifact_requirements.clean_dataset must exist for cleaning scope"
-                    )
-                else:
-                    output_path = clean_dataset.get("output_path") or clean_dataset.get("output")
-                    manifest_path = clean_dataset.get("output_manifest_path") or clean_dataset.get("manifest_path")
-                    if not isinstance(output_path, str) or not is_file_path(output_path.strip()):
-                        errors.append(
-                            f"{section_id}: artifact_requirements.clean_dataset.output_path must be a file path"
-                        )
-                    if not isinstance(manifest_path, str) or not is_file_path(manifest_path.strip()):
-                        errors.append(
-                            f"{section_id}: artifact_requirements.clean_dataset.output_manifest_path must be a file path"
-                        )
-                    req_cols = clean_dataset.get("required_columns")
-                    required_cols_clean, required_cols_invalid = _to_clean_str_list(req_cols)
-                    if required_cols_invalid:
-                        errors.append(
-                            f"{section_id}: artifact_requirements.clean_dataset.required_columns must contain only strings"
-                        )
-                    selector_tokens_in_required = [
-                        col for col in required_cols_clean if _looks_like_selector_token(col)
-                    ]
-                    if selector_tokens_in_required:
-                        errors.append(
-                            f"{section_id}: required_columns must contain concrete column names only; "
-                            f"use required_feature_selectors for selectors ({selector_tokens_in_required[:6]})"
-                        )
-                    selectors, selector_errors = _extract_clean_dataset_selectors(clean_dataset)
-                    optional_passthrough, optional_errors = _extract_optional_passthrough_columns(clean_dataset)
-                    for selector_error in selector_errors:
-                        errors.append(f"{section_id}: {selector_error}")
-                    for optional_error in optional_errors:
-                        errors.append(f"{section_id}: {optional_error}")
-                    if not required_cols_clean and not selectors and not optional_passthrough:
-                        errors.append(
-                            f"{section_id}: clean_dataset coverage is empty; provide required_columns and/or "
-                            "required_feature_selectors and/or optional_passthrough_columns"
-                        )
-                    (
-                        drop_columns,
-                        scale_columns,
-                        selector_drop_reasons,
-                        criteria_drop_directives,
-                        transform_errors,
-                    ) = _extract_clean_dataset_transformations(clean_dataset)
-                    for transform_error in transform_errors:
-                        errors.append(f"{section_id}: {transform_error}")
-                    req_norm = {str(col).strip().lower() for col in required_cols_clean if str(col).strip()}
-                    passthrough_norm = {
-                        str(col).strip().lower() for col in optional_passthrough if str(col).strip()
-                    }
-                    drop_norm = {str(col).strip().lower() for col in drop_columns if str(col).strip()}
-                    scale_norm = {str(col).strip().lower() for col in scale_columns if str(col).strip()}
-                    coverage_norm = req_norm | passthrough_norm
-                    if coverage_norm and drop_norm:
-                        overlap = sorted([col for col in coverage_norm if col in drop_norm])
-                        if overlap:
-                            errors.append(
-                                f"{section_id}: column_transformations.drop_columns conflicts with required/passthrough columns ({overlap[:8]})"
-                            )
-                    if scale_norm:
-                        uncovered: List[str] = []
-                        for col in sorted(scale_norm):
-                            if col in coverage_norm:
-                                continue
-                            if _column_matches_any_selector(col, selectors):
-                                continue
-                            if selector_reference_matches_any(col, selectors):
-                                continue
-                            uncovered.append(col)
-                        if uncovered:
-                            errors.append(
-                                f"{section_id}: column_transformations.scale_columns must be covered by "
-                                "required_columns/optional_passthrough_columns/required_feature_selectors "
-                                f"(including selector refs like regex:/prefix:/selector:<name>) ({uncovered[:8]})"
-                            )
-                    has_declared_selectors = bool(selectors)
-                    if has_declared_selectors and criteria_drop_directives and not (drop_columns or selector_drop_reasons):
-                        errors.append(
-                            f"{section_id}: selectors plus criteria-based drop directives require "
-                            "column_transformations.drop_policy.allow_selector_drops_when "
-                            "(or explicit drop_columns)."
-                        )
-                runbook_text = _flatten_text_payload(payload.get("data_engineer_runbook"))
-                has_drop_directive = _has_non_negated_action(runbook_text, _drop_column_pattern)
-                has_scale_directive = _has_non_negated_action(runbook_text, _scale_column_pattern)
-                if isinstance(clean_dataset, dict):
-                    drop_columns, scale_columns, selector_drop_reasons, _, _ = _extract_clean_dataset_transformations(clean_dataset)
-                else:
-                    drop_columns, scale_columns, selector_drop_reasons = [], [], []
-                if has_drop_directive and not (drop_columns or selector_drop_reasons):
-                    errors.append(
-                        f"{section_id}: runbook indicates column dropping but no structured drop declaration "
-                        "was found (drop_columns/drop_policy)."
-                    )
-                if has_scale_directive and not scale_columns:
-                    errors.append(
-                        f"{section_id}: runbook indicates scaling/normalization but clean_dataset.column_transformations.scale_columns is missing"
-                    )
-
-            if section_id == "ml_contract" and _scope_requires_ml(candidate_scope):
-                eval_spec = payload.get("evaluation_spec")
-                if eval_spec is not None and not isinstance(eval_spec, dict):
-                    errors.append(f"{section_id}: evaluation_spec must be an object when provided")
-                if not _gate_list_valid(payload.get("qa_gates"), "qa_gates"):
-                    errors.append(
-                        f"{section_id}: qa_gates must be a non-empty list of consumable gate objects "
-                        "(prefer name/severity/params)"
-                    )
-                if not _gate_list_valid(payload.get("reviewer_gates"), "reviewer_gates"):
-                    errors.append(
-                        f"{section_id}: reviewer_gates must be a non-empty list of consumable gate objects "
-                        "(prefer name/severity/params)"
-                    )
-                validation_reqs = payload.get("validation_requirements")
-                if not isinstance(validation_reqs, dict) or not validation_reqs:
-                    errors.append(f"{section_id}: validation_requirements must be a non-empty object")
-                if not _runbook_non_empty(payload.get("ml_engineer_runbook")):
-                    errors.append(f"{section_id}: ml_engineer_runbook must be non-empty")
-                objective_analysis = payload.get("objective_analysis")
-                objective_ok = False
-                if isinstance(objective_analysis, dict):
-                    problem_type = objective_analysis.get("problem_type")
-                    objective_ok = isinstance(problem_type, str) and bool(problem_type.strip())
-                if not objective_ok and isinstance(eval_spec, dict):
-                    objective_type = eval_spec.get("objective_type")
-                    objective_ok = isinstance(objective_type, str) and bool(objective_type.strip())
-                if not objective_ok:
-                    errors.append(
-                        f"{section_id}: objective_analysis.problem_type or evaluation_spec.objective_type must be present for ML scope"
-                    )
-
-            return errors
-
-        def _validate_section_payload(
-            section_id: str,
-            payload: Dict[str, Any],
-            required_keys: List[str],
-            current_contract: Dict[str, Any] | None = None,
-        ) -> List[str]:
-            errors: List[str] = []
-            if not isinstance(payload, dict):
-                return [f"{section_id}: payload is not an object"]
-
-            effective_required = _effective_required_keys(
-                section_id,
-                required_keys,
-                current_contract=current_contract,
-                payload=payload,
-            )
-            if not effective_required:
-                return []
-
-            for key in effective_required:
-                if key not in payload:
-                    errors.append(f"{section_id}: missing key '{key}'")
-                    continue
-                value = payload.get(key)
-                expected_type = _SECTION_REQUIRED_TYPES.get(key)
-                if expected_type and not isinstance(value, expected_type):
-                    expected_name = (
-                        " | ".join(t.__name__ for t in expected_type)
-                        if isinstance(expected_type, tuple)
-                        else expected_type.__name__
-                    )
-                    errors.append(
-                        f"{section_id}: key '{key}' must be {expected_name}, got {type(value).__name__}"
-                    )
-                    continue
-                if isinstance(value, (dict, list)) and not value:
-                    errors.append(f"{section_id}: key '{key}' cannot be empty")
-                    continue
-                if isinstance(value, str) and not value.strip():
-                    errors.append(f"{section_id}: key '{key}' cannot be blank")
-
-            errors.extend(_validate_section_semantics(section_id, payload, current_contract=current_contract))
-            return errors
-
-        def _merge_section_payload(working: Dict[str, Any], section_payload: Dict[str, Any]) -> Dict[str, Any]:
-            merged = dict(working) if isinstance(working, dict) else {}
-            for key, value in section_payload.items():
-                if value is None:
-                    continue
-                if key == "scope":
-                    normalized_scope = _normalize_scope(value)
-                    merged[key] = normalized_scope if normalized_scope in _SCOPE_VALUES else value
-                    continue
-                if key == "column_roles" and isinstance(value, dict):
-                    canonical_for_roles = merged.get("canonical_columns")
-                    if not isinstance(canonical_for_roles, list):
-                        canonical_for_roles = []
-                    normalized_roles, _ = _normalize_column_roles_payload(
-                        value,
-                        canonical_columns=canonical_for_roles,
-                    )
-                    merged[key] = normalized_roles if normalized_roles else value
-                    continue
-                merged[key] = value
-            canonical_for_roles = merged.get("canonical_columns")
-            column_roles = merged.get("column_roles")
-            if isinstance(column_roles, dict):
-                if not isinstance(canonical_for_roles, list):
-                    canonical_for_roles = []
-                normalized_roles, _ = _normalize_column_roles_payload(
-                    column_roles,
-                    canonical_columns=canonical_for_roles,
-                )
-                if normalized_roles:
-                    merged["column_roles"] = normalized_roles
-            return merged
-
-        def _build_section_prompt(
-            *,
-            section_id: str,
-            section_goal: str,
-            required_keys: List[str],
-            current_contract: Dict[str, Any],
-            original_inputs_text: str,
-        ) -> str:
-            return (
-                "You are Execution Contract Compiler.\n"
-                f"SECTION: {section_id}\n"
-                f"GOAL: {section_goal}\n"
-                "Use this reasoning workflow for the section:\n"
-                "- Resolve the grounded facts relevant to this section only.\n"
-                "- Populate required section keys with canonical shapes that downstream agents can execute.\n"
-                "- If gates are in scope, emit executable {name,severity,params} objects only when justified.\n"
-                "- Self-check the section and minimally fix before returning.\n"
-                "Return ONLY one JSON object.\n"
-                "Do not include markdown, comments, or explanations.\n"
-                "Schema registry examples:\n"
-                + CONTRACT_SCHEMA_EXAMPLES_TEXT
-                + "\n"
-                "Use only data from ORIGINAL INPUTS; do not invent columns.\n"
-                "Use downstream_consumer_interface and evidence_policy from ORIGINAL INPUTS.\n"
-                "Keep semantics aligned with strategy/business objective.\n"
-                "required_outputs MUST be a list of artifact file paths only (List[str], never logical labels/column names).\n"
-                "If rich metadata is needed, use required_output_artifacts as list[object] with path/required/owner/kind/description/id.\n"
-                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
-                "Example: {\"age\": {\"target_dtype\": \"float64\", \"nullable\": false}}.\n"
-                "For cleaning scope, artifact_requirements.clean_dataset must include output_path + output_manifest_path.\n"
-                "required_feature_selectors entries must be list[object] and each object must have key type.\n"
-                "Example: [{\"type\": \"prefix\", \"value\": \"feature_\"}, {\"type\": \"regex\", \"pattern\": \"^pixel_\\\\d+$\"}].\n"
-                "If cleaning requires dropping/scaling columns, set "
-                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy} explicitly.\n"
-                "For wide feature families, scale_columns may use selector refs "
-                "(regex:/prefix:/suffix:/contains:/selector:<name>) instead of exhaustive lists.\n"
-                "If required_feature_selectors are used and any drop-by-criteria is requested, set "
-                "column_transformations.drop_policy.allow_selector_drops_when.\n"
-                "If selector-drop policy is active, required_columns and optional_passthrough_columns must remain "
-                "outside required_feature_selectors (non-droppable anchors).\n"
-                "If selector-drop policy is active, HARD cleaning gates must not depend on selector-covered columns.\n"
-                "For wide feature families, you may use artifact_requirements.clean_dataset.required_feature_selectors "
-                "(regex/prefix/range/list) to avoid lossy explicit enumeration.\n"
-                "Avoid enumerating massive feature families as explicit lists; keep explicit anchors only.\n"
-                "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
-                "enabled/apply_stage/target_columns/report_path/strict.\n"
-                "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
-                "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
-                "For ML scope, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
-                "aligned with strategy/evidence so views can request the right visuals.\n"
-                "Gate lists must be executable by downstream views: each gate should expose a consumable identifier "
-                "(prefer name) and include severity + params.\n"
-                "Gate example: {\"name\": \"no_nulls_target\", \"severity\": \"HARD\", \"params\": {\"column\": \"target\"}}.\n"
-                f"Required keys for this section: {json.dumps(required_keys)}\n"
-                "If this section has no required keys for the selected scope, return {}.\n\n"
-                "ORIGINAL INPUTS:\n"
-                + (original_inputs_text or "")
-                + "\n\nCURRENT CONTRACT DRAFT (from previous compiled sections):\n"
-                + json.dumps(current_contract or {}, ensure_ascii=False, indent=2)
-            )
-
-        def _build_section_repair_prompt(
-            *,
-            section_id: str,
-            section_goal: str,
-            required_keys: List[str],
-            current_contract: Dict[str, Any],
-            original_inputs_text: str,
-            previous_response_text: str | None,
-            previous_parse_feedback: str | None,
-            previous_validation_errors: List[str] | None,
-        ) -> str:
-            def _section_targeted_actions(messages: List[str] | None) -> str:
-                if not isinstance(messages, list):
-                    return "- Fix structural and semantic issues while preserving unchanged valid keys."
-                actions: List[str] = []
-                seen: set[str] = set()
-
-                def _add(key: str, text: str) -> None:
-                    if key in seen:
-                        return
-                    seen.add(key)
-                    actions.append(f"- {text}")
-
-                for raw_msg in messages:
-                    msg = str(raw_msg or "").strip()
-                    if not msg:
-                        continue
-                    low = msg.lower()
-                    if "missing key" in low:
-                        _add(f"missing:{msg}", f"Add the missing required key exactly once: {msg}")
-                    if "column_roles" in low:
-                        _add(
-                            "roles",
-                            "Use canonical column_roles buckets and include at least outcome + pre_decision coverage.",
-                        )
-                    if "required_outputs" in low:
-                        _add(
-                            "required_outputs",
-                            "Keep required_outputs as List[str] artifact file paths only.",
-                        )
-                    if "required_columns" in low and "selector" in low:
-                        _add(
-                            "required_columns_selector",
-                            "Keep required_columns concrete only; place patterns in required_feature_selectors.",
-                        )
-                    if "scale_columns" in low:
-                        _add(
-                            "scale_coverage",
-                            "Ensure scale_columns are covered by required_columns/passthrough/selectors.",
-                        )
-                    if "drop_columns" in low:
-                        _add(
-                            "drop_conflict",
-                            "Avoid dropping columns that are required or passthrough.",
-                        )
-                    if "selector_drop" in low or "selector-covered" in low:
-                        _add(
-                            "selector_drop_conflict",
-                            "When selector-drop policy is active, keep required/passthrough anchors and HARD gate columns outside selector coverage.",
-                        )
-                    if "clean_dataset" in low and ("output_path" in low or "manifest" in low):
-                        _add(
-                            "clean_paths",
-                            "Set clean_dataset.output_path and output_manifest_path as valid file paths.",
-                        )
-                    if "gate" in low:
-                        _add(
-                            "gates",
-                            "Provide executable gates with consumable identifiers plus severity and params.",
-                        )
-                    if "objective_analysis" in low or "evaluation_spec" in low:
-                        _add(
-                            "objective",
-                            "For ML scope include objective_analysis.problem_type or evaluation_spec.objective_type.",
-                        )
-                    if len(actions) >= 8:
-                        break
-                if not actions:
-                    actions.append("- Fix structural and semantic issues while preserving unchanged valid keys.")
-                return "\n".join(actions)
-
-            validation_feedback = "\n".join(f"- {msg}" for msg in (previous_validation_errors or [])) or "None"
-            parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
-            targeted_actions = _section_targeted_actions(previous_validation_errors)
-            original_inputs_compact = _compress_text_preserve_ends(
-                original_inputs_text or "",
-                max_chars=18000,
-                head=13000,
-                tail=5000,
-            )
-            current_contract_compact = _compress_text_preserve_ends(
-                json.dumps(current_contract or {}, ensure_ascii=False, indent=2),
-                max_chars=14000,
-                head=10000,
-                tail=4000,
-            )
-            previous_response_compact = _compress_text_preserve_ends(
-                previous_response_text or "",
-                max_chars=12000,
-                head=8000,
-                tail=4000,
-            )
-            return (
-                "Repair the section output.\n"
-                f"SECTION: {section_id}\n"
-                f"GOAL: {section_goal}\n"
-                "Use this repair workflow for the section:\n"
-                "- Re-ground the relevant constraints from ORIGINAL INPUTS.\n"
-                "- Preserve valid keys and patch only section-required fields.\n"
-                "- Normalize gates only when needed so they remain executable and semantically stable.\n"
-                "- Apply minimal edits until section checks pass.\n"
-                "Return ONLY one JSON object.\n"
-                "No markdown, no comments.\n"
-                "Patch policy: edit only fields required by this SECTION and listed issues; preserve already valid content.\n"
-                "Schema registry examples:\n"
-                + CONTRACT_SCHEMA_EXAMPLES_TEXT
-                + "\n"
-                f"Required keys: {json.dumps(required_keys)}\n"
-                "Use ORIGINAL INPUTS as source of truth and keep compatibility with CURRENT CONTRACT DRAFT.\n"
-                "Use downstream_consumer_interface and evidence_policy from ORIGINAL INPUTS.\n"
-                "Do not invent columns not present in column_inventory.\n\n"
-                "Use required_outputs as List[str] artifact file paths.\n"
-                "If needed, use required_output_artifacts for rich metadata.\n\n"
-                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
-                "Example: {\"age\": {\"target_dtype\": \"float64\", \"nullable\": false}}.\n"
-                "For cleaning scope, include artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
-                "required_feature_selectors entries must be list[object] and each object must have key type.\n"
-                "Example: [{\"type\": \"prefix\", \"value\": \"feature_\"}, {\"type\": \"regex\", \"pattern\": \"^pixel_\\\\d+$\"}].\n"
-                "If cleaning requires dropping/scaling columns, set "
-                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy} explicitly.\n"
-                "For wide feature families, scale_columns may use selector refs "
-                "(regex:/prefix:/suffix:/contains:/selector:<name>) instead of exhaustive lists.\n"
-                "If required_feature_selectors are used and any drop-by-criteria is requested, set "
-                "column_transformations.drop_policy.allow_selector_drops_when.\n"
-                "If selector-drop policy is active, required/passthrough anchors and HARD gate columns must stay "
-                "outside selector coverage.\n"
-                "For wide feature families, you may use artifact_requirements.clean_dataset.required_feature_selectors "
-                "(regex/prefix/range/list) to avoid lossy explicit enumeration.\n"
-                "Avoid enumerating massive feature families as explicit lists; keep explicit anchors only.\n"
-                "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
-                "enabled/apply_stage/target_columns/report_path/strict.\n"
-                "For ML scope, include non-empty evaluation_spec plus objective_analysis.problem_type "
-                "(or evaluation_spec.objective_type) and non-empty column_roles.\n\n"
-                "For ML scope, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
-                "aligned with strategy/evidence so views can request the right visuals.\n\n"
-                "Gate lists must be executable by downstream views: each gate should expose a consumable identifier "
-                "(prefer name) and include severity + params.\n\n"
-                "Gate example: {\"name\": \"no_nulls_target\", \"severity\": \"HARD\", \"params\": {\"column\": \"target\"}}.\n\n"
-                "Targeted fixes:\n"
-                + targeted_actions
-                + "\n\n"
-                "ORIGINAL INPUTS:\n"
-                + original_inputs_compact
-                + "\n\nCURRENT CONTRACT DRAFT:\n"
-                + current_contract_compact
-                + "\n\nValidation issues to fix:\n"
-                + validation_feedback
-                + "\n\nParse diagnostics:\n"
-                + parse_feedback
-                + "\n\nPrevious section response:\n"
-                + previous_response_compact
-            )
-
-        def _compile_contract_by_sections(
-            *,
-            original_inputs_text: str,
-            model_names: List[str],
-            max_rounds: int,
-        ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-            section_specs: List[Dict[str, Any]] = [
-                {
-                    "id": "core",
-                    "goal": "Define minimal contract identity, declared scope, columns, roles, and output artifact requirements.",
-                    "required_keys": [
-                        "scope",
-                        "strategy_title",
-                        "business_objective",
-                        "output_dialect",
-                        "canonical_columns",
-                        "column_roles",
-                        "artifact_requirements",
-                        "required_outputs",
-                        "iteration_policy",
-                    ],
-                    "optional": False,
-                },
-                {
-                    "id": "cleaning_contract",
-                    "goal": "Define cleaning gates, DE runbook, and clean_dataset artifact paths when scope includes cleaning.",
-                    "required_keys": [
-                        "cleaning_gates",
-                        "data_engineer_runbook",
-                        "artifact_requirements",
-                    ],
-                    "optional": False,
-                },
-                {
-                    "id": "ml_contract",
-                    "goal": "Define ML objective type, QA/reviewer gates, validation requirements, and ML runbook when scope includes ML.",
-                    "required_keys": [
-                        "objective_analysis",
-                        "qa_gates",
-                        "reviewer_gates",
-                        "validation_requirements",
-                        "ml_engineer_runbook",
-                    ],
-                    "optional": False,
-                },
-                {
-                    "id": "optional_context",
-                    "goal": "Optionally add useful execution context and supplemental hints, including outlier policy.",
-                    "required_keys": ["outlier_policy"],
-                    "optional": True,
-                },
-            ]
-            working_contract: Dict[str, Any] = (
-                copy.deepcopy(deterministic_scaffold_contract)
-                if isinstance(deterministic_scaffold_contract, dict) and deterministic_scaffold_contract
-                else {}
-            )
-            if working_contract:
-                working_contract = _apply_deterministic_repairs(working_contract)
-            section_diag: List[Dict[str, Any]] = []
-            invalid_candidate: Dict[str, Any] | None = None
-            invalid_raw: str | None = None
-            invalid_meta: Dict[str, Any] = {}
-
-            for spec in section_specs:
-                section_id = str(spec.get("id"))
-                section_goal = str(spec.get("goal") or "")
-                base_required_keys = [str(k) for k in (spec.get("required_keys") or []) if k]
-                required_keys = _effective_required_keys(
-                    section_id,
-                    base_required_keys,
-                    current_contract=working_contract,
-                )
-                optional_section = bool(spec.get("optional"))
-                if not required_keys:
-                    section_diag.append(
-                        {
-                            "compiler_mode": "sectional",
-                            "section_id": section_id,
-                            "section_skipped": True,
-                            "skip_reason": "scope_or_optional_without_required_keys",
-                            "scope": _normalize_scope(working_contract.get("scope")),
-                        }
-                    )
-                    continue
-
-                current_prompt = _build_section_prompt(
-                    section_id=section_id,
-                    section_goal=section_goal,
-                    required_keys=required_keys,
-                    current_contract=working_contract,
-                    original_inputs_text=original_inputs_text,
-                )
-                prompt_name = f"prompt_section_{section_id}_r1.txt"
-                section_success = False
-                best_errors: List[str] = []
-                best_parse: str | None = None
-                best_raw: str | None = None
-                best_payload: Dict[str, Any] | None = None
-
-                for round_idx in range(1, max_rounds + 1):
-                    for model_idx, model_name in enumerate(model_names, start=1):
-                        response_name = f"response_section_{section_id}_r{round_idx}_m{model_idx}.txt"
-                        response_text = ""
-                        parse_error: Optional[Exception] = None
-                        finish_reason = None
-                        usage_metadata = None
-                        generation_config_used = None
-                        parsed: Any = None
-                        validation_errors: List[str] = []
-                        parse_feedback: str | None = None
-
-                        try:
-                            model_client = self._build_model_client(model_name)
-                            if model_client is None:
-                                parse_error = ValueError(f"Planner client unavailable for model {model_name}")
-                            else:
-                                response, generation_config_used = self._generate_content_with_budget(
-                                    model_client,
-                                    current_prompt,
-                                    output_token_floor=2048 * round_idx,
-                                )
-                                response_text = getattr(response, "text", "") or ""
-                                self.last_prompt = current_prompt
-                                self.last_response = response_text
-                                try:
-                                    candidates = getattr(response, "candidates", None)
-                                    if candidates:
-                                        finish_reason = getattr(candidates[0], "finish_reason", None)
-                                except Exception:
-                                    finish_reason = None
-                                usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
-                        except Exception as err:
-                            parse_error = err
-
-                        _persist_attempt(prompt_name, response_name, current_prompt, response_text)
-
-                        parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
-                        if parse_exc:
-                            parse_error = parse_exc
-                            parse_feedback = _build_parse_feedback(response_text, parse_error)
-                            validation_errors = ["section output is not parseable JSON object"]
-                        elif isinstance(parsed, dict):
-                            payload = _extract_section_payload(parsed, required_keys)
-                            payload = _apply_deterministic_repairs(payload)
-                            if optional_section:
-                                optional_keys = [key for key in required_keys if key in payload]
-                                validation_errors = (
-                                    _validate_section_payload(
-                                        section_id,
-                                        payload,
-                                        optional_keys,
-                                        current_contract=working_contract,
-                                    )
-                                    if optional_keys
-                                    else []
-                                )
-                            else:
-                                validation_errors = _validate_section_payload(
-                                    section_id,
-                                    payload,
-                                    required_keys,
-                                    current_contract=working_contract,
-                                )
-                            if not validation_errors:
-                                working_contract = _merge_section_payload(working_contract, payload)
-                                working_contract = _apply_deterministic_repairs(working_contract)
-                                section_success = True
-                                parsed = payload
-                            else:
-                                if isinstance(payload, dict) and payload:
-                                    parsed = payload
-                        else:
-                            validation_errors = ["section output is not an object"]
-
-                        section_diag.append(
-                            {
-                                "compiler_mode": "sectional",
-                                "section_id": section_id,
-                                "section_round": round_idx,
-                                "model_name": model_name,
-                                "prompt_char_len": len(current_prompt or ""),
-                                "response_char_len": len(response_text or ""),
-                                "finish_reason": str(finish_reason) if finish_reason is not None else None,
-                                "generation_config": generation_config_used,
-                                "usage_metadata": usage_metadata,
-                                "parse_error_type": type(parse_error).__name__ if parse_error else None,
-                                "parse_error_message": str(parse_error) if parse_error else None,
-                                "section_success": section_success,
-                                "section_validation_errors": validation_errors,
-                            }
-                        )
-
-                        if section_success:
-                            break
-
-                        if isinstance(parsed, dict) and parsed:
-                            best_payload = _merge_section_payload(working_contract, parsed)
-                        if response_text and best_raw is None:
-                            best_raw = response_text
-                        if parse_feedback and best_parse is None:
-                            best_parse = parse_feedback
-                        if validation_errors:
-                            best_errors = validation_errors
-
-                    if section_success:
-                        break
-                    if optional_section:
-                        break
-                    prompt_name = f"prompt_section_{section_id}_r{round_idx + 1}.txt"
-                    current_prompt = _build_section_repair_prompt(
-                        section_id=section_id,
-                        section_goal=section_goal,
-                        required_keys=required_keys,
-                        current_contract=working_contract,
-                        original_inputs_text=original_inputs_text,
-                        previous_response_text=best_raw,
-                        previous_parse_feedback=best_parse,
-                        previous_validation_errors=best_errors,
-                    )
-
-                if not section_success and not optional_section:
-                    partial_contract = _merge_contract_missing_fields(
-                        _apply_deterministic_repairs(copy.deepcopy(working_contract)),
-                        deterministic_scaffold_contract,
-                    )
-                    invalid_candidate = (
-                        _merge_contract_missing_fields(best_payload, partial_contract)
-                        if isinstance(best_payload, dict)
-                        else partial_contract
-                    )
-                    invalid_raw = best_raw
-                    invalid_meta = {
-                        "mode": "sectional",
-                        "failed_section": section_id,
-                        "validation_errors": best_errors,
-                        "parse_feedback": best_parse,
-                        "section_diag": section_diag,
-                    }
-                    return None, {
-                        "invalid_candidate": invalid_candidate,
-                        "invalid_raw": invalid_raw,
-                        "invalid_meta": invalid_meta,
-                        "section_diag": section_diag,
-                        "partial_contract": partial_contract,
-                    }
-
-            final_contract = _merge_contract_missing_fields(
-                _apply_deterministic_repairs(working_contract),
-                deterministic_scaffold_contract,
-            )
-            return final_contract, {
-                "invalid_candidate": invalid_candidate,
-                "invalid_raw": invalid_raw,
-                "invalid_meta": invalid_meta,
-                "section_diag": section_diag,
-                "partial_contract": final_contract,
-            }
-
-        def _build_progressive_judgment_prompt(
-            *,
-            original_inputs_text: str,
-            scaffold_contract: Dict[str, Any],
-            allowed_fields: List[str],
-        ) -> str:
-            scaffold_compact = _compress_text_preserve_ends(
-                json.dumps(scaffold_contract or {}, ensure_ascii=False, indent=2),
-                max_chars=22000,
-                head=15000,
-                tail=7000,
-            )
-            return (
-                "You are Execution Contract Compiler in progressive mode.\n"
-                "Pass 1 (deterministic scaffold) is already provided.\n"
-                "Your task is Pass 2: provide only judgment-driven updates as a JSON patch object.\n"
-                "Use phased compilation: FACTS_EXTRACTOR -> CONTRACT_BUILDER -> GATE_COMPOSER -> VALIDATOR_REPAIR.\n"
-                "Return ONLY one valid JSON object (no markdown/comments).\n"
-                "The object may contain only keys listed in ALLOWED_PATCH_FIELDS.\n"
-                "Do not remove mandatory scaffold structure. You may override scaffold fields only with evidence.\n"
-                "Use ORIGINAL INPUTS as source of truth and keep compatibility with downstream consumers.\n"
-                "Schema registry examples:\n"
-                + CONTRACT_SCHEMA_EXAMPLES_TEXT
-                + "\n"
-                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
-                "required_feature_selectors entries must be list[object] and each object must include key type.\n"
-                "Gate lists must use executable objects: {name, severity, params}.\n"
-                f"ALLOWED_PATCH_FIELDS: {json.dumps(allowed_fields)}\n\n"
-                "ORIGINAL INPUTS:\n"
-                + (original_inputs_text or "")
-                + "\n\nDETERMINISTIC_SCAFFOLD_CONTRACT:\n"
-                + scaffold_compact
-            )
-
-        def _build_progressive_repair_prompt(
-            *,
-            original_inputs_text: str,
-            scaffold_contract: Dict[str, Any],
-            allowed_fields: List[str],
-            previous_candidate: Dict[str, Any] | None,
-            previous_validation: Dict[str, Any] | None,
-            previous_response_text: str | None,
-            previous_parse_feedback: str | None,
-        ) -> str:
-            validation_feedback = _compact_validation_feedback(previous_validation)
-            parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
-            previous_payload = (
-                json.dumps(previous_candidate, ensure_ascii=False, indent=2)
-                if isinstance(previous_candidate, dict)
-                else (previous_response_text or "")
-            )
-            previous_payload_compact = _compress_text_preserve_ends(
-                previous_payload,
-                max_chars=18000,
-                head=12000,
-                tail=6000,
-            )
-            scaffold_compact = _compress_text_preserve_ends(
-                json.dumps(scaffold_contract or {}, ensure_ascii=False, indent=2),
-                max_chars=22000,
-                head=15000,
-                tail=7000,
-            )
-            return (
-                "Repair the progressive judgment patch.\n"
-                "Use phased repair: FACTS_EXTRACTOR -> CONTRACT_BUILDER -> GATE_COMPOSER -> VALIDATOR_REPAIR.\n"
-                "Return ONLY one valid JSON object (no markdown/comments).\n"
-                "Patch policy: preserve valid updates; change only what fixes listed issues.\n"
-                "The object may contain only keys listed in ALLOWED_PATCH_FIELDS.\n"
-                "Schema registry examples:\n"
-                + CONTRACT_SCHEMA_EXAMPLES_TEXT
-                + "\n"
-                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
-                "required_feature_selectors entries must be list[object] and each object must include key type.\n"
-                "Gate lists must use executable objects: {name, severity, params}.\n"
-                f"ALLOWED_PATCH_FIELDS: {json.dumps(allowed_fields)}\n\n"
-                "ORIGINAL INPUTS:\n"
-                + (original_inputs_text or "")
-                + "\n\nDETERMINISTIC_SCAFFOLD_CONTRACT:\n"
-                + scaffold_compact
-                + "\n\nValidation issues to fix:\n"
-                + validation_feedback
-                + "\n\nParse diagnostics:\n"
-                + parse_feedback
-                + "\n\nPrevious patch/candidate:\n"
-                + previous_payload_compact
-            )
-
-        def _compile_contract_progressive(
-            *,
-            original_inputs_text: str,
-            model_names: List[str],
-            scaffold_contract: Dict[str, Any],
-            max_rounds: int,
-        ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-            progressive_diag: List[Dict[str, Any]] = []
-            if not isinstance(scaffold_contract, dict) or not scaffold_contract:
-                return None, {
-                    "mode": "progressive",
-                    "accepted": False,
-                    "diag": progressive_diag,
-                    "reason": "missing_scaffold",
-                    "best_candidate": None,
-                    "best_validation": None,
-                    "best_raw": None,
-                    "best_parse_feedback": None,
-                }
-
-            allowed_fields = [
-                "scope",
-                "strategy_title",
-                "business_objective",
-                "output_dialect",
-                "canonical_columns",
-                "column_roles",
-                "column_dtype_targets",
-                "artifact_requirements",
-                "required_outputs",
-                "cleaning_gates",
-                "qa_gates",
-                "reviewer_gates",
-                "validation_requirements",
-                "data_engineer_runbook",
-                "ml_engineer_runbook",
-                "objective_analysis",
-                "evaluation_spec",
-                "iteration_policy",
-                "outlier_policy",
-                "reporting_policy",
-                "feature_engineering_plan",
-                "feature_engineering_tasks",
-                "data_analysis",
-                "missing_columns_handling",
-                "execution_constraints",
-                "allowed_feature_sets",
-                "outcome_columns",
-                "decision_columns",
-                "preprocessing_requirements",
-                "leakage_execution_plan",
-                "optimization_specification",
-                "segmentation_constraints",
-                "data_limited_mode",
-                "derived_columns",
-                "unknowns",
-                "assumptions",
-                "notes_for_engineers",
-            ]
-
-            best_candidate: Dict[str, Any] | None = None
-            best_validation: Dict[str, Any] | None = None
-            best_raw: str | None = None
-            best_parse_feedback: str | None = None
-            best_error_count: Optional[int] = None
-            best_warning_count: Optional[int] = None
-
-            current_prompt = _build_progressive_judgment_prompt(
-                original_inputs_text=original_inputs_text,
-                scaffold_contract=scaffold_contract,
-                allowed_fields=allowed_fields,
-            )
-            prompt_name = "prompt_progressive_r1.txt"
-
-            for round_idx in range(1, max_rounds + 1):
-                for model_idx, model_name in enumerate(model_names, start=1):
-                    response_name = f"response_progressive_r{round_idx}_m{model_idx}.txt"
-                    response_text = ""
-                    parse_error: Optional[Exception] = None
-                    finish_reason = None
-                    usage_metadata = None
-                    generation_config_used = None
-                    validation_result: Dict[str, Any] | None = None
-                    accepted = False
-                    parse_feedback: str | None = None
-
-                    try:
-                        model_client = self._build_model_client(model_name)
-                        if model_client is None:
-                            parse_error = ValueError(f"Planner client unavailable for model {model_name}")
-                        else:
-                            response, generation_config_used = self._generate_content_with_budget(
-                                model_client,
-                                current_prompt,
-                                output_token_floor=2048 * round_idx,
-                            )
-                            response_text = getattr(response, "text", "") or ""
-                            self.last_prompt = current_prompt
-                            self.last_response = response_text
-                            try:
-                                candidates = getattr(response, "candidates", None)
-                                if candidates:
-                                    finish_reason = getattr(candidates[0], "finish_reason", None)
-                            except Exception:
-                                finish_reason = None
-                            usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
-                    except Exception as err:
-                        parse_error = err
-
-                    _persist_attempt(prompt_name, response_name, current_prompt, response_text)
-
-                    parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
-                    if parse_exc:
-                        parse_error = parse_exc
-                        parse_feedback = _build_parse_feedback(response_text, parse_error)
-                    patch_payload: Dict[str, Any] | None = None
-                    candidate_contract: Dict[str, Any] | None = None
-                    if isinstance(parsed, dict):
-                        raw_patch = parsed.get("judgment_patch") if isinstance(parsed.get("judgment_patch"), dict) else parsed
-                        if isinstance(raw_patch, dict):
-                            patch_payload = {
-                                key: value
-                                for key, value in raw_patch.items()
-                                if key in allowed_fields
-                            }
-                            candidate_contract = _deep_merge_contract_override(scaffold_contract, patch_payload)
-                            candidate_contract = _apply_deterministic_repairs(candidate_contract)
-                            try:
-                                validation_result = _validate_contract_quality(copy.deepcopy(candidate_contract))
-                            except Exception as val_err:
-                                validation_result = {
-                                    "status": "error",
-                                    "accepted": False,
-                                    "issues": [
-                                        {
-                                            "severity": "error",
-                                            "rule": "contract_validation_exception",
-                                            "message": str(val_err),
-                                        }
-                                    ],
-                                    "summary": {"error_count": 1, "warning_count": 0},
-                                }
-                            accepted = _contract_is_accepted(validation_result)
-
-                            summary = validation_result.get("summary") if isinstance(validation_result, dict) else {}
-                            error_count = int(summary.get("error_count", 0)) if isinstance(summary, dict) else 9999
-                            warning_count = int(summary.get("warning_count", 0)) if isinstance(summary, dict) else 9999
-                            if (
-                                best_error_count is None
-                                or error_count < best_error_count
-                                or (
-                                    error_count == best_error_count
-                                    and (best_warning_count is None or warning_count < best_warning_count)
-                                )
-                            ):
-                                best_candidate = candidate_contract
-                                best_validation = validation_result
-                                best_raw = response_text
-                                best_parse_feedback = parse_feedback
-                                best_error_count = error_count
-                                best_warning_count = warning_count
-
-                    progressive_diag.append(
-                        {
-                            "compiler_mode": "progressive",
-                            "progressive_round": round_idx,
-                            "model_name": model_name,
-                            "prompt_char_len": len(current_prompt or ""),
-                            "response_char_len": len(response_text or ""),
-                            "finish_reason": str(finish_reason) if finish_reason is not None else None,
-                            "generation_config": generation_config_used,
-                            "usage_metadata": usage_metadata,
-                            "parse_error_type": type(parse_error).__name__ if parse_error else None,
-                            "parse_error_message": str(parse_error) if parse_error else None,
-                            "quality_status": (
-                                str(validation_result.get("status") or "").lower()
-                                if isinstance(validation_result, dict)
-                                else None
-                            ),
-                            "quality_error_count": (
-                                int((validation_result.get("summary") or {}).get("error_count", 0))
-                                if isinstance(validation_result, dict)
-                                else None
-                            ),
-                            "quality_warning_count": (
-                                int((validation_result.get("summary") or {}).get("warning_count", 0))
-                                if isinstance(validation_result, dict)
-                                else None
-                            ),
-                            "quality_accepted": accepted,
-                        }
-                    )
-
-                    if accepted and isinstance(candidate_contract, dict):
-                        return candidate_contract, {
-                            "mode": "progressive",
-                            "accepted": True,
-                            "diag": progressive_diag,
-                            "best_candidate": candidate_contract,
-                            "best_validation": validation_result,
-                            "best_raw": response_text,
-                            "best_parse_feedback": parse_feedback,
-                        }
-
-                if round_idx >= max_rounds:
-                    break
-                prompt_name = f"prompt_progressive_r{round_idx + 1}.txt"
-                current_prompt = _build_progressive_repair_prompt(
-                    original_inputs_text=original_inputs_text,
-                    scaffold_contract=scaffold_contract,
-                    allowed_fields=allowed_fields,
-                    previous_candidate=best_candidate,
-                    previous_validation=best_validation,
-                    previous_response_text=best_raw,
-                    previous_parse_feedback=best_parse_feedback,
-                )
-
-            return None, {
-                "mode": "progressive",
-                "accepted": False,
-                "diag": progressive_diag,
-                "best_candidate": best_candidate,
-                "best_validation": best_validation,
-                "best_raw": best_raw,
-                "best_parse_feedback": best_parse_feedback,
-            }
-
         def _build_contract_diagnostics(contract: Dict[str, Any], where: str, llm_success: bool) -> Dict[str, Any]:
             diagnostics: Dict[str, Any] = {
                 "schema_version": 1,
@@ -9532,62 +8585,6 @@ class ExecutionPlannerAgent:
             status = str(validation_result.get("status") or "unknown").lower()
             issues = validation_result.get("issues") if isinstance(validation_result, dict) else []
             accepted = _contract_is_accepted(validation_result if isinstance(validation_result, dict) else None)
-
-            # Best-effort soft acceptance: if the contract has minimum
-            # required structure and only non-structural quality errors,
-            # downgrade those errors to warnings so the pipeline can proceed.
-            _DIAG_BESTEFFORT_MIN_KEYS = {"scope", "column_roles", "canonical_columns"}
-            _DIAG_BESTEFFORT_SOFT_RULES = {
-                "contract.outcome_columns_sanity",
-                "contract.llm_min_contract_divergence",
-                "contract.iteration_policy_limits",
-                "contract.iteration_policy_alias",
-                "contract.canonical_columns_coverage",
-            }
-            if (
-                not accepted
-                and isinstance(contract, dict)
-                and contract
-                and _DIAG_BESTEFFORT_MIN_KEYS.issubset(set(contract.keys()))
-                and isinstance(issues, list)
-            ):
-                diag_error_rules = [
-                    str(iss.get("rule") or "")
-                    for iss in issues
-                    if isinstance(iss, dict)
-                    and str(iss.get("severity") or "").lower() in {"error", "fail"}
-                ]
-                if diag_error_rules and all(r in _DIAG_BESTEFFORT_SOFT_RULES for r in diag_error_rules):
-                    for iss in issues:
-                        if (
-                            isinstance(iss, dict)
-                            and str(iss.get("severity") or "").lower() in {"error", "fail"}
-                            and str(iss.get("rule") or "") in _DIAG_BESTEFFORT_SOFT_RULES
-                        ):
-                            iss["severity"] = "warning"
-                            iss["message"] = "[best-effort accepted] " + str(iss.get("message") or "")
-                    recalc_errors = sum(
-                        1 for iss in issues
-                        if isinstance(iss, dict) and str(iss.get("severity") or "").lower() in {"error", "fail"}
-                    )
-                    recalc_warnings = sum(
-                        1 for iss in issues
-                        if isinstance(iss, dict) and str(iss.get("severity") or "").lower() == "warning"
-                    )
-                    if recalc_errors == 0:
-                        status = "warning" if recalc_warnings > 0 else "ok"
-                        accepted = True
-                        validation_result["status"] = status
-                        validation_result["accepted"] = True
-                        validation_result["issues"] = issues
-                        summary_vr = validation_result.get("summary") or {}
-                        summary_vr["error_count"] = recalc_errors
-                        summary_vr["warning_count"] = recalc_warnings
-                        validation_result["summary"] = summary_vr
-                        print(
-                            "CONTRACT_BESTEFFORT_ACCEPT: Downgraded non-structural errors to warnings; "
-                            f"contract accepted with {recalc_warnings} warning(s)."
-                        )
 
             if status == "error":
                 print(f"CONTRACT_VALIDATION_ERROR: {len(issues) if isinstance(issues, list) else 0} issues found")
@@ -9632,50 +8629,7 @@ class ExecutionPlannerAgent:
 
         def _finalize_and_persist(contract, where, llm_success: bool):
             if isinstance(contract, dict) and contract:
-                contract = _merge_contract_missing_fields(contract, deterministic_scaffold_contract)
-                contract = _apply_deterministic_repairs(contract)
-                contract = _sanitize_target_mapping_conflicts(
-                    contract,
-                    data_profile if isinstance(data_profile, dict) else None,
-                )
-                contract = _ensure_contract_visual_policy(
-                    contract=contract,
-                    strategy=strategy if isinstance(strategy, dict) else {},
-                    business_objective=business_objective,
-                )
-                contract = _ensure_feature_engineering_plan_from_strategy(
-                    contract,
-                    strategy if isinstance(strategy, dict) else {},
-                )
-                contract = _ensure_optimization_policy(contract)
-                # Apply deliverables canonicalization + auto-sync
-                contract = _apply_deliverables(contract)
-                # Lint deliverable invariants
-                obj_type = _infer_objective_type()
-                invariant_errors = _lint_deliverable_invariants(contract, obj_type)
-                if invariant_errors:
-                    error_items = [e for e in invariant_errors if e.get("severity") == "error"]
-                    if error_items:
-                        print(f"DELIVERABLE_LINT: {len(error_items)} invariant errors detected")
-                        for err in error_items:
-                            print(f"  - {err['invariant']}: {err['message']}")
-                        # Re-apply deliverables with corrective derivation (attempt 2)
-                        contract = _apply_deliverables(contract)
-                        final_errors = _lint_deliverable_invariants(contract, obj_type)
-                        if final_errors:
-                            final_error_items = [e for e in final_errors if e.get("severity") == "error"]
-                            if final_error_items:
-                                contract = _repair_deliverable_invariants(contract, final_error_items)
-                                post_repair = _lint_deliverable_invariants(contract, obj_type)
-                                post_repair_errors = [e for e in post_repair if e.get("severity") == "error"]
-                                if post_repair_errors:
-                                    print(f"DELIVERABLE_LINT: {len(post_repair_errors)} errors persist after auto-repair")
-                                    for err in post_repair_errors:
-                                        print(f"  - {err['invariant']}: {err['message']}")
-                                else:
-                                    print(f"DELIVERABLE_LINT: auto-repair resolved {len(final_error_items)} invariant(s)")
-                contract = apply_contract_schema_registry_repairs(contract)
-                contract = normalize_artifact_requirements(contract)
+                contract = _apply_planner_structural_support(contract)
 
                 def _llm_minimal_repair_provider(
                     current_contract: Dict[str, Any],
@@ -9778,9 +8732,12 @@ class ExecutionPlannerAgent:
 
         target_candidates: List[Dict[str, Any]] = []
         if not self.client:
-            contract = _fallback("Planner client unavailable; using deterministic V4.1 fallback.")
+            planner_candidate_invalid_meta = {
+                "reason": "planner_client_unavailable",
+                "llm_required": True,
+            }
             self.last_contract_min = None
-            return _finalize_and_persist(contract, where="execution_planner:no_client", llm_success=False)
+            return _finalize_and_persist({}, where="execution_planner:no_client", llm_success=False)
 
         target_candidates: List[Dict[str, Any]] = []
         resolved_target = None
@@ -9822,24 +8779,6 @@ class ExecutionPlannerAgent:
                 if resolved:
                     resolved_target = resolved
                     break
-
-        deterministic_scaffold_contract: Dict[str, Any] = {}
-        deterministic_scaffold_build_error: str | None = None
-        try:
-            deterministic_scaffold_contract = build_contract_min(
-                full_contract_or_partial={},
-                strategy=strategy if isinstance(strategy, dict) else {},
-                column_inventory=column_inventory or [],
-                relevant_columns=relevant_columns,
-                target_candidates=target_candidates if isinstance(target_candidates, list) else [],
-                data_profile=data_profile if isinstance(data_profile, dict) else {},
-                business_objective_hint=business_objective,
-            )
-            deterministic_scaffold_contract = _apply_deterministic_repairs(deterministic_scaffold_contract)
-        except Exception as scaffold_err:
-            deterministic_scaffold_contract = {}
-            deterministic_scaffold_build_error = str(scaffold_err)
-
         strategy_json = json.dumps(strategy, indent=2)
         column_sets_payload = column_sets if isinstance(column_sets, dict) else {}
         column_sets_summary = summarize_column_sets(column_sets_payload) if column_sets_payload else ""
@@ -9901,15 +8840,6 @@ class ExecutionPlannerAgent:
             head=1300,
             tail=700,
         )
-        deterministic_scaffold_compact = _compress_text_preserve_ends(
-            json.dumps(deterministic_scaffold_contract, ensure_ascii=False, indent=2)
-            if deterministic_scaffold_contract
-            else "{}",
-            max_chars=18000,
-            head=12000,
-            tail=6000,
-        )
-
         user_input = f"""
 strategy:
 {strategy_json}
@@ -10016,35 +8946,6 @@ planner_semantic_resolution_policy:
 phased_contract_compilation_protocol:
 {json.dumps(PHASED_CONTRACT_COMPILATION_PROTOCOL_V1, indent=2)}
 
-progressive_contract_construction_policy:
-{json.dumps({
-    "pass_1_deterministic_scaffold": [
-        "scope",
-        "canonical_columns",
-        "column_roles",
-        "column_dtype_targets",
-        "artifact_requirements",
-        "required_outputs",
-    ],
-    "pass_2_llm_judgment_fields": [
-        "cleaning_gates",
-        "qa_gates",
-        "reviewer_gates",
-        "runbooks",
-        "evaluation_spec",
-        "validation_requirements",
-        "iteration_policy",
-        "outlier_policy",
-    ],
-    "llm_may_override_scaffold_with_evidence": True,
-}, indent=2)}
-
-deterministic_contract_scaffold:
-{deterministic_scaffold_compact}
-
-deterministic_contract_scaffold_build_error:
-{json.dumps(deterministic_scaffold_build_error)}
-
 contract_consistency_guardrails:
 {json.dumps({
     "required_columns_must_be_non_droppable": True,
@@ -10093,177 +8994,9 @@ domain_expert_critique:
         except Exception:
             max_quality_rounds = 3
 
-        section_first_flag = str(os.getenv("EXECUTION_PLANNER_SECTION_FIRST", "1")).strip().lower()
-        section_first_enabled = section_first_flag not in {"0", "false", "no", "off"}
-        progressive_flag = str(os.getenv("EXECUTION_PLANNER_PROGRESSIVE_MODE", "0")).strip().lower()
-        progressive_enabled = progressive_flag not in {"0", "false", "no", "off"}
-        sectional_rounds = 2
-        try:
-            sectional_rounds = max(1, int(os.getenv("EXECUTION_PLANNER_SECTION_ROUNDS", "2")))
-        except Exception:
-            sectional_rounds = 2
-        progressive_rounds = 2
-        try:
-            progressive_rounds = max(1, int(os.getenv("EXECUTION_PLANNER_PROGRESSIVE_ROUNDS", "2")))
-        except Exception:
-            progressive_rounds = 2
-
-        sectional_attempted = False
-        sectional_contract_cached: Dict[str, Any] | None = None
-        sectional_payload_cached: Dict[str, Any] = {}
-        sectional_validation_cached: Dict[str, Any] | None = None
-        sectional_accepted_cached = False
-
         current_prompt = full_prompt
         current_prompt_name = "prompt_attempt_1.txt"
         attempt_counter = 0
-
-        if progressive_enabled and contract is None:
-            progressive_contract, progressive_payload = _compile_contract_progressive(
-                original_inputs_text=user_input,
-                model_names=model_chain,
-                scaffold_contract=deterministic_scaffold_contract,
-                max_rounds=progressive_rounds,
-            )
-            progressive_diag = progressive_payload.get("diag") if isinstance(progressive_payload, dict) else None
-            if isinstance(progressive_diag, list) and progressive_diag:
-                base_attempt_index = len(planner_diag)
-                for idx, row in enumerate(progressive_diag, start=1):
-                    if isinstance(row, dict):
-                        item = dict(row)
-                    else:
-                        item = {"compiler_mode": "progressive", "detail": str(row)}
-                    if "attempt_index" not in item:
-                        item["attempt_index"] = base_attempt_index + idx
-                    planner_diag.append(item)
-                attempt_counter = max(attempt_counter, len(planner_diag))
-            if isinstance(progressive_contract, dict) and progressive_contract:
-                contract = progressive_contract
-                llm_success = True
-                print("SUCCESS: Execution Planner succeeded via progressive two-pass compiler.")
-            else:
-                progressive_best_candidate = (
-                    progressive_payload.get("best_candidate")
-                    if isinstance(progressive_payload, dict)
-                    else None
-                )
-                progressive_best_validation = (
-                    progressive_payload.get("best_validation")
-                    if isinstance(progressive_payload, dict)
-                    else None
-                )
-                progressive_best_raw = (
-                    progressive_payload.get("best_raw")
-                    if isinstance(progressive_payload, dict)
-                    else None
-                )
-                progressive_best_parse_feedback = (
-                    progressive_payload.get("best_parse_feedback")
-                    if isinstance(progressive_payload, dict)
-                    else None
-                )
-                if isinstance(progressive_best_candidate, dict):
-                    best_candidate = progressive_best_candidate
-                if isinstance(progressive_best_validation, dict):
-                    best_validation = progressive_best_validation
-                    summary = progressive_best_validation.get("summary")
-                    if isinstance(summary, dict):
-                        try:
-                            best_error_count = int(summary.get("error_count", 0))
-                        except Exception:
-                            best_error_count = None
-                        try:
-                            best_warning_count = int(summary.get("warning_count", 0))
-                        except Exception:
-                            best_warning_count = None
-                if isinstance(progressive_best_raw, str):
-                    best_response_text = progressive_best_raw
-                if isinstance(progressive_best_parse_feedback, str):
-                    best_parse_feedback = progressive_best_parse_feedback
-
-        if section_first_enabled:
-            sectional_attempted = True
-            try:
-                sectional_contract_cached, sectional_payload_cached = _compile_contract_by_sections(
-                    original_inputs_text=user_input,
-                    model_names=model_chain,
-                    max_rounds=sectional_rounds,
-                )
-            except Exception as section_err:
-                sectional_contract_cached = None
-                sectional_payload_cached = {
-                    "invalid_candidate": None,
-                    "invalid_raw": None,
-                    "invalid_meta": {
-                        "mode": "sectional",
-                        "section_compiler_exception": str(section_err),
-                    },
-                    "section_diag": [],
-                }
-
-            section_diag = sectional_payload_cached.get("section_diag")
-            if isinstance(section_diag, list) and section_diag:
-                base_attempt_index = len(planner_diag)
-                for idx, item in enumerate(section_diag, start=1):
-                    if isinstance(item, dict):
-                        row = dict(item)
-                    else:
-                        row = {"compiler_mode": "sectional", "detail": str(item)}
-                    if "attempt_index" not in row:
-                        row["attempt_index"] = base_attempt_index + idx
-                    planner_diag.append(row)
-
-            if isinstance(sectional_contract_cached, dict) and sectional_contract_cached:
-                sectional_contract_cached = _merge_contract_missing_fields(
-                    sectional_contract_cached,
-                    deterministic_scaffold_contract,
-                )
-                sectional_contract_cached = _apply_deterministic_repairs(sectional_contract_cached)
-                try:
-                    sectional_validation_cached = _validate_contract_quality(copy.deepcopy(sectional_contract_cached))
-                except Exception as section_val_err:
-                    sectional_validation_cached = {
-                        "status": "error",
-                        "accepted": False,
-                        "issues": [
-                            {
-                                "severity": "error",
-                                "rule": "sectional_contract_validation_exception",
-                                "message": str(section_val_err),
-                            }
-                        ],
-                        "summary": {"error_count": 1, "warning_count": 0},
-                    }
-                sectional_accepted_cached = _contract_is_accepted(sectional_validation_cached)
-
-            if sectional_accepted_cached and isinstance(sectional_contract_cached, dict):
-                contract = sectional_contract_cached
-                llm_success = True
-                print("SUCCESS: Execution Planner succeeded via sectional compiler (primary path).")
-            else:
-                sectional_partial = (
-                    sectional_payload_cached.get("partial_contract")
-                    if isinstance(sectional_payload_cached.get("partial_contract"), dict)
-                    else None
-                )
-                if isinstance(sectional_partial, dict) and sectional_partial:
-                    sectional_partial = _merge_contract_missing_fields(
-                        sectional_partial,
-                        deterministic_scaffold_contract,
-                    )
-                    sectional_partial = _apply_deterministic_repairs(sectional_partial)
-                    try:
-                        rescue_validation = _validate_contract_quality(copy.deepcopy(sectional_partial))
-                    except Exception:
-                        rescue_validation = None
-                    if _contract_is_accepted(rescue_validation):
-                        sectional_contract_cached = sectional_partial
-                        sectional_validation_cached = rescue_validation
-                        sectional_accepted_cached = True
-                        print(
-                            "INFO: Sectional partial contract rescued and cached; "
-                            "continuing full-contract generation for richer LLM output."
-                        )
 
         if contract is None:
             for quality_round in range(1, max_quality_rounds + 1):
@@ -10322,11 +9055,7 @@ domain_expert_critique:
                     quality_error_message = None
                     if parsed is not None and isinstance(parsed, dict):
                         round_has_candidate = True
-                        candidate_for_validation = _merge_contract_missing_fields(
-                            parsed,
-                            deterministic_scaffold_contract,
-                        )
-                        candidate_for_validation = _apply_deterministic_repairs(candidate_for_validation)
+                        candidate_for_validation = _apply_planner_structural_support(parsed)
                         try:
                             validation_result = _validate_contract_quality(copy.deepcopy(candidate_for_validation))
                         except Exception as val_err:
@@ -10442,8 +9171,7 @@ domain_expert_critique:
                         print(f"WARNING: Planner contract rejected by quality gate on attempt {attempt_counter} (model={model_name}).")
                         continue
 
-                    contract = _merge_contract_missing_fields(parsed, deterministic_scaffold_contract)
-                    contract = _apply_deterministic_repairs(contract)
+                    contract = _apply_planner_structural_support(parsed)
                     llm_success = True
                     break
 
@@ -10487,366 +9215,32 @@ domain_expert_critique:
                     )
 
         if contract is None:
-            sectional_contract: Dict[str, Any] | None = sectional_contract_cached if sectional_attempted else None
-            sectional_payload: Dict[str, Any] = sectional_payload_cached if sectional_attempted else {}
-            sectional_validation: Dict[str, Any] | None = sectional_validation_cached if sectional_attempted else None
-            sectional_accepted = sectional_accepted_cached if sectional_attempted else False
-
-            if not sectional_attempted:
-                try:
-                    sectional_contract, sectional_payload = _compile_contract_by_sections(
-                        original_inputs_text=user_input,
-                        model_names=model_chain,
-                        max_rounds=sectional_rounds,
-                    )
-                except Exception as section_err:
-                    sectional_contract = None
-                    sectional_payload = {
-                        "invalid_candidate": None,
-                        "invalid_raw": None,
-                        "invalid_meta": {
-                            "mode": "sectional",
-                            "section_compiler_exception": str(section_err),
-                        },
-                        "section_diag": [],
-                    }
-
-                section_diag = sectional_payload.get("section_diag")
-                if isinstance(section_diag, list) and section_diag:
-                    base_attempt_index = len(planner_diag)
-                    for idx, item in enumerate(section_diag, start=1):
-                        if isinstance(item, dict):
-                            row = dict(item)
-                        else:
-                            row = {"compiler_mode": "sectional", "detail": str(item)}
-                        if "attempt_index" not in row:
-                            row["attempt_index"] = base_attempt_index + idx
-                        planner_diag.append(row)
-
-                if isinstance(sectional_contract, dict) and sectional_contract:
-                    sectional_contract = _merge_contract_missing_fields(
-                        sectional_contract,
-                        deterministic_scaffold_contract,
-                    )
-                    sectional_contract = _apply_deterministic_repairs(sectional_contract)
-                    try:
-                        sectional_validation = _validate_contract_quality(copy.deepcopy(sectional_contract))
-                    except Exception as section_val_err:
-                        sectional_validation = {
-                            "status": "error",
-                            "accepted": False,
-                            "issues": [
-                                {
-                                    "severity": "error",
-                                    "rule": "sectional_contract_validation_exception",
-                                    "message": str(section_val_err),
-                                }
-                            ],
-                            "summary": {"error_count": 1, "warning_count": 0},
-                        }
-                    sectional_accepted = _contract_is_accepted(sectional_validation)
-
-            if sectional_accepted and isinstance(sectional_contract, dict):
-                contract = sectional_contract
-                llm_success = True
-                print("SUCCESS: Execution Planner succeeded via sectional compiler fallback.")
-            else:
-                fallback_attempts: List[Dict[str, Any]] = []
-
-                def _record_fallback_attempt(source: str, validation: Dict[str, Any] | None) -> None:
-                    summary = validation.get("summary") if isinstance(validation, dict) else {}
-                    fallback_attempts.append(
-                        {
-                            "source": source,
-                            "accepted": _contract_is_accepted(validation),
-                            "status": (validation.get("status") if isinstance(validation, dict) else None),
-                            "error_count": int(summary.get("error_count", 0)) if isinstance(summary, dict) else None,
-                            "warning_count": int(summary.get("warning_count", 0)) if isinstance(summary, dict) else None,
-                        }
-                    )
-
-                accepted_fallback_contract: Dict[str, Any] | None = None
-                accepted_fallback_source = ""
-
-                fallback_candidates: List[Tuple[str, Dict[str, Any]]] = []
-                if isinstance(best_candidate, dict) and best_candidate:
-                    fallback_candidates.append(("best_candidate", best_candidate))
-                partial_from_sectional = (
-                    sectional_payload.get("partial_contract")
-                    if isinstance(sectional_payload.get("partial_contract"), dict)
-                    else None
-                )
-                if isinstance(partial_from_sectional, dict) and partial_from_sectional:
-                    fallback_candidates.append(("sectional_partial_contract", partial_from_sectional))
-                invalid_from_sectional = (
-                    sectional_payload.get("invalid_candidate")
-                    if isinstance(sectional_payload.get("invalid_candidate"), dict)
-                    else None
-                )
-                if isinstance(invalid_from_sectional, dict) and invalid_from_sectional:
-                    fallback_candidates.append(("sectional_invalid_candidate", invalid_from_sectional))
-                if isinstance(sectional_contract, dict) and sectional_contract:
-                    fallback_candidates.append(("sectional_contract_raw", sectional_contract))
-
-                dedup_seen: set[str] = set()
-                for source, raw_candidate in fallback_candidates:
-                    fingerprint = json.dumps(raw_candidate, sort_keys=True, ensure_ascii=False)
-                    if fingerprint in dedup_seen:
-                        continue
-                    dedup_seen.add(fingerprint)
-                    candidate = _merge_contract_missing_fields(raw_candidate, deterministic_scaffold_contract)
-                    candidate = _apply_deterministic_repairs(candidate)
-                    try:
-                        validation = _validate_contract_quality(copy.deepcopy(candidate))
-                    except Exception as candidate_err:
-                        validation = {
-                            "status": "error",
-                            "accepted": False,
-                            "issues": [
-                                {
-                                    "severity": "error",
-                                    "rule": "contract_validation_exception",
-                                    "message": str(candidate_err),
-                                }
-                            ],
-                            "summary": {"error_count": 1, "warning_count": 0},
-                        }
-                    _record_fallback_attempt(source, validation)
-                    if _contract_is_accepted(validation):
-                        accepted_fallback_contract = candidate
-                        accepted_fallback_source = source
-                        break
-
-                if accepted_fallback_contract is None:
-                    scaffold_candidate = _apply_deterministic_repairs(
-                        _merge_contract_missing_fields({}, deterministic_scaffold_contract)
-                    )
-                    if scaffold_candidate:
-                        try:
-                            scaffold_validation = _validate_contract_quality(copy.deepcopy(scaffold_candidate))
-                        except Exception as scaffold_err:
-                            scaffold_validation = {
-                                "status": "error",
-                                "accepted": False,
-                                "issues": [
-                                    {
-                                        "severity": "error",
-                                        "rule": "contract_validation_exception",
-                                        "message": str(scaffold_err),
-                                    }
-                                ],
-                                "summary": {"error_count": 1, "warning_count": 0},
-                            }
-                        _record_fallback_attempt("deterministic_scaffold", scaffold_validation)
-                        if _contract_is_accepted(scaffold_validation):
-                            accepted_fallback_contract = scaffold_candidate
-                            accepted_fallback_source = "deterministic_scaffold"
-
-                if accepted_fallback_contract is None:
-                    contract_min_seed = (
-                        best_candidate
-                        if isinstance(best_candidate, dict)
-                        else (
-                            partial_from_sectional
-                            if isinstance(partial_from_sectional, dict)
-                            else {}
-                        )
-                    )
-                    try:
-                        contract_min = build_contract_min(
-                            full_contract_or_partial=contract_min_seed,
-                            strategy=strategy if isinstance(strategy, dict) else {},
-                            column_inventory=column_inventory or [],
-                            relevant_columns=relevant_columns,
-                            target_candidates=target_candidates if isinstance(target_candidates, list) else [],
-                            data_profile=data_profile if isinstance(data_profile, dict) else {},
-                            business_objective_hint=business_objective,
-                        )
-                    except Exception as contract_min_err:
-                        contract_min = {}
-                        fallback_attempts.append(
-                            {
-                                "source": "build_contract_min_exception",
-                                "accepted": False,
-                                "status": "error",
-                                "error": str(contract_min_err),
-                            }
-                        )
-
-                    if isinstance(contract_min, dict) and contract_min:
-                        merged_contract_min = _merge_contract_missing_fields(
-                            _apply_deterministic_repairs(contract_min_seed if isinstance(contract_min_seed, dict) else {}),
-                            contract_min,
-                        )
-                        merged_contract_min = _merge_contract_missing_fields(
-                            merged_contract_min,
-                            deterministic_scaffold_contract,
-                        )
-                        merged_contract_min = _apply_deterministic_repairs(merged_contract_min)
-                        try:
-                            merged_validation = _validate_contract_quality(copy.deepcopy(merged_contract_min))
-                        except Exception as merged_err:
-                            merged_validation = {
-                                "status": "error",
-                                "accepted": False,
-                                "issues": [
-                                    {
-                                        "severity": "error",
-                                        "rule": "contract_validation_exception",
-                                        "message": str(merged_err),
-                                    }
-                                ],
-                                "summary": {"error_count": 1, "warning_count": 0},
-                            }
-                        _record_fallback_attempt("build_contract_min_merged", merged_validation)
-                        if _contract_is_accepted(merged_validation):
-                            accepted_fallback_contract = merged_contract_min
-                            accepted_fallback_source = "build_contract_min_merged"
-                        else:
-                            contract_min_only = _apply_deterministic_repairs(contract_min)
-                            try:
-                                min_validation = _validate_contract_quality(copy.deepcopy(contract_min_only))
-                            except Exception as min_err:
-                                min_validation = {
-                                    "status": "error",
-                                    "accepted": False,
-                                    "issues": [
-                                        {
-                                            "severity": "error",
-                                            "rule": "contract_validation_exception",
-                                            "message": str(min_err),
-                                        }
-                                    ],
-                                    "summary": {"error_count": 1, "warning_count": 0},
-                                }
-                            _record_fallback_attempt("build_contract_min_only", min_validation)
-                            if _contract_is_accepted(min_validation):
-                                accepted_fallback_contract = contract_min_only
-                                accepted_fallback_source = "build_contract_min_only"
-
-                if isinstance(accepted_fallback_contract, dict) and accepted_fallback_contract:
-                    contract = accepted_fallback_contract
-                    llm_success = True
-                    print(
-                        "SUCCESS: Execution Planner recovered with deterministic fallback "
-                        f"({accepted_fallback_source})."
-                    )
-                else:
-                    best_effort_contract = (
-                        best_candidate
-                        if isinstance(best_candidate, dict) and best_candidate
-                        else (
-                            partial_from_sectional
-                            if isinstance(partial_from_sectional, dict) and partial_from_sectional
-                            else (
-                                invalid_from_sectional
-                                if isinstance(invalid_from_sectional, dict) and invalid_from_sectional
-                                else (
-                                    sectional_contract
-                                    if isinstance(sectional_contract, dict) and sectional_contract
-                                    else deterministic_scaffold_contract
-                                )
-                            )
-                        )
-                    )
-                    contract = _apply_deterministic_repairs(
-                        _merge_contract_missing_fields(
-                            best_effort_contract if isinstance(best_effort_contract, dict) else {},
-                            deterministic_scaffold_contract,
-                        )
-                    )
-                    # Best-effort acceptance: if the contract has minimum required
-                    # structure and only non-structural quality errors, accept it
-                    # with warnings instead of failing the entire pipeline.
-                    _BESTEFFORT_MIN_KEYS = {"scope", "column_roles", "canonical_columns"}
-                    _BESTEFFORT_SOFT_RULES = {
-                        "contract.outcome_columns_sanity",
-                        "contract.llm_min_contract_divergence",
-                        "contract.iteration_policy_limits",
-                        "contract.iteration_policy_alias",
-                        "contract.canonical_columns_coverage",
-                    }
-                    has_min_keys = (
-                        isinstance(contract, dict)
-                        and contract
-                        and _BESTEFFORT_MIN_KEYS.issubset(set(contract.keys()))
-                    )
-                    if has_min_keys:
-                        try:
-                            be_validation = _validate_contract_quality(copy.deepcopy(contract))
-                        except Exception:
-                            be_validation = None
-                        if isinstance(be_validation, dict):
-                            be_issues = be_validation.get("issues") or []
-                            be_error_rules = [
-                                str(iss.get("rule") or "")
-                                for iss in be_issues
-                                if isinstance(iss, dict)
-                                and str(iss.get("severity") or "").lower() in {"error", "fail"}
-                            ]
-                            all_soft = all(r in _BESTEFFORT_SOFT_RULES for r in be_error_rules)
-                            if all_soft:
-                                # Downgrade remaining errors to warnings in the validation result
-                                for iss in be_issues:
-                                    if isinstance(iss, dict) and str(iss.get("severity") or "").lower() in {"error", "fail"}:
-                                        if str(iss.get("rule") or "") in _BESTEFFORT_SOFT_RULES:
-                                            iss["severity"] = "warning"
-                                            iss["message"] = "[best-effort accepted] " + str(iss.get("message") or "")
-                                error_count = sum(
-                                    1 for iss in be_issues
-                                    if isinstance(iss, dict) and str(iss.get("severity") or "").lower() in {"error", "fail"}
-                                )
-                                warning_count = sum(
-                                    1 for iss in be_issues
-                                    if isinstance(iss, dict) and str(iss.get("severity") or "").lower() == "warning"
-                                )
-                                be_validation["status"] = "error" if error_count > 0 else ("warning" if warning_count > 0 else "ok")
-                                be_validation["accepted"] = error_count == 0
-                                be_validation["issues"] = be_issues
-                                summary = be_validation.get("summary") or {}
-                                summary["error_count"] = error_count
-                                summary["warning_count"] = warning_count
-                                be_validation["summary"] = summary
-                                if be_validation.get("accepted"):
-                                    llm_success = True
-                                    _record_fallback_attempt("best_effort_soft_accept", be_validation)
-                                    print(
-                                        "SUCCESS: Execution Planner accepted best-effort contract "
-                                        "(only non-structural quality warnings remain)."
-                                    )
-                    if not llm_success:
-                        llm_success = False
-
-                planner_candidate_invalid = (
-                    best_candidate
-                    if isinstance(best_candidate, dict)
-                    else (
-                        invalid_from_sectional
-                        if isinstance(invalid_from_sectional, dict)
-                        else (sectional_contract if isinstance(sectional_contract, dict) else None)
-                    )
-                )
-                planner_candidate_invalid_raw = (
-                    best_response_text
-                    if isinstance(best_response_text, str) and best_response_text.strip()
-                    else (
-                        sectional_payload.get("invalid_raw")
-                        if isinstance(sectional_payload.get("invalid_raw"), str)
-                        else None
-                    )
-                )
-                planner_candidate_invalid_meta = {
-                    "best_validation": best_validation if isinstance(best_validation, dict) else None,
-                    "best_parse_feedback": best_parse_feedback,
-                    "attempt_count": len(planner_diag),
-                    "sectional_validation": sectional_validation if isinstance(sectional_validation, dict) else None,
-                    "sectional_meta": (
-                        sectional_payload.get("invalid_meta")
-                        if isinstance(sectional_payload.get("invalid_meta"), dict)
-                        else {}
-                    ),
-                    "fallback_attempts": fallback_attempts,
-                }
+            invalid_contract = (
+                latest_candidate_for_repair
+                if isinstance(latest_candidate_for_repair, dict) and latest_candidate_for_repair
+                else (best_candidate if isinstance(best_candidate, dict) and best_candidate else None)
+            )
+            invalid_raw = (
+                latest_response_text_for_repair
+                if isinstance(latest_response_text_for_repair, str) and latest_response_text_for_repair.strip()
+                else (best_response_text if isinstance(best_response_text, str) and best_response_text.strip() else None)
+            )
+            planner_candidate_invalid = invalid_contract
+            planner_candidate_invalid_raw = invalid_raw
+            planner_candidate_invalid_meta = {
+                "best_validation": best_validation if isinstance(best_validation, dict) else None,
+                "latest_validation": (
+                    latest_validation_for_repair if isinstance(latest_validation_for_repair, dict) else None
+                ),
+                "best_parse_feedback": best_parse_feedback,
+                "latest_parse_feedback": latest_parse_feedback_for_repair,
+                "attempt_count": len(planner_diag),
+                "fallback_mode": "llm_candidates_only",
+            }
+            contract = _apply_planner_structural_support(
+                invalid_contract if isinstance(invalid_contract, dict) else {}
+            )
+            llm_success = False
 
         if llm_success and resolved_target:
             print(

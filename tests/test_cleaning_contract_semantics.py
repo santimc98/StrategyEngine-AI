@@ -1,4 +1,7 @@
-from src.utils.cleaning_contract_semantics import expand_required_feature_selectors
+from src.utils.cleaning_contract_semantics import (
+    expand_required_feature_selectors,
+    extract_selector_drop_reasons,
+)
 
 
 def test_expand_required_feature_selectors_supports_all_numeric_except_value_alias():
@@ -16,3 +19,16 @@ def test_expand_required_feature_selectors_supports_all_numeric_except_value_ali
 
     assert issues == []
     assert expanded == ["feature_a", "feature_b"]
+
+
+def test_extract_selector_drop_reasons_infers_tokens_from_natural_language() -> None:
+    reasons, issues = extract_selector_drop_reasons(
+        {
+            "drop_policy": {
+                "allow_selector_drops_when": "Drop selector-covered columns only when constant or duplicate."
+            }
+        }
+    )
+
+    assert issues == []
+    assert reasons == ["constant", "duplicate"]
