@@ -1803,6 +1803,157 @@ class MLEngineerAgent:
             "optimization_feedback_brief": feedback_brief or "No optimization feedback provided.",
         }
 
+    def _build_optimization_authoritative_state(
+        self,
+        *,
+        data_path: str,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+    ) -> str:
+        execution_contract = execution_contract if isinstance(execution_contract, dict) else {}
+        ml_view = ml_view if isinstance(ml_view, dict) else {}
+
+        allowed_sets = (
+            execution_contract.get("allowed_feature_sets")
+            if isinstance(execution_contract.get("allowed_feature_sets"), dict)
+            else (
+                ml_view.get("allowed_feature_sets")
+                if isinstance(ml_view.get("allowed_feature_sets"), dict)
+                else {}
+            )
+        )
+        column_roles = (
+            execution_contract.get("column_roles")
+            if isinstance(execution_contract.get("column_roles"), dict)
+            else (
+                ml_view.get("column_roles")
+                if isinstance(ml_view.get("column_roles"), dict)
+                else {}
+            )
+        )
+        evaluation_spec = (
+            execution_contract.get("evaluation_spec")
+            if isinstance(execution_contract.get("evaluation_spec"), dict)
+            else (
+                ml_view.get("evaluation_spec")
+                if isinstance(ml_view.get("evaluation_spec"), dict)
+                else {}
+            )
+        )
+        validation_requirements = (
+            execution_contract.get("validation_requirements")
+            if isinstance(execution_contract.get("validation_requirements"), dict)
+            else (
+                ml_view.get("validation_requirements")
+                if isinstance(ml_view.get("validation_requirements"), dict)
+                else {}
+            )
+        )
+        split_spec = (
+            execution_contract.get("split_spec")
+            if isinstance(execution_contract.get("split_spec"), dict)
+            else (
+                ml_view.get("split_spec")
+                if isinstance(ml_view.get("split_spec"), dict)
+                else {}
+            )
+        )
+        artifact_requirements = (
+            execution_contract.get("artifact_requirements")
+            if isinstance(execution_contract.get("artifact_requirements"), dict)
+            else (
+                ml_view.get("artifact_requirements")
+                if isinstance(ml_view.get("artifact_requirements"), dict)
+                else {}
+            )
+        )
+
+        model_features = allowed_sets.get("model_features")
+        if not isinstance(model_features, list) or not model_features:
+            model_features = column_roles.get("pre_decision")
+        if not isinstance(model_features, list):
+            model_features = []
+
+        forbidden_features = allowed_sets.get("forbidden_features")
+        if not isinstance(forbidden_features, list):
+            forbidden_features = []
+
+        target_columns = evaluation_spec.get("target_columns")
+        if not isinstance(target_columns, list) or not target_columns:
+            target_columns = validation_requirements.get("label_columns")
+        if not isinstance(target_columns, list):
+            target_columns = []
+
+        scored_rows_schema = (
+            artifact_requirements.get("scored_rows_schema")
+            if isinstance(artifact_requirements.get("scored_rows_schema"), dict)
+            else {}
+        )
+        submission_schema = (
+            artifact_requirements.get("file_schemas", {}).get("submission.csv")
+            if isinstance(artifact_requirements.get("file_schemas"), dict)
+            else {}
+        )
+        primary_metric = (
+            validation_requirements.get("primary_metric")
+            or evaluation_spec.get("primary_metric")
+        )
+        metric_rule = evaluation_spec.get("metric_definition_rule")
+        if (
+            not metric_rule
+            and isinstance(primary_metric, str)
+            and "mean" in primary_metric.lower()
+        ):
+            metric_rule = (
+                "Use a simple arithmetic mean unless the contract explicitly provides weights."
+            )
+
+        authoritative_state = {
+            "input_dataset": data_path,
+            "source_of_truth": {
+                "features": "allowed_feature_sets.model_features (fallback: column_roles.pre_decision)",
+                "forbidden_features": "allowed_feature_sets.forbidden_features",
+                "targets": "evaluation_spec.target_columns (fallback: validation_requirements.label_columns)",
+                "split_rules": "split_spec",
+                "output_schema": "required_outputs + artifact_requirements",
+                "cleaning_manifest_scope": (
+                    "Use data/cleaning_manifest.json only for output_dialect and observed cleaning metadata. "
+                    "Do not treat it as the authoritative source for model_features, target_columns, split rules, or required outputs unless those keys are explicitly present."
+                ),
+            },
+            "resolved_contract": {
+                "target_columns": [str(item) for item in target_columns[:12] if str(item).strip()],
+                "primary_metric": primary_metric,
+                "metric_definition_rule": metric_rule,
+                "model_features": [str(item) for item in model_features[:60] if str(item).strip()],
+                "forbidden_features": [str(item) for item in forbidden_features[:30] if str(item).strip()],
+                "split_column": split_spec.get("split_column"),
+                "training_rows_rule": split_spec.get("training_rows_rule"),
+                "scoring_rows_rule": split_spec.get("scoring_rows_rule"),
+                "required_outputs": [
+                    str(item)
+                    for item in (
+                        execution_contract.get("required_outputs")
+                        if isinstance(execution_contract.get("required_outputs"), list)
+                        else (ml_view.get("required_outputs") if isinstance(ml_view.get("required_outputs"), list) else [])
+                    )[:12]
+                    if str(item).strip()
+                ],
+                "submission_required_columns": (
+                    scored_rows_schema.get("required_columns")
+                    if isinstance(scored_rows_schema.get("required_columns"), list)
+                    else []
+                )[:12],
+                "submission_expected_row_count": submission_schema.get("expected_row_count"),
+            },
+        }
+        return self._serialize_json_for_prompt(
+            authoritative_state,
+            max_chars=5000,
+            max_str_len=320,
+            max_list_items=100,
+        )
+
     def _extract_decisioning_context(
         self,
         ml_view: Dict[str, Any] | None,
@@ -1919,10 +2070,9 @@ class MLEngineerAgent:
         - Strategy Hypothesis: $hypothesis
         - Strategy Techniques (compact): $strategy_techniques_compact
         - Required Outputs: $deliverables_json
-        - ML Contract Summary: $ml_view_context
-        - Evaluation Spec Summary: $evaluation_spec_json
-        - Data Partitioning Context:
-        $data_partitioning_context
+        - Optimization Authoritative State: $optimization_authoritative_state
+        - Treat that state as the single execution truth for targets, features, split rules, metrics, and output schema.
+        - Use data/cleaning_manifest.json only for CSV dialect and cleaning metadata unless the authoritative state explicitly says otherwise.
 
         Return Python code only.
         """
@@ -4526,6 +4676,11 @@ class MLEngineerAgent:
                 max_chars=5000,
                 max_str_len=500,
                 max_list_items=120,
+            ),
+            optimization_authoritative_state=self._build_optimization_authoritative_state(
+                data_path=data_path,
+                execution_contract=execution_contract_input,
+                ml_view=ml_view,
             ),
             data_sample_context_json=data_sample_context_json,
             execution_profile_json=execution_profile_json,

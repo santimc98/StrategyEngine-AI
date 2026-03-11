@@ -161,7 +161,26 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
             },
         },
         execution_contract={"required_outputs": ["data/metrics.json"], "canonical_columns": []},
-        ml_view={"required_outputs": ["data/metrics.json"]},
+        ml_view={
+            "required_outputs": ["data/metrics.json"],
+            "allowed_feature_sets": {
+                "model_features": ["feature_a", "feature_b"],
+                "forbidden_features": ["label_12h"],
+            },
+            "evaluation_spec": {
+                "target_columns": ["label_12h", "label_24h"],
+                "primary_metric": "mean_multi_horizon_log_loss",
+            },
+            "split_spec": {
+                "split_column": "__split",
+                "training_rows_rule": "rows where label_12h is not missing",
+                "scoring_rows_rule": "rows where label_12h is missing",
+            },
+            "artifact_requirements": {
+                "file_schemas": {"submission.csv": {"expected_row_count": 95}},
+                "scored_rows_schema": {"required_columns": ["event_id", "prob_12h", "prob_24h"]},
+            },
+        },
         editor_mode=True,
     )
 
@@ -173,6 +192,12 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
     assert "ACTIVE HYPOTHESIS BRIEF:" in prompt
     assert "CURRENT EVIDENCE BRIEF:" in prompt
     assert "LOCKED INVARIANTS:" in prompt
+    assert "Optimization Authoritative State:" in prompt
+    assert "cleaning_manifest.json only for CSV dialect and cleaning metadata" in prompt
+    assert "allowed_feature_sets.model_features" in prompt
+    assert '"feature_a"' in prompt
+    assert "target_columns" in prompt
+    assert '"label_12h"' in prompt
     assert "simple arithmetic mean" in prompt
     assert "STRUCTURED CRITIQUE PACKET:" not in prompt
     assert "OPTIMIZATION CONTEXT (authoritative current round):" not in prompt
