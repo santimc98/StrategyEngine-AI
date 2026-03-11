@@ -1924,11 +1924,24 @@ class MLEngineerAgent:
             if isinstance(artifact_requirements.get("scored_rows_schema"), dict)
             else {}
         )
-        submission_schema = (
-            artifact_requirements.get("file_schemas", {}).get("submission.csv")
+        file_schemas = (
+            artifact_requirements.get("file_schemas")
             if isinstance(artifact_requirements.get("file_schemas"), dict)
             else {}
         )
+        submission_schema: Dict[str, Any] = {}
+        if isinstance(file_schemas, dict) and file_schemas:
+            for candidate_key in ("submission.csv", "data/submission.csv", "outputs/submission.csv"):
+                candidate_schema = file_schemas.get(candidate_key)
+                if isinstance(candidate_schema, dict):
+                    submission_schema = candidate_schema
+                    break
+            if not submission_schema:
+                for path_key, schema_obj in file_schemas.items():
+                    normalized_path = str(path_key or "").replace("\\", "/").strip().lower()
+                    if normalized_path.endswith("submission.csv") and isinstance(schema_obj, dict):
+                        submission_schema = schema_obj
+                        break
         primary_metric = (
             validation_requirements.get("primary_metric")
             or evaluation_spec.get("primary_metric")

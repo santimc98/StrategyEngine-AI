@@ -205,6 +205,74 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
     assert "FEATURE GOVERNANCE" not in prompt
 
 
+def test_optimization_authoritative_state_accepts_submission_schema_alias_paths(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={"title": "Alias Schema Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        previous_code="print('baseline')\n",
+        execution_contract={
+            "required_outputs": ["outputs/submission.csv", "data/metrics.json"],
+            "artifact_requirements": {
+                "file_schemas": {"outputs/submission.csv": {"expected_row_count": 95}},
+                "scored_rows_schema": {"required_columns": ["event_id", "prob_12h"]},
+            },
+        },
+        ml_view={
+            "required_outputs": ["outputs/submission.csv", "data/metrics.json"],
+            "evaluation_spec": {
+                "target_columns": ["label_12h", "label_24h"],
+                "primary_metric": "mean_multi_horizon_log_loss",
+            },
+            "allowed_feature_sets": {"model_features": ["feature_a"]},
+            "artifact_requirements": {
+                "file_schemas": {"outputs/submission.csv": {"expected_row_count": 95}},
+                "scored_rows_schema": {"required_columns": ["event_id", "prob_12h"]},
+            },
+        },
+        gate_context={
+            "source": "metric_improvement_optimizer",
+            "status": "OPTIMIZATION_REQUIRED",
+            "feedback": "Optimization round active.",
+            "failed_gates": [],
+            "required_fixes": ["Apply hypothesis with material edits."],
+        },
+        iteration_handoff={
+            "mode": "optimize",
+            "source": "actor_critic_metric_improvement",
+            "optimization_context": {
+                "policy": {"phase": "explore", "bundle_size": 1},
+                "metric_snapshot": {"primary_metric_name": "mean_multi_horizon_log_loss", "baseline_metric": 0.80},
+                "contract_lock": {"required_outputs": ["data/metrics.json"]},
+            },
+            "hypothesis_packet": {
+                "action": "APPLY",
+                "hypothesis": {"technique": "missing_indicators", "target_columns": ["ALL_NUMERIC"]},
+            },
+            "editor_constraints": {"must_apply_hypothesis": True, "forbid_noop": True},
+        },
+        editor_mode=True,
+    )
+
+    prompt = str(agent.last_prompt or "")
+    assert "Optimization Authoritative State:" in prompt
+    assert "submission_expected_row_count" in prompt
+    assert "outputs/submission.csv" in prompt
+    assert "95" in prompt
+
+
 def test_editor_prompt_includes_authoritative_repair_ground_truth(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
