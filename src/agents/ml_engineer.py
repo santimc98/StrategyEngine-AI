@@ -701,6 +701,11 @@ class MLEngineerAgent:
             if isinstance(raw.get("deferred_optimization"), dict)
             else {}
         )
+        optimization_lane = (
+            raw.get("optimization_lane")
+            if isinstance(raw.get("optimization_lane"), dict)
+            else {}
+        )
         repair_first = bool(repair_policy.get("repair_first")) or str(
             repair_policy.get("primary_focus") or retry_context.get("repair_focus") or ""
         ).strip().lower() in {"runtime", "persistence", "compliance"}
@@ -825,7 +830,10 @@ class MLEngineerAgent:
                     else []
                 ),
             }
-        if repair_first:
+        keep_optimization_lane = bool(optimization_lane.get("active")) and (
+            optimization_context or hypothesis_packet or deferred_optimization
+        )
+        if repair_first and not keep_optimization_lane:
             optimization_focus = {}
             optimization_context = {}
             critic_packet = {}
@@ -857,6 +865,7 @@ class MLEngineerAgent:
                 "runtime_error_tail": str(feedback.get("runtime_error_tail") or "").strip(),
                 "evidence": evidence_focus,
             },
+            "optimization_lane": optimization_lane if isinstance(optimization_lane, dict) else {},
             "repair_policy": repair_policy if isinstance(repair_policy, dict) else {},
             "deferred_optimization": deferred_optimization if isinstance(deferred_optimization, dict) else {},
             "retry_context": retry_context if isinstance(retry_context, dict) else {},
@@ -1106,8 +1115,6 @@ class MLEngineerAgent:
     ) -> bool:
         gate_context = gate_context if isinstance(gate_context, dict) else {}
         handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
-        if self._is_repair_first_context(gate_context=gate_context, handoff_payload=handoff_payload):
-            return False
         mode = str(handoff_payload.get("mode") or "").strip().lower()
         source = str(handoff_payload.get("source") or gate_context.get("source") or "").strip().lower()
         quality_focus = handoff_payload.get("quality_focus") if isinstance(handoff_payload.get("quality_focus"), dict) else {}
@@ -1118,6 +1125,32 @@ class MLEngineerAgent:
         ).strip().upper()
         constraints = handoff_payload.get("editor_constraints") if isinstance(handoff_payload.get("editor_constraints"), dict) else {}
         must_apply_hypothesis = bool(constraints.get("must_apply_hypothesis"))
+        optimization_context = (
+            handoff_payload.get("optimization_context")
+            if isinstance(handoff_payload.get("optimization_context"), dict)
+            else {}
+        )
+        hypothesis_packet = (
+            handoff_payload.get("hypothesis_packet")
+            if isinstance(handoff_payload.get("hypothesis_packet"), dict)
+            else {}
+        )
+        deferred_optimization = (
+            handoff_payload.get("deferred_optimization")
+            if isinstance(handoff_payload.get("deferred_optimization"), dict)
+            else {}
+        )
+        optimization_lane = (
+            handoff_payload.get("optimization_lane")
+            if isinstance(handoff_payload.get("optimization_lane"), dict)
+            else {}
+        )
+        if self._is_repair_first_context(gate_context=gate_context, handoff_payload=handoff_payload):
+            if bool(optimization_lane.get("active")) and (
+                optimization_context or hypothesis_packet or deferred_optimization
+            ):
+                return True
+            return False
         if mode in {"optimize", "improve", "metric_optimize"}:
             return True
         if status in {"OPTIMIZATION_REQUIRED", "IMPROVEMENT_REQUIRED"}:
@@ -1125,6 +1158,8 @@ class MLEngineerAgent:
         if "metric_improvement" in source and must_apply_hypothesis:
             return True
         if "actor_critic" in source and must_apply_hypothesis:
+            return True
+        if bool(optimization_lane.get("active")) and (optimization_context or hypothesis_packet):
             return True
         return False
 
@@ -4865,6 +4900,12 @@ class MLEngineerAgent:
         CURRENT EVIDENCE BRIEF:
         $current_evidence_brief
 
+        REPAIR GROUND TRUTH:
+        $repair_ground_truth
+
+        REPAIR SCOPE:
+        $repair_scope
+
         PARAMETER / IMPLEMENTATION HINTS:
         $optimization_blueprint_hint
 
@@ -4898,6 +4939,7 @@ class MLEngineerAgent:
         - Treat the previous script as the incumbent and preserve working behavior by default.
         - Keep contract paths, split logic, expected row counts, target semantics, and model family unchanged unless the invariant block explicitly allows otherwise.
         - Use the evidence brief to target the weakest part of the incumbent instead of inventing a new plan.
+        - If CURRENT PHASE is runtime_repair or persistence, fix the verified blocker first using REPAIR GROUND TRUTH and REPAIR SCOPE, then preserve the active optimization lane.
         - If the primary metric is defined as a mean and the contract does not provide explicit weights, compute a simple arithmetic mean.
         - Avoid unrelated refactors; edit only the regions needed for metric improvement.
         - Prefer the cheapest valid implementation that tests the idea without destabilizing working behavior.
@@ -5054,6 +5096,8 @@ class MLEngineerAgent:
                     optimization_round_brief=optimization_briefs.get("round_brief") or "{}",
                     active_hypothesis_brief=optimization_briefs.get("active_hypothesis_brief") or "{}",
                     current_evidence_brief=optimization_briefs.get("current_evidence_brief") or "{}",
+                    repair_ground_truth=repair_ground_truth_block or "{}",
+                    repair_scope=repair_scope_block or "{}",
                     optimization_blueprint_hint=optimization_briefs.get("optimization_blueprint_hint") or "[]",
                     invariants_lock=optimization_briefs.get("invariants_lock") or "{}",
                     action_family_guidelines=action_family_guidelines_block,

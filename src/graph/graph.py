@@ -10692,6 +10692,27 @@ def _apply_repair_first_handoff(
             ),
             "active_technique": technique or None,
         }
+    optimization_lane = (
+        copy.deepcopy(repaired.get("optimization_lane"))
+        if isinstance(repaired.get("optimization_lane"), dict)
+        else {}
+    )
+    if optimization_context or hypothesis_packet or deferred_optimization:
+        active_hypothesis = optimization_context.get("active_hypothesis") if isinstance(optimization_context, dict) else {}
+        technique = _extract_hypothesis_technique(hypothesis_packet) or str(
+            ((active_hypothesis.get("hypothesis") or {}).get("technique") if isinstance(active_hypothesis, dict) else "")
+            or ""
+        ).strip()
+        optimization_lane.update(
+            {
+                "active": True,
+                "resume_after_repair": True,
+                "repair_first": True,
+                "repair_focus": repair_focus,
+                "source": source,
+                "active_technique": technique or optimization_lane.get("active_technique"),
+            }
+        )
     repaired["mode"] = "patch"
     repaired["source"] = source
     repaired["repair_policy"] = {
@@ -10702,6 +10723,8 @@ def _apply_repair_first_handoff(
     repaired["retry_context"] = retry_context
     if deferred_optimization:
         repaired["deferred_optimization"] = deferred_optimization
+    if optimization_lane:
+        repaired["optimization_lane"] = optimization_lane
     editor_constraints = (
         dict(repaired.get("editor_constraints"))
         if isinstance(repaired.get("editor_constraints"), dict)
@@ -11173,6 +11196,18 @@ def _build_iteration_handoff(
         if isinstance(optimization_context.get("metric_snapshot"), dict)
         else {},
         "optimization_context": optimization_context if isinstance(optimization_context, dict) else {},
+        "optimization_lane": {
+            "active": bool(enforce_apply_hypothesis),
+            "resume_after_repair": False,
+            "repair_first": False,
+            "repair_focus": None,
+            "source": (
+                "actor_critic_metric_improvement"
+                if enforce_apply_hypothesis
+                else None
+            ),
+            "active_technique": hypothesis_technique or None,
+        } if (optimization_context or hypothesis_packet or enforce_apply_hypothesis) else {},
         "critic_packet": (
             state.get("ml_improvement_critique_packet")
             if isinstance(state.get("ml_improvement_critique_packet"), dict)

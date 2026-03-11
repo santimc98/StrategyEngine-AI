@@ -76,6 +76,46 @@ def test_editor_phase_prioritizes_runtime_repair_over_metric_optimization():
     assert agent._is_metric_optimization_context(gate_context, handoff) is False
 
 
+def test_repair_first_metric_round_keeps_optimization_context_active():
+    agent = _agent()
+    handoff = {
+        "mode": "patch",
+        "source": "result_evaluator_repair_first",
+        "repair_policy": {"repair_first": True, "primary_focus": "runtime"},
+        "retry_context": {"error_type": "shape_or_dtype", "repair_focus": "runtime"},
+        "optimization_lane": {
+            "active": True,
+            "resume_after_repair": True,
+            "repair_first": True,
+            "repair_focus": "runtime",
+            "source": "result_evaluator_repair_first",
+            "active_technique": "out_of_fold_probability_calibration_per_horizon",
+        },
+        "optimization_context": {
+            "metric_snapshot": {"primary_metric_name": "logloss", "baseline_metric": 0.38},
+            "contract_lock": {"required_outputs": ["data/metrics.json"]},
+        },
+        "hypothesis_packet": {
+            "action": "APPLY",
+            "hypothesis": {"technique": "out_of_fold_probability_calibration_per_horizon"},
+        },
+        "editor_constraints": {"must_apply_hypothesis": False},
+    }
+    gate_context = {
+        "runtime_error": {"type": "shape_or_dtype", "summary": "ValueError: inconsistent samples"},
+        "failed_gates": ["runtime_failure"],
+    }
+
+    phase = agent._classify_editor_phase(
+        gate_context=gate_context,
+        handoff_payload=handoff,
+        feedback_text="ValueError: inconsistent samples during calibration.",
+    )
+
+    assert phase == "runtime_repair"
+    assert agent._is_metric_optimization_context(gate_context, handoff) is True
+
+
 class _FakeOpenAI:
     def __init__(self, api_key=None, base_url=None, timeout=None, default_headers=None):
         self.api_key = api_key

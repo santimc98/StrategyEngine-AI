@@ -121,6 +121,10 @@ def test_iteration_handoff_defers_metric_optimization_when_runtime_blockers_exis
     assert handoff["retry_context"]["error_type"] == "timeout"
     assert handoff["retry_context"]["cost_reduction_required"] is True
     assert handoff["deferred_optimization"]["active_technique"] == "multi_seed_catboost_averaging"
+    assert handoff["optimization_lane"]["active"] is True
+    assert handoff["optimization_lane"]["resume_after_repair"] is True
+    assert handoff["optimization_lane"]["repair_first"] is True
+    assert handoff["optimization_lane"]["active_technique"] == "multi_seed_catboost_averaging"
 
 
 def test_iteration_handoff_builds_repair_ground_truth_for_runtime_api_misuse():

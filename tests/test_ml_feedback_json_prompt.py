@@ -324,6 +324,92 @@ def test_editor_prompt_enforces_patch_only_repair_scope(monkeypatch):
     assert "Editable targets: script_line:2; call_site:os.remove." in prompt
 
 
+def test_metric_optimization_runtime_repair_keeps_optimization_editor_prompt(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={"title": "Optimization Repair Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        previous_code="print('baseline')\n",
+        gate_context={
+            "source": "Execution Runtime",
+            "status": "REJECTED",
+            "feedback": "ValueError: inconsistent sample lengths during calibration.",
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Fix the runtime root cause first."],
+            "runtime_error": {"type": "shape_or_dtype", "summary": "ValueError: inconsistent sample lengths"},
+        },
+        iteration_handoff={
+            "mode": "patch",
+            "source": "result_evaluator_repair_first",
+            "repair_policy": {"repair_first": True, "primary_focus": "runtime"},
+            "optimization_lane": {
+                "active": True,
+                "resume_after_repair": True,
+                "repair_first": True,
+                "repair_focus": "runtime",
+                "source": "result_evaluator_repair_first",
+                "active_technique": "out_of_fold_probability_calibration_per_horizon",
+            },
+            "optimization_context": {
+                "policy": {"phase": "explore", "bundle_size": 1},
+                "metric_snapshot": {"primary_metric_name": "logloss", "baseline_metric": 0.80},
+                "contract_lock": {"required_outputs": ["data/metrics.json"]},
+            },
+            "hypothesis_packet": {
+                "action": "APPLY",
+                "hypothesis": {
+                    "technique": "out_of_fold_probability_calibration_per_horizon",
+                    "target_columns": ["ALL_NUMERIC"],
+                },
+            },
+            "editor_constraints": {
+                "must_apply_hypothesis": False,
+                "forbid_noop": False,
+                "patch_intensity": "surgical",
+                "scope_policy": "patch_only",
+                "allow_strategy_changes": False,
+                "freeze_unimplicated_regions": True,
+            },
+            "repair_scope": {
+                "phase": "compliance_runtime",
+                "scope_policy": "patch_only",
+                "editable_targets": ["calibration_scoring_loop"],
+                "protected_regions": ["model_selection", "output_paths_contract"],
+                "must_preserve_invariants": ["Keep incumbent outputs and split logic stable."],
+            },
+            "repair_ground_truth": {
+                "root_cause_type": "shape_or_dtype",
+                "repair_focus": "runtime",
+                "failure_signature": "ValueError: inconsistent sample lengths",
+            },
+        },
+        execution_contract={"required_outputs": ["data/metrics.json"], "canonical_columns": []},
+        ml_view={"required_outputs": ["data/metrics.json"]},
+        editor_mode=True,
+    )
+
+    prompt = str(agent.last_prompt or "")
+    assert "MODE: CODE_EDITOR_MODE_OPTIMIZATION" in prompt
+    assert "CURRENT ROUND BRIEF:" in prompt
+    assert "CURRENT PHASE:" in prompt
+    assert "runtime_repair" in prompt
+    assert "REPAIR GROUND TRUTH:" in prompt
+    assert "REPAIR SCOPE:" in prompt
+    assert "calibration_scoring_loop" in prompt
+
+
 def test_generate_code_records_subcall_trace_with_completion_reprompt(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _TraceOpenAI)
