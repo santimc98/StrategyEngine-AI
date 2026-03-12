@@ -425,6 +425,8 @@ def check_artifact_requirements(
 
     # Check scored_rows schema
     scored_schema = artifact_requirements.get("scored_rows_schema", {})
+    if not isinstance(scored_schema, dict):
+        scored_schema = {}
     required_columns = scored_schema.get("required_columns", [])
     required_any_of_groups = scored_schema.get("required_any_of_groups")
     required_any_of_group_severity = scored_schema.get("required_any_of_group_severity")
@@ -448,12 +450,13 @@ def check_artifact_requirements(
     else:
         scored_rows_report = {
             "exists": False,
+            "applicable": False,
             "present_columns": [],
-            "missing_columns": required_columns,
-            "missing_any_of_groups": required_any_of_groups or [],
+            "missing_columns": [],
+            "missing_any_of_groups": [],
             "matched_any_of_groups": [],
             "missing_any_of_groups_with_severity": [],
-            "summary": "No scored_rows file defined in required_files",
+            "summary": "Not applicable (no scored_rows artifact declared in required_files)",
         }
 
     # Determine overall status
@@ -461,11 +464,15 @@ def check_artifact_requirements(
         status = "error"
     elif row_count_report.get("mismatches") or row_count_report.get("errors"):
         status = "error"
-    elif scored_rows_report.get("missing_columns"):
+    elif scored_rows_report.get("applicable", True) and scored_rows_report.get("missing_columns"):
         status = "error"
     else:
         # Check any-of groups with severity
-        missing_with_severity = scored_rows_report.get("missing_any_of_groups_with_severity", [])
+        missing_with_severity = (
+            scored_rows_report.get("missing_any_of_groups_with_severity", [])
+            if scored_rows_report.get("applicable", True)
+            else []
+        )
         has_fail_severity = any(m["severity"] == "fail" for m in missing_with_severity)
         if has_fail_severity:
             status = "error"

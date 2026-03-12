@@ -199,6 +199,7 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
     assert "target_columns" in prompt
     assert '"label_12h"' in prompt
     assert "simple arithmetic mean" in prompt
+    assert "ARTIFACT: data/scored_rows.csv" not in prompt
     assert "STRUCTURED CRITIQUE PACKET:" not in prompt
     assert "OPTIMIZATION CONTEXT (authoritative current round):" not in prompt
     assert "CONTRACT-FIRST EXECUTION MAP (MANDATORY)" not in prompt
@@ -226,18 +227,21 @@ def test_optimization_authoritative_state_accepts_submission_schema_alias_paths(
         execution_contract={
             "required_outputs": ["outputs/submission.csv", "data/metrics.json"],
             "artifact_requirements": {
+                "clean_dataset": {"output_manifest_path": "artifacts/manifests/custom_clean_manifest.json"},
                 "file_schemas": {"outputs/submission.csv": {"expected_row_count": 95}},
                 "scored_rows_schema": {"required_columns": ["event_id", "prob_12h"]},
             },
         },
         ml_view={
             "required_outputs": ["outputs/submission.csv", "data/metrics.json"],
+            "cleaning_manifest_path": "artifacts/manifests/custom_clean_manifest.json",
             "evaluation_spec": {
                 "target_columns": ["label_12h", "label_24h"],
                 "primary_metric": "mean_multi_horizon_log_loss",
             },
             "allowed_feature_sets": {"model_features": ["feature_a"]},
             "artifact_requirements": {
+                "clean_dataset": {"output_manifest_path": "artifacts/manifests/custom_clean_manifest.json"},
                 "file_schemas": {"outputs/submission.csv": {"expected_row_count": 95}},
                 "scored_rows_schema": {"required_columns": ["event_id", "prob_12h"]},
             },
@@ -271,6 +275,7 @@ def test_optimization_authoritative_state_accepts_submission_schema_alias_paths(
     assert "submission_expected_row_count" in prompt
     assert "outputs/submission.csv" in prompt
     assert "95" in prompt
+    assert "artifacts/manifests/custom_clean_manifest.json" in prompt
 
 
 def test_editor_prompt_includes_authoritative_repair_ground_truth(monkeypatch):

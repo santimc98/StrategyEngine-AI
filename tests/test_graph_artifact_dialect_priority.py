@@ -26,3 +26,47 @@ def test_artifact_gate_dialect_prefers_state(tmp_workdir):
     assert dialect["sep"] == "\t"
     assert dialect["decimal"] == "."
     assert dialect["encoding"] == "utf-8"
+
+
+def test_artifact_gate_dialect_uses_declared_manifest_path(tmp_workdir):
+    manifest_path = tmp_workdir / "artifacts" / "manifests" / "custom_clean_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps({"output_dialect": {"sep": ";", "decimal": ",", "encoding": "latin-1"}}),
+        encoding="utf-8",
+    )
+    contract = {
+        "artifact_requirements": {
+            "clean_dataset": {
+                "output_path": "artifacts/features/custom_cleaned.csv",
+                "output_manifest_path": "artifacts/manifests/custom_clean_manifest.json",
+            }
+        }
+    }
+
+    dialect = graph_mod._resolve_artifact_gate_dialect({}, contract)
+    assert dialect["sep"] == ";"
+    assert dialect["decimal"] == ","
+    assert dialect["encoding"] == "latin-1"
+
+
+def test_case_alignment_skip_reason_uses_declared_scored_rows_path(tmp_workdir):
+    manifest_path = tmp_workdir / "artifacts" / "manifests" / "custom_clean_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps({"output_dialect": {"sep": ";", "decimal": ".", "encoding": "utf-8"}}), encoding="utf-8")
+
+    scored_rows_path = tmp_workdir / "artifacts" / "outputs" / "scored_rows.csv"
+    scored_rows_path.parent.mkdir(parents=True, exist_ok=True)
+    scored_rows_path.write_text("segment_name;pred_score\nA;0.9\nB;0.2\n", encoding="utf-8")
+
+    contract = {
+        "required_outputs": ["artifacts/outputs/scored_rows.csv"],
+        "artifact_requirements": {
+            "clean_dataset": {
+                "output_manifest_path": "artifacts/manifests/custom_clean_manifest.json",
+            }
+        },
+    }
+
+    skip_reason = graph_mod._case_alignment_skip_reason(contract, {})
+    assert skip_reason == ""

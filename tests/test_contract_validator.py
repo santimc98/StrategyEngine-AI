@@ -124,6 +124,28 @@ class TestAmbiguityDetection:
         assert all(isinstance(path, str) for path in required_outputs)
         assert "data/custom_output.csv" in required_outputs
 
+    def test_normalize_artifact_requirements_does_not_inject_default_files(self):
+        contract = {"artifact_requirements": {}}
+
+        artifact_req, warnings = normalize_artifact_requirements(contract)
+
+        assert warnings == []
+        assert artifact_req.get("required_files") == []
+        assert "scored_rows_schema" not in artifact_req
+
+    def test_normalize_artifact_requirements_does_not_promote_file_schemas_to_required(self):
+        contract = {
+            "artifact_requirements": {
+                "file_schemas": {"outputs/submission.csv": {"expected_row_count": 95}},
+            }
+        }
+
+        artifact_req, warnings = normalize_artifact_requirements(contract)
+
+        assert warnings == []
+        assert artifact_req.get("required_files") == []
+        assert artifact_req.get("file_schemas", {}).get("outputs/submission.csv", {}).get("expected_row_count") == 95
+
 
 class TestContractValidation:
     """Test P1.2: Contract Self-Consistency Gate."""
@@ -230,6 +252,6 @@ class TestContractValidation:
 
         result = validate_contract(contract)
 
-        # Should have normalized artifact_requirements with defaults
+        # LLM-first policy: no default business artifacts are injected.
         norm_req = result.get("normalized_artifact_requirements", {})
-        assert len(norm_req.get("required_files", [])) > 0  # Defaults added
+        assert norm_req.get("required_files", []) == []

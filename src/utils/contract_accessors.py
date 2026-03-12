@@ -14,6 +14,7 @@ Compatibility:
   - Preserves legacy function names/constants for incremental migration.
 """
 
+import os
 from typing import Dict, Any, List, Set
 from src.utils.contract_validator import is_probably_path
 
@@ -961,12 +962,11 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     
     Normalizes paths:
       - Backslash to forward slash
-      - Known basenames (metrics.json, etc.) get data/ prefix
+      - Strips leading slash while preserving contract-declared relative paths
     
     Returns:
         Unique list of required output paths (normalized).
     """
-    import os
     import re
     
     def _normalize_path(path: str) -> str:
@@ -1159,6 +1159,14 @@ def _infer_owner_from_path(path: str) -> str:
     return "ml_engineer"
 
 
+def normalize_artifact_path(path: Any) -> str:
+    """Normalize a declared artifact path without changing its intended location."""
+    if not isinstance(path, str):
+        return ""
+    normalized = path.replace("\\", "/").strip()
+    return normalized.lstrip("/")
+
+
 def get_required_outputs_by_owner(contract: Dict[str, Any], owner: str) -> List[str]:
     """Return required output paths filtered by owner.
 
@@ -1220,6 +1228,271 @@ def get_deliverables(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "description": "",
             })
     return result
+
+
+def get_declared_artifacts(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return a canonical registry of artifact paths explicitly declared by the contract.
+
+    The registry preserves the agent-declared path exactly (slash-normalized only)
+    and merges metadata from deliverables, required_outputs, required_files,
+    file_schemas, and clean_dataset output/manifest declarations.
+    """
+    if not isinstance(contract, dict):
+        return []
+
+    registry: Dict[str, Dict[str, Any]] = {}
+
+    def _merge(path: Any, payload: Dict[str, Any] | None = None) -> None:
+        normalized_path = normalize_artifact_path(path)
+        if not normalized_path:
+            return
+        payload = payload if isinstance(payload, dict) else {}
+        key = normalized_path.lower()
+        existing = registry.get(
+            key,
+            {
+                "path": normalized_path,
+                "required": False,
+                "kind": "",
+                "owner": "",
+                "description": "",
+                "sources": [],
+            },
+        )
+        existing["path"] = existing.get("path") or normalized_path
+        existing["required"] = bool(existing.get("required")) or bool(payload.get("required"))
+        kind = str(payload.get("kind") or "").strip()
+        if not kind:
+            kind = _infer_kind_from_path(normalized_path)
+        if kind and not existing.get("kind"):
+            existing["kind"] = kind
+        owner = str(payload.get("owner") or "").strip()
+        if not owner:
+            owner = _infer_owner_from_path(normalized_path)
+        if owner and not existing.get("owner"):
+            existing["owner"] = owner
+        description = str(payload.get("description") or "").strip()
+        if description and not existing.get("description"):
+            existing["description"] = description
+        source = str(payload.get("source") or "").strip()
+        if source:
+            sources = existing.get("sources")
+            if not isinstance(sources, list):
+                sources = []
+            if source not in sources:
+                sources.append(source)
+            existing["sources"] = sources
+        registry[key] = existing
+
+    for deliverable in get_deliverables(contract):
+        if not isinstance(deliverable, dict):
+            continue
+        _merge(
+            deliverable.get("path"),
+            {
+                "required": bool(deliverable.get("required")),
+                "kind": deliverable.get("kind"),
+                "owner": deliverable.get("owner"),
+                "description": deliverable.get("description"),
+                "source": "deliverables",
+            },
+        )
+
+    required_outputs = contract.get("required_outputs")
+    if isinstance(required_outputs, list):
+        for item in required_outputs:
+            if isinstance(item, dict):
+                _merge(
+                    item.get("path") or item.get("output") or item.get("artifact"),
+                    {
+                        "required": bool(item.get("required", True)),
+                        "kind": item.get("kind"),
+                        "owner": item.get("owner"),
+                        "description": item.get("description"),
+                        "source": "required_outputs",
+                    },
+                )
+            else:
+                _merge(item, {"required": True, "source": "required_outputs"})
+
+    artifact_reqs = get_artifact_requirements(contract)
+    required_files = artifact_reqs.get("required_files")
+    if isinstance(required_files, list):
+        for item in required_files:
+            if isinstance(item, dict):
+                _merge(
+                    item.get("path") or item.get("output") or item.get("artifact"),
+                    {
+                        "required": bool(item.get("required", True)),
+                        "kind": item.get("kind") or item.get("artifact_type"),
+                        "owner": item.get("owner"),
+                        "description": item.get("description"),
+                        "source": "artifact_requirements.required_files",
+                    },
+                )
+            else:
+                _merge(item, {"required": True, "source": "artifact_requirements.required_files"})
+
+    file_schemas = artifact_reqs.get("file_schemas")
+    if isinstance(file_schemas, dict):
+        for schema_path, schema_obj in file_schemas.items():
+            schema_kind = ""
+            schema_owner = ""
+            if isinstance(schema_obj, dict):
+                schema_kind = str(schema_obj.get("kind") or schema_obj.get("artifact_type") or "").strip()
+                schema_owner = str(schema_obj.get("owner") or "").strip()
+            _merge(
+                schema_path,
+                {
+                    "required": False,
+                    "kind": schema_kind or None,
+                    "owner": schema_owner or None,
+                    "source": "artifact_requirements.file_schemas",
+                },
+            )
+
+    clean_cfg = artifact_reqs.get("clean_dataset")
+    if isinstance(clean_cfg, dict):
+        clean_output = clean_cfg.get("output_path") or clean_cfg.get("output") or clean_cfg.get("path")
+        if clean_output:
+            _merge(
+                clean_output,
+                {
+                    "required": True,
+                    "kind": "dataset",
+                    "owner": "data_engineer",
+                    "description": "Cleaned dataset output.",
+                    "source": "artifact_requirements.clean_dataset.output_path",
+                },
+            )
+        clean_manifest = clean_cfg.get("output_manifest_path") or clean_cfg.get("manifest_path")
+        if clean_manifest:
+            _merge(
+                clean_manifest,
+                {
+                    "required": True,
+                    "kind": "manifest",
+                    "owner": "data_engineer",
+                    "description": "Cleaning manifest output.",
+                    "source": "artifact_requirements.clean_dataset.manifest_path",
+                },
+            )
+
+    return list(registry.values())
+
+
+def get_declared_artifact_path(
+    contract: Dict[str, Any],
+    target: str | None = None,
+    *,
+    owner: str | None = None,
+    kind: str | None = None,
+    required_only: bool = False,
+) -> str:
+    """Resolve a declared artifact path by exact path, basename, owner, and/or kind."""
+    artifacts = get_declared_artifacts(contract)
+    if not artifacts:
+        return ""
+
+    owner_norm = str(owner or "").strip().lower()
+    kind_norm = str(kind or "").strip().lower()
+    target_norm = normalize_artifact_path(target or "").lower()
+    target_base = os.path.basename(target_norm) if target_norm else ""
+
+    exact_matches: List[str] = []
+    basename_matches: List[str] = []
+    filtered: List[str] = []
+
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if required_only and not artifact.get("required"):
+            continue
+        artifact_path = normalize_artifact_path(artifact.get("path"))
+        if not artifact_path:
+            continue
+        artifact_owner = str(artifact.get("owner") or "").strip().lower()
+        artifact_kind = str(artifact.get("kind") or "").strip().lower()
+        if owner_norm and artifact_owner != owner_norm:
+            continue
+        if kind_norm and artifact_kind != kind_norm:
+            continue
+        filtered.append(artifact_path)
+        artifact_key = artifact_path.lower()
+        artifact_base = os.path.basename(artifact_key)
+        if target_norm and artifact_key == target_norm:
+            exact_matches.append(artifact_path)
+        elif target_norm and target_base and artifact_base == target_base:
+            basename_matches.append(artifact_path)
+
+    if exact_matches:
+        return exact_matches[0]
+    if basename_matches:
+        return basename_matches[0]
+    if not target_norm and filtered:
+        return filtered[0]
+    return ""
+
+
+def get_declared_file_schema(
+    contract: Dict[str, Any],
+    target: str | None = None,
+    *,
+    owner: str | None = None,
+    kind: str | None = None,
+) -> Dict[str, Any]:
+    """Resolve a file schema using the same path resolution rules as declared artifacts."""
+    artifact_reqs = get_artifact_requirements(contract)
+    file_schemas = artifact_reqs.get("file_schemas")
+    if not isinstance(file_schemas, dict) or not file_schemas:
+        return {}
+
+    resolved_path = get_declared_artifact_path(contract, target, owner=owner, kind=kind)
+    if resolved_path:
+        for schema_path, schema_obj in file_schemas.items():
+            if normalize_artifact_path(schema_path).lower() == resolved_path.lower() and isinstance(schema_obj, dict):
+                return schema_obj
+
+    target_norm = normalize_artifact_path(target or "").lower()
+    target_base = os.path.basename(target_norm) if target_norm else ""
+    for schema_path, schema_obj in file_schemas.items():
+        normalized_schema_path = normalize_artifact_path(schema_path).lower()
+        if target_norm and (
+            normalized_schema_path == target_norm
+            or (target_base and os.path.basename(normalized_schema_path) == target_base)
+        ):
+            if isinstance(schema_obj, dict):
+                return schema_obj
+    return {}
+
+
+def get_clean_dataset_output_path(contract: Dict[str, Any]) -> str:
+    """Resolve the cleaned dataset output path declared by the contract."""
+    artifact_reqs = get_artifact_requirements(contract)
+    clean_cfg = artifact_reqs.get("clean_dataset")
+    if isinstance(clean_cfg, dict):
+        for key in ("output_path", "output", "path"):
+            value = clean_cfg.get(key)
+            normalized = normalize_artifact_path(value)
+            if normalized:
+                return normalized
+    return get_declared_artifact_path(contract, kind="dataset", owner="data_engineer")
+
+
+def get_clean_manifest_path(contract: Dict[str, Any]) -> str:
+    """Resolve the cleaning manifest path declared by the contract."""
+    artifact_reqs = get_artifact_requirements(contract)
+    clean_cfg = artifact_reqs.get("clean_dataset")
+    if isinstance(clean_cfg, dict):
+        for key in ("output_manifest_path", "manifest_path"):
+            value = clean_cfg.get(key)
+            normalized = normalize_artifact_path(value)
+            if normalized:
+                return normalized
+    manifest_path = get_declared_artifact_path(contract, "cleaning_manifest.json", owner="data_engineer")
+    if manifest_path:
+        return manifest_path
+    return get_declared_artifact_path(contract, kind="manifest", owner="data_engineer")
 
 
 def get_deliverables_by_owner(contract: Dict[str, Any], owner: str) -> List[Dict[str, Any]]:

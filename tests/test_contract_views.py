@@ -478,6 +478,32 @@ def test_translator_view_includes_decisioning_requirements():
     assert decisioning.get("required") is True
 
 
+def test_ml_view_exposes_declared_cleaning_manifest_path():
+    contract = {
+        "strategy_title": "Custom Paths",
+        "business_objective": "Respect declared artifact locations",
+        "canonical_columns": ["entity_id", "feature_a", "label"],
+        "column_roles": {"pre_decision": ["entity_id", "feature_a"], "target": ["label"], "id": ["entity_id"]},
+        "allowed_feature_sets": {"model_features": ["feature_a"], "segmentation_features": [], "forbidden_for_modeling": []},
+        "validation_requirements": {"primary_metric": "logloss"},
+        "required_outputs": ["outputs/final/submission.csv", "artifacts/manifests/custom_clean_manifest.json"],
+        "artifact_requirements": {
+            "clean_dataset": {
+                "output_path": "prepared/cleaned_features.csv",
+                "output_manifest_path": "artifacts/manifests/custom_clean_manifest.json",
+            },
+            "required_files": [{"path": "outputs/final/submission.csv"}],
+            "file_schemas": {"outputs/final/submission.csv": {"expected_row_count": 95}},
+        },
+    }
+
+    projected = build_contract_views_projection(contract, artifact_index=[])
+    ml_view = projected.get("ml_view") or {}
+
+    assert ml_view.get("cleaned_data_path") == "prepared/cleaned_features.csv"
+    assert ml_view.get("cleaning_manifest_path") == "artifacts/manifests/custom_clean_manifest.json"
+
+
 def test_ml_view_inherits_roles_when_min_lax():
     contract_min = {
         "canonical_columns": ["feature_a", "target", "audit_col", "entity_id"],

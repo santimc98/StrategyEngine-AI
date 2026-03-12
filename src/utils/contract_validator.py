@@ -436,9 +436,10 @@ def normalize_artifact_requirements(
     """
     Normalize contract to use artifact_requirements structure.
 
-    Converts legacy required_outputs to:
+    Converts explicit contract output declarations to:
     - artifact_requirements.required_files (paths)
-    - scored_rows_schema.required_columns (columns)
+    - artifact_requirements.scored_rows_schema only when the contract
+      explicitly declares it or legacy output columns imply it
 
     Returns:
         (artifact_requirements, warnings)
@@ -463,17 +464,21 @@ def normalize_artifact_requirements(
             normalized_files.append(item)
     required_files = normalized_files
 
-    # Merge file_schemas keys if present
-    file_schemas = artifact_req.get("file_schemas", {})
-    if isinstance(file_schemas, dict):
-        existing_paths = {f.get("path") for f in required_files if f.get("path")}
-        for path in file_schemas.keys():
-            if path and path not in existing_paths:
-                required_files.append({"path": path, "description": "From file_schemas"})
+    # Preserve declared file_schemas for validation/path resolution, but do not
+    # silently promote them to required_files. Required-ness must come from the
+    # contract's explicit deliverables/required outputs.
+    raw_file_schemas = artifact_req.get("file_schemas", {})
+    file_schemas = {}
+    if isinstance(raw_file_schemas, dict):
+        for raw_path, schema_obj in raw_file_schemas.items():
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            normalized_path = raw_path.strip().replace("\\", "/").lstrip("/")
+            file_schemas[normalized_path] = schema_obj
 
-    scored_schema = artifact_req.get("scored_rows_schema", {})
-    if not isinstance(scored_schema, dict):
-        scored_schema = {}
+    scored_schema_raw = artifact_req.get("scored_rows_schema")
+    scored_schema_present = isinstance(scored_schema_raw, dict)
+    scored_schema = scored_schema_raw if scored_schema_present else {}
 
     required_columns = scored_schema.get("required_columns", [])
     if not isinstance(required_columns, list):
@@ -535,25 +540,29 @@ def normalize_artifact_requirements(
                 notes.append(note)
             contract["notes_for_engineers"] = notes
 
-    # Ensure minimum required files exist
-    default_files = [
-        {"path": "data/cleaned_data.csv", "description": "Cleaned dataset"},
-        {"path": "data/metrics.json", "description": "Model metrics"},
-    ]
-    existing_paths = {f.get("path", "").lower() for f in required_files}
-    for df in default_files:
-        if df["path"].lower() not in existing_paths:
-            required_files.append(df)
-
     # Build normalized structure
     artifact_requirements = {
         "required_files": required_files,
-        "scored_rows_schema": {
-            "required_columns": required_columns,
-            "recommended_columns": scored_schema.get("recommended_columns", [])
-        },
         "file_schemas": file_schemas
     }
+    scored_schema_payload = {
+        "required_columns": required_columns,
+        "recommended_columns": scored_schema.get("recommended_columns", []),
+    }
+    if isinstance(scored_schema.get("required_any_of_groups"), list):
+        scored_schema_payload["required_any_of_groups"] = scored_schema.get("required_any_of_groups", [])
+    if isinstance(scored_schema.get("required_any_of_group_severity"), list):
+        scored_schema_payload["required_any_of_group_severity"] = scored_schema.get(
+            "required_any_of_group_severity",
+            [],
+        )
+    if (
+        scored_schema_present
+        or bool(required_columns)
+        or bool(scored_schema_payload.get("recommended_columns"))
+        or bool(scored_schema_payload.get("required_any_of_groups"))
+    ):
+        artifact_requirements["scored_rows_schema"] = scored_schema_payload
 
     # Preserve schema_binding and clean_dataset if present (do not drop optional passthrough info)
     schema_binding = artifact_req.get("schema_binding")
@@ -1707,8 +1716,7 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     2) outcome_columns must be in canonical_columns (or explicitly unknown)
     3) decision_columns only if action_space/levers declared
     4) artifact_requirements.required_files must exist as list
-    5) scored_rows_schema.required_columns must exist
-    6) Contract schema linting (Fix #6): column_roles, required_columns, coherence checks
+    5) Contract schema linting (Fix #6): column_roles, required_columns, coherence checks
 
     Returns:
         {
@@ -1937,18 +1945,6 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
             "rule": "missing_required_files",
             "severity": "warning",
             "message": "artifact_requirements.required_files is empty or missing",
-            "item": None
-        })
-        if status == "ok":
-            status = "warning"
-
-    # Rule 5: scored_rows_schema should exist
-    scored_schema = artifact_req.get("scored_rows_schema", {})
-    if not isinstance(scored_schema, dict):
-        issues.append({
-            "rule": "missing_scored_schema",
-            "severity": "warning",
-            "message": "artifact_requirements.scored_rows_schema is missing",
             "item": None
         })
         if status == "ok":

@@ -1,4 +1,9 @@
-from src.utils.contract_accessors import get_outcome_columns
+from src.utils.contract_accessors import (
+    get_clean_manifest_path,
+    get_declared_artifact_path,
+    get_declared_file_schema,
+    get_outcome_columns,
+)
 
 
 def test_get_outcome_columns_reads_validation_requirements_target_column():
@@ -29,3 +34,35 @@ def test_get_outcome_columns_reads_task_semantics_targets():
     }
 
     assert get_outcome_columns(contract) == ["label_12h", "label_24h", "label_48h", "label_72h"]
+
+
+def test_declared_artifact_resolution_preserves_custom_paths():
+    contract = {
+        "required_outputs": ["artifacts/submission_bundle/submission.csv"],
+        "spec_extraction": {
+            "deliverables": [
+                {
+                    "path": "artifacts/submission_bundle/submission.csv",
+                    "required": True,
+                    "owner": "ml_engineer",
+                    "kind": "submission",
+                }
+            ]
+        },
+        "artifact_requirements": {
+            "clean_dataset": {
+                "output_path": "prepared/clean_dataset.csv",
+                "output_manifest_path": "artifacts/manifests/clean_manifest.json",
+            },
+            "file_schemas": {
+                "artifacts/submission_bundle/submission.csv": {"expected_row_count": 95}
+            },
+        },
+    }
+
+    assert get_clean_manifest_path(contract) == "artifacts/manifests/clean_manifest.json"
+    assert (
+        get_declared_artifact_path(contract, "submission.csv", kind="submission")
+        == "artifacts/submission_bundle/submission.csv"
+    )
+    assert get_declared_file_schema(contract, "submission.csv").get("expected_row_count") == 95

@@ -49,7 +49,6 @@ from src.agents.execution_planner import (
     build_execution_plan,
     build_dataset_profile,
     build_plot_spec,
-    build_contract_min,
 )
 from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
@@ -93,9 +92,13 @@ from src.utils.case_alignment import build_case_alignment_report
 # REMOVED: from src.utils.contract_validation import ensure_role_runbooks  # V4.1 cutover
 from src.utils.data_engineer_preflight import data_engineer_preflight
 from src.utils.contract_accessors import (
+    get_clean_dataset_output_path,
+    get_clean_manifest_path,
     get_canonical_columns,
     get_artifact_requirements,
     get_derived_column_names,
+    get_declared_artifact_path,
+    get_declared_file_schema,
     get_outcome_columns,
     get_required_outputs,
     get_column_roles,
@@ -106,6 +109,7 @@ from src.utils.contract_accessors import (
     get_reviewer_gates_for_phase,
     get_decision_columns,
     filter_gate_list_for_phase,
+    normalize_artifact_path,
 )
 from src.utils.contract_validator import (
     normalize_contract_scope,
@@ -498,6 +502,101 @@ def _resolve_contract_pair_from_state(state: Dict[str, Any]) -> Tuple[Dict[str, 
     return contract_full, {}
 
 
+def _resolve_declared_artifact_path_from_state(
+    state: Dict[str, Any] | None,
+    target: str,
+    *,
+    owner: str | None = None,
+    kind: str | None = None,
+    fallback: str = "",
+) -> str:
+    state_obj = state if isinstance(state, dict) else {}
+    contract_full, _ = _resolve_contract_pair_from_state(state_obj)
+    resolved = get_declared_artifact_path(contract_full, target, owner=owner, kind=kind)
+    if resolved:
+        return resolved
+    if target == "cleaning_manifest.json":
+        state_manifest_path = normalize_artifact_path(state_obj.get("cleaning_manifest_path"))
+        if state_manifest_path:
+            return state_manifest_path
+    return normalize_artifact_path(fallback) if fallback else ""
+
+
+def _resolve_cleaning_manifest_path_from_state(
+    state: Dict[str, Any] | None,
+    fallback: str = "",
+) -> str:
+    state_obj = state if isinstance(state, dict) else {}
+    contract_full, _ = _resolve_contract_pair_from_state(state_obj)
+    resolved = get_clean_manifest_path(contract_full)
+    if resolved:
+        return resolved
+    state_manifest_path = normalize_artifact_path(state_obj.get("cleaning_manifest_path"))
+    if state_manifest_path:
+        return state_manifest_path
+    return normalize_artifact_path(fallback)
+
+
+def _resolve_declared_file_schema_from_state(
+    state: Dict[str, Any] | None,
+    target: str,
+    *,
+    owner: str | None = None,
+    kind: str | None = None,
+) -> Dict[str, Any]:
+    state_obj = state if isinstance(state, dict) else {}
+    contract_full, _ = _resolve_contract_pair_from_state(state_obj)
+    schema = get_declared_file_schema(contract_full, target, owner=owner, kind=kind)
+    return schema if isinstance(schema, dict) else {}
+
+
+def _load_declared_json_artifact_from_state(
+    state: Dict[str, Any] | None,
+    target: str,
+    *,
+    owner: str | None = None,
+    kind: str | None = None,
+    fallback: str = "",
+) -> Tuple[Dict[str, Any], str]:
+    path = _resolve_declared_artifact_path_from_state(
+        state,
+        target,
+        owner=owner,
+        kind=kind,
+        fallback=fallback,
+    )
+    payload = _load_json_safe(path) if path else {}
+    if isinstance(payload, dict):
+        return payload, path
+    return {}, path
+
+
+def _resolve_declared_artifact_path_from_contract_or_state(
+    contract: Dict[str, Any] | None,
+    state: Dict[str, Any] | None,
+    target: str,
+    *,
+    owner: str | None = None,
+    kind: str | None = None,
+    fallback: str = "",
+) -> str:
+    contract_obj = contract if isinstance(contract, dict) else {}
+    resolved = get_declared_artifact_path(contract_obj, target, owner=owner, kind=kind)
+    if resolved:
+        return resolved
+    if target == "cleaning_manifest.json":
+        manifest_path = get_clean_manifest_path(contract_obj)
+        if manifest_path:
+            return manifest_path
+    return _resolve_declared_artifact_path_from_state(
+        state,
+        target,
+        owner=owner,
+        kind=kind,
+        fallback=fallback,
+    )
+
+
 def _persist_execution_contract_snapshot(
     state: Dict[str, Any],
     contract: Dict[str, Any],
@@ -829,14 +928,19 @@ def _resolve_output_contract_report_for_facts(state: Dict[str, Any]) -> Dict[str
 
 def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     candidates: List[tuple[Dict[str, Any], str]] = []
+    metrics_path = _resolve_declared_artifact_path_from_state(
+        state,
+        "metrics.json",
+        kind="metrics",
+    )
 
     state_metrics = state.get("metrics_report")
     if isinstance(state_metrics, dict) and state_metrics:
         candidates.append((state_metrics, "state.metrics_report"))
 
-    file_metrics = _load_json_safe("data/metrics.json")
+    file_metrics = _load_json_safe(metrics_path) if metrics_path else {}
     if isinstance(file_metrics, dict) and file_metrics:
-        candidates.append((file_metrics, "data/metrics.json"))
+        candidates.append((file_metrics, metrics_path))
 
     insights = _load_json_safe("data/insights.json")
     if isinstance(insights, dict) and insights:
@@ -1243,7 +1347,12 @@ def _extract_primary_metric_for_board(
             "source": str(snapshot.get("primary_metric_source") or snapshot.get("source") or "primary_metric_snapshot"),
         }
 
-    weights_report = _load_json_safe("data/weights.json")
+    weights_path = _resolve_declared_artifact_path_from_state(
+        state,
+        "weights.json",
+        kind="weights",
+    )
+    weights_report = _load_json_safe(weights_path) if weights_path else {}
     if not isinstance(weights_report, dict):
         weights_report = {}
 
@@ -1284,7 +1393,11 @@ def _extract_primary_metric_for_board(
             contract_metric,
         )
         if direct_value is None:
-            raw_metrics = _load_json_safe("data/metrics.json")
+            raw_metrics, raw_metrics_path = _load_declared_json_artifact_from_state(
+                state,
+                "metrics.json",
+                kind="metrics",
+            )
             if isinstance(raw_metrics, dict):
                 direct_value = _extract_primary_metric(raw_metrics, contract_metric)
         if direct_value is not None:
@@ -1293,7 +1406,7 @@ def _extract_primary_metric_for_board(
                 "canonical_name": contract_canonical_name,
                 "value": float(direct_value),
                 "matched_key": contract_metric,
-                "source": str((metrics_report or {}).get("source") or "data/metrics.json.direct_scan"),
+                "source": str((metrics_report or {}).get("source") or f"{raw_metrics_path}.direct_scan"),
             }
         return {
             "name": contract_metric,
@@ -1337,7 +1450,10 @@ def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     metrics_report = _resolve_metrics_report_for_facts(state if isinstance(state, dict) else {})
     if not isinstance(metrics_report, dict):
         metrics_report = {}
-    alignment_check = _load_json_safe("data/alignment_check.json")
+    alignment_check, _alignment_path = _load_declared_json_artifact_from_state(
+        state,
+        "alignment_check.json",
+    )
     if not isinstance(alignment_check, dict):
         alignment_check = {}
     oc_report = _resolve_output_contract_report_for_facts(state if isinstance(state, dict) else {})
@@ -2280,7 +2396,7 @@ def _stage_illustrative_assets(
             lower = rel_posix.lower()
             is_plot = lower.startswith("static/plots/") and lower.endswith((".png", ".jpg", ".jpeg"))
             is_json = lower.startswith(("data/", "reports/")) and lower.endswith(".json")
-            is_scored_rows = rel_posix == "data/scored_rows.csv"
+            is_scored_rows = lower.endswith("/scored_rows.csv") or lower == "scored_rows.csv"
             if not (is_plot or is_json or is_scored_rows):
                 continue
             dest = os.path.join(report_root, rel)
@@ -2867,9 +2983,10 @@ def _build_signal_summary_context(
     norm_map: Dict[str, str],
     header_cols: List[str],
     dataset_semantics: Dict[str, Any] | None = None,
+    manifest_path: str | None = None,
 ) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
-    manifest = _load_json_safe("data/cleaning_manifest.json")
+    manifest = _load_json_safe(manifest_path) if manifest_path else {}
     row_count = _extract_manifest_row_count(manifest) or _estimate_row_count(
         csv_path,
         dialect.get("encoding", "utf-8"),
@@ -3237,7 +3354,7 @@ def _build_cleaned_data_summary_min(
         "source": "system_after_data_engineer",
         "advisory_only": True,
         "contract_precedence_policy": "if_conflict_use_ml_view_and_execution_contract",
-        "data_path": str(data_path or "data/cleaned_data.csv"),
+        "data_path": str(data_path or ""),
         "row_count": rows_total,
         "column_count": int(len(df_cols)),
         "split_column": split_column,
@@ -3458,17 +3575,11 @@ def _resolve_allowed_patterns_for_gate(contract: Any) -> List[str]:
     patterns: List[str] = []
     if not isinstance(contract, dict):
         return patterns
-    artifact_requirements = contract.get("artifact_requirements", {})
-    if not isinstance(artifact_requirements, dict):
-        artifact_requirements = {}
-    schema = artifact_requirements.get("file_schemas")
-    # V4.1: No legacy spec_extraction or artifact_schemas fallback
-    if isinstance(schema, dict):
-        scored_schema = schema.get("data/scored_rows.csv")
-        if isinstance(scored_schema, dict):
-            allowed_patterns = scored_schema.get("allowed_name_patterns")
-            if isinstance(allowed_patterns, list):
-                patterns.extend([str(pat) for pat in allowed_patterns if isinstance(pat, str) and pat.strip()])
+    scored_schema = get_declared_file_schema(contract, "scored_rows.csv")
+    if isinstance(scored_schema, dict):
+        allowed_patterns = scored_schema.get("allowed_name_patterns")
+        if isinstance(allowed_patterns, list):
+            patterns.extend([str(pat) for pat in allowed_patterns if isinstance(pat, str) and pat.strip()])
     return patterns
 
 def _resolve_contract_columns_for_cleaning(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
@@ -3878,14 +3989,6 @@ def _resolve_optional_runtime_downloads(contract: Dict[str, Any]) -> List[str]:
                 else:
                     _add_optional(item)
 
-    # Universal governance/debug artifacts that may be generated by ML scripts.
-    for path in (
-        "data/alignment_check.json",
-        "data/metrics.json",
-        "data/scored_rows.csv",
-        "data/case_alignment_report.json",
-    ):
-        _add_optional(path)
     return resolved
 
 
@@ -4391,9 +4494,12 @@ def _should_run_case_alignment(
         return False
     required_outputs = _resolve_required_outputs(contract)
     required_set = {str(p) for p in (required_outputs or []) if p}
-    requires_outputs = bool(
-        required_set.intersection({"data/scored_rows.csv", "data/weights.json", "data/case_summary.csv"})
-    )
+    required_basenames = {
+        os.path.basename(str(path)).lower()
+        for path in required_set
+        if str(path).strip()
+    }
+    requires_outputs = bool(required_basenames.intersection({"scored_rows.csv", "weights.json", "case_summary.csv"}))
     spec_requires = False
     if isinstance(evaluation_spec, dict):
         spec_requires = bool(
@@ -4420,11 +4526,15 @@ def _case_alignment_skip_reason(
             case_taxonomy = evaluation_spec.get("case_taxonomy") if isinstance(evaluation_spec.get("case_taxonomy"), list) else []
         case_key = case_key or evaluation_spec.get("case_key")
         case_columns = case_columns or evaluation_spec.get("case_columns")
+    manifest_path = get_clean_manifest_path(contract)
+    scored_rows_path = get_declared_artifact_path(contract, "scored_rows.csv")
 
-    def _scored_rows_has_group_signals(scored_path: str = "data/scored_rows.csv") -> bool:
+    def _scored_rows_has_group_signals(scored_path: str = "") -> bool:
+        if not scored_path:
+            return False
         if not os.path.exists(scored_path):
             return False
-        dialect = _load_output_dialect_local()
+        dialect = _load_output_dialect_local(manifest_path)
         header = _read_csv_header(scored_path, dialect.get("encoding", "utf-8"), dialect.get("sep", ","))
         if not header:
             return False
@@ -4434,11 +4544,11 @@ def _case_alignment_skip_reason(
         return bool(has_group and has_score)
 
     if not case_taxonomy:
-        if _scored_rows_has_group_signals():
+        if _scored_rows_has_group_signals(scored_rows_path):
             return ""
         return "case_taxonomy missing or empty"
     if not case_key and not case_columns:
-        if _scored_rows_has_group_signals():
+        if _scored_rows_has_group_signals(scored_rows_path):
             return ""
         return "case_key/case_columns missing"
     return ""
@@ -4542,13 +4652,13 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
             "Do not assign new columns into df; use Pipeline/ColumnTransformer or write derived columns to separate artifacts.",
         ],
         "DIALECT_LOADING_MISSING": [
-            "CRITICAL: You MUST load output_dialect from 'data/cleaning_manifest.json' BEFORE loading any CSV data.",
-            "Define a load_dialect() function that reads cleaning_manifest.json and extracts {sep, decimal, encoding}.",
+            "CRITICAL: You MUST load output_dialect from the declared cleaning manifest path BEFORE loading any CSV data.",
+            "Define a load_dialect() function that reads the declared cleaning manifest and extracts {sep, decimal, encoding}.",
             "Then use: sep, decimal, encoding = load_dialect() and apply them to ALL pd.read_csv() and .to_csv() calls.",
             "NEVER hardcode sep=',', decimal='.', or other dialect values. Always read from manifest first.",
             "Example pattern:",
             "  def load_dialect():",
-            "      manifest_path = 'data/cleaning_manifest.json'",
+            "      manifest_path = '<declared_cleaning_manifest_path>'",
             "      if os.path.exists(manifest_path):",
             "          with open(manifest_path, 'r') as f:",
             "              manifest = json.load(f)",
@@ -4590,10 +4700,10 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
             "Return valid Python syntax; do not output partial code or truncated blocks.",
         ],
         "ALIGNMENT_CHECK_OUTPUT": [
-            "Write data/alignment_check.json with per-requirement status and evidence (metrics, artifacts, or logs).",
+            "Write the declared alignment artifact with per-requirement status and evidence (metrics, artifacts, or logs).",
         ],
         "alignment_check_missing": [
-            "Create data/alignment_check.json and include it in required outputs.",
+            "Create the declared alignment artifact and include it in required outputs.",
         ],
         "alignment_method_choice": [
             "Revise methodology to align with contract requirements (segmentation, decision variables, validation).",
@@ -6131,10 +6241,13 @@ def ml_quality_preflight(
         if not (has_imputer or has_nan_robust_model or has_dropna):
             issues.append("IMPUTER_REQUIRED")
 
-    # CRITICAL: Check for dialect loading from cleaning_manifest.json
+    # CRITICAL: Check for dialect loading from the declared cleaning manifest
     # ML Engineer MUST read output_dialect before loading data
     has_load_dialect_function = "def load_dialect" in code
-    has_manifest_read = "cleaning_manifest.json" in code and ("json.load" in code or "pd.read_json" in code)
+    has_manifest_read = (
+        any(token in code_lower for token in ["cleaning_manifest", "manifest_path", "output_manifest"])
+        and ("json.load" in code or "pd.read_json" in code)
+    )
     has_dialect_extraction = "output_dialect" in code and "manifest" in code_lower
 
     # Check if pd.read_csv is called with dialect parameters
@@ -7062,8 +7175,11 @@ def _resolve_artifact_gate_dialect(state: Dict[str, Any], contract: Dict[str, An
     csv_sep = state.get("csv_sep") or None
     csv_decimal = state.get("csv_decimal") or None
     csv_encoding = state.get("csv_encoding") or None
-    if (not csv_sep or not csv_decimal or not csv_encoding) and os.path.exists("data/cleaning_manifest.json"):
-        manifest = _load_json_safe("data/cleaning_manifest.json")
+    manifest_path = _resolve_cleaning_manifest_path_from_state(state if isinstance(state, dict) else {})
+    if not manifest_path and isinstance(contract, dict):
+        manifest_path = get_clean_manifest_path(contract)
+    if (not csv_sep or not csv_decimal or not csv_encoding) and manifest_path and os.path.exists(manifest_path):
+        manifest = _load_json_safe(manifest_path)
         output_dialect = manifest.get("output_dialect") if isinstance(manifest, dict) else None
         if isinstance(output_dialect, dict):
             if not csv_sep:
@@ -7233,22 +7349,33 @@ def _collect_iteration_diagnostics(state: Dict[str, Any]) -> Dict[str, Any]:
     csv_decimal = state.get("csv_decimal", ".")
     csv_encoding = state.get("csv_encoding", "utf-8")
     contract = state.get("execution_contract", {}) if isinstance(state, dict) else {}
-    scored_path = "data/scored_rows.csv"
+    scored_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "scored_rows.csv",
+    )
     seg_stats = _summarize_segmentation_stats(scored_path, csv_sep, csv_decimal, csv_encoding, contract)
     n_rows = seg_stats.get("n_rows")
     if n_rows is None:
         fallback_path = str(state.get("ml_data_path") or "").strip()
         if not fallback_path or not os.path.exists(fallback_path):
-            fallback_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
+            fallback_path = get_clean_dataset_output_path(contract) or ""
         if fallback_path and os.path.exists(fallback_path):
             try:
                 n_rows = _count_raw_rows(fallback_path, csv_encoding, csv_sep, csv_decimal)
                 seg_stats["n_rows"] = n_rows
             except Exception:
                 pass
+    curves_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "price_sensitivity_curves.json",
+    )
+    guide_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "optimal_pricing_guide.csv",
+    )
     pricing_stats = _summarize_pricing_artifacts(
-        curves_path="data/price_sensitivity_curves.json",
-        guide_path="data/optimal_pricing_guide.csv",
+        curves_path=curves_path,
+        guide_path=guide_path,
         csv_sep=csv_sep,
         csv_decimal=csv_decimal,
         csv_encoding=csv_encoding,
@@ -7265,8 +7392,14 @@ def _collect_iteration_diagnostics(state: Dict[str, Any]) -> Dict[str, Any]:
 def _validate_artifact_content(state: Dict[str, Any]) -> tuple[List[str], Dict[str, Any]]:
     diagnostics = _collect_iteration_diagnostics(state)
     issues: List[str] = []
-    curves_path = "data/price_sensitivity_curves.json"
-    guide_path = "data/optimal_pricing_guide.csv"
+    curves_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "price_sensitivity_curves.json",
+    )
+    guide_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "optimal_pricing_guide.csv",
+    )
     if curves_path and os.path.exists(curves_path):
         if diagnostics.get("curves_points", 0) == 0:
             issues.append("price_sensitivity_curves_empty")
@@ -7309,12 +7442,22 @@ def _score_attempt(
     score -= float(len(missing)) * 2.0
     score -= float(len(content_issues)) * 3.0
 
-    # ML metric bonus: extract primary metric from metrics.json and add it
+    # ML metric bonus: extract primary metric from the declared metrics artifact and add it
     # as a dominant score component.  We use a large multiplier (1000x) so
     # that even a 0.0001 AUC improvement (+0.1 score) overwhelms any
     # completeness difference (~1-2 points).
     try:
-        metrics_json = _load_json_safe("data/metrics.json")
+        metrics_candidates: List[str] = []
+        for path in artifact_paths or []:
+            normalized = normalize_artifact_path(path)
+            if normalized and os.path.basename(normalized).lower() == "metrics.json" and normalized not in metrics_candidates:
+                metrics_candidates.insert(0, normalized)
+        metrics_json = {}
+        for metrics_path in metrics_candidates:
+            candidate_payload = _load_json_safe(metrics_path)
+            if isinstance(candidate_payload, dict) and candidate_payload:
+                metrics_json = candidate_payload
+                break
         if isinstance(metrics_json, dict):
             # Determine metric name from metrics.json or default
             metric_name = str(metrics_json.get("primary_metric") or "roc_auc").strip()
@@ -7765,17 +7908,20 @@ def _artifact_alignment_gate(
 
     flags = _resolve_eval_flags(evaluation_spec)
     requires_row_scoring = bool(flags.get("requires_row_scoring"))
+    declared_scored_rows_path = normalize_artifact_path(
+        get_declared_artifact_path(contract if isinstance(contract, dict) else {}, "scored_rows.csv")
+    )
     required_outputs = contract.get("required_outputs", []) if isinstance(contract, dict) else []
-    if "data/scored_rows.csv" in (required_outputs or []):
+    if declared_scored_rows_path and declared_scored_rows_path in (required_outputs or []):
         requires_row_scoring = True
     deliverables = _resolve_contract_deliverables(contract) if isinstance(contract, dict) else []
     if isinstance(deliverables, list):
         for item in deliverables:
-            if isinstance(item, dict) and item.get("path") == "data/scored_rows.csv":
+            if isinstance(item, dict) and normalize_artifact_path(item.get("path")) == declared_scored_rows_path:
                 if bool(item.get("required")):
                     requires_row_scoring = True
                 break
-            if isinstance(item, str) and item == "data/scored_rows.csv":
+            if isinstance(item, str) and normalize_artifact_path(item) == declared_scored_rows_path:
                 requires_row_scoring = True
                 break
 
@@ -7839,7 +7985,7 @@ def _artifact_alignment_gate(
         # V4.1: Use artifact_requirements.file_schemas only, no legacy fallback
         reqs = contract.get("artifact_requirements") or {}
         schema = _normalize_schema(reqs.get("file_schemas"))
-    scored_schema = schema.get("data/scored_rows.csv") if isinstance(schema, dict) else {}
+    scored_schema = get_declared_file_schema(contract, "scored_rows.csv")
     allowed_extra = scored_schema.get("allowed_extra_columns") if isinstance(scored_schema, dict) else None
     allowed_patterns = scored_schema.get("allowed_name_patterns") if isinstance(scored_schema, dict) else None
 
@@ -8093,7 +8239,7 @@ def _normalize_metrics_from_weights(weights_obj: Dict[str, Any]) -> Dict[str, An
     }
     return report
 
-def _load_output_dialect_local(manifest_path: str = "data/cleaning_manifest.json") -> Dict[str, str]:
+def _load_output_dialect_local(manifest_path: str = "") -> Dict[str, str]:
     defaults = {"sep": ",", "decimal": ".", "encoding": "utf-8"}
     manifest = _load_json_safe(manifest_path) or {}
     if isinstance(manifest, dict):
@@ -8121,8 +8267,9 @@ def _compute_adjacent_violations(ref_series, score_series) -> int:
     return int(violations)
 
 def _compute_metrics_from_scored_rows(
-    scored_rows_path: str = "data/scored_rows.csv",
-    case_summary_path: str = "data/case_summary.csv",
+    scored_rows_path: str = "",
+    case_summary_path: str = "",
+    manifest_path: str = "",
     weights_obj: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     if not os.path.exists(scored_rows_path):
@@ -8131,7 +8278,7 @@ def _compute_metrics_from_scored_rows(
         import pandas as pd
     except Exception:
         return {}
-    dialect = _load_output_dialect_local()
+    dialect = _load_output_dialect_local(manifest_path)
     try:
         df = pd.read_csv(
             scored_rows_path,
@@ -9413,8 +9560,9 @@ def _build_reviewer_evidence_packet(
     if not has_segmentation:
         seg_block = metrics_report.get("segmentation") if isinstance(metrics_report, dict) else None
         has_segmentation = isinstance(seg_block, dict) and bool(seg_block)
-    has_alignment_check = os.path.exists("data/alignment_check.json") or any(
-        "alignment_check.json" in str(path).lower() for path in present_outputs
+    has_alignment_check = any(
+        os.path.basename(str(path or "")).lower() == "alignment_check.json"
+        for path in present_outputs
     )
     has_metrics = bool(metric_lines)
 
@@ -11332,7 +11480,7 @@ def _suggest_next_actions(
     if "UNKNOWN_COLUMNS_REFERENCED" in issues or "unknown_columns" in reasons:
         actions.append("Use only contract/canonical columns; avoid invented names.")
     if "DIALECT_LOADING_MISSING" in issues:
-        actions.append("CRITICAL: Define load_dialect() function and read output_dialect from 'data/cleaning_manifest.json' before ANY data loading.")
+        actions.append("CRITICAL: Define load_dialect() function and read output_dialect from the declared cleaning manifest path before ANY data loading.")
     if "BASELINE_REQUIRED" in issues or "baseline_missing" in reasons:
         actions.append("Add a DummyClassifier/DummyRegressor baseline with metrics.")
     if "IMPUTER_REQUIRED" in issues or "imputer_missing" in reasons:
@@ -12167,17 +12315,44 @@ def _summarize_case_summary(path: str) -> Dict[str, Any]:
         "case_col": case_col,
     }
 
-def _persist_iteration_artifacts(iter_id: int) -> Dict[str, str]:
+def _persist_iteration_artifacts(iter_id: int, state: Dict[str, Any] | None = None) -> Dict[str, str]:
     if not iter_id or iter_id < 1:
         return {}
     import shutil
     os.makedirs(os.path.join("artifacts", "iterations"), exist_ok=True)
+    state_obj = state if isinstance(state, dict) else {}
     mappings = {
         "case_alignment_report": ("data/case_alignment_report.json", f"case_alignment_report_iter_{iter_id}.json"),
-        "weights": ("data/weights.json", f"weights_iter_{iter_id}.json"),
-        "metrics": ("data/metrics.json", f"metrics_iter_{iter_id}.json"),
-        "case_summary": ("data/case_summary.csv", f"case_summary_iter_{iter_id}.csv"),
-        "scored_rows": ("data/scored_rows.csv", f"scored_rows_iter_{iter_id}.csv"),
+        "weights": (
+            _resolve_declared_artifact_path_from_state(
+                state_obj,
+                "weights.json",
+                kind="weights",
+            ),
+            f"weights_iter_{iter_id}.json",
+        ),
+        "metrics": (
+            _resolve_declared_artifact_path_from_state(
+                state_obj,
+                "metrics.json",
+                kind="metrics",
+            ),
+            f"metrics_iter_{iter_id}.json",
+        ),
+        "case_summary": (
+            _resolve_declared_artifact_path_from_state(
+                state_obj,
+                "case_summary.csv",
+            ),
+            f"case_summary_iter_{iter_id}.csv",
+        ),
+        "scored_rows": (
+            _resolve_declared_artifact_path_from_state(
+                state_obj,
+                "scored_rows.csv",
+            ),
+            f"scored_rows_iter_{iter_id}.csv",
+        ),
     }
     saved: Dict[str, str] = {}
     for key, (src, dst_name) in mappings.items():
@@ -14650,19 +14825,16 @@ def _detect_de_heavy_runner_protocol_mismatch(
     elif error_payload:
         err_parts.append(str(error_payload))
     err_text = " ".join(part for part in err_parts if part).lower()
-    missing_ml_outputs = all(
-        token in err_text
-        for token in ["data/metrics.json", "data/scored_rows.csv", "data/alignment_check.json"]
-    )
-    if not missing_ml_outputs:
-        return False
-    cleaned_success_logged = "cleaned data written to" in str(heavy_log_text or "").lower()
-    downloaded_keys = set(downloaded.keys()) if isinstance(downloaded, dict) else set()
     expected = {
         _normalize_output_path(path)
         for path in (expected_outputs or [])
         if isinstance(path, str) and path.strip()
     }
+    missing_ml_outputs = bool(expected) and all(token.lower() in err_text for token in expected)
+    if not missing_ml_outputs:
+        return False
+    cleaned_success_logged = "cleaned data written to" in str(heavy_log_text or "").lower()
+    downloaded_keys = set(downloaded.keys()) if isinstance(downloaded, dict) else set()
     expected_output_seen = any(path in downloaded_keys for path in expected)
     return bool(cleaned_success_logged or expected_output_seen)
 
@@ -14760,15 +14932,6 @@ def _candidate_ml_input_paths(state: Dict[str, Any]) -> List[str]:
                 norm = _normalize_output_path(path)
                 if norm.endswith(".csv") and "/clean" in norm.lower():
                     candidates.append(norm)
-
-    # Canonical/project aliases (universal fallbacks)
-    candidates.extend(
-        [
-            "data/cleaned_dataset.csv",
-            "data/cleaned_data.csv",
-            "data/cleaned_full.csv",
-        ]
-    )
 
     normalized: List[str] = []
     seen: set[str] = set()
@@ -15115,7 +15278,10 @@ def _finalize_heavy_execution(
 
     artifact_issues = _artifact_alignment_gate(
         cleaned_path=cleaned_path,
-        scored_path="data/scored_rows.csv",
+        scored_path=_resolve_declared_artifact_path_from_state(
+            state if isinstance(state, dict) else {},
+            "scored_rows.csv",
+        ),
         contract=contract,
         evaluation_spec=eval_spec,
         csv_sep=csv_sep,
@@ -15758,53 +15924,9 @@ def run_execution_planner(state: AgentState) -> AgentState:
     contract_scope = normalize_contract_scope(contract.get("scope")) if isinstance(contract, dict) else ""
     if not evaluation_spec and contract_scope in {"ml_only", "full_pipeline"}:
         print("Warning: execution_contract has no evaluation_spec; reviewers will use contract-level gates only.")
-    # Deterministic enrichment: build_contract_min computes file_schemas,
-    # row_count_hints (n_train/n_test), and scored_rows_schema from data_profile.
-    # The LLM contract rarely populates these correctly, so we always merge
-    # the deterministic values as a post-processing step (universal, idempotent).
-    try:
-        _deterministic_enrichment = build_contract_min(
-            full_contract_or_partial=copy.deepcopy(contract) if isinstance(contract, dict) else {},
-            strategy=strategy if isinstance(strategy, dict) else {},
-            column_inventory=column_inventory or [],
-            relevant_columns=column_inventory or [],
-            target_candidates=None,
-            data_profile=planner_data_profile if isinstance(planner_data_profile, dict) else {},
-            business_objective_hint=business_objective or "",
-        )
-        if isinstance(_deterministic_enrichment, dict) and _deterministic_enrichment:
-            _det_artifacts = _deterministic_enrichment.get("artifact_requirements")
-            if isinstance(_det_artifacts, dict):
-                _contract_artifacts = contract.get("artifact_requirements")
-                if not isinstance(_contract_artifacts, dict):
-                    _contract_artifacts = {}
-                    contract["artifact_requirements"] = _contract_artifacts
-                # Merge file_schemas (deterministic always wins over empty)
-                _det_fs = _det_artifacts.get("file_schemas")
-                if isinstance(_det_fs, dict) and _det_fs:
-                    _existing_fs = _contract_artifacts.get("file_schemas")
-                    if not isinstance(_existing_fs, dict) or not _existing_fs:
-                        _contract_artifacts["file_schemas"] = _det_fs
-                # Merge row_count_hints (prefer richer set)
-                _det_rch = _det_artifacts.get("row_count_hints")
-                if isinstance(_det_rch, dict) and _det_rch:
-                    _existing_rch = _contract_artifacts.get("row_count_hints")
-                    if not isinstance(_existing_rch, dict):
-                        _existing_rch = {}
-                    for _rch_key in ("n_total", "n_train", "n_test"):
-                        _rch_val = _det_rch.get(_rch_key)
-                        if isinstance(_rch_val, int) and _rch_val > 0 and _rch_key not in _existing_rch:
-                            _existing_rch[_rch_key] = _rch_val
-                    if _existing_rch:
-                        _contract_artifacts["row_count_hints"] = _existing_rch
-                # Merge scored_rows_schema (deterministic always wins over empty)
-                _det_srs = _det_artifacts.get("scored_rows_schema")
-                if isinstance(_det_srs, dict) and _det_srs:
-                    _existing_srs = _contract_artifacts.get("scored_rows_schema")
-                    if not isinstance(_existing_srs, dict) or not _existing_srs.get("required_any_of_groups"):
-                        _contract_artifacts["scored_rows_schema"] = _det_srs
-    except Exception as _enrich_err:
-        print(f"Warning: deterministic contract enrichment failed: {_enrich_err}")
+    # LLM-first policy: do not mutate the planner contract with deterministic
+    # scaffold or enrichment defaults at runtime. The graph may validate and
+    # diagnose the contract, but it must not backfill semantic artifact fields.
 
     work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
     try:
@@ -19220,7 +19342,7 @@ def run_engineer(state: AgentState) -> AgentState:
             data_audit_context,
             "WARNING: execution_contract missing; using minimal contract context only.",
         )
-    manifest_path = "data/cleaning_manifest.json"
+    manifest_path = _resolve_cleaning_manifest_path_from_state(state if isinstance(state, dict) else {})
     if os.path.exists(manifest_path):
         use_manifest = bool(state.get("use_output_dialect") or state.get("dialect_from_manifest"))
         if not use_manifest and csv_sep == "," and csv_decimal == "." and str(csv_encoding).lower() in {"utf-8", "utf8"}:
@@ -19484,6 +19606,7 @@ def run_engineer(state: AgentState) -> AgentState:
                     norm_map,
                     header_cols,
                     state.get("dataset_semantics") if isinstance(state, dict) else None,
+                    _resolve_cleaning_manifest_path_from_state(state if isinstance(state, dict) else {}),
                 )
                 if signal_summary:
                     context_ops_blocks.append(
@@ -20715,8 +20838,9 @@ def execute_code(state: AgentState) -> AgentState:
             for rel_path in optional_download_artifacts:
                 download_map.setdefault(rel_path, rel_path)
             support_files = []
+            manifest_support_path = _resolve_cleaning_manifest_path_from_state(state if isinstance(state, dict) else {})
             for rel_path in [
-                "data/cleaning_manifest.json",
+                manifest_support_path,
                 "data/column_sets.json",
                 "data/column_inventory.json",
                 "data/execution_contract.json",
@@ -20877,8 +21001,13 @@ def execute_code(state: AgentState) -> AgentState:
 
     # Prevent stale metrics from previous iterations
     try:
-        if os.path.exists("data/metrics.json"):
-            os.remove("data/metrics.json")
+        stale_metrics_path = _resolve_declared_artifact_path_from_state(
+            state if isinstance(state, dict) else {},
+            "metrics.json",
+            kind="metrics",
+        )
+        if stale_metrics_path and os.path.exists(stale_metrics_path):
+            os.remove(stale_metrics_path)
     except Exception:
         pass
 
@@ -21041,7 +21170,7 @@ def execute_code(state: AgentState) -> AgentState:
                     print(f"SANDBOX_INPUT_ALIASES: {COMMON_CLEANED_ALIASES}")
 
                 # P2.1: Upload manifest to canonical path and root
-                local_manifest = "data/cleaning_manifest.json"
+                local_manifest = _resolve_cleaning_manifest_path_from_state(state if isinstance(state, dict) else {})
                 remote_manifest_abs = canonical_abs(run_root, CANONICAL_MANIFEST_REL)
                 remote_manifest_root_abs = os.path.join(run_root, "cleaning_manifest.json").replace("\\", "/")
 
@@ -21070,9 +21199,17 @@ def execute_code(state: AgentState) -> AgentState:
                              code = code.replace(f"./{local_csv}", remote_clean_abs)
 
                 # Manifest patching -> Point to ROOT manifest as requested
-                code = code.replace("./data/cleaning_manifest.json", remote_manifest_root_abs)
-                code = code.replace("'data/cleaning_manifest.json'", f"'{remote_manifest_root_abs}'")
-                code = code.replace('"data/cleaning_manifest.json"', f'"{remote_manifest_root_abs}"')
+                manifest_literals = {
+                    "./data/cleaning_manifest.json",
+                    "data/cleaning_manifest.json",
+                    local_manifest,
+                }
+                for manifest_literal in manifest_literals:
+                    if not manifest_literal:
+                        continue
+                    code = code.replace(f"./{manifest_literal}" if not str(manifest_literal).startswith("./") else str(manifest_literal), remote_manifest_root_abs)
+                    code = code.replace(f"'{manifest_literal}'", f"'{remote_manifest_root_abs}'")
+                    code = code.replace(f'\"{manifest_literal}\"', f'\"{remote_manifest_root_abs}\"')
 
                 # Inject robust prelude
                 working_dir_injection = (
@@ -21277,34 +21414,6 @@ def execute_code(state: AgentState) -> AgentState:
                         else:
                             print(f"Warning: failed to download optional output {remote_opt}")
 
-                # Defense-in-depth: download canonical outputs if they exist in sandbox
-                for rel_path in ["data/scored_rows.csv", "data/alignment_check.json"]:
-                    if os.path.exists(rel_path):
-                        continue
-                    remote_path = f"{run_root}/{rel_path}"
-                    list_cmd = f"sh -c 'ls -1 {remote_path} 2>/dev/null || true'"
-                    lst = sandbox.commands.run(list_cmd)
-                    if lst.exit_code != 0:
-                        continue
-                    files = [p for p in lst.stdout.strip().split("\n") if p]
-                    for remote_extra in files:
-                        if not remote_extra:
-                            continue
-                        content = safe_download_bytes(sandbox, remote_extra)
-                        if content is None:
-                            print(f"Warning: failed to download optional canonical output {remote_extra}")
-                            continue
-                        if remote_extra.startswith(run_root):
-                            local_path = remote_extra[len(run_root):].lstrip("/")
-                        elif remote_extra.startswith("/home/user/"):
-                            local_path = remote_extra[len("/home/user/"):].lstrip("/")
-                        else:
-                            local_path = remote_extra.lstrip("/")
-                        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-                        with open(local_path, "wb") as f_local:
-                            f_local.write(content)
-                        downloaded_paths.append(local_path)
-                        print(f"Downloaded canonical output: {local_path}")
                 list_cmd = f"sh -c 'cd {run_root} && find . -maxdepth 5 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
                 outputs_listing = []
                 try:
@@ -21412,7 +21521,10 @@ def execute_code(state: AgentState) -> AgentState:
 
     artifact_issues = _artifact_alignment_gate(
         cleaned_path=cleaned_path,
-        scored_path="data/scored_rows.csv",
+        scored_path=_resolve_declared_artifact_path_from_state(
+            state if isinstance(state, dict) else {},
+            "scored_rows.csv",
+        ),
         contract=contract,
         evaluation_spec=eval_spec,
         csv_sep=csv_sep,
@@ -21905,8 +22017,12 @@ def _check_decisioning_columns(decisioning: Dict[str, Any], max_rows: int = 500)
         return result
     output = decisioning.get("output") if isinstance(decisioning.get("output"), dict) else {}
     required_columns = output.get("required_columns") or []
-    file_path = output.get("file") or "data/scored_rows.csv"
+    file_path = str(output.get("file") or "").strip()
     if not required_columns:
+        return result
+    if not file_path:
+        result["missing_file"] = ""
+        result["missing_file_spec"] = True
         return result
     if not os.path.exists(file_path):
         result["missing_file"] = file_path
@@ -22083,7 +22199,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         if decisioning_required and (missing_file or missing_columns or constraint_violations):
             message = (
                 "Decisioning requirements missing: "
-                f"file={missing_file if missing_file else 'data/scored_rows.csv'}, "
+                f"file={missing_file if missing_file else '<undeclared decisioning output file>'}, "
                 f"columns={missing_columns}, constraints={constraint_violations}"
             )
             history = list(state.get("feedback_history", []))
@@ -22224,22 +22340,34 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "skip_reason": skip_reason,
         }
     elif case_alignment_required:
+        declared_scored_rows_path = _resolve_declared_artifact_path_from_state(
+            state if isinstance(state, dict) else {},
+            "scored_rows.csv",
+        )
+        declared_case_summary_path = _resolve_declared_artifact_path_from_state(
+            state if isinstance(state, dict) else {},
+            "case_summary.csv",
+        )
+        declared_weights_path = _resolve_declared_artifact_path_from_state(
+            state if isinstance(state, dict) else {},
+            "weights.json",
+            kind="weights",
+        )
         data_paths = []
         ml_data_path = state.get("ml_data_path")
         if isinstance(ml_data_path, str) and ml_data_path and os.path.exists(ml_data_path):
             data_paths.append(ml_data_path)
-        if os.path.exists("data/cleaned_full.csv"):
-            data_paths.append("data/cleaned_full.csv")
-        if os.path.exists("data/cleaned_data.csv"):
-            data_paths.append("data/cleaned_data.csv")
-        if os.path.exists("data/scored_rows.csv"):
-            data_paths.append("data/scored_rows.csv")
+        declared_cleaned_path = get_clean_dataset_output_path(contract)
+        if declared_cleaned_path and os.path.exists(declared_cleaned_path):
+            data_paths.append(declared_cleaned_path)
+        if declared_scored_rows_path and os.path.exists(declared_scored_rows_path):
+            data_paths.append(declared_scored_rows_path)
         case_report = build_case_alignment_report(
             contract=contract,
-            case_summary_path="data/case_summary.csv",
-            weights_path="data/weights.json",
+            case_summary_path=declared_case_summary_path,
+            weights_path=declared_weights_path,
             data_paths=data_paths,
-            scored_rows_path="data/scored_rows.csv",
+            scored_rows_path=declared_scored_rows_path,
         )
         try:
             metrics = case_report.get("metrics", {}) if isinstance(case_report, dict) else {}
@@ -22256,9 +22384,29 @@ def run_result_evaluator(state: AgentState) -> AgentState:
 
     # Detect stale metrics file across iterations (diagnostic for ML)
     metrics_report = metrics_report if isinstance(metrics_report, dict) else {}
-    raw_metrics_payload = _load_json_safe("data/metrics.json")
+    metrics_path = _resolve_declared_artifact_path_from_contract_or_state(
+        contract,
+        state if isinstance(state, dict) else {},
+        "metrics.json",
+        kind="metrics",
+    )
+    scored_rows_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "scored_rows.csv",
+    )
+    case_summary_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "case_summary.csv",
+    )
+    weights_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "weights.json",
+        kind="weights",
+    )
+    manifest_path = _resolve_cleaning_manifest_path_from_state(state if isinstance(state, dict) else {})
+    raw_metrics_payload = _load_json_safe(metrics_path) if metrics_path else {}
     raw_metrics_present = isinstance(raw_metrics_payload, dict) and bool(raw_metrics_payload)
-    weights_report = _load_json_safe("data/weights.json")
+    weights_report = _load_json_safe(weights_path) if weights_path else {}
     metrics_signature = _hash_json(metrics_report)
     weights_signature = _hash_json(weights_report)
     prev_metrics_signature = state.get("metrics_signature")
@@ -22268,15 +22416,15 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         if weights_signature and weights_signature != prev_weights_signature:
             metrics_stale = True
             new_history.append(
-                "METRICS_STALE: data/metrics.json unchanged while weights changed; recompute metrics from current outputs."
+                f"METRICS_STALE: {metrics_path} unchanged while weights changed; recompute metrics from current outputs."
             )
         else:
             new_history.append(
-                "METRICS_UNCHANGED: data/metrics.json is identical to the prior iteration; ensure metrics are recomputed and saved per run."
+                f"METRICS_UNCHANGED: {metrics_path} is identical to the prior iteration; ensure metrics are recomputed and saved per run."
             )
     if not metrics_report:
         new_history.append(
-            "METRICS_MISSING: data/metrics.json not found or empty; downstream evaluation may be using stale metrics."
+            f"METRICS_MISSING: {metrics_path} not found or empty; downstream evaluation may be using stale metrics."
         )
         contract_metric_name = _resolve_contract_primary_metric_name(
             state if isinstance(state, dict) else {},
@@ -22287,7 +22435,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             if direct_value is not None:
                 metrics_report = {
                     "model_performance": {contract_metric_name: float(direct_value)},
-                    "source": "data/metrics.json.direct_scan",
+                    "source": f"{metrics_path}.direct_scan",
                 }
                 metrics_signature = _hash_json(metrics_report)
                 new_history.append(
@@ -22297,8 +22445,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         synthesized = _normalize_metrics_from_weights(weights_report)
         if not synthesized:
             synthesized = _compute_metrics_from_scored_rows(
-                scored_rows_path="data/scored_rows.csv",
-                case_summary_path="data/case_summary.csv",
+                scored_rows_path=scored_rows_path,
+                case_summary_path=case_summary_path,
+                manifest_path=manifest_path,
                 weights_obj=weights_report,
             )
         if synthesized:
@@ -22309,14 +22458,15 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 "METRICS_FALLBACK: metrics synthesized from weights/scored_rows due to missing or stale metrics.json."
             )
             try:
-                os.makedirs("data", exist_ok=True)
-                fallback_target = "data/metrics.json"
+                diagnostic_metrics_path = os.path.join("artifacts", "diagnostics", "metrics_fallback.json")
+                fallback_target = metrics_path or diagnostic_metrics_path
                 if raw_metrics_present and not metrics_stale:
-                    fallback_target = "data/metrics_fallback.json"
+                    fallback_target = diagnostic_metrics_path
+                os.makedirs(os.path.dirname(fallback_target), exist_ok=True)
                 dump_json(fallback_target, metrics_report)
-                if fallback_target != "data/metrics.json":
+                if fallback_target != (metrics_path or ""):
                     new_history.append(
-                        "METRICS_FALLBACK_PRESERVE_RAW: wrote synthesized metrics to data/metrics_fallback.json and preserved existing data/metrics.json."
+                        f"METRICS_FALLBACK_DIAGNOSTIC: wrote synthesized metrics to {fallback_target} and preserved declared metrics artifact."
                     )
             except Exception as metrics_err:
                 print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
@@ -22346,7 +22496,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         except Exception as consistency_err:
             print(f"Warning: model metrics consistency validation failed: {consistency_err}")
     iter_id = int(state.get("iteration_count", 0)) + 1
-    saved_iter_artifacts = _persist_iteration_artifacts(iter_id)
+    saved_iter_artifacts = _persist_iteration_artifacts(iter_id, state if isinstance(state, dict) else {})
 
     if case_alignment_required and case_report.get("status") == "FAIL":
         feedback = f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('explanation')}"
@@ -22384,7 +22534,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         retry_worth_it = True
 
     alignment_failed_gates: List[str] = []
-    alignment_check = _load_json_safe("data/alignment_check.json")
+    alignment_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "alignment_check.json",
+    )
+    alignment_check = _load_json_safe(alignment_path) if alignment_path else {}
     alignment_requirements = []
     if isinstance(evaluation_spec, dict):
         alignment_requirements = evaluation_spec.get("alignment_requirements") or []
@@ -22395,7 +22549,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         if not alignment_check:
             status = "NEEDS_IMPROVEMENT"
             alignment_failed_gates.append("alignment_check_missing")
-            msg = "ALIGNMENT_CHECK_MISSING: data/alignment_check.json not found."
+            msg = f"ALIGNMENT_CHECK_MISSING: {alignment_path or 'alignment_check.json'} not found."
             feedback = f"{feedback}\n{msg}" if feedback else msg
             new_history.append(msg)
         else:
@@ -22405,7 +22559,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             if normalized_alignment != alignment_check:
                 alignment_check = normalized_alignment
                 try:
-                    dump_json("data/alignment_check.json", alignment_check)
+                    target_alignment_path = alignment_path or os.path.join("artifacts", "diagnostics", "alignment_check.json")
+                    os.makedirs(os.path.dirname(target_alignment_path), exist_ok=True)
+                    dump_json(target_alignment_path, alignment_check)
                 except Exception:
                     pass
             raw_status = str(alignment_check.get("status", "")).upper()
@@ -22432,7 +22588,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 new_history.append(msg)
                 feedback = f"{feedback}\n{msg}" if feedback else msg
                 try:
-                    dump_json("data/alignment_check.json", alignment_check)
+                    target_alignment_path = alignment_path or os.path.join("artifacts", "diagnostics", "alignment_check.json")
+                    os.makedirs(os.path.dirname(target_alignment_path), exist_ok=True)
+                    dump_json(target_alignment_path, alignment_check)
                 except Exception:
                     pass
             data_modes = {"data_limited", "data", "insufficient_data", "data_limitations"}
@@ -23438,7 +23596,16 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         iter_id=iter_id,
         metrics_report=metrics_report,
         case_report=case_report,
-        weights_report=_load_json_safe("data/weights.json"),
+        weights_report=(
+            _load_json_safe(
+                _resolve_declared_artifact_path_from_state(
+                    state if isinstance(state, dict) else {},
+                    "weights.json",
+                    kind="weights",
+                )
+            )
+            or {}
+        ),
         code=code,
         prev_summary=prev_summary,
         advisor_note=result_state.get("ml_results_advice"),
@@ -25405,15 +25572,6 @@ def _resolve_ml_outputs_for_metric_round(contract: Dict[str, Any], state: Dict[s
             outputs = []
         excluded = _resolve_ml_de_input_exclusions(state)
         outputs = [path for path in outputs if str(path or "").lower() not in excluded]
-
-    extras = ["data/metrics.json", "data/submission.csv", "data/scored_rows.csv"]
-    seen = {str(path).lower() for path in outputs}
-    for path in extras:
-        if path.lower() in seen:
-            continue
-        if os.path.exists(path):
-            outputs.append(path)
-            seen.add(path.lower())
     return _normalize_output_path_list(outputs)
 
 
@@ -26271,7 +26429,13 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     metric_higher_is_better = metric_target.get("higher_is_better")
     if not isinstance(metric_higher_is_better, bool):
         metric_higher_is_better = bool(_metric_higher_is_better(metric_name))
-    baseline_metrics = _load_json_safe("data/metrics.json")
+    metrics_path = _resolve_declared_artifact_path_from_contract_or_state(
+        contract,
+        state if isinstance(state, dict) else {},
+        "metrics.json",
+        kind="metrics",
+    )
+    baseline_metrics = _load_json_safe(metrics_path) if metrics_path else {}
     if not isinstance(baseline_metrics, dict):
         baseline_metrics = {}
 
@@ -27017,7 +27181,13 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     baseline_verdict = normalize_review_status(state.get("ml_improvement_baseline_review_verdict") or "APPROVED")
     force_finalize_reason = str(state.get("ml_improvement_force_finalize_reason") or "").strip().lower()
     force_finalize = bool(force_finalize_reason)
-    current_metrics = _load_json_safe("data/metrics.json")
+    metrics_path = _resolve_declared_artifact_path_from_contract_or_state(
+        contract,
+        state if isinstance(state, dict) else {},
+        "metrics.json",
+        kind="metrics",
+    )
+    current_metrics = _load_json_safe(metrics_path) if metrics_path else {}
     if not isinstance(current_metrics, dict):
         current_metrics = {}
     improved_value = _extract_primary_metric(current_metrics, metric_name)
@@ -27223,7 +27393,12 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         no_improve_streak = 0
         state["ml_improvement_incumbent_metric"] = float(improved_value) if improved_value is not None else baseline_value
 
-    final_metrics_payload = _load_json_safe("data/metrics.json")
+    metrics_path = _resolve_declared_artifact_path_from_state(
+        state if isinstance(state, dict) else {},
+        "metrics.json",
+        kind="metrics",
+    )
+    final_metrics_payload = _load_json_safe(metrics_path) if metrics_path else {}
     if not isinstance(final_metrics_payload, dict):
         final_metrics_payload = {}
     final_metric_value = _extract_primary_metric(final_metrics_payload, metric_name)
@@ -27240,7 +27415,16 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     final_primary_metric_state = _build_primary_metric_state(
         state=state if isinstance(state, dict) else {},
         metrics_report=final_metrics_payload,
-        weights_report=_load_json_safe("data/weights.json") or {},
+        weights_report=(
+            _load_json_safe(
+                _resolve_declared_artifact_path_from_state(
+                    state if isinstance(state, dict) else {},
+                    "weights.json",
+                    kind="weights",
+                )
+            )
+            or {}
+        ),
         objective_type=objective_type_state,
         evaluation_spec=evaluation_spec_state if isinstance(evaluation_spec_state, dict) else None,
         contract=contract if isinstance(contract, dict) else None,
@@ -28171,7 +28355,12 @@ def run_translator(state: AgentState) -> AgentState:
             if de_cleaned_path and os.path.exists(de_cleaned_path):
                 cleaned_path = de_cleaned_path
         if not cleaned_path:
-            cleaned_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
+            report_contract = (
+                report_state.get("execution_contract")
+                if isinstance(report_state, dict) and isinstance(report_state.get("execution_contract"), dict)
+                else {}
+            )
+            cleaned_path = get_clean_dataset_output_path(report_contract) or ""
         preview_root = None
         run_dir = get_run_dir(run_id) if run_id else None
         if run_id and not run_dir:

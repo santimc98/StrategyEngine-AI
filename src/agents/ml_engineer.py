@@ -29,6 +29,12 @@ from src.utils.action_families import (
     classify_action_family,
     get_action_family_guidance,
 )
+from src.utils.contract_accessors import (
+    get_clean_manifest_path,
+    get_declared_artifact_path,
+    get_declared_file_schema,
+    normalize_artifact_path,
+)
 
 # NOTE: scan_code_safety referenced by tests as a required safety mechanism.
 # ML code executes in sandbox; keep the reference for integration checks.
@@ -428,6 +434,52 @@ class MLEngineerAgent:
 
         return compact
 
+    def _resolve_declared_artifact_path(
+        self,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+        filename: str,
+    ) -> str:
+        contract = execution_contract if isinstance(execution_contract, dict) else {}
+        resolved = get_declared_artifact_path(contract, filename)
+        if resolved:
+            return resolved
+        artifact_reqs = ml_view.get("artifact_requirements") if isinstance(ml_view, dict) else {}
+        if isinstance(artifact_reqs, dict):
+            artifact_contract = {"artifact_requirements": artifact_reqs}
+            resolved = get_declared_artifact_path(artifact_contract, filename)
+            if resolved:
+                return resolved
+        required_outputs = ml_view.get("required_outputs") if isinstance(ml_view, dict) else []
+        if isinstance(required_outputs, list):
+            artifact_contract = {"required_outputs": required_outputs}
+            resolved = get_declared_artifact_path(artifact_contract, filename)
+            if resolved:
+                return resolved
+        return ""
+
+    def _resolve_cleaning_manifest_path(
+        self,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+    ) -> str:
+        contract = execution_contract if isinstance(execution_contract, dict) else {}
+        resolved = get_clean_manifest_path(contract)
+        if resolved:
+            return resolved
+        if isinstance(ml_view, dict):
+            for key in ("cleaning_manifest_path", "output_manifest_path"):
+                candidate = normalize_artifact_path(ml_view.get(key))
+                if candidate:
+                    return candidate
+            artifact_reqs = ml_view.get("artifact_requirements")
+            if isinstance(artifact_reqs, dict):
+                artifact_contract = {"artifact_requirements": artifact_reqs}
+                resolved = get_clean_manifest_path(artifact_contract)
+                if resolved:
+                    return resolved
+        return "data/cleaning_manifest.json"
+
     def _render_artifact_schema_block(
         self,
         execution_contract: Dict[str, Any] | None,
@@ -446,13 +498,14 @@ class MLEngineerAgent:
             artifact_reqs = view.get("artifact_requirements")
         if not isinstance(artifact_reqs, dict) or not artifact_reqs:
             return ""
+        scored_rows_path = self._resolve_declared_artifact_path(contract, view, "scored_rows.csv")
 
         lines = ["=== REQUIRED OUTPUT ARTIFACTS SCHEMA ==="]
 
         # --- scored_rows_schema ---
         scored_schema = artifact_reqs.get("scored_rows_schema")
-        if isinstance(scored_schema, dict):
-            lines.append("\nARTIFACT: data/scored_rows.csv")
+        if isinstance(scored_schema, dict) and scored_rows_path:
+            lines.append(f"\nARTIFACT: {scored_rows_path}")
             req_cols = scored_schema.get("required_columns")
             if isinstance(req_cols, list) and req_cols:
                 lines.append(f"  REQUIRED_COLUMNS (must ALL be present): {req_cols}")
@@ -559,12 +612,7 @@ class MLEngineerAgent:
         """V4.1: Use artifact_requirements.file_schemas only, no legacy fallback."""
         if not isinstance(contract, dict):
             return []
-        # V4.1: Use artifact_requirements.file_schemas
-        artifact_reqs = contract.get("artifact_requirements", {})
-        schema = artifact_reqs.get("file_schemas") if isinstance(artifact_reqs, dict) else {}
-        if not isinstance(schema, dict):
-            return []
-        scored_schema = schema.get("data/scored_rows.csv")
+        scored_schema = get_declared_file_schema(contract, "scored_rows.csv")
         if not isinstance(scored_schema, dict):
             return []
         allowed = scored_schema.get("allowed_name_patterns")
@@ -1929,19 +1977,28 @@ class MLEngineerAgent:
             if isinstance(artifact_requirements.get("file_schemas"), dict)
             else {}
         )
-        submission_schema: Dict[str, Any] = {}
-        if isinstance(file_schemas, dict) and file_schemas:
-            for candidate_key in ("submission.csv", "data/submission.csv", "outputs/submission.csv"):
-                candidate_schema = file_schemas.get(candidate_key)
-                if isinstance(candidate_schema, dict):
-                    submission_schema = candidate_schema
+        cleaning_manifest_path = self._resolve_cleaning_manifest_path(execution_contract, ml_view)
+        scored_rows_path = self._resolve_declared_artifact_path(
+            execution_contract if isinstance(execution_contract, dict) else {},
+            ml_view if isinstance(ml_view, dict) else {},
+            "scored_rows.csv",
+        )
+        submission_path = self._resolve_declared_artifact_path(
+            execution_contract if isinstance(execution_contract, dict) else {},
+            ml_view if isinstance(ml_view, dict) else {},
+            "submission.csv",
+        )
+        submission_schema: Dict[str, Any] = get_declared_file_schema(
+            execution_contract if isinstance(execution_contract, dict) else {},
+            "submission.csv",
+            kind="submission",
+        )
+        if not submission_schema and isinstance(file_schemas, dict) and file_schemas:
+            for path_key, schema_obj in file_schemas.items():
+                normalized_path = normalize_artifact_path(path_key).lower()
+                if normalized_path.endswith("submission.csv") and isinstance(schema_obj, dict):
+                    submission_schema = schema_obj
                     break
-            if not submission_schema:
-                for path_key, schema_obj in file_schemas.items():
-                    normalized_path = str(path_key or "").replace("\\", "/").strip().lower()
-                    if normalized_path.endswith("submission.csv") and isinstance(schema_obj, dict):
-                        submission_schema = schema_obj
-                        break
         primary_metric = (
             validation_requirements.get("primary_metric")
             or evaluation_spec.get("primary_metric")
@@ -1965,7 +2022,7 @@ class MLEngineerAgent:
                 "split_rules": "split_spec",
                 "output_schema": "required_outputs + artifact_requirements",
                 "cleaning_manifest_scope": (
-                    "Use data/cleaning_manifest.json only for output_dialect and observed cleaning metadata. "
+                    f"Use {cleaning_manifest_path} only for output_dialect and observed cleaning metadata. "
                     "Do not treat it as the authoritative source for model_features, target_columns, split rules, or required outputs unless those keys are explicitly present."
                 ),
             },
@@ -1987,11 +2044,17 @@ class MLEngineerAgent:
                     )[:12]
                     if str(item).strip()
                 ],
-                "submission_required_columns": (
+                "per_row_output_required_columns": (
                     scored_rows_schema.get("required_columns")
-                    if isinstance(scored_rows_schema.get("required_columns"), list)
+                    if (
+                        isinstance(scored_rows_schema.get("required_columns"), list)
+                        and scored_rows_path
+                    )
                     else []
                 )[:12],
+                "per_row_output_path": scored_rows_path or None,
+                "cleaning_manifest_path": cleaning_manifest_path,
+                "submission_path": submission_path or None,
                 "submission_expected_row_count": submission_schema.get("expected_row_count"),
             },
         }
@@ -2057,6 +2120,7 @@ class MLEngineerAgent:
                 "decisioning_policy_notes": decisioning_policy_notes,
                 "decisioning_columns_text": decisioning_columns_text,
                 "visual_requirements_context": visual_requirements_context,
+                "cleaning_manifest_path": self._resolve_cleaning_manifest_path(execution_contract, ml_view),
                 "senior_reasoning_protocol": SENIOR_REASONING_PROTOCOL_GENERAL,
                 "senior_engineering_protocol": SENIOR_ENGINEERING_PROTOCOL,
             }
@@ -2100,7 +2164,7 @@ class MLEngineerAgent:
         HARD CONSTRAINTS
         - Output valid Python code only. No markdown, no code fences.
         - Read input data only from "$data_path".
-        - Respect data/cleaning_manifest.json output_dialect for CSV reads and writes.
+        - Respect $cleaning_manifest_path output_dialect for CSV reads and writes.
         - Do not invent columns, synthetic rows, or fallback datasets.
         - Do not overwrite input data.
         - Respect required outputs exactly as contract paths.
@@ -2120,7 +2184,7 @@ class MLEngineerAgent:
         - Required Outputs: $deliverables_json
         - Optimization Authoritative State: $optimization_authoritative_state
         - Treat that state as the single execution truth for targets, features, split rules, metrics, and output schema.
-        - Use data/cleaning_manifest.json only for CSV dialect and cleaning metadata unless the authoritative state explicitly says otherwise.
+        - Use $cleaning_manifest_path only for CSV dialect and cleaning metadata unless the authoritative state explicitly says otherwise.
 
         Return Python code only.
         """
@@ -2224,7 +2288,7 @@ class MLEngineerAgent:
                 "- Baseline model is required.",
                 "- Include SimpleImputer in preprocessing when NaNs may exist.",
                 "- Write all required outputs to exact paths.",
-                "- scored_rows may include canonical + contract-approved derived outputs only.",
+                "- Only write per-row scoring artifacts when the contract explicitly declares them; include only contract-approved columns.",
                 "- Define CONTRACT_INPUT_COLUMNS from clean_dataset.required_columns (fallback canonical) and print a MAPPING SUMMARY.",
             ]
         )
@@ -4178,7 +4242,7 @@ class MLEngineerAgent:
         HARD CONSTRAINTS
         - Output valid Python code only. No markdown, no code fences.
         - Read input data only from "$data_path" (no hardcoded alternatives).
-        - Load CSV dialect from data/cleaning_manifest.json output_dialect and use it for all CSV reads/writes.
+        - Load CSV dialect from $cleaning_manifest_path output_dialect and use it for all CSV reads/writes.
         - Do not invent columns, synthetic rows, or dummy fallback datasets.
         - Do not overwrite the input file; treat input as immutable.
         - If contract requires target-based modeling and target is unavailable, fail explicitly with ValueError.
@@ -4503,7 +4567,14 @@ class MLEngineerAgent:
                     "file_schemas": artifact_requirements_lock.get("file_schemas"),
                     "scored_rows_required_columns": (
                         artifact_requirements_lock.get("scored_rows_schema", {}).get("required_columns")
-                        if isinstance(artifact_requirements_lock.get("scored_rows_schema"), dict)
+                        if (
+                            isinstance(artifact_requirements_lock.get("scored_rows_schema"), dict)
+                            and self._resolve_declared_artifact_path(
+                                execution_contract if isinstance(execution_contract, dict) else {},
+                                ml_view if isinstance(ml_view, dict) else {},
+                                "scored_rows.csv",
+                            )
+                        )
                         else []
                     ),
                 },

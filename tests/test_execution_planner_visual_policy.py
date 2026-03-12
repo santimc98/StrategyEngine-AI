@@ -88,3 +88,39 @@ def test_build_plot_spec_uses_dynamic_max_plots():
     plots = plot_spec.get("plots") or []
 
     assert plot_spec.get("max_plots") == len(plots)
+
+
+def test_build_plot_spec_uses_declared_artifact_paths():
+    contract = _base_ml_contract()
+    contract["required_outputs"] = [
+        "artifacts/features/custom_cleaned.csv",
+        "artifacts/outputs/scored_rows.csv",
+        "artifacts/reports/metrics.json",
+        "artifacts/checks/alignment_check.json",
+    ]
+    contract["artifact_requirements"] = {
+        "clean_dataset": {
+            "required_columns": ["id", "feature_num", "target", "__split"],
+            "output_path": "artifacts/features/custom_cleaned.csv",
+            "output_manifest_path": "artifacts/manifests/custom_clean_manifest.json",
+        },
+        "file_schemas": {
+            "artifacts/reports/metrics.json": {"expected_row_count": 1},
+            "artifacts/checks/alignment_check.json": {"expected_row_count": 1},
+        },
+    }
+
+    plot_spec = build_plot_spec(contract)
+    plots = plot_spec.get("plots") or []
+    preferred_sources = {
+        source
+        for plot in plots
+        for source in ((plot.get("inputs") or {}).get("preferred_sources") or [])
+    }
+
+    assert "artifacts/features/custom_cleaned.csv" in preferred_sources
+    assert "artifacts/outputs/scored_rows.csv" in preferred_sources
+    assert "artifacts/reports/metrics.json" in preferred_sources
+    assert "artifacts/checks/alignment_check.json" in preferred_sources
+    assert "data/cleaned_data.csv" not in preferred_sources
+    assert "data/scored_rows.csv" not in preferred_sources

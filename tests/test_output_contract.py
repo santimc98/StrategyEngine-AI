@@ -205,6 +205,24 @@ def test_artifact_requirements_with_any_of_groups(tmp_path: Path):
     assert missing_with_severity[0]["severity"] == "fail"
 
 
+def test_artifact_requirements_ignore_scored_schema_without_declared_file(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    cleaned_path = data_dir / "cleaned_data.csv"
+    cleaned_path.write_text("x\n1\n", encoding="utf-8")
+
+    artifact_requirements = {
+        "required_files": [{"path": "data/cleaned_data.csv", "description": ""}],
+        "scored_rows_schema": {"required_columns": ["event_id", "score"]},
+    }
+
+    report = check_artifact_requirements(artifact_requirements, work_dir=str(tmp_path))
+
+    assert report["status"] == "ok"
+    assert report["scored_rows_report"]["applicable"] is False
+    assert "no scored_rows artifact declared" in report["scored_rows_report"]["summary"].lower()
+
+
 def test_artifact_requirements_missing_identifier_warning(tmp_path: Path):
     """
     P1.6.1: Missing identifier group with severity="warning" should return warning.

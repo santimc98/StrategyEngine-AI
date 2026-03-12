@@ -17,9 +17,12 @@ from src.utils.contract_validation import (
 )
 from src.utils.contract_accessors import (
     get_canonical_columns,
+    get_clean_dataset_output_path,
     get_cleaning_gates,
     get_column_roles,
+    get_declared_artifact_path,
     get_derived_column_names,
+    normalize_artifact_path,
     get_qa_gates,
     get_required_outputs,
     get_reviewer_gates,
@@ -2169,7 +2172,7 @@ def _create_v41_skeleton(
             "is_active": False,
             "activation_reasons": [],
             "fallback_methodology": "unknown",
-            "minimum_outputs": ["data/metrics.json", "data/scored_rows.csv", "data/alignment_check.json"],
+            "minimum_outputs": [],
             "artifact_reductions_allowed": True
         },
         
@@ -2182,12 +2185,8 @@ def _create_v41_skeleton(
         },
         
         "artifact_requirements": {
-            "required_files": ["data/cleaned_data.csv", "data/metrics.json", "data/scored_rows.csv"],
+            "required_files": [],
             "file_schemas": {},
-            "scored_rows_schema": {
-                "required_columns": identifiers if identifiers else [],  # Dynamic IDs, no hardcoded "id"
-                "recommended_columns": ["prediction"] + outcome_cols
-            }
         },
         
         "qa_gates": _apply_qa_gate_policy([], strategy, business_objective or "", {}),
@@ -5125,8 +5124,21 @@ def build_contract_min(
     inherited_optional_passthrough: List[str] = []
     inherited_required_columns: List[str] = []
     inherited_column_transformations: Dict[str, Any] = {}
-    inherited_clean_output_path = "data/cleaned_data.csv"
-    inherited_clean_manifest_path = "data/cleaning_manifest.json"
+    inherited_clean_output_path = (
+        get_clean_dataset_output_path(full_contract_or_partial)
+        if isinstance(full_contract_or_partial, dict)
+        else ""
+    )
+    inherited_clean_manifest_path = (
+        get_declared_artifact_path(
+            full_contract_or_partial,
+            "cleaning_manifest.json",
+            owner="data_engineer",
+            kind="manifest",
+        )
+        if isinstance(full_contract_or_partial, dict)
+        else ""
+    )
     if isinstance(full_clean_dataset, dict):
         required_raw = full_clean_dataset.get("required_columns")
         if isinstance(required_raw, list):
@@ -5202,9 +5214,6 @@ def build_contract_min(
             "column_dtype_targets": column_dtype_targets,
             "optional_passthrough_columns": inherited_optional_passthrough,
         },
-        "metrics": {"required": True, "path": "data/metrics.json"},
-        "alignment_check": {"required": True, "path": "data/alignment_check.json"},
-        "plots": {"optional": True, "expected": ["*.png"]},
         # P1.1: Formal file vs column separation
         "required_files": required_files,
         "scored_rows_schema": scored_rows_schema,
@@ -5223,27 +5232,27 @@ def build_contract_min(
 
     data_engineer_runbook = "\n".join(
         [
-            "Produce data/cleaned_data.csv containing ONLY the columns listed in required_columns.",
+            f"Produce {inherited_clean_output_path} containing ONLY the columns listed in required_columns.",
             "Your output CSV must match EXACTLY the required_columns list - no more, no less.",
             "If a column exists in raw data but is NOT in required_columns, DISCARD it (do not include in output).",
             "Constant columns (single unique value) have been pre-excluded from required_columns.",
             "Preserve column names; do not invent or rename columns.",
-            "Load using output_dialect from cleaning_manifest.json when available.",
+            f"Load using output_dialect from {inherited_clean_manifest_path} when available.",
             "Parse numeric/date fields conservatively; document conversions.",
             "If a required column is missing from input, report and stop (no fabrication).",
             "Do not derive targets or train models.",
             "Avoid advanced validation metrics (MAE/correlation); report only dtype and null counts.",
-            "Write cleaning_manifest.json with input/output dialect details.",
+            f"Write {inherited_clean_manifest_path} with input/output dialect details.",
         ]
     )
     ml_engineer_runbook = "\n".join(
         [
             "Use allowed_feature_sets for modeling/segmentation.",
             "Never use forbidden_features in training or optimization.",
-            "Produce data/scored_rows.csv, data/metrics.json, data/alignment_check.json.",
-            "Respect output_dialect from cleaning_manifest.json.",
+            "Produce only the artifacts explicitly declared by the execution contract.",
+            f"Respect output_dialect from {inherited_clean_manifest_path}.",
             "Document leakage checks and any data_limited_mode fallback.",
-            "Include feature_usage in alignment_check.json (used_features, target_columns, excluded_features).",
+            "If the contract declares an alignment artifact, include feature_usage there (used_features, target_columns, excluded_features).",
         ]
     )
 
@@ -6268,6 +6277,7 @@ def build_reporting_policy(
     run_context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     outputs = execution_plan.get("outputs", []) if isinstance(execution_plan, dict) else []
+    required_outputs = get_required_outputs(run_context if isinstance(run_context, dict) else {})
     output_types = {
         str(item.get("artifact_type"))
         for item in outputs
@@ -6287,10 +6297,24 @@ def build_reporting_policy(
         }
         slots.append(slot)
 
+    def _find_declared_output(*basenames: str) -> str:
+        normalized_names = {str(name).strip().lower() for name in basenames if str(name).strip()}
+        for path in required_outputs:
+            candidate = normalize_artifact_path(path)
+            if not candidate:
+                continue
+            if os.path.basename(candidate).lower() in normalized_names:
+                return candidate
+        return ""
+
+    metrics_path = _find_declared_output("metrics.json")
+    predictions_path = _find_declared_output("scored_rows.csv", "predictions.csv")
+    alignment_path = _find_declared_output("alignment_check.json", "case_alignment_report.json")
+
     if "metrics" in output_types:
-        _add_slot("model_metrics", "required", "metrics_summary", ["data/metrics.json"])
+        _add_slot("model_metrics", "required", "metrics_summary", [metrics_path] if metrics_path else [])
     if "predictions" in output_types:
-        _add_slot("predictions_overview", "conditional", "predictions_summary", ["data/scored_rows.csv"])
+        _add_slot("predictions_overview", "conditional", "predictions_summary", [predictions_path] if predictions_path else [])
     if "feature_importances" in output_types:
         _add_slot("explainability", "optional", "feature_importances_summary", [])
     if "error_analysis" in output_types:
@@ -6300,8 +6324,8 @@ def build_reporting_policy(
     if "ranking_scores" in output_types:
         _add_slot("ranking_top", "required", "ranking_summary", [])
 
-    _add_slot("alignment_risks", "conditional", "leakage_audit", ["data/alignment_check.json"])
-    _add_slot("segment_pricing", "conditional", "segment_pricing_summary", ["data/scored_rows.csv"])
+    _add_slot("alignment_risks", "conditional", "leakage_audit", [alignment_path] if alignment_path else [])
+    _add_slot("segment_pricing", "conditional", "segment_pricing_summary", [predictions_path] if predictions_path else [])
 
     policy = {
         "audience": "executive",
@@ -6331,6 +6355,23 @@ def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
     contract = contract_full if isinstance(contract_full, dict) else {}
     required_outputs = get_required_outputs(contract)
     outputs_lower = [str(path).lower() for path in required_outputs if path]
+    cleaned_data_path = get_clean_dataset_output_path(contract)
+    scored_rows_path = (
+        get_declared_artifact_path(contract, "scored_rows.csv")
+        or get_declared_artifact_path(contract, kind="predictions")
+    )
+    metrics_path = (
+        get_declared_artifact_path(contract, "metrics.json", kind="metrics")
+        or get_declared_artifact_path(contract, kind="metrics")
+    )
+    weights_path = (
+        get_declared_artifact_path(contract, "weights.json", kind="weights")
+        or get_declared_artifact_path(contract, kind="weights")
+    )
+    alignment_path = (
+        get_declared_artifact_path(contract, "alignment_check.json")
+        or get_declared_artifact_path(contract, kind="alignment")
+    )
 
     def _has_output(token: str) -> bool:
         return any(token in path for path in outputs_lower)
@@ -6350,6 +6391,9 @@ def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
 
     def _sample(values: List[str], limit: int) -> List[str]:
         return _dedupe([str(v) for v in values if v])[:limit]
+
+    def _sources(*values: str) -> List[str]:
+        return _dedupe([str(v) for v in values if v])
 
     def _safe_column_name(name: str) -> str:
         if not name:
@@ -6476,89 +6520,89 @@ def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
         }
         plots.append(plot)
 
-    if len(canonical_columns) >= 4:
+    if len(canonical_columns) >= 4 and cleaned_data_path:
         _add_plot(
             "missingness_overview",
             "Missingness by column",
             "Quantify missing data to focus cleaning and feature engineering.",
             "bar",
-            ["data/cleaned_data.csv"],
+            _sources(cleaned_data_path),
             optional_cols=_sample(canonical_columns, 24),
             compute={"metric": "missing_fraction", "top_k": 20},
             caption_template="Top missingness rates across columns (top {top_k}).",
         )
 
-    if numeric_cols:
+    if numeric_cols and cleaned_data_path:
         _add_plot(
             "numeric_distributions",
             "Numeric feature distributions",
             "Show the distribution of key numeric features.",
             "histogram",
-            ["data/cleaned_data.csv"],
+            _sources(cleaned_data_path),
             required_any=_sample(numeric_cols, 12),
             optional_cols=_sample(numeric_cols, 12),
             compute={"x": "AUTO_NUMERIC", "max_columns": min(6, len(numeric_cols))},
             caption_template="Distributions for selected numeric features.",
         )
 
-    if datetime_cols and (is_forecast or has_scored_rows):
+    if datetime_cols and (is_forecast or has_scored_rows) and _sources(cleaned_data_path, scored_rows_path):
         _add_plot(
             "trend_over_time",
             "Trend over time",
             "Highlight temporal trends for the primary target or prediction.",
             "timeseries",
-            ["data/cleaned_data.csv", "data/scored_rows.csv"],
+            _sources(cleaned_data_path, scored_rows_path),
             required_any=_sample(datetime_cols, 6),
             optional_cols=_sample(datetime_cols, 6),
             compute={"x": "AUTO_TIME", "y": "AUTO_TARGET_OR_NUMERIC"},
             caption_template="Trend over time using available temporal columns.",
         )
 
-    if has_scored_rows and pred_candidates:
+    if has_scored_rows and pred_candidates and scored_rows_path:
         _add_plot(
             "score_distribution",
             "Prediction/score distribution",
             "Summarize the distribution of model outputs.",
             "histogram",
-            ["data/scored_rows.csv", "data/cleaned_data.csv"],
+            _sources(scored_rows_path, cleaned_data_path),
             required_any=pred_candidates,
             compute={"x": "PREDICTION", "bins": 30},
             caption_template="Distribution of predicted scores.",
         )
 
-    if has_scored_rows and outcome_cols and (is_classification or is_ranking):
+    if has_scored_rows and outcome_cols and (is_classification or is_ranking) and scored_rows_path:
         _add_plot(
             "topk_lift",
             "Top-k outcome lift",
             "Show outcome rate across score buckets.",
             "bar",
-            ["data/scored_rows.csv"],
+            _sources(scored_rows_path),
             required_any=pred_candidates,
             required_all=[outcome_cols[0]],
             compute={"x": "PREDICTION", "y": outcome_cols[0], "group_by": "decile", "metric": "mean"},
             caption_template="Outcome rate by score decile.",
         )
 
-    if has_scored_rows and outcome_cols and is_regression:
+    if has_scored_rows and outcome_cols and is_regression and scored_rows_path:
         _add_plot(
             "residuals_scatter",
             "Prediction vs actual",
             "Assess residuals and bias in regression outputs.",
             "scatter",
-            ["data/scored_rows.csv"],
+            _sources(scored_rows_path),
             required_any=pred_candidates,
             required_all=[outcome_cols[0]],
             compute={"x": "PREDICTION", "y": outcome_cols[0]},
             caption_template="Predicted vs actual values.",
         )
 
-    if has_scored_rows and outcome_cols and pred_candidates and is_survival:
+    if has_scored_rows and outcome_cols and pred_candidates and is_survival and scored_rows_path:
         _add_plot(
             "survival_risk_vs_time",
             "Risk vs event time",
             "Contrast predicted risk against observed event time on labeled rows.",
             "scatter",
-            ["data/scored_rows.csv"],
+            _sources(scored_rows_path),
             required_any=pred_candidates,
             required_all=[outcome_cols[0]],
             compute={"x": "PREDICTION", "y": outcome_cols[0], "color": "AUTO_EVENT"},
@@ -6571,29 +6615,29 @@ def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
             "Feature weights/importance",
             "Highlight the strongest feature contributions or weights.",
             "bar",
-            ["data/weights.json", "data/metrics.json"],
+            _sources(weights_path, metrics_path),
             compute={"metric": "weights", "top_k": 20},
             caption_template="Top contributing features (if weights available).",
         )
 
-    if has_alignment:
+    if has_alignment and alignment_path:
         _add_plot(
             "alignment_check_summary",
             "Alignment check summary",
             "Visualize alignment requirements or validation outcomes.",
             "bar",
-            ["data/alignment_check.json"],
+            _sources(alignment_path),
             compute={"metric": "alignment_requirements", "top_k": 12},
             caption_template="Alignment check results by requirement.",
         )
 
-    if is_segmentation or segmentation_features or segment_candidates:
+    if (is_segmentation or segmentation_features or segment_candidates) and _sources(scored_rows_path, cleaned_data_path):
         _add_plot(
             "segment_sizes",
             "Segment distribution",
             "Show sizes or performance by segment where available.",
             "bar",
-            ["data/scored_rows.csv", "data/cleaned_data.csv"],
+            _sources(scored_rows_path, cleaned_data_path),
             required_any=segment_candidates,
             compute={"x": "SEGMENT_COLUMN", "metric": "count", "top_k": 20},
             caption_template="Segment sizes based on available segment identifiers.",
@@ -6883,6 +6927,7 @@ def _ensure_contract_visual_policy(
         policy = build_reporting_policy(
             execution_plan if isinstance(execution_plan, dict) else {},
             strategy_payload,
+            contract,
         )
     policy = dict(policy)
     policy["plot_spec"] = merged_visuals.get("plot_spec")
@@ -7136,19 +7181,21 @@ class ExecutionPlannerAgent:
             return _infer_kind_from_path(path)
 
         def _default_deliverable_description(path: str, kind: str) -> str:
-            known = {
-                "data/cleaned_data.csv": "Cleaned dataset used for downstream modeling.",
-                "data/metrics.json": "Model metrics and validation summary.",
-                "data/weights.json": "Feature weights or scoring coefficients.",
-                "data/case_summary.csv": "Per-case scoring summary.",
-                "data/case_alignment_report.json": "Case alignment QA metrics.",
-                "data/scored_rows.csv": "Row-level scores and key features.",
-                "data/alignment_check.json": "Alignment check results for contract requirements.",
-                "static/plots/*.png": "Required diagnostic plots.",
-                "reports/recommendations_preview.json": "Illustrative recommendation examples for the executive report.",
+            basename = os.path.basename(str(path or "")).lower()
+            known_by_basename = {
+                "cleaned_data.csv": "Cleaned dataset used for downstream modeling.",
+                "metrics.json": "Model metrics and validation summary.",
+                "weights.json": "Feature weights or scoring coefficients.",
+                "case_summary.csv": "Per-case scoring summary.",
+                "case_alignment_report.json": "Case alignment QA metrics.",
+                "scored_rows.csv": "Row-level scores and key features.",
+                "alignment_check.json": "Alignment check results for contract requirements.",
+                "recommendations_preview.json": "Illustrative recommendation examples for the executive report.",
             }
-            if path in known:
-                return known[path]
+            if basename in known_by_basename:
+                return known_by_basename[basename]
+            if str(path or "").replace("\\", "/").startswith("static/plots/"):
+                return "Required diagnostic plots."
             if kind == "plot":
                 return "Diagnostic plots required by the contract."
             if kind == "metrics":
@@ -7259,109 +7306,6 @@ class ExecutionPlannerAgent:
                 seen.add(candidate)
             return deliverables
 
-        def _derive_deliverables(
-            objective_type: str,
-            strategy_obj: Dict[str, Any],
-            spec_obj: Dict[str, Any],
-        ) -> List[Dict[str, Any]]:
-            """
-            Context-aware deliverable derivation based on objective_type.
-
-            DYNAMIC DELIVERABLES POLICY:
-            - descriptive: metrics.json and scored_rows.csv are OPTIONAL (no model training)
-            - predictive/causal: metrics.json REQUIRED, scored_rows.csv REQUIRED
-            - prescriptive: metrics.json REQUIRED, scored_rows.csv REQUIRED, plus optimization artifacts
-            """
-            deliverables: List[Dict[str, Any]] = []
-
-            def _add(path: str, required: bool = True, kind: str | None = None,
-                     description: str | None = None, owner: str | None = None) -> None:
-                item = _build_deliverable(path, required=required, kind=kind,
-                                          description=description, owner=owner)
-                if item:
-                    deliverables.append(item)
-
-            # Determine if this objective involves model training
-            involves_model_training = objective_type in ("predictive", "prescriptive", "causal")
-
-            # Core deliverable: cleaned_data.csv is always required (data_engineer)
-            _add("data/cleaned_data.csv", True, "dataset",
-                 "Cleaned dataset used for downstream analysis.", owner="data_engineer")
-
-            # CONTEXT-AWARE: metrics.json only required if model training is involved
-            if involves_model_training:
-                _add("data/metrics.json", True, "metrics",
-                     "Model metrics and validation summary.", owner="ml_engineer")
-            else:
-                _add("data/metrics.json", False, "metrics",
-                     "Optional metrics for descriptive analysis.", owner="ml_engineer")
-
-            _add("static/plots/*.png", False, "plot",
-                 "Optional diagnostic plots.", owner="ml_engineer")
-            _add("data/predictions.csv", False, "predictions",
-                 "Optional predictions output.", owner="ml_engineer")
-            _add("data/feature_importances.json", False, "feature_importances",
-                 "Optional feature importance output.", owner="ml_engineer")
-            _add("data/error_analysis.json", False, "error_analysis",
-                 "Optional error analysis output.", owner="ml_engineer")
-            _add(
-                "reports/recommendations_preview.json",
-                False,
-                "report",
-                "Optional illustrative recommendation preview for executive reporting.",
-                owner="ml_engineer",
-            )
-
-            target_type = str(spec_obj.get("target_type") or "").lower()
-            scoring_formula = spec_obj.get("scoring_formula")
-            analysis_type = str(strategy_obj.get("analysis_type") or "").lower()
-            techniques_text = " ".join([str(t) for t in (strategy_obj.get("techniques") or [])]).lower()
-            signal_text = " ".join([analysis_type, techniques_text, target_type, str(scoring_formula or "").lower()])
-
-            # CONTEXT-AWARE: scored_rows.csv only required for scoring/optimization objectives
-            if any(tok in signal_text for tok in ["ranking", "scoring", "weight", "weights", "optimization", "optimiz", "priorit"]):
-                _add("data/weights.json", False, "weights",
-                     "Optional weights artifact for legacy consumers.", owner="ml_engineer")
-                _add("data/case_summary.csv", False, "dataset",
-                     "Optional legacy case summary output.", owner="ml_engineer")
-                # scored_rows required for prescriptive, optional for descriptive
-                _add("data/scored_rows.csv", involves_model_training, "predictions",
-                     "Scored rows output.", owner="ml_engineer")
-                _add("data/case_alignment_report.json", False, "report",
-                     "Optional legacy alignment report.", owner="ml_engineer")
-            elif involves_model_training:
-                # Predictive/causal without explicit scoring: scored_rows still required
-                _add("data/scored_rows.csv", True, "predictions",
-                     "Model predictions output.", owner="ml_engineer")
-            else:
-                # Descriptive: scored_rows is optional
-                _add("data/scored_rows.csv", False, "predictions",
-                     "Optional scored rows for descriptive analysis.", owner="ml_engineer")
-
-            # Kaggle / competition detection: deterministic guardrail
-            if _detect_submission_requirement():
-                sub_path = _resolve_submission_path(spec_obj)
-                _add(sub_path, True, "submission",
-                     "Submission file for competition/leaderboard.", owner="ml_engineer")
-
-            return deliverables
-
-        def _detect_submission_requirement() -> bool:
-            """Deterministic detection of Kaggle/competition submission requirement."""
-            signal = (business_objective or "").lower()
-            strategy_obj = strategy if isinstance(strategy, dict) else {}
-            signal += " " + str(strategy_obj.get("analysis_type") or "").lower()
-            signal += " " + str(strategy_obj.get("title") or "").lower()
-            return any(tok in signal for tok in ["kaggle", "submission", "competition", "leaderboard", "submit"])
-
-        def _resolve_submission_path(spec_obj: Dict[str, Any]) -> str:
-            """Resolve submission file path from contract or default."""
-            eval_spec = spec_obj.get("evaluation_spec") or {}
-            sub_cfg = eval_spec.get("submission") or {}
-            if isinstance(sub_cfg, dict) and sub_cfg.get("path"):
-                return str(sub_cfg["path"])
-            return "data/submission.csv"
-
         def _apply_deliverables(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return {}
@@ -7370,11 +7314,7 @@ class ExecutionPlannerAgent:
                 spec = {}
 
             def _normalize_path(p: str) -> str:
-                known = ["metrics.json", "alignment_check.json", "scored_rows.csv", "cleaned_data.csv"]
-                base = os.path.basename(str(p))
-                if base in known and not str(p).startswith("data/"):
-                    return f"data/{base}"
-                return str(p).replace("\\", "/")
+                return normalize_artifact_path(str(p))
 
             def _extract_required_paths(raw_outputs: Any) -> set[str]:
                 paths: set[str] = set()
@@ -7395,15 +7335,16 @@ class ExecutionPlannerAgent:
 
             legacy_required = contract.get("required_outputs", []) or []
             legacy_required_paths = _extract_required_paths(legacy_required)
-            derived = _derive_deliverables(_infer_objective_type(), strategy or {}, spec)
             legacy = _normalize_deliverables(legacy_required, default_required=True)
             existing = _normalize_deliverables(
                 spec.get("deliverables"),
                 default_required=True,
                 required_paths=legacy_required_paths,
             )
-            deliverables = _merge_deliverables(derived, legacy)
-            deliverables = _merge_deliverables(deliverables, existing)
+            # LLM-first policy: normalize only deliverables explicitly declared
+            # by the planner contract. Do not synthesize business artifacts from
+            # objective defaults or platform heuristics.
+            deliverables = _merge_deliverables(legacy, existing)
             deliverables = _ensure_unique_deliverable_ids(deliverables)
             spec["deliverables"] = deliverables
             contract["spec_extraction"] = spec
@@ -7474,92 +7415,6 @@ class ExecutionPlannerAgent:
                         if plot_entry:
                             contract["required_output_artifacts"].append(plot_entry)
                             contract["required_outputs"].append(normalized_plot_path)
-
-            return contract
-
-        def _repair_deliverable_invariants(
-            contract: Dict[str, Any],
-            errors: List[Dict[str, Any]],
-        ) -> Dict[str, Any]:
-            """Auto-repair deliverable invariant violations.
-
-            For each error that specifies expected_kind and expected_owner, try to
-            promote an existing optional deliverable to required.  If none exists,
-            synthesise a minimal one with a conventional path.
-            """
-            artifacts = contract.get("required_output_artifacts")
-            if not isinstance(artifacts, list):
-                artifacts = []
-                contract["required_output_artifacts"] = artifacts
-
-            required_outputs = contract.get("required_outputs")
-            if not isinstance(required_outputs, list):
-                required_outputs = []
-                contract["required_outputs"] = required_outputs
-
-            _KIND_DEFAULT_PATH: Dict[str, str] = {
-                "dataset": "data/cleaned_data.csv",
-                "metrics": "data/metrics.json",
-                "predictions": "data/predictions.csv",
-                "submission": "data/submission.csv",
-                "report": "reports/report.json",
-            }
-
-            for err in errors:
-                expected_kind_raw = str(err.get("expected_kind") or "")
-                expected_owner = str(err.get("expected_owner") or "")
-                if not expected_kind_raw or not expected_owner:
-                    continue
-
-                # expected_kind may be "predictions|submission" — accept any
-                candidate_kinds = [
-                    k.strip() for k in expected_kind_raw.split("|") if k.strip()
-                ]
-
-                # Try to find an existing optional deliverable to promote
-                promoted = False
-                for art in artifacts:
-                    if not isinstance(art, dict):
-                        continue
-                    if (art.get("kind") in candidate_kinds
-                            and art.get("owner") == expected_owner
-                            and not art.get("required")):
-                        art["required"] = True
-                        path = art.get("path") or ""
-                        if path and path not in required_outputs:
-                            required_outputs.append(path)
-                        print(
-                            f"DELIVERABLE_REPAIR: promoted '{art.get('id', path)}' "
-                            f"(kind={art.get('kind')}) to required"
-                        )
-                        promoted = True
-                        break
-
-                if promoted:
-                    continue
-
-                # No existing deliverable — synthesise a minimal one
-                chosen_kind = candidate_kinds[0] if candidate_kinds else "predictions"
-                default_path = _KIND_DEFAULT_PATH.get(chosen_kind, f"data/{chosen_kind}.csv")
-                new_entry = {
-                    "id": f"auto_{chosen_kind}",
-                    "path": default_path,
-                    "required": True,
-                    "kind": chosen_kind,
-                    "description": f"Auto-generated to satisfy {err.get('invariant', 'unknown')} invariant.",
-                    "owner": expected_owner,
-                }
-                artifacts.append(new_entry)
-                required_outputs.append(default_path)
-                print(
-                    f"DELIVERABLE_REPAIR: created '{new_entry['id']}' "
-                    f"(kind={chosen_kind}, path={default_path}) for invariant {err.get('invariant')}"
-                )
-
-            # Sync spec_extraction.deliverables as well
-            spec = contract.get("spec_extraction")
-            if isinstance(spec, dict):
-                spec["deliverables"] = artifacts
 
             return contract
 

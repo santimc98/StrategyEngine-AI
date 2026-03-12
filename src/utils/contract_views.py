@@ -7,8 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from src.utils.contract_accessors import (
     get_canonical_columns,
+    get_clean_dataset_output_path,
+    get_clean_manifest_path,
     get_column_roles,
     get_cleaning_gates,
+    get_declared_artifacts,
     get_derived_column_names,
     get_outlier_policy,
     get_outcome_columns,
@@ -82,6 +85,9 @@ class MLView(TypedDict, total=False):
     case_rules: Any
     plot_spec: Dict[str, Any]
     artifact_requirements: Dict[str, Any]
+    artifact_paths: Dict[str, str]
+    cleaning_manifest_path: str
+    cleaned_data_path: str
     outlier_policy: Dict[str, Any]
     split_spec: Dict[str, Any]
     n_train_rows: int
@@ -555,11 +561,10 @@ def _resolve_output_path(
     contract_full: Dict[str, Any],
     required_outputs: List[str],
 ) -> Optional[str]:
-    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
-        contract_full.get("artifact_requirements")
-    )
-    clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
-    output_path = _first_value(clean_cfg.get("output_path"), clean_cfg.get("output"), clean_cfg.get("path"))
+    combined = contract_full if isinstance(contract_full, dict) else {}
+    if isinstance(contract_min, dict) and contract_min:
+        combined = {**combined, **contract_min}
+    output_path = get_clean_dataset_output_path(combined)
     if output_path:
         return str(output_path)
     for path in required_outputs:
@@ -574,11 +579,10 @@ def _resolve_manifest_path(
     contract_full: Dict[str, Any],
     required_outputs: List[str],
 ) -> Optional[str]:
-    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
-        contract_full.get("artifact_requirements")
-    )
-    clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
-    manifest_path = _first_value(clean_cfg.get("manifest_path"), clean_cfg.get("output_manifest_path"))
+    combined = contract_full if isinstance(contract_full, dict) else {}
+    if isinstance(contract_min, dict) and contract_min:
+        combined = {**combined, **contract_min}
+    manifest_path = get_clean_manifest_path(combined)
     if manifest_path:
         return str(manifest_path)
     for path in required_outputs:
@@ -1057,16 +1061,24 @@ def _expected_metrics_from_objective(objective_type: str, reviewer_gates: List[A
 def _build_min_reporting_policy(artifact_index: List[Dict[str, Any]]) -> Dict[str, Any]:
     artifacts = _normalize_artifact_index(artifact_index)
     artifact_types = {str(item.get("artifact_type") or "").lower() for item in artifacts if isinstance(item, dict)}
+    artifact_paths_by_type: Dict[str, str] = {}
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        artifact_type = str(item.get("artifact_type") or "").lower().strip()
+        artifact_path = str(item.get("path") or "").strip()
+        if artifact_type and artifact_path and artifact_type not in artifact_paths_by_type:
+            artifact_paths_by_type[artifact_type] = artifact_path
     slots = []
     sections = ["Executive Decision", "Evidence & Metrics", "Risks & Limitations", "Next Actions"]
     if "metrics" in artifact_types:
-        slots.append({"id": "model_metrics", "mode": "required", "sources": ["data/metrics.json"]})
+        slots.append({"id": "model_metrics", "mode": "required", "sources": [artifact_paths_by_type.get("metrics", "data/metrics.json")]})
     if "predictions" in artifact_types:
-        slots.append({"id": "predictions_overview", "mode": "optional", "sources": ["data/scored_rows.csv"]})
+        slots.append({"id": "predictions_overview", "mode": "optional", "sources": [artifact_paths_by_type.get("predictions", "data/scored_rows.csv")]})
     if "insights" in artifact_types:
-        slots.append({"id": "insights", "mode": "optional", "sources": ["data/insights.json"]})
+        slots.append({"id": "insights", "mode": "optional", "sources": [artifact_paths_by_type.get("insights", "data/insights.json")]})
     if "report" in artifact_types:
-        slots.append({"id": "alignment_check", "mode": "optional", "sources": ["data/alignment_check.json"]})
+        slots.append({"id": "alignment_check", "mode": "optional", "sources": [artifact_paths_by_type.get("report", "data/alignment_check.json")]})
     return {"sections": sections, "slots": slots}
 
 
@@ -2065,22 +2077,14 @@ def build_contract_views_projection(
         )
     )
 
-    output_path = clean_cfg.get("output_path") or clean_cfg.get("output")
-    if not isinstance(output_path, str) or not output_path.strip():
-        output_path = ""
-        for path in required_outputs:
-            lower = str(path).lower()
-            if lower.endswith(".csv") and ("clean" in lower or "prepared" in lower):
-                output_path = str(path)
-                break
-    manifest_path = clean_cfg.get("manifest_path") or clean_cfg.get("output_manifest_path")
-    if not isinstance(manifest_path, str) or not manifest_path.strip():
-        manifest_path = ""
-        for path in required_outputs:
-            lower = str(path).lower()
-            if lower.endswith(".json") and "manifest" in lower:
-                manifest_path = str(path)
-                break
+    output_path = _resolve_output_path(contract_full, contract_full, required_outputs) or ""
+    manifest_path = _resolve_manifest_path(contract_full, contract_full, required_outputs) or ""
+    declared_artifacts = get_declared_artifacts(contract_full)
+    artifact_paths = {
+        str(item.get("kind") or item.get("path") or f"artifact_{idx}"): str(item.get("path") or "")
+        for idx, item in enumerate(declared_artifacts, start=1)
+        if isinstance(item, dict) and str(item.get("path") or "").strip()
+    }
 
     required_files: List[str] = []
     for entry in artifact_reqs.get("required_files", []) if isinstance(artifact_reqs.get("required_files"), list) else []:
@@ -2203,9 +2207,13 @@ def build_contract_views_projection(
         "reviewer_gates": reviewer_gates if isinstance(reviewer_gates, list) else [],
         "ml_engineer_runbook": ml_engineer_runbook,
         "artifact_requirements": artifact_payload,
+        "cleaned_data_path": output_path,
+        "cleaning_manifest_path": manifest_path,
         "decisioning_requirements": decisioning_requirements,
         "visual_requirements": visual_requirements,
     }
+    if artifact_paths:
+        ml_view["artifact_paths"] = artifact_paths
     if outlier_policy:
         ml_view["outlier_policy"] = outlier_policy
     if plot_spec is not None:
