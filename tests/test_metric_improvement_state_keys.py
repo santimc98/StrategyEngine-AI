@@ -6,6 +6,7 @@ def test_agent_state_declares_metric_improvement_persistence_keys() -> None:
     required_keys = [
         "primary_metric_state",
         "primary_metric_snapshot",
+        "metric_loop_state",
         "metric_history",
         "ml_improvement_round_active",
         "ml_improvement_continue",

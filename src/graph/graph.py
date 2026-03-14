@@ -1098,6 +1098,421 @@ def _persist_primary_metric_state(
         return existing_index if isinstance(existing_index, list) else []
 
 
+def _load_metric_loop_state(
+    state: Dict[str, Any] | None = None,
+    contract: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    payload = state.get("metric_loop_state")
+    if isinstance(payload, dict) and payload:
+        return dict(payload)
+    loaded = _load_json_safe("data/metric_loop_state.json")
+    if isinstance(loaded, dict) and loaded:
+        return loaded
+    return _derive_metric_loop_state_from_legacy(
+        state,
+        contract if isinstance(contract, dict) else (
+            state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+        ),
+    )
+
+
+def _persist_metric_loop_state(
+    metric_loop_state: Dict[str, Any] | None,
+    *,
+    existing_index: Any = None,
+) -> List[Dict[str, Any]]:
+    metric_loop_state = metric_loop_state if isinstance(metric_loop_state, dict) else {}
+    if not metric_loop_state:
+        return existing_index if isinstance(existing_index, list) else []
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/metric_loop_state.json", metric_loop_state)
+        normalized_existing = existing_index if isinstance(existing_index, list) else []
+        additions = _build_artifact_index(["data/metric_loop_state.json"], None)
+        merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+        dump_json("data/produced_artifact_index.json", merged_index)
+        return merged_index
+    except Exception as metric_err:
+        print(f"Warning: failed to persist metric_loop_state.json: {metric_err}")
+        return existing_index if isinstance(existing_index, list) else []
+
+
+def _resolve_metric_loop_value(
+    metric_name: str | None,
+    metrics_payload: Dict[str, Any] | None,
+    fallback_value: Any = None,
+) -> float | None:
+    payload = metrics_payload if isinstance(metrics_payload, dict) else {}
+    metric_name = str(metric_name or "").strip()
+    if metric_name and payload:
+        resolved = _resolve_metric_payload(payload, metric_name, source_hint="metric_loop_state")
+        if isinstance(resolved, dict) and resolved.get("value") is not None:
+            return float(resolved.get("value"))
+    return _coerce_float(fallback_value)
+
+
+def _build_metric_loop_entry(
+    *,
+    label: str,
+    metric_name: str,
+    canonical_name: str,
+    metrics_payload: Dict[str, Any] | None,
+    fallback_value: Any = None,
+    path: str | None = None,
+    source: str | None = None,
+    round_id: Any = None,
+    status: str | None = None,
+    review_verdict: str | None = None,
+) -> Dict[str, Any]:
+    payload = metrics_payload if isinstance(metrics_payload, dict) else {}
+    metric_value = _resolve_metric_loop_value(metric_name, payload, fallback_value)
+    try:
+        round_id_int = int(round_id) if round_id is not None else None
+    except Exception:
+        round_id_int = None
+    return {
+        "label": str(label or "").strip() or "unknown",
+        "metric_name": str(metric_name or "").strip() or None,
+        "canonical_name": str(canonical_name or _metric_canonical_name(metric_name)).strip() or None,
+        "metric_value": float(metric_value) if metric_value is not None else None,
+        "metrics_payload": copy.deepcopy(payload) if payload else {},
+        "path": str(path or "").strip() or None,
+        "source": str(source or "").strip() or None,
+        "round_id": round_id_int,
+        "status": str(status or "").strip() or None,
+        "review_verdict": str(review_verdict or "").strip() or None,
+    }
+
+
+def _metric_loop_value_is_better(
+    candidate_value: Any,
+    incumbent_value: Any,
+    higher_is_better: bool,
+) -> bool:
+    candidate = _coerce_float(candidate_value)
+    incumbent = _coerce_float(incumbent_value)
+    if candidate is None:
+        return False
+    if incumbent is None:
+        return True
+    if higher_is_better:
+        return float(candidate) > float(incumbent)
+    return float(candidate) < float(incumbent)
+
+
+def _build_metric_loop_state(
+    *,
+    state: Dict[str, Any],
+    contract: Dict[str, Any] | None,
+    round_id: int,
+    rounds_allowed: int,
+    patience: int,
+    no_improve_streak: int,
+    min_delta: float,
+    active: bool,
+    incumbent_metrics_payload: Dict[str, Any] | None,
+    incumbent_fallback_value: Any = None,
+    incumbent_path: str | None = None,
+    incumbent_source: str = "round_baseline",
+    baseline_review_verdict: str | None = None,
+    candidate_metrics_payload: Dict[str, Any] | None = None,
+    candidate_fallback_value: Any = None,
+    candidate_path: str | None = None,
+    candidate_source: str | None = None,
+    candidate_status: str | None = None,
+    best_observed_value: Any = None,
+    best_observed_label: str | None = None,
+    best_observed_source: str | None = None,
+    final_label: str | None = None,
+    final_metrics_payload: Dict[str, Any] | None = None,
+    final_fallback_value: Any = None,
+    final_path: str | None = None,
+    final_source: str | None = None,
+    selection: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    contract = contract if isinstance(contract, dict) else {}
+    metric_target = _resolve_contract_metric_target(state if isinstance(state, dict) else {}, contract)
+    prior_loop_target = (
+        state.get("metric_loop_state", {}).get("target")
+        if isinstance(state.get("metric_loop_state"), dict)
+        and isinstance(state.get("metric_loop_state", {}).get("target"), dict)
+        else {}
+    )
+    primary_metric_state = _load_primary_metric_state(state if isinstance(state, dict) else {})
+    metric_name = str(
+        metric_target.get("name")
+        or prior_loop_target.get("name")
+        or primary_metric_state.get("target_metric_name")
+        or primary_metric_state.get("primary_metric_name")
+        or state.get("ml_improvement_primary_metric_name")
+        or ""
+    ).strip()
+    canonical_name = str(
+        metric_target.get("canonical_name")
+        or prior_loop_target.get("canonical_name")
+        or primary_metric_state.get("target_metric_canonical_name")
+        or primary_metric_state.get("primary_metric_canonical_name")
+        or _metric_canonical_name(metric_name)
+    ).strip()
+    higher_is_better = metric_target.get("higher_is_better")
+    if not isinstance(higher_is_better, bool):
+        higher_is_better = prior_loop_target.get("higher_is_better")
+    if not isinstance(higher_is_better, bool):
+        higher_is_better = state.get("ml_improvement_higher_is_better")
+    if not isinstance(higher_is_better, bool):
+        higher_is_better = bool(_metric_higher_is_better(metric_name))
+
+    incumbent = _build_metric_loop_entry(
+        label="incumbent",
+        metric_name=metric_name,
+        canonical_name=canonical_name,
+        metrics_payload=incumbent_metrics_payload,
+        fallback_value=incumbent_fallback_value,
+        path=incumbent_path,
+        source=incumbent_source,
+        round_id=round_id,
+        status="active" if active else "stable",
+        review_verdict=baseline_review_verdict,
+    )
+    round_baseline = copy.deepcopy(incumbent)
+    round_baseline["label"] = "round_baseline"
+
+    candidate = _build_metric_loop_entry(
+        label="candidate",
+        metric_name=metric_name,
+        canonical_name=canonical_name,
+        metrics_payload=candidate_metrics_payload,
+        fallback_value=candidate_fallback_value,
+        path=candidate_path,
+        source=candidate_source,
+        round_id=round_id,
+        status=candidate_status or ("pending" if active else None),
+        review_verdict=None,
+    )
+
+    best_value = _coerce_float(best_observed_value)
+    if best_value is None:
+        best_value = incumbent.get("metric_value")
+    best_label = str(best_observed_label or ("incumbent" if best_value == incumbent.get("metric_value") else "")).strip() or "incumbent"
+    best_source = str(best_observed_source or ("round_baseline" if best_label == "incumbent" else "")).strip() or "round_baseline"
+
+    final_entry = {}
+    if final_label or final_metrics_payload or final_fallback_value is not None:
+        final_entry = _build_metric_loop_entry(
+            label=str(final_label or "final").strip() or "final",
+            metric_name=metric_name,
+            canonical_name=canonical_name,
+            metrics_payload=final_metrics_payload,
+            fallback_value=final_fallback_value,
+            path=final_path,
+            source=final_source,
+            round_id=round_id,
+            status="selected" if final_label else None,
+            review_verdict=None,
+        )
+
+    return {
+        "schema_version": "v1",
+        "target": {
+            "name": metric_name or None,
+            "canonical_name": canonical_name or None,
+            "higher_is_better": bool(higher_is_better),
+            "min_delta": float(min_delta),
+            "source": str(metric_target.get("source") or primary_metric_state.get("target_metric_source") or "metric_loop_state").strip(),
+        },
+        "round": {
+            "round_id": int(round_id),
+            "rounds_allowed": int(rounds_allowed),
+            "patience": int(patience),
+            "no_improve_streak": int(no_improve_streak),
+            "status": "active" if active else "complete",
+            "baseline": round_baseline,
+        },
+        "incumbent": incumbent,
+        "candidate": candidate,
+        "best_observed": {
+            "label": best_label,
+            "metric_name": metric_name or None,
+            "canonical_name": canonical_name or None,
+            "metric_value": float(best_value) if best_value is not None else None,
+            "round_id": int(round_id),
+            "source": best_source,
+        },
+        "final": final_entry,
+        "selection": copy.deepcopy(selection) if isinstance(selection, dict) else {},
+    }
+
+
+def _derive_metric_loop_state_from_legacy(
+    state: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    contract = contract if isinstance(contract, dict) else {}
+    metric_state = _load_primary_metric_state(state)
+    metric_path = _resolve_declared_artifact_path_from_contract_or_state(
+        contract,
+        state,
+        "metrics.json",
+        kind="metrics",
+    )
+    current_metrics_payload = _load_json_safe(metric_path) if metric_path else {}
+    if not isinstance(current_metrics_payload, dict):
+        current_metrics_payload = {}
+    round_baseline_metrics = (
+        state.get("ml_improvement_round_baseline_metrics")
+        if isinstance(state.get("ml_improvement_round_baseline_metrics"), dict)
+        else {}
+    )
+    baseline_metrics = (
+        round_baseline_metrics
+        if round_baseline_metrics
+        else (
+            state.get("ml_improvement_baseline_metrics")
+            if isinstance(state.get("ml_improvement_baseline_metrics"), dict)
+            else {}
+        )
+    )
+    round_id = int(
+        state.get("ml_improvement_current_round_id")
+        or state.get("ml_improvement_round_count")
+        or 0
+        or 0
+    )
+    rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
+    patience = int(state.get("ml_improvement_patience", 2) or 2)
+    no_improve_streak = int(state.get("ml_improvement_no_improve_streak", 0) or 0)
+    min_delta = float(state.get("ml_improvement_min_delta", 0.0005) or 0.0005)
+    active = bool(state.get("ml_improvement_round_active"))
+    incumbent_payload = baseline_metrics if active and baseline_metrics else current_metrics_payload
+    incumbent_fallback_value = (
+        state.get("ml_improvement_incumbent_metric")
+        if state.get("ml_improvement_incumbent_metric") not in (None, "")
+        else (
+            state.get("ml_improvement_round_baseline_metric")
+            if state.get("ml_improvement_round_baseline_metric") not in (None, "")
+            else metric_state.get("baseline_value")
+        )
+    )
+    candidate_payload = current_metrics_payload if active else {}
+    candidate_fallback_value = metric_state.get("primary_metric_value") if active else None
+    return _build_metric_loop_state(
+        state=state,
+        contract=contract,
+        round_id=round_id,
+        rounds_allowed=rounds_allowed,
+        patience=patience,
+        no_improve_streak=no_improve_streak,
+        min_delta=min_delta,
+        active=active,
+        incumbent_metrics_payload=incumbent_payload,
+        incumbent_fallback_value=incumbent_fallback_value,
+        incumbent_path=metric_path,
+        incumbent_source="legacy_round_state" if active else "legacy_current_outputs",
+        baseline_review_verdict=str(state.get("ml_improvement_baseline_review_verdict") or "").strip() or None,
+        candidate_metrics_payload=candidate_payload,
+        candidate_fallback_value=candidate_fallback_value,
+        candidate_path=metric_path if active else None,
+        candidate_source="legacy_current_outputs" if active else None,
+        candidate_status="pending" if active else None,
+        best_observed_value=state.get("ml_improvement_best_metric"),
+        best_observed_label="incumbent",
+        best_observed_source="legacy_best_metric",
+        selection=state.get("opt_incumbent_selection") if isinstance(state.get("opt_incumbent_selection"), dict) else {},
+    )
+
+
+def _build_metric_loop_prompt_snapshot(
+    metric_loop_state: Dict[str, Any] | None,
+    *,
+    current_metric_value: Any = None,
+    current_metric_name: str | None = None,
+) -> Dict[str, Any]:
+    loop_state = metric_loop_state if isinstance(metric_loop_state, dict) else {}
+    target = loop_state.get("target") if isinstance(loop_state.get("target"), dict) else {}
+    round_payload = loop_state.get("round") if isinstance(loop_state.get("round"), dict) else {}
+    round_baseline = round_payload.get("baseline") if isinstance(round_payload.get("baseline"), dict) else {}
+    best_observed = loop_state.get("best_observed") if isinstance(loop_state.get("best_observed"), dict) else {}
+    current_metric = _coerce_float(current_metric_value)
+    if current_metric is None:
+        candidate = loop_state.get("candidate") if isinstance(loop_state.get("candidate"), dict) else {}
+        current_metric = _coerce_float(candidate.get("metric_value"))
+    metric_name = str(
+        current_metric_name
+        or target.get("name")
+        or round_baseline.get("metric_name")
+        or ""
+    ).strip()
+    return {
+        "primary_metric_name": metric_name or None,
+        "primary_metric_canonical_name": str(target.get("canonical_name") or _metric_canonical_name(metric_name)).strip() or None,
+        "baseline_metric": _coerce_float(round_baseline.get("metric_value")),
+        "current_metric": current_metric,
+        "best_metric_so_far": _coerce_float(best_observed.get("metric_value")),
+        "higher_is_better": (
+            bool(target.get("higher_is_better"))
+            if isinstance(target.get("higher_is_better"), bool)
+            else bool(_metric_higher_is_better(metric_name))
+        ),
+        "min_delta": _coerce_float(target.get("min_delta")),
+        "round_id": round_payload.get("round_id"),
+        "rounds_allowed": round_payload.get("rounds_allowed"),
+        "selected_label": (
+            (loop_state.get("selection") or {}).get("selected_label")
+            if isinstance(loop_state.get("selection"), dict)
+            else None
+        ),
+    }
+
+
+def _sync_metric_loop_legacy_fields(
+    state: Dict[str, Any],
+    metric_loop_state: Dict[str, Any] | None,
+) -> None:
+    if not isinstance(state, dict):
+        return
+    loop_state = metric_loop_state if isinstance(metric_loop_state, dict) else {}
+    if not loop_state:
+        return
+    target = loop_state.get("target") if isinstance(loop_state.get("target"), dict) else {}
+    round_payload = loop_state.get("round") if isinstance(loop_state.get("round"), dict) else {}
+    round_baseline = round_payload.get("baseline") if isinstance(round_payload.get("baseline"), dict) else {}
+    incumbent = loop_state.get("incumbent") if isinstance(loop_state.get("incumbent"), dict) else {}
+    best_observed = loop_state.get("best_observed") if isinstance(loop_state.get("best_observed"), dict) else {}
+
+    state["metric_loop_state"] = copy.deepcopy(loop_state)
+    state["ml_improvement_primary_metric_name"] = str(target.get("name") or "").strip()
+    state["ml_improvement_primary_metric_source"] = str(target.get("source") or "").strip()
+    state["ml_improvement_higher_is_better"] = (
+        bool(target.get("higher_is_better"))
+        if isinstance(target.get("higher_is_better"), bool)
+        else bool(state.get("ml_improvement_higher_is_better"))
+    )
+    min_delta = _coerce_float(target.get("min_delta"))
+    if min_delta is not None:
+        state["ml_improvement_min_delta"] = float(min_delta)
+    state["ml_improvement_round_count"] = int(round_payload.get("round_id") or state.get("ml_improvement_round_count", 0) or 0)
+    state["ml_improvement_current_round_id"] = int(round_payload.get("round_id") or state.get("ml_improvement_current_round_id", 0) or 0)
+    state["ml_improvement_rounds_allowed"] = int(round_payload.get("rounds_allowed") or state.get("ml_improvement_rounds_allowed", 1) or 1)
+    state["ml_improvement_patience"] = int(round_payload.get("patience") or state.get("ml_improvement_patience", 2) or 2)
+    state["ml_improvement_no_improve_streak"] = int(round_payload.get("no_improve_streak") or state.get("ml_improvement_no_improve_streak", 0) or 0)
+
+    round_baseline_value = _coerce_float(round_baseline.get("metric_value"))
+    incumbent_value = _coerce_float(incumbent.get("metric_value"))
+    best_value = _coerce_float(best_observed.get("metric_value"))
+    if round_baseline_value is not None:
+        state["ml_improvement_round_baseline_metric"] = float(round_baseline_value)
+        state["ml_improvement_baseline_metric"] = float(round_baseline_value)
+    if isinstance(round_baseline.get("metrics_payload"), dict):
+        state["ml_improvement_round_baseline_metrics"] = copy.deepcopy(round_baseline.get("metrics_payload") or {})
+        state["ml_improvement_baseline_metrics"] = copy.deepcopy(round_baseline.get("metrics_payload") or {})
+    if incumbent_value is not None:
+        state["ml_improvement_incumbent_metric"] = float(incumbent_value)
+    if best_value is not None:
+        state["ml_improvement_best_metric"] = float(best_value)
+    if round_baseline.get("review_verdict"):
+        state["ml_improvement_baseline_review_verdict"] = str(round_baseline.get("review_verdict"))
 def _resolve_metric_payload(
     metrics_report: Dict[str, Any] | None,
     metric_name: str | None,
@@ -11110,9 +11525,21 @@ def _build_iteration_handoff(
     qa_feedback = _truncate_handoff_text(qa_result.get("feedback"), max_len=900)
 
     metric_snapshot = _load_primary_metric_state(state)
-    metric_name = str(metric_snapshot.get("primary_metric_name") or "")
+    metric_loop_state = _load_metric_loop_state(state, contract)
+    metric_name = str(
+        metric_snapshot.get("primary_metric_name")
+        or ((metric_loop_state.get("target") or {}).get("name") if isinstance(metric_loop_state.get("target"), dict) else "")
+        or ""
+    )
     metric_value = metric_snapshot.get("primary_metric_value")
     baseline_value = metric_snapshot.get("baseline_value")
+    if not _is_number(metric_value):
+        incumbent_payload = metric_loop_state.get("incumbent") if isinstance(metric_loop_state.get("incumbent"), dict) else {}
+        metric_value = _coerce_float(incumbent_payload.get("metric_value"))
+    if not _is_number(baseline_value):
+        round_payload = metric_loop_state.get("round") if isinstance(metric_loop_state.get("round"), dict) else {}
+        round_baseline = round_payload.get("baseline") if isinstance(round_payload.get("baseline"), dict) else {}
+        baseline_value = _coerce_float(round_baseline.get("metric_value"))
     # If snapshot is missing/incomplete, recover from deterministic facts so handoff
     # preserves metric continuity across iterations.
     if not metric_name or not _is_number(metric_value):
@@ -11245,20 +11672,29 @@ def _build_iteration_handoff(
         round_history = state.get("ml_improvement_round_history")
         if not isinstance(round_history, list):
             round_history = []
+        loop_metric_snapshot = _build_metric_loop_prompt_snapshot(
+            metric_loop_state,
+            current_metric_value=metric_value,
+            current_metric_name=metric_name,
+        )
         optimization_context = {
             "policy": {},
-            "metric_snapshot": {
-                "primary_metric_name": metric_name or state.get("ml_improvement_primary_metric_name"),
-                "baseline_metric": _coerce_float(state.get("ml_improvement_round_baseline_metric")),
-                "best_metric_so_far": _coerce_float(state.get("ml_improvement_best_metric")),
-                "higher_is_better": bool(state.get("ml_improvement_higher_is_better", True)),
-                "min_delta": _coerce_float(state.get("ml_improvement_min_delta")),
-            },
+            "metric_snapshot": loop_metric_snapshot,
             "contract_lock": _build_metric_round_contract_lock(contract, required_outputs, metric_name or "unknown"),
             "active_hypothesis": compress_long_lists(hypothesis_packet or {})[0],
             "experiment_tracker_recent": compress_long_lists((tracker_recent or [])[-5:])[0],
             "round_history_recent": compress_long_lists((round_history or [])[-4:])[0],
+            "metric_loop_state": metric_loop_state,
         }
+    elif isinstance(optimization_context, dict) and optimization_context:
+        optimization_context = dict(optimization_context)
+        optimization_context["metric_snapshot"] = _build_metric_loop_prompt_snapshot(
+            metric_loop_state,
+            current_metric_value=metric_value,
+            current_metric_name=metric_name,
+        )
+        if metric_loop_state:
+            optimization_context["metric_loop_state"] = metric_loop_state
     optimization_blueprint = _resolve_cached_optimization_blueprint(
         state,
         run_id=str(state.get("run_id") or ""),
@@ -12391,6 +12827,7 @@ class AgentState(TypedDict):
     weights_signature: str
     primary_metric_state: Dict[str, Any]
     primary_metric_snapshot: Dict[str, Any]
+    metric_loop_state: Dict[str, Any]
     metric_history: List[Dict[str, Any]]
     execution_output_stale: bool
     sandbox_failed: bool
@@ -13084,6 +13521,7 @@ def run_steward(state: AgentState) -> AgentState:
         "ml_journal_written_ids": [],
         "primary_metric_state": {},
         "primary_metric_snapshot": {},
+        "metric_loop_state": {},
         "metric_history": [],
         "feedback_history": [],
         "has_partial_visuals": False,
@@ -26425,8 +26863,20 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
 
     run_id = str(state.get("run_id") or "")
     metric_target = _resolve_contract_metric_target(state, contract)
-    metric_name = str(metric_target.get("name") or "roc_auc").strip() or "roc_auc"
+    prior_metric_loop_state = _load_metric_loop_state(state, contract)
+    prior_loop_target = (
+        prior_metric_loop_state.get("target")
+        if isinstance(prior_metric_loop_state.get("target"), dict)
+        else {}
+    )
+    metric_name = str(
+        metric_target.get("name")
+        or prior_loop_target.get("name")
+        or "roc_auc"
+    ).strip() or "roc_auc"
     metric_higher_is_better = metric_target.get("higher_is_better")
+    if not isinstance(metric_higher_is_better, bool):
+        metric_higher_is_better = prior_loop_target.get("higher_is_better")
     if not isinstance(metric_higher_is_better, bool):
         metric_higher_is_better = bool(_metric_higher_is_better(metric_name))
     metrics_path = _resolve_declared_artifact_path_from_contract_or_state(
@@ -26533,13 +26983,60 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     round_history = state.get("ml_improvement_round_history")
     if not isinstance(round_history, list):
         round_history = []
-    best_metric_so_far = _coerce_float(state.get("ml_improvement_best_metric"))
-    if best_metric_so_far is None:
-        best_metric_so_far = _coerce_float(baseline_value)
 
     output_paths = _resolve_ml_outputs_for_metric_round(contract, state)
+    metrics_path = _resolve_declared_artifact_path_from_contract_or_state(
+        contract,
+        state if isinstance(state, dict) else {},
+        "metrics.json",
+        kind="metrics",
+    )
     snapshot_dir = Path("work") / f"ml_incumbent_snapshot_r{round_id}"
     _snapshot_ml_outputs(output_paths, snapshot_dir)
+    prior_loop_state = prior_metric_loop_state
+    best_metric_so_far = _coerce_float(
+        ((prior_loop_state.get("best_observed") or {}).get("metric_value"))
+        if isinstance(prior_loop_state.get("best_observed"), dict)
+        else None
+    )
+    if best_metric_so_far is None:
+        best_metric_so_far = _coerce_float(baseline_value)
+    metric_loop_state = _build_metric_loop_state(
+        state=state,
+        contract=contract,
+        round_id=int(round_id),
+        rounds_allowed=int(rounds),
+        patience=int(patience),
+        no_improve_streak=int(no_improve_streak),
+        min_delta=float(min_delta),
+        active=True,
+        incumbent_metrics_payload=baseline_metrics if isinstance(baseline_metrics, dict) else {},
+        incumbent_fallback_value=baseline_value,
+        incumbent_path=metrics_path,
+        incumbent_source="round_bootstrap",
+        baseline_review_verdict=normalize_review_status(state.get("review_verdict")),
+        candidate_metrics_payload={},
+        candidate_fallback_value=None,
+        candidate_path=metrics_path,
+        candidate_source="pending",
+        candidate_status="pending",
+        best_observed_value=best_metric_so_far,
+        best_observed_label=(
+            "incumbent"
+            if not _metric_loop_value_is_better(best_metric_so_far, baseline_value, bool(metric_higher_is_better))
+            else "prior_best"
+        ),
+        best_observed_source="prior_metric_loop_state" if _coerce_float(((prior_loop_state.get("best_observed") or {}).get("metric_value")) if isinstance(prior_loop_state.get("best_observed"), dict) else None) is not None else "round_bootstrap",
+    )
+    metric_snapshot = _build_metric_loop_prompt_snapshot(metric_loop_state)
+    _sync_metric_loop_legacy_fields(state, metric_loop_state)
+    merged_index = _persist_metric_loop_state(
+        metric_loop_state,
+        existing_index=state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else state.get("produced_artifact_index"),
+    )
+    if isinstance(merged_index, list) and merged_index:
+        state["artifact_index"] = merged_index
+        state["produced_artifact_index"] = merged_index
     if run_id:
         try:
             log_run_event(
@@ -26905,17 +27402,12 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     )
     optimization_context = {
         "policy": hybrid_policy_meta,
-        "metric_snapshot": {
-            "primary_metric_name": metric_name,
-            "baseline_metric": float(baseline_value),
-            "best_metric_so_far": float(best_metric_so_far if best_metric_so_far is not None else baseline_value),
-            "higher_is_better": bool(metric_higher_is_better),
-            "min_delta": float(min_delta),
-        },
+        "metric_snapshot": metric_snapshot,
         "contract_lock": _build_metric_round_contract_lock(contract, output_paths, metric_name),
         "active_hypothesis": compress_long_lists(hypothesis_packet or {})[0],
         "experiment_tracker_recent": compress_long_lists((tracker_entries or [])[-5:])[0],
         "round_history_recent": compress_long_lists((round_history or [])[-4:])[0],
+        "metric_loop_state": metric_loop_state,
     }
     history_policy_line = (
         "METRIC_IMPROVEMENT_POLICY: phase="
@@ -27021,7 +27513,6 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     state["ml_optimization_context"] = optimization_context
     state["ml_improvement_apply_guard_report"] = {}
     state["ml_improvement_round_active"] = True
-    state["ml_improvement_round_count"] = int(round_id)
     state["ml_improvement_attempted"] = False
     state["ml_improvement_continue"] = False
     state["ml_improvement_loop_complete"] = False
@@ -27029,9 +27520,6 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     state["ml_improvement_review_mode"] = _resolve_metric_round_review_mode(contract)
     state["ml_improvement_snapshot_dir"] = str(snapshot_dir)
     state["ml_improvement_output_paths"] = output_paths
-    state["ml_improvement_current_round_id"] = int(round_id)
-    state["ml_improvement_round_baseline_metric"] = float(baseline_value)
-    state["ml_improvement_round_baseline_metrics"] = baseline_metrics
     state["ml_improvement_round_baseline_reviewer_packet"] = (
         dict(state.get("reviewer_last_result"))
         if isinstance(state.get("reviewer_last_result"), dict)
@@ -27042,22 +27530,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         if isinstance(state.get("qa_last_result"), dict)
         else {}
     )
-    state["ml_improvement_incumbent_metric"] = float(baseline_value)
-    state["ml_improvement_primary_metric_name"] = metric_name
-    state["ml_improvement_primary_metric_source"] = metric_target.get("source")
-    state["ml_improvement_baseline_metric"] = float(best_metric_so_far if best_metric_so_far is not None else baseline_value)
-    state["ml_improvement_baseline_metrics"] = baseline_metrics
     state["ml_improvement_baseline_review_verdict"] = normalize_review_status(state.get("review_verdict"))
-    state["ml_improvement_higher_is_better"] = bool(metric_higher_is_better)
-    state["ml_improvement_min_delta"] = float(min_delta)
-    state["ml_improvement_rounds_allowed"] = int(rounds)
-    state["ml_improvement_patience"] = int(patience)
-    state["ml_improvement_no_improve_streak"] = int(no_improve_streak)
-    state["ml_improvement_best_metric"] = (
-        float(best_metric_so_far)
-        if best_metric_so_far is not None
-        else float(baseline_value)
-    )
     state["ml_improvement_best_round"] = int(state.get("ml_improvement_best_round", 0) or 0)
     if not isinstance(state.get("ml_improvement_round_history"), list):
         state["ml_improvement_round_history"] = round_history
@@ -27138,19 +27611,28 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
 
 
 def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str, Any]) -> str:
-    metric_target = _resolve_contract_metric_target(state, contract if isinstance(contract, dict) else {})
+    contract = contract if isinstance(contract, dict) else {}
+    metric_loop_state = _load_metric_loop_state(state, contract)
+    metric_target = _resolve_contract_metric_target(state, contract)
+    loop_target = metric_loop_state.get("target") if isinstance(metric_loop_state.get("target"), dict) else {}
+    round_payload = metric_loop_state.get("round") if isinstance(metric_loop_state.get("round"), dict) else {}
+    round_baseline_entry = round_payload.get("baseline") if isinstance(round_payload.get("baseline"), dict) else {}
+    best_observed = metric_loop_state.get("best_observed") if isinstance(metric_loop_state.get("best_observed"), dict) else {}
     metric_name = str(
-        state.get("ml_improvement_primary_metric_name")
+        loop_target.get("name")
+        or state.get("ml_improvement_primary_metric_name")
         or metric_target.get("name")
         or _resolve_contract_primary_metric_name(state, contract)
         or "roc_auc"
     ).strip()
     round_baseline_value = _coerce_float(
-        state.get("ml_improvement_round_baseline_metric")
+        round_baseline_entry.get("metric_value")
+        if isinstance(round_baseline_entry, dict)
+        else state.get("ml_improvement_round_baseline_metric")
     )
     if round_baseline_value is None:
         round_baseline_value = _coerce_float(state.get("ml_improvement_incumbent_metric"))
-    best_metric_value = _coerce_float(state.get("ml_improvement_best_metric"))
+    best_metric_value = _coerce_float(best_observed.get("metric_value"))
     if best_metric_value is None:
         best_metric_value = _coerce_float(state.get("ml_improvement_baseline_metric"))
     baseline_value = (
@@ -27159,14 +27641,16 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         else best_metric_value
     )
     min_delta = float(state.get("ml_improvement_min_delta", 0.0005) or 0.0005)
-    rounds_allowed = int(state.get("ml_improvement_rounds_allowed", 1) or 1)
-    patience = int(state.get("ml_improvement_patience", 2) or 2)
-    round_id = int(state.get("ml_improvement_current_round_id", state.get("ml_improvement_round_count", 0) or 0) or 0)
-    no_improve_streak = int(state.get("ml_improvement_no_improve_streak", 0) or 0)
+    rounds_allowed = int(round_payload.get("rounds_allowed") or state.get("ml_improvement_rounds_allowed", 1) or 1)
+    patience = int(round_payload.get("patience") or state.get("ml_improvement_patience", 2) or 2)
+    round_id = int(round_payload.get("round_id") or state.get("ml_improvement_current_round_id", state.get("ml_improvement_round_count", 0) or 0) or 0)
+    no_improve_streak = int(round_payload.get("no_improve_streak") or state.get("ml_improvement_no_improve_streak", 0) or 0)
     round_history = state.get("ml_improvement_round_history")
     if not isinstance(round_history, list):
         round_history = []
-    higher_is_better_state = state.get("ml_improvement_higher_is_better")
+    higher_is_better_state = loop_target.get("higher_is_better")
+    if not isinstance(higher_is_better_state, bool):
+        higher_is_better_state = state.get("ml_improvement_higher_is_better")
     if isinstance(higher_is_better_state, bool):
         higher_is_better = higher_is_better_state
     else:
@@ -27201,8 +27685,8 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         phase="metric_round",
     )
     baseline_metrics_payload = (
-        state.get("ml_improvement_round_baseline_metrics")
-        if isinstance(state.get("ml_improvement_round_baseline_metrics"), dict)
+        round_baseline_entry.get("metrics_payload")
+        if isinstance(round_baseline_entry.get("metrics_payload"), dict)
         else {}
     )
     if not baseline_metrics_payload:
@@ -27379,8 +27863,6 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             state["reviewer_last_result"] = dict(baseline_reviewer_packet)
         if baseline_qa_packet:
             state["qa_last_result"] = dict(baseline_qa_packet)
-        if baseline_value is not None:
-            state["ml_improvement_incumbent_metric"] = float(baseline_value)
         # Both runtime failures and metric stagnation count toward the
         # no-improve streak.  A runtime failure means all execution retries
         # were exhausted without producing viable results — the technique
@@ -27391,7 +27873,6 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         state["ml_improvement_kept"] = "improved"
         state["stop_reason"] = "IMPROVEMENT_ROUND_KEPT_IMPROVED"
         no_improve_streak = 0
-        state["ml_improvement_incumbent_metric"] = float(improved_value) if improved_value is not None else baseline_value
 
     metrics_path = _resolve_declared_artifact_path_from_state(
         state if isinstance(state, dict) else {},
@@ -27404,6 +27885,12 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     final_metric_value = _extract_primary_metric(final_metrics_payload, metric_name)
     if final_metric_value is None:
         final_metric_value = improved_value if improved else baseline_value
+    selected_label_for_loop = "candidate" if improved else "baseline"
+    if improved and _metric_loop_value_is_better(improved_value, best_metric_value, bool(higher_is_better)):
+        best_metric_value = improved_value
+        state["ml_improvement_best_round"] = int(round_id or 0)
+    elif best_metric_value is None:
+        best_metric_value = final_metric_value
     evaluation_spec_state = state.get("evaluation_spec") if isinstance(state.get("evaluation_spec"), dict) else {}
     if not evaluation_spec_state and isinstance(contract, dict):
         evaluation_spec_state = contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {}
@@ -27470,21 +27957,54 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         force_finalize=bool(force_finalize),
         force_finalize_reason=force_finalize_reason if force_finalize else "",
     )
-
-    def _metric_better(candidate: Optional[float], incumbent: Optional[float], hib: bool) -> bool:
-        if candidate is None:
-            return False
-        if incumbent is None:
-            return True
-        if hib:
-            return float(candidate) > float(incumbent)
-        return float(candidate) < float(incumbent)
-
-    if _metric_better(improved_value if improved else baseline_value, best_metric_value, bool(higher_is_better)):
-        best_metric_value = improved_value if improved else baseline_value
-        if best_metric_value is not None:
-            state["ml_improvement_best_metric"] = float(best_metric_value)
-            state["ml_improvement_best_round"] = int(round_id or 0)
+    finalized_metric_loop_state = _build_metric_loop_state(
+        state=state,
+        contract=contract,
+        round_id=int(round_id),
+        rounds_allowed=int(rounds_allowed),
+        patience=int(patience),
+        no_improve_streak=int(no_improve_streak),
+        min_delta=float(min_delta),
+        active=False,
+        incumbent_metrics_payload=(
+            final_metrics_payload if improved else baseline_metrics_payload
+        ),
+        incumbent_fallback_value=(final_metric_value if improved else baseline_value),
+        incumbent_path=metrics_path,
+        incumbent_source="candidate_kept" if improved else "restored_round_baseline",
+        baseline_review_verdict=baseline_verdict,
+        candidate_metrics_payload=current_metrics,
+        candidate_fallback_value=improved_value,
+        candidate_path=metrics_path,
+        candidate_source="candidate_round_output",
+        candidate_status="selected" if improved else "rejected",
+        best_observed_value=best_metric_value,
+        best_observed_label="candidate" if improved and _coerce_float(improved_value) is not None and best_metric_value == _coerce_float(improved_value) else str(best_observed.get("label") or "incumbent"),
+        best_observed_source="candidate_kept" if improved and _coerce_float(improved_value) is not None and best_metric_value == _coerce_float(improved_value) else str(best_observed.get("source") or "round_baseline"),
+        final_label=selected_label_for_loop,
+        final_metrics_payload=final_metrics_payload,
+        final_fallback_value=final_metric_value,
+        final_path=metrics_path,
+        final_source="candidate_kept" if improved else "restored_round_baseline",
+        selection=incumbent_selection,
+    )
+    _sync_metric_loop_legacy_fields(state, finalized_metric_loop_state)
+    merged_index = _persist_metric_loop_state(
+        finalized_metric_loop_state,
+        existing_index=state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else state.get("produced_artifact_index"),
+    )
+    if isinstance(merged_index, list) and merged_index:
+        state["artifact_index"] = merged_index
+        state["produced_artifact_index"] = merged_index
+    state["ml_optimization_context"] = {
+        **(
+            state.get("ml_optimization_context")
+            if isinstance(state.get("ml_optimization_context"), dict)
+            else {}
+        ),
+        "metric_snapshot": _build_metric_loop_prompt_snapshot(finalized_metric_loop_state),
+        "metric_loop_state": finalized_metric_loop_state,
+    }
 
     hypothesis_packet_for_round = (
         state.get("ml_improvement_hypothesis_packet")

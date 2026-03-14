@@ -841,3 +841,229 @@ def test_metric_round_guarded_mode_ignores_advisory_verdict(tmp_path, monkeypatc
 
     assert route == "approved"
     assert state.get("ml_improvement_kept") == "improved"
+
+
+def test_bootstrap_metric_round_prefers_canonical_metric_loop_state_over_stale_legacy_scalars(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("data/metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps({"mean_multi_horizon_log_loss": 0.0862}), encoding="utf-8")
+
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod, "log_run_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_critique_packet",
+        lambda _ctx: {
+            "metric_comparison": {
+                "baseline_value": 0.0862,
+                "candidate_value": 0.0862,
+                "meets_min_delta": False,
+            },
+            "validation_signals": {"validation_mode": "cv"},
+            "error_modes": [],
+            "analysis_summary": "Baseline ready.",
+        },
+    )
+    monkeypatch.setattr(
+        graph_mod.strategist,
+        "generate_iteration_hypothesis",
+        lambda _ctx: {
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "missing_indicators",
+                "objective": "Improve calibration.",
+                "target_columns": ["label_12h", "label_24h"],
+                "feature_scope": "model_features",
+                "params": {},
+            },
+            "tracker_context": {"signature": "hyp_metric_loop_state", "is_duplicate": False, "duplicate_of": None},
+            "success_criteria": {"primary_metric_name": "mean_multi_horizon_log_loss", "min_delta": 0.0005},
+        },
+    )
+    monkeypatch.setattr(graph_mod.results_advisor, "last_critique_meta", {"mode": "deterministic", "source": "deterministic", "provider": "none", "model": None})
+    monkeypatch.setattr(graph_mod.strategist, "last_iteration_meta", {"mode": "deterministic", "source": "deterministic", "model": None})
+
+    contract = {
+        "validation_requirements": {"primary_metric": "mean_multi_horizon_log_loss"},
+        "iteration_policy": {"metric_improvement_rounds": 2, "metric_min_delta": 0.0005},
+        "artifact_requirements": {"required_files": [{"path": "data/metrics.json"}]},
+        "required_outputs": ["data/metrics.json"],
+        "column_roles": {},
+    }
+    state = {
+        "run_id": "run_metric_loop_state",
+        "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_attempted": False,
+        "iteration_count": 0,
+        "generated_code": "def train():\n    return None\n",
+        "feedback_history": [],
+        # Deliberately stale/conflicting legacy values.
+        "ml_improvement_best_metric": 0.1475,
+        "ml_improvement_higher_is_better": True,
+        "metric_loop_state": {
+            "schema_version": "v1",
+            "target": {
+                "name": "mean_multi_horizon_log_loss",
+                "canonical_name": "logloss",
+                "higher_is_better": False,
+                "min_delta": 0.0005,
+                "source": "test",
+            },
+            "round": {
+                "round_id": 0,
+                "rounds_allowed": 2,
+                "patience": 2,
+                "no_improve_streak": 0,
+                "status": "complete",
+                "baseline": {
+                    "label": "round_baseline",
+                    "metric_name": "mean_multi_horizon_log_loss",
+                    "metric_value": 0.0862,
+                    "metrics_payload": {"mean_multi_horizon_log_loss": 0.0862},
+                },
+            },
+            "incumbent": {
+                "label": "incumbent",
+                "metric_name": "mean_multi_horizon_log_loss",
+                "metric_value": 0.0862,
+                "metrics_payload": {"mean_multi_horizon_log_loss": 0.0862},
+            },
+            "best_observed": {
+                "label": "incumbent",
+                "metric_name": "mean_multi_horizon_log_loss",
+                "metric_value": 0.0862,
+                "source": "test",
+            },
+        },
+    }
+
+    activated = graph_mod._bootstrap_metric_improvement_round(state, contract)
+
+    assert activated is True
+    handoff = state.get("iteration_handoff", {})
+    optimization_context = handoff.get("optimization_context") if isinstance(handoff.get("optimization_context"), dict) else {}
+    metric_snapshot = optimization_context.get("metric_snapshot") if isinstance(optimization_context.get("metric_snapshot"), dict) else {}
+    assert metric_snapshot.get("primary_metric_name") == "mean_multi_horizon_log_loss"
+    assert metric_snapshot.get("higher_is_better") is False
+    assert metric_snapshot.get("best_metric_so_far") == pytest.approx(0.0862, abs=1e-12)
+
+
+def test_finalize_metric_round_persists_canonical_metric_loop_state_without_mixing_baseline_and_candidate(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("data/metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline = {"mean_multi_horizon_log_loss": 0.0862}
+    metrics_path.write_text(json.dumps(baseline), encoding="utf-8")
+    snapshot_dir = Path("work/ml_incumbent_snapshot_r1")
+    output_paths = ["data/metrics.json"]
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    candidate = {"mean_multi_horizon_log_loss": 0.1264}
+    metrics_path.write_text(json.dumps(candidate), encoding="utf-8")
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_critique_packet",
+        lambda _ctx: {
+            "metric_comparison": {
+                "baseline_value": 0.0862,
+                "candidate_value": 0.1264,
+                "meets_min_delta": False,
+            },
+            "validation_signals": {"validation_mode": "cv"},
+            "error_modes": [],
+        },
+    )
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "last_critique_meta",
+        {"mode": "deterministic", "source": "deterministic", "provider": "none", "model": None},
+    )
+
+    state = {
+        "review_verdict": "APPROVED",
+        "execution_contract": {
+            "validation_requirements": {"primary_metric": "mean_multi_horizon_log_loss"},
+            "artifact_requirements": {"required_files": [{"path": "data/metrics.json"}]},
+            "required_outputs": ["data/metrics.json"],
+            "iteration_policy": {"metric_improvement_rounds": 3, "metric_improvement_patience": 2, "metric_min_delta": 0.0005},
+        },
+        "ml_improvement_round_active": True,
+        "ml_improvement_round_count": 1,
+        "ml_improvement_current_round_id": 1,
+        "ml_improvement_primary_metric_name": "mean_multi_horizon_log_loss",
+        "ml_improvement_round_baseline_metric": 0.0862,
+        "ml_improvement_round_baseline_metrics": baseline,
+        "ml_improvement_baseline_metric": 0.0862,
+        "ml_improvement_baseline_metrics": baseline,
+        "ml_improvement_best_metric": 0.0862,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": False,
+        "ml_improvement_output_paths": output_paths,
+        "ml_improvement_snapshot_dir": str(snapshot_dir),
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "ml_improvement_rounds_allowed": 3,
+        "ml_improvement_patience": 2,
+        "ml_improvement_no_improve_streak": 0,
+        "feedback_history": [],
+        "metric_loop_state": {
+            "schema_version": "v1",
+            "target": {
+                "name": "mean_multi_horizon_log_loss",
+                "canonical_name": "logloss",
+                "higher_is_better": False,
+                "min_delta": 0.0005,
+                "source": "test",
+            },
+            "round": {
+                "round_id": 1,
+                "rounds_allowed": 3,
+                "patience": 2,
+                "no_improve_streak": 0,
+                "status": "active",
+                "baseline": {
+                    "label": "round_baseline",
+                    "metric_name": "mean_multi_horizon_log_loss",
+                    "metric_value": 0.0862,
+                    "metrics_payload": baseline,
+                    "review_verdict": "APPROVED",
+                },
+            },
+            "incumbent": {
+                "label": "incumbent",
+                "metric_name": "mean_multi_horizon_log_loss",
+                "metric_value": 0.0862,
+                "metrics_payload": baseline,
+            },
+            "candidate": {
+                "label": "candidate",
+                "metric_name": "mean_multi_horizon_log_loss",
+                "metric_value": None,
+                "metrics_payload": {},
+                "status": "pending",
+            },
+            "best_observed": {
+                "label": "incumbent",
+                "metric_name": "mean_multi_horizon_log_loss",
+                "metric_value": 0.0862,
+                "source": "test",
+            },
+        },
+    }
+
+    route = check_evaluation(state)
+
+    assert route == "approved"
+    loop_state = state.get("metric_loop_state") if isinstance(state.get("metric_loop_state"), dict) else {}
+    assert loop_state.get("round", {}).get("baseline", {}).get("metric_value") == pytest.approx(0.0862, abs=1e-12)
+    assert loop_state.get("candidate", {}).get("metric_value") == pytest.approx(0.1264, abs=1e-12)
+    assert loop_state.get("final", {}).get("label") == "baseline"
+    assert loop_state.get("final", {}).get("metric_value") == pytest.approx(0.0862, abs=1e-12)
+    assert loop_state.get("incumbent", {}).get("metric_value") == pytest.approx(0.0862, abs=1e-12)
+    assert loop_state.get("best_observed", {}).get("metric_value") == pytest.approx(0.0862, abs=1e-12)
+    persisted_loop_state = json.loads(Path("data/metric_loop_state.json").read_text(encoding="utf-8"))
+    assert persisted_loop_state.get("final", {}).get("label") == "baseline"
