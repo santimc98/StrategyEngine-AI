@@ -13300,7 +13300,7 @@ def get_runtime_agent_models() -> Dict[str, str]:
         "ml_engineer": _normalize_runtime_model_name(getattr(ml_engineer, "model_name", "")),
     }
     editor_model = _normalize_runtime_model_name(getattr(ml_engineer, "editor_model_name", ""))
-    if editor_model:
+    if editor_model and editor_model != models["ml_engineer"]:
         models["ml_engineer_editor"] = editor_model
     return models
 
@@ -13337,10 +13337,9 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
     ml_engineer_model = normalized.get("ml_engineer")
     if ml_engineer_model:
         ml_engineer.model_name = ml_engineer_model
+        ml_engineer.editor_model_name = ml_engineer_model
         ml_engineer.last_model_used = None
-    ml_engineer_editor_model = normalized.get("ml_engineer_editor")
-    if ml_engineer_editor_model:
-        ml_engineer.editor_model_name = ml_engineer_editor_model
+    ml_engineer.editor_model_name = _normalize_runtime_model_name(getattr(ml_engineer, "model_name", ""))
 
     return get_runtime_agent_models()
 

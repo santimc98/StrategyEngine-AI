@@ -151,19 +151,25 @@ class MLEngineerAgent:
             os.getenv("OPENROUTER_ML_FALLBACK_MODEL")
             or "minimax/minimax-m2.5"
         ).strip()
-        # Editor model: used for REPAIR/editor mode iterations (when previous
-        # code exists). Falls back to primary model when not configured.
-        _editor_raw = (os.getenv("OPENROUTER_ML_EDITOR_MODEL") or "").strip()
-        self.editor_model_name = _editor_raw if _editor_raw else None
         if not self.model_name:
             self.model_name = "moonshotai/kimi-k2.5"
         if not self.fallback_model_name:
             self.fallback_model_name = "minimax/minimax-m2.5"
+        # Keep editor mode on the same primary model as base generation so
+        # optimization/repair quality follows the run's configured main model.
+        _editor_raw = (os.getenv("OPENROUTER_ML_EDITOR_MODEL") or "").strip()
+        if _editor_raw and _editor_raw != self.model_name:
+            self.logger.warning(
+                "OPENROUTER_ML_EDITOR_MODEL=%s ignored; editor follows primary model=%s",
+                _editor_raw,
+                self.model_name,
+            )
+        self.editor_model_name = self.model_name
         self.logger.info(
             "ML_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s editor=%s",
             self.model_name,
             self.fallback_model_name,
-            self.editor_model_name or "(same as primary)",
+            self.editor_model_name,
         )
         self.last_prompt = None
         self.last_response = None
