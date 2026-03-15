@@ -9,8 +9,7 @@ import re
 import difflib
 
 from dotenv import load_dotenv
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from openai import OpenAI
 from src.utils.contract_validation import (
     DEFAULT_DATA_ENGINEER_RUNBOOK,
     DEFAULT_ML_ENGINEER_RUNBOOK,
@@ -86,6 +85,45 @@ contract based on your semantic understanding of what the downstream agents will
 """
 
 CONTRACT_SCHEMA_EXAMPLES_TEXT = build_contract_schema_examples_text()
+
+_EXECUTION_CONTRACT_TOOL_NAME = "emit_execution_contract"
+_EXECUTION_CONTRACT_PATCH_TOOL_NAME = "emit_execution_contract_patch"
+_JSON_PATCH_VALUE_SCHEMA: Dict[str, Any] = {
+    "anyOf": [
+        {"type": "object", "additionalProperties": True},
+        {"type": "array", "items": {}},
+        {"type": "string"},
+        {"type": "number"},
+        {"type": "integer"},
+        {"type": "boolean"},
+        {"type": "null"},
+    ]
+}
+_EXECUTION_CONTRACT_PATCH_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "changes": {
+            "type": "object",
+            "additionalProperties": _JSON_PATCH_VALUE_SCHEMA,
+            "description": "Minimal nested fields to deep-merge into the current contract.",
+        },
+        "patch": {
+            "type": "array",
+            "description": "Optional JSON Patch operations.",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "op": {"type": "string", "enum": ["add", "remove", "replace"]},
+                    "path": {"type": "string"},
+                    "value": _JSON_PATCH_VALUE_SCHEMA,
+                },
+                "required": ["op", "path"],
+            },
+        },
+    },
+}
 
 MINIMAL_CONTRACT_COMPILER_PROMPT = """
 You are an Execution Contract Compiler for a multi-agent business intelligence system.
@@ -6945,10 +6983,14 @@ class ExecutionPlannerAgent:
         # Explicit `api_key=None` means "disable external LLM client" (used by tests/fallback paths).
         # Omitting the argument keeps env-based resolution for runtime behavior.
         if api_key is _API_KEY_SENTINEL:
-            resolved_api_key = os.getenv("GOOGLE_API_KEY")
+            resolved_api_key = (
+                os.getenv("EXECUTION_PLANNER_API_KEY")
+                or os.getenv("OPENROUTER_API_KEY")
+            )
         else:
             resolved_api_key = api_key
         self.api_key = str(resolved_api_key).strip() if resolved_api_key not in (None, "") else None
+        self.provider = "openrouter"
         max_output_tokens = 16384
         try:
             max_output_tokens = int(os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "16384"))
@@ -6964,28 +7006,38 @@ class ExecutionPlannerAgent:
         self._generation_config = {
             "temperature": 0.0,
             "top_p": 0.9,
-            "top_k": 40,
             "response_mime_type": "application/json",
             "max_output_tokens": self._default_max_output_tokens,
         }
         schema_flag = str(os.getenv("EXECUTION_PLANNER_USE_RESPONSE_SCHEMA", "0")).strip().lower()
         self._use_response_schema = schema_flag not in {"0", "false", "no", "off", ""}
-        self._safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
+        base_url = os.getenv("EXECUTION_PLANNER_BASE_URL", "").strip()
+        if not base_url:
+            base_url = "https://openrouter.ai/api/v1"
+        self.base_url = base_url or None
+        self.model_name = (
+            os.getenv("EXECUTION_PLANNER_PRIMARY_MODEL")
+            or os.getenv("EXECUTION_PLANNER_MODEL")
+            or "openai/gpt-5.4"
+        ).strip()
+        if not self.model_name:
+            self.model_name = "openai/gpt-5.4"
         if not self.api_key:
             self.client = None
         else:
-            genai.configure(api_key=self.api_key)
-            self.client = genai.GenerativeModel(
-                model_name="gemini-3-flash-preview",
-                generation_config=self._generation_config,
-                safety_settings=self._safety_settings,
-            )
-        self.model_name = "gemini-3-flash-preview"
+            client_kwargs: Dict[str, Any] = {"api_key": self.api_key}
+            if self.base_url:
+                client_kwargs["base_url"] = self.base_url
+            headers: Dict[str, str] = {}
+            referer = os.getenv("OPENROUTER_HTTP_REFERER")
+            if referer:
+                headers["HTTP-Referer"] = referer
+            title = os.getenv("OPENROUTER_X_TITLE")
+            if title:
+                headers["X-Title"] = title
+            if headers:
+                client_kwargs["default_headers"] = headers
+            self.client = OpenAI(**client_kwargs)
         chain_raw = os.getenv("EXECUTION_PLANNER_MODEL_CHAIN", "")
         chain: List[str] = [self.model_name]
         if isinstance(chain_raw, str) and chain_raw.strip():
@@ -7022,7 +7074,7 @@ class ExecutionPlannerAgent:
     @staticmethod
     def _is_response_schema_unsupported_error(err: Exception) -> bool:
         message = str(err or "").lower()
-        if "response_schema" not in message:
+        if "response_schema" not in message and "json_schema" not in message and "tool" not in message:
             return False
         unsupported_tokens = (
             "unknown field",
@@ -7035,25 +7087,122 @@ class ExecutionPlannerAgent:
         )
         return any(token in message for token in unsupported_tokens)
 
-    def _generate_content_with_budget(self, model_client: Any, prompt: str, output_token_floor: int = 1024):
-        generation_config = self._generation_config_for_prompt(prompt, output_token_floor=output_token_floor)
+    @staticmethod
+    def _build_function_tool(name: str, description: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": copy.deepcopy(schema),
+            },
+        }
+
+    @staticmethod
+    def _extract_openai_response_text(response: Any) -> str:
+        if response is None:
+            return ""
         try:
-            response = model_client.generate_content(prompt, generation_config=generation_config)
+            choices = getattr(response, "choices", None) or []
+            if choices:
+                message = getattr(choices[0], "message", None)
+                tool_calls = getattr(message, "tool_calls", None) if message is not None else None
+                if tool_calls:
+                    function_payload = getattr(tool_calls[0], "function", None)
+                    arguments = getattr(function_payload, "arguments", None)
+                    if isinstance(arguments, str) and arguments.strip():
+                        return arguments.strip()
+                content = getattr(message, "content", None) if message is not None else None
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+        except Exception:
+            pass
+        text = getattr(response, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        return ""
+
+    @staticmethod
+    def _extract_openai_finish_reason(response: Any) -> Any:
+        try:
+            choices = getattr(response, "choices", None) or []
+            if choices:
+                return getattr(choices[0], "finish_reason", None)
+        except Exception:
+            return None
+        return None
+
+    def _generate_content_with_budget(
+        self,
+        model_client: Any,
+        prompt: str,
+        output_token_floor: int = 1024,
+        *,
+        model_name: str | None = None,
+        tool_mode: str = "contract",
+    ):
+        generation_config = self._generation_config_for_prompt(prompt, output_token_floor=output_token_floor)
+        if hasattr(model_client, "generate_content"):
+            try:
+                response = model_client.generate_content(prompt, generation_config=generation_config)
+            except TypeError:
+                response = model_client.generate_content(prompt)
+            except Exception as err:
+                if (
+                    "response_schema" in generation_config
+                    and self._is_response_schema_unsupported_error(err)
+                ):
+                    retry_config = dict(generation_config)
+                    retry_config.pop("response_schema", None)
+                    try:
+                        response = model_client.generate_content(prompt, generation_config=retry_config)
+                    except TypeError:
+                        response = model_client.generate_content(prompt)
+                    generation_config = retry_config
+                else:
+                    raise
+            return response, generation_config
+
+        selected_model = str(model_name or self.model_name or "").strip() or self.model_name
+        schema = (
+            copy.deepcopy(_EXECUTION_CONTRACT_PATCH_SCHEMA)
+            if tool_mode == "patch"
+            else copy.deepcopy(EXECUTION_CONTRACT_V42_MIN_SCHEMA)
+        )
+        tool = self._build_function_tool(
+            _EXECUTION_CONTRACT_PATCH_TOOL_NAME if tool_mode == "patch" else _EXECUTION_CONTRACT_TOOL_NAME,
+            "Return the final execution planner JSON payload.",
+            schema,
+        )
+        messages = [{"role": "user", "content": prompt}]
+        call_kwargs: Dict[str, Any] = {
+            "model": selected_model,
+            "messages": messages,
+            "temperature": float(generation_config.get("temperature", 0.0)),
+            "max_tokens": int(generation_config.get("max_output_tokens", self._default_max_output_tokens)),
+            "tools": [tool],
+            "tool_choice": {
+                "type": "function",
+                "function": {
+                    "name": _EXECUTION_CONTRACT_PATCH_TOOL_NAME if tool_mode == "patch" else _EXECUTION_CONTRACT_TOOL_NAME
+                },
+            },
+        }
+        top_p = generation_config.get("top_p")
+        if top_p is not None:
+            call_kwargs["top_p"] = top_p
+        try:
+            response = model_client.chat.completions.create(**call_kwargs)
         except TypeError:
-            # Some mocks/stubs only accept the positional prompt argument.
-            response = model_client.generate_content(prompt)
+            retry_kwargs = dict(call_kwargs)
+            retry_kwargs.pop("temperature", None)
+            retry_kwargs.pop("top_p", None)
+            response = model_client.chat.completions.create(**retry_kwargs)
         except Exception as err:
-            if (
-                "response_schema" in generation_config
-                and self._is_response_schema_unsupported_error(err)
-            ):
-                retry_config = dict(generation_config)
-                retry_config.pop("response_schema", None)
-                try:
-                    response = model_client.generate_content(prompt, generation_config=retry_config)
-                except TypeError:
-                    response = model_client.generate_content(prompt)
-                generation_config = retry_config
+            if self._is_response_schema_unsupported_error(err):
+                fallback_kwargs = dict(call_kwargs)
+                fallback_kwargs.pop("tool_choice", None)
+                response = model_client.chat.completions.create(**fallback_kwargs)
             else:
                 raise
         return response, generation_config
@@ -7061,13 +7210,7 @@ class ExecutionPlannerAgent:
     def _build_model_client(self, model_name: str) -> Any:
         if not self.api_key:
             return None
-        if model_name == self.model_name and self.client is not None:
-            return self.client
-        return genai.GenerativeModel(
-            model_name=model_name,
-            generation_config=self._generation_config,
-            safety_settings=self._safety_settings,
-        )
+        return self.client
 
     def generate_contract(
         self,
@@ -7645,13 +7788,29 @@ class ExecutionPlannerAgent:
                 except Exception:
                     pass
             usage_payload = {}
-            for key in ("prompt_token_count", "candidates_token_count", "total_token_count"):
+            for key in (
+                "prompt_token_count",
+                "candidates_token_count",
+                "completion_token_count",
+                "total_token_count",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+            ):
                 try:
                     value = getattr(raw_usage, key)
                 except Exception:
                     value = None
                 if value is not None:
                     usage_payload[key] = value
+            if "prompt_tokens" in usage_payload and "prompt_token_count" not in usage_payload:
+                usage_payload["prompt_token_count"] = usage_payload.get("prompt_tokens")
+            if "completion_tokens" in usage_payload and "candidates_token_count" not in usage_payload:
+                usage_payload["candidates_token_count"] = usage_payload.get("completion_tokens")
+            if "completion_tokens" in usage_payload and "completion_token_count" not in usage_payload:
+                usage_payload["completion_token_count"] = usage_payload.get("completion_tokens")
+            if "total_tokens" in usage_payload and "total_token_count" not in usage_payload:
+                usage_payload["total_token_count"] = usage_payload.get("total_tokens")
             return usage_payload or {"value": str(raw_usage)}
 
         def _build_parse_feedback(raw_text: str | None, parse_error: Exception | None) -> str:
@@ -8534,16 +8693,16 @@ class ExecutionPlannerAgent:
                             model_client,
                             repair_prompt,
                             output_token_floor=768,
+                            model_name=self.model_name,
+                            tool_mode="patch",
                         )
                     except Exception:
                         return None
 
-                    response_text = getattr(response, "text", "") or ""
+                    response_text = self._extract_openai_response_text(response)
                     if not response_text.strip():
                         return None
                     parsed, _ = _parse_json_response(response_text)
-                    if isinstance(parsed, list):
-                        return {"patch": parsed}
                     if not isinstance(parsed, dict):
                         return None
                     if isinstance(parsed.get("patch"), list):
@@ -8882,20 +9041,19 @@ domain_expert_critique:
                                 model_client,
                                 current_prompt,
                                 output_token_floor=3072 * quality_round,
+                                model_name=model_name,
+                                tool_mode="contract",
                             )
-                            response_text = getattr(response, "text", "") or ""
+                            response_text = self._extract_openai_response_text(response)
                             self.last_response = response_text
                     except Exception as err:
                         parse_error = err
 
                     if response is not None:
-                        try:
-                            candidates = getattr(response, "candidates", None)
-                            if candidates:
-                                finish_reason = getattr(candidates[0], "finish_reason", None)
-                        except Exception:
-                            finish_reason = None
-                        usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
+                        finish_reason = self._extract_openai_finish_reason(response)
+                        usage_metadata = _normalize_usage_metadata(
+                            getattr(response, "usage", None) or getattr(response, "usage_metadata", None)
+                        )
 
                     _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
 

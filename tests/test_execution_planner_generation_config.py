@@ -14,7 +14,6 @@ def test_execution_planner_generation_config_keeps_stable_defaults(monkeypatch):
 
     assert agent._generation_config["temperature"] == 0.0
     assert agent._generation_config["top_p"] == 0.9
-    assert agent._generation_config["top_k"] == 40
 
 
 def test_execution_planner_max_output_tokens_env_below_floor_is_clamped(monkeypatch):
@@ -74,3 +73,35 @@ def test_execution_planner_generate_content_retries_without_response_schema(monk
     assert "response_schema" not in second_cfg
     assert "response_schema" not in used_config
     assert used_config.get("response_mime_type") == "application/json"
+
+
+def test_execution_planner_defaults_to_openai_function_calling_stack(monkeypatch):
+    monkeypatch.delenv("EXECUTION_PLANNER_PROVIDER", raising=False)
+    monkeypatch.delenv("EXECUTION_PLANNER_PRIMARY_MODEL", raising=False)
+    monkeypatch.delenv("EXECUTION_PLANNER_MODEL", raising=False)
+
+    agent = ExecutionPlannerAgent(api_key=None)
+
+    assert agent.provider == "openrouter"
+    assert agent.model_name == "openai/gpt-5.4"
+
+
+def test_execution_planner_forces_openrouter_even_if_provider_env_requests_openai(monkeypatch):
+    monkeypatch.setenv("EXECUTION_PLANNER_PROVIDER", "openai")
+
+    agent = ExecutionPlannerAgent(api_key=None)
+
+    assert agent.provider == "openrouter"
+    assert agent.base_url == "https://openrouter.ai/api/v1"
+
+
+def test_execution_planner_extracts_tool_call_arguments():
+    agent = ExecutionPlannerAgent(api_key=None)
+
+    function_obj = type("_Fn", (), {"arguments": '{"scope":"full_pipeline"}'})()
+    tool_call = type("_ToolCall", (), {"function": function_obj})()
+    message = type("_Msg", (), {"tool_calls": [tool_call], "content": None})()
+    choice = type("_Choice", (), {"message": message})()
+    response = type("_Resp", (), {"choices": [choice]})()
+
+    assert agent._extract_openai_response_text(response) == '{"scope":"full_pipeline"}'
