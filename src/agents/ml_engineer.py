@@ -1561,6 +1561,11 @@ class MLEngineerAgent:
         scope_policy = str(constraints.get("scope_policy") or "").strip().lower()
         allow_strategy_changes = bool(constraints.get("allow_strategy_changes"))
         freeze_unimplicated = bool(constraints.get("freeze_unimplicated_regions"))
+        optimization_context = (
+            handoff_payload.get("optimization_context")
+            if isinstance(handoff_payload.get("optimization_context"), dict)
+            else {}
+        )
         repair_scope = (
             handoff_payload.get("repair_scope")
             if isinstance(handoff_payload.get("repair_scope"), dict)
@@ -1593,6 +1598,8 @@ class MLEngineerAgent:
                 lines.append("- Treat all regions outside REPAIR SCOPE as frozen unless new verified runtime evidence directly contradicts them.")
             if not allow_strategy_changes:
                 lines.append("- Strategy changes are NOT allowed in this mode.")
+            if optimization_context:
+                lines.append("- Active optimization hypothesis is deferred in patch-only mode; repair the incumbent defect first and preserve hypothesis context without implementing broader metric changes.")
             if editable_targets:
                 lines.append("- Editable targets: " + "; ".join(editable_targets[:4]) + ".")
             if protected_regions:
@@ -5023,6 +5030,7 @@ class MLEngineerAgent:
         - Treat the previous script as the incumbent and preserve working behavior by default.
         - Keep contract paths, split logic, expected row counts, target semantics, and model family unchanged unless the invariant block explicitly allows otherwise.
         - Use the evidence brief to target the weakest part of the incumbent instead of inventing a new plan.
+        - If the current phase is runtime_repair or persistence with patch_only scope, the hypothesis is deferred context only: repair the scoped defect first and do not implement broader metric changes unless the failing block is exactly where the hypothesis applies.
         - If CURRENT PHASE is runtime_repair or persistence, fix the verified blocker first using REPAIR GROUND TRUTH and REPAIR SCOPE, then preserve the active optimization lane.
         - If the primary metric is defined as a mean and the contract does not provide explicit weights, compute a simple arithmetic mean.
         - Avoid unrelated refactors; edit only the regions needed for metric improvement.

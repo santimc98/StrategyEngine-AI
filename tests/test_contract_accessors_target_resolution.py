@@ -66,3 +66,17 @@ def test_declared_artifact_resolution_preserves_custom_paths():
         == "artifacts/submission_bundle/submission.csv"
     )
     assert get_declared_file_schema(contract, "submission.csv").get("expected_row_count") == 95
+
+
+def test_declared_artifact_resolution_treats_evaluation_report_as_metrics_artifact():
+    contract = {
+        "required_outputs": ["reports/evaluation_report.json"],
+        "artifact_requirements": {
+            "required_files": [{"path": "reports/evaluation_report.json"}],
+        },
+    }
+
+    assert (
+        get_declared_artifact_path(contract, "metrics.json", kind="metrics")
+        == "reports/evaluation_report.json"
+    )

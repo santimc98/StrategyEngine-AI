@@ -953,6 +953,99 @@ def test_bootstrap_metric_round_prefers_canonical_metric_loop_state_over_stale_l
     assert metric_snapshot.get("best_metric_so_far") == pytest.approx(0.0862, abs=1e-12)
 
 
+def test_bootstrap_metric_round_ignores_uninitialized_legacy_defaults_and_uses_evaluation_report_alias(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    report_path = Path("reports/evaluation_report.json")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps({"metrics": {"mean_multi_horizon_log_loss": 0.21735549007130867}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod, "log_run_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_critique_packet",
+        lambda _ctx: {
+            "metric_comparison": {
+                "baseline_value": 0.21735549007130867,
+                "candidate_value": 0.21735549007130867,
+                "meets_min_delta": False,
+            },
+            "validation_signals": {"validation_mode": "cv"},
+            "error_modes": [],
+            "analysis_summary": "Baseline ready.",
+        },
+    )
+    monkeypatch.setattr(
+        graph_mod.strategist,
+        "generate_iteration_hypothesis",
+        lambda _ctx: {
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "cross_horizon_features",
+                "objective": "Improve multi-horizon log loss.",
+                "target_columns": ["label_12h", "label_24h"],
+                "feature_scope": "model_features",
+                "params": {},
+            },
+            "tracker_context": {"signature": "hyp_bootstrap_alias", "is_duplicate": False, "duplicate_of": None},
+            "success_criteria": {"primary_metric_name": "mean_multi_horizon_log_loss", "min_delta": 0.0005},
+        },
+    )
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "last_critique_meta",
+        {"mode": "deterministic", "source": "deterministic", "provider": "none", "model": None},
+    )
+    monkeypatch.setattr(
+        graph_mod.strategist,
+        "last_iteration_meta",
+        {"mode": "deterministic", "source": "deterministic", "model": None},
+    )
+
+    contract = {
+        "validation_requirements": {"primary_metric": "mean_multi_horizon_log_loss"},
+        "iteration_policy": {"metric_improvement_rounds": 2, "metric_min_delta": 0.0005},
+        "artifact_requirements": {"required_files": [{"path": "reports/evaluation_report.json"}]},
+        "required_outputs": ["reports/evaluation_report.json"],
+        "column_roles": {},
+    }
+    state = {
+        "run_id": "run_metric_loop_alias",
+        "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_attempted": False,
+        "iteration_count": 0,
+        "generated_code": "def train():\n    return None\n",
+        "feedback_history": [],
+        # Default-style legacy values that should be ignored before the first round.
+        "ml_improvement_best_metric": 0.0,
+        "ml_improvement_higher_is_better": True,
+        "ml_improvement_round_count": 0,
+        "ml_improvement_current_round_id": 0,
+        "metric_loop_state": {},
+        "primary_metric_snapshot": {},
+    }
+
+    activated = graph_mod._bootstrap_metric_improvement_round(state, contract)
+
+    assert activated is True
+    loop_state = state.get("metric_loop_state") if isinstance(state.get("metric_loop_state"), dict) else {}
+    target = loop_state.get("target") if isinstance(loop_state.get("target"), dict) else {}
+    handoff = state.get("iteration_handoff", {})
+    optimization_context = handoff.get("optimization_context") if isinstance(handoff.get("optimization_context"), dict) else {}
+    metric_snapshot = optimization_context.get("metric_snapshot") if isinstance(optimization_context.get("metric_snapshot"), dict) else {}
+    assert target.get("higher_is_better") is False
+    assert metric_snapshot.get("higher_is_better") is False
+    assert metric_snapshot.get("baseline_metric") == pytest.approx(0.21735549007130867, abs=1e-12)
+    assert metric_snapshot.get("best_metric_so_far") == pytest.approx(0.21735549007130867, abs=1e-12)
+
+
 def test_finalize_metric_round_persists_canonical_metric_loop_state_without_mixing_baseline_and_candidate(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     metrics_path = Path("data/metrics.json")
