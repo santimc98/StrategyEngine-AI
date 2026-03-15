@@ -1,6 +1,10 @@
 from unittest.mock import MagicMock
 
-from src.agents.execution_planner import ExecutionPlannerAgent, parse_derive_from_expression
+from src.agents.execution_planner import (
+    ExecutionPlannerAgent,
+    _apply_planner_structural_support,
+    parse_derive_from_expression,
+)
 
 
 def test_parse_derive_from_expression_simple():
@@ -67,3 +71,33 @@ def test_invalid_llm_contract_is_not_replaced_by_deterministic_scaffold(monkeypa
     diagnostics = planner.last_contract_diagnostics or {}
     summary = diagnostics.get("summary") or {}
     assert summary.get("accepted") is False
+
+
+def test_planner_structural_support_projects_clean_dataset_from_canonical_contract():
+    contract = {
+        "scope": "full_pipeline",
+        "canonical_columns": ["event_id", "__split", "feature_a", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "outcome": ["target"],
+            "identifiers": ["event_id"],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature_a"],
+            "segmentation_features": [],
+            "forbidden_features": ["target"],
+            "audit_only_features": ["__split"],
+        },
+        "required_outputs": [
+            "artifacts/clean/clean_dataset.csv",
+            "artifacts/clean/clean_dataset_manifest.json",
+            "artifacts/ml/submission.csv",
+        ],
+    }
+
+    supported = _apply_planner_structural_support(contract)
+    clean_dataset = ((supported.get("artifact_requirements") or {}).get("clean_dataset") or {})
+
+    assert clean_dataset.get("output_path") == "artifacts/clean/clean_dataset.csv"
+    assert clean_dataset.get("output_manifest_path") == "artifacts/clean/clean_dataset_manifest.json"
+    assert set(clean_dataset.get("required_columns") or []) >= {"event_id", "__split", "feature_a", "target"}

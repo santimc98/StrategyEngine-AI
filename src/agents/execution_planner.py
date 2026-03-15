@@ -17,6 +17,7 @@ from src.utils.contract_validation import (
 from src.utils.contract_accessors import (
     get_canonical_columns,
     get_clean_dataset_output_path,
+    get_clean_manifest_path,
     get_cleaning_gates,
     get_column_roles,
     get_declared_artifact_path,
@@ -50,7 +51,9 @@ from src.utils.contract_schema_registry import (
     get_contract_schema_repair_action,
     apply_contract_schema_registry_repairs,
 )
-from src.utils.contract_response_schema import EXECUTION_CONTRACT_V42_MIN_SCHEMA
+from src.utils.contract_response_schema import (
+    EXECUTION_CONTRACT_TRANSPORT_SCHEMA,
+)
 from src.utils.problem_capabilities import (
     infer_problem_capabilities,
     is_problem_family,
@@ -575,7 +578,116 @@ def _apply_planner_structural_support(contract: Dict[str, Any] | None) -> Dict[s
         return {}
     supported = ensure_v41_schema(copy.deepcopy(contract))
     supported = normalize_artifact_requirements(supported)
+    supported = _project_operational_contract_from_canonical(supported)
     return supported
+
+
+def _append_unique_columns(bucket: List[str], values: Any) -> None:
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return
+    seen = {str(item).strip().lower() for item in bucket if str(item).strip()}
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        bucket.append(text)
+
+
+def _derive_clean_dataset_required_columns(contract: Dict[str, Any]) -> List[str]:
+    required: List[str] = []
+    _append_unique_columns(required, contract.get("canonical_columns"))
+
+    column_roles = get_column_roles(contract)
+    if isinstance(column_roles, dict):
+        for values in column_roles.values():
+            _append_unique_columns(required, values)
+
+    allowed_feature_sets = contract.get("allowed_feature_sets")
+    if isinstance(allowed_feature_sets, dict):
+        for key in ("model_features", "segmentation_features", "audit_only_features"):
+            _append_unique_columns(required, allowed_feature_sets.get(key))
+
+    split_spec = contract.get("split_spec")
+    if isinstance(split_spec, dict):
+        for key in ("split_column", "fold_column"):
+            value = split_spec.get(key)
+            if isinstance(value, str):
+                _append_unique_columns(required, [value])
+        _append_unique_columns(required, split_spec.get("split_columns"))
+
+    _append_unique_columns(required, _collect_cleaning_hard_gate_columns(contract))
+    return required
+
+
+def _project_operational_contract_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+
+    scope = normalize_contract_scope(contract.get("scope"))
+    if scope not in {"cleaning_only", "full_pipeline"}:
+        return contract
+
+    artifact_requirements = contract.get("artifact_requirements")
+    if not isinstance(artifact_requirements, dict):
+        artifact_requirements = {}
+    clean_dataset = artifact_requirements.get("clean_dataset")
+    if not isinstance(clean_dataset, dict):
+        clean_dataset = {}
+        artifact_requirements["clean_dataset"] = clean_dataset
+
+    if not str(clean_dataset.get("output_path") or clean_dataset.get("output") or clean_dataset.get("path") or "").strip():
+        output_path = get_clean_dataset_output_path(contract)
+        if output_path:
+            clean_dataset["output_path"] = output_path
+
+    if not str(clean_dataset.get("output_manifest_path") or clean_dataset.get("manifest_path") or "").strip():
+        manifest_path = get_clean_manifest_path(contract)
+        if manifest_path:
+            clean_dataset["output_manifest_path"] = manifest_path
+
+    required_columns = clean_dataset.get("required_columns")
+    if not isinstance(required_columns, list) or not any(str(col or "").strip() for col in required_columns):
+        projected_required_columns = _derive_clean_dataset_required_columns(contract)
+        if projected_required_columns:
+            clean_dataset["required_columns"] = projected_required_columns
+
+    passthrough = clean_dataset.get("optional_passthrough_columns")
+    if passthrough in (None, {}):
+        passthrough = []
+    if not isinstance(passthrough, list):
+        passthrough = []
+    if not passthrough:
+        allowed_feature_sets = contract.get("allowed_feature_sets")
+        audit_only = []
+        if isinstance(allowed_feature_sets, dict):
+            audit_only = [
+                str(col).strip()
+                for col in (allowed_feature_sets.get("audit_only_features") or [])
+                if str(col).strip()
+            ]
+        required_set = {str(col).strip().lower() for col in (clean_dataset.get("required_columns") or []) if str(col).strip()}
+        passthrough = [col for col in audit_only if col.lower() not in required_set]
+        if passthrough:
+            clean_dataset["optional_passthrough_columns"] = passthrough
+
+    artifact_requirements["clean_dataset"] = clean_dataset
+    contract["artifact_requirements"] = artifact_requirements
+    return contract
+
+
+def _unwrap_execution_contract_transport(payload: Any) -> Dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    contract = payload.get("contract")
+    if isinstance(contract, dict):
+        return contract
+    return payload
 
 
 def _normalize_strategy_feature_engineering_payload(strategy: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -7068,7 +7180,7 @@ class ExecutionPlannerAgent:
         config = dict(self._generation_config)
         config["max_output_tokens"] = int(budgeted_max)
         if self._use_response_schema:
-            config["response_schema"] = copy.deepcopy(EXECUTION_CONTRACT_V42_MIN_SCHEMA)
+            config["response_schema"] = copy.deepcopy(EXECUTION_CONTRACT_TRANSPORT_SCHEMA)
         return config
 
     @staticmethod
@@ -7167,7 +7279,7 @@ class ExecutionPlannerAgent:
         schema = (
             copy.deepcopy(_EXECUTION_CONTRACT_PATCH_SCHEMA)
             if tool_mode == "patch"
-            else copy.deepcopy(EXECUTION_CONTRACT_V42_MIN_SCHEMA)
+            else copy.deepcopy(EXECUTION_CONTRACT_TRANSPORT_SCHEMA)
         )
         tool = self._build_function_tool(
             _EXECUTION_CONTRACT_PATCH_TOOL_NAME if tool_mode == "patch" else _EXECUTION_CONTRACT_TOOL_NAME,
@@ -7676,9 +7788,11 @@ class ExecutionPlannerAgent:
         planner_diag: List[Dict[str, Any]] = []
         self.last_planner_diag = planner_diag
         self.last_contract_min = None
+        self.last_contract_canonical = None
         planner_candidate_invalid: Dict[str, Any] | None = None
         planner_candidate_invalid_raw: str | None = None
         planner_candidate_invalid_meta: Dict[str, Any] | None = None
+        planner_contract_canonical: Dict[str, Any] | None = None
 
         def _write_text(path: str, content: str) -> None:
             try:
@@ -7704,6 +7818,7 @@ class ExecutionPlannerAgent:
 
         def _persist_contracts(
             full_contract: Dict[str, Any] | None,
+            canonical_contract: Dict[str, Any] | None = None,
             diagnostics_payload: Dict[str, Any] | None = None,
             invalid_contract: Dict[str, Any] | None = None,
             invalid_raw: str | None = None,
@@ -7711,6 +7826,8 @@ class ExecutionPlannerAgent:
         ) -> None:
             if not planner_dir:
                 return
+            if canonical_contract:
+                _write_json(os.path.join(planner_dir, "contract_canonical.json"), canonical_contract)
             if full_contract:
                 _write_json(os.path.join(planner_dir, "contract_full.json"), full_contract)
             if planner_diag:
@@ -8737,10 +8854,16 @@ class ExecutionPlannerAgent:
             self.last_contract_diagnostics = diagnostics
             _persist_contracts(
                 contract if isinstance(contract, dict) else {},
-                diagnostics,
+                canonical_contract=planner_contract_canonical,
+                diagnostics_payload=diagnostics,
                 invalid_contract=planner_candidate_invalid,
                 invalid_raw=planner_candidate_invalid_raw,
                 invalid_meta=planner_candidate_invalid_meta,
+            )
+            self.last_contract_canonical = (
+                copy.deepcopy(planner_contract_canonical)
+                if isinstance(planner_contract_canonical, dict)
+                else None
             )
             return contract
 
@@ -9057,17 +9180,21 @@ domain_expert_critique:
 
                     _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
 
-                    parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
+                    parsed_payload, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
                     if parse_exc:
                         parse_error = parse_exc
 
+                    parsed = _unwrap_execution_contract_transport(parsed_payload)
                     had_json_parse_error = parsed is None or not isinstance(parsed, dict)
-                    if parsed is not None and not isinstance(parsed, dict):
+                    if parsed_payload is not None and not isinstance(parsed_payload, dict):
                         parse_error = ValueError("Parsed JSON is not an object")
+                    elif parsed is None:
+                        parse_error = ValueError("Parsed tool payload is missing a contract object")
 
                     quality_error_message = None
                     if parsed is not None and isinstance(parsed, dict):
                         round_has_candidate = True
+                        planner_contract_canonical = copy.deepcopy(parsed)
                         candidate_for_validation = _apply_planner_structural_support(parsed)
                         try:
                             validation_result = _validate_contract_quality(copy.deepcopy(candidate_for_validation))
@@ -9184,6 +9311,7 @@ domain_expert_critique:
                         print(f"WARNING: Planner contract rejected by quality gate on attempt {attempt_counter} (model={model_name}).")
                         continue
 
+                    planner_contract_canonical = copy.deepcopy(parsed)
                     contract = _apply_planner_structural_support(parsed)
                     llm_success = True
                     break
@@ -9253,6 +9381,8 @@ domain_expert_critique:
             contract = _apply_planner_structural_support(
                 invalid_contract if isinstance(invalid_contract, dict) else {}
             )
+            if isinstance(invalid_contract, dict):
+                planner_contract_canonical = copy.deepcopy(invalid_contract)
             llm_success = False
 
         if llm_success and resolved_target:

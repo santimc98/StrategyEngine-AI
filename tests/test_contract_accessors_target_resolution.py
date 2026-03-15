@@ -1,4 +1,5 @@
 from src.utils.contract_accessors import (
+    get_clean_dataset_output_path,
     get_clean_manifest_path,
     get_declared_artifact_path,
     get_declared_file_schema,
@@ -80,3 +81,15 @@ def test_declared_artifact_resolution_treats_evaluation_report_as_metrics_artifa
         get_declared_artifact_path(contract, "metrics.json", kind="metrics")
         == "reports/evaluation_report.json"
     )
+
+
+def test_clean_artifact_resolution_handles_clean_dataset_aliases_from_required_outputs():
+    contract = {
+        "required_outputs": [
+            "artifacts/clean/clean_dataset.csv",
+            "artifacts/clean/clean_dataset_manifest.json",
+        ]
+    }
+
+    assert get_clean_dataset_output_path(contract) == "artifacts/clean/clean_dataset.csv"
+    assert get_clean_manifest_path(contract) == "artifacts/clean/clean_dataset_manifest.json"

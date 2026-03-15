@@ -1,6 +1,4 @@
-"""
-Execution Planner structured-output schemas.
-"""
+"""Execution Planner structured-output transport schemas."""
 
 from typing import Any, Dict
 import copy
@@ -141,3 +139,19 @@ EXECUTION_CONTRACT_V42_MIN_SCHEMA["properties"]["optimization_policy"] = copy.de
     OPTIMIZATION_POLICY_MIN_SCHEMA
 )
 
+
+EXECUTION_CONTRACT_TRANSPORT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["contract"],
+    "properties": {
+        "contract": {
+            "type": "object",
+            "description": (
+                "Complete execution contract JSON object. "
+                "Preserve every semantically grounded field required by downstream views and validation."
+            ),
+            "additionalProperties": True,
+        }
+    },
+    "additionalProperties": False,
+}

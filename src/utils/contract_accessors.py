@@ -1138,6 +1138,8 @@ def _infer_kind_from_path(path: str) -> str:
             return "submission"
         return "dataset"
     if lower.endswith(".json"):
+        if "cleaning_manifest" in lower or "clean_manifest" in lower or "clean_dataset_manifest" in lower:
+            return "manifest"
         if "evaluation_report" in lower:
             return "metrics"
         if "metrics" in lower:
@@ -1156,7 +1158,17 @@ def _infer_owner_from_path(path: str) -> str:
     Returns "data_engineer" for cleaning-related artifacts, "ml_engineer" otherwise.
     """
     lower = (path or "").lower()
-    if any(tok in lower for tok in ("cleaned_data", "cleaning_manifest")):
+    if any(
+        tok in lower
+        for tok in (
+            "cleaned_data",
+            "cleaning_manifest",
+            "clean_manifest",
+            "clean_dataset",
+            "/clean/",
+            "\\clean\\",
+        )
+    ):
         return "data_engineer"
     return "ml_engineer"
 
@@ -1503,6 +1515,12 @@ def get_clean_manifest_path(contract: Dict[str, Any]) -> str:
             if normalized:
                 return normalized
     manifest_path = get_declared_artifact_path(contract, "cleaning_manifest.json", owner="data_engineer")
+    if manifest_path:
+        return manifest_path
+    manifest_path = get_declared_artifact_path(contract, "clean_manifest.json", owner="data_engineer")
+    if manifest_path:
+        return manifest_path
+    manifest_path = get_declared_artifact_path(contract, "clean_dataset_manifest.json", owner="data_engineer")
     if manifest_path:
         return manifest_path
     return get_declared_artifact_path(contract, kind="manifest", owner="data_engineer")

@@ -44,8 +44,10 @@ def test_execution_planner_generation_config_includes_response_schema_when_enabl
     assert "response_schema" in cfg
     schema = cfg.get("response_schema") or {}
     assert schema.get("type") == "object"
-    assert "required_outputs" in ((schema.get("properties") or {}).keys())
-    assert "optimization_policy" in ((schema.get("properties") or {}).keys())
+    assert "contract" in ((schema.get("properties") or {}).keys())
+    contract_schema = (schema.get("properties") or {}).get("contract") or {}
+    assert contract_schema.get("type") == "object"
+    assert contract_schema.get("additionalProperties") is True
 
 
 def test_execution_planner_generate_content_retries_without_response_schema(monkeypatch):
@@ -105,3 +107,14 @@ def test_execution_planner_extracts_tool_call_arguments():
     response = type("_Resp", (), {"choices": [choice]})()
 
     assert agent._extract_openai_response_text(response) == '{"scope":"full_pipeline"}'
+
+
+def test_execution_planner_unwraps_transport_payload():
+    agent = ExecutionPlannerAgent(api_key=None)
+
+    payload = {"contract": {"scope": "full_pipeline", "required_outputs": ["data/submission.csv"]}}
+
+    assert agent._extract_openai_response_text is not None
+    from src.agents.execution_planner import _unwrap_execution_contract_transport
+
+    assert _unwrap_execution_contract_transport(payload) == payload["contract"]
