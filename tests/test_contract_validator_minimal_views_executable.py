@@ -372,6 +372,36 @@ def test_validate_contract_minimal_readonly_rejects_unresolved_scale_selector_re
     assert "contract.cleaning_transforms_scale_conflict" in rules
 
 
+def test_validate_contract_minimal_readonly_does_not_treat_schema_standardization_as_feature_scaling():
+    contract = _base_full_pipeline_contract()
+    contract["data_engineer_runbook"] = {
+        "steps": [
+            "load the dataset preserving original columns",
+            "standardize schema and persist cleaned output",
+        ]
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_transforms_scale_missing" not in rules
+
+
+def test_validate_contract_minimal_readonly_requires_scale_columns_for_explicit_feature_scaling():
+    contract = _base_full_pipeline_contract()
+    contract["data_engineer_runbook"] = {
+        "steps": [
+            "scale numeric feature columns before persisting the clean dataset",
+        ]
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is False
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_transforms_scale_missing" in rules
+
+
 def test_validate_contract_minimal_readonly_rejects_low_canonical_coverage_without_selectors():
     contract = _base_full_pipeline_contract()
     contract["canonical_columns"] = ["id", "target"]

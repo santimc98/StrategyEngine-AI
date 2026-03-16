@@ -2511,9 +2511,25 @@ _DROP_COLUMN_DIRECTIVE_PATTERN = re.compile(
     r"\b(drop|discard|remove|eliminar|descartar|quitar)\b.{0,32}\b(column|columns|columna|columnas)\b",
     re.IGNORECASE,
 )
-_SCALE_COLUMN_DIRECTIVE_PATTERN = re.compile(
-    r"\b(scale|rescale|standardize|standardise|minmax|zscore|z-score|escalar|estandarizar)\b"
-    r"|(\b(normalize|normalise|normalizar)\b.{0,24}\b(column|columns|feature|features|variable|variables|columna|columnas)\b)",
+_SCALE_ACTION_PATTERN = re.compile(
+    r"\b("
+    r"scale|scaling|rescale|rescaling|"
+    r"standardize|standardise|standardization|standardisation|"
+    r"normalize|normalise|normalization|normalisation|normalizar|"
+    r"minmax|min-max|zscore|z-score|escalar|estandarizar"
+    r")\b",
+    re.IGNORECASE,
+)
+_SCALE_TARGET_PATTERN = re.compile(
+    r"\b("
+    r"column|columns|columna|columnas|"
+    r"feature|features|variable|variables|"
+    r"predictor|predictors|input|inputs|numeric|numerical"
+    r")\b",
+    re.IGNORECASE,
+)
+_SCHEMA_STANDARDIZATION_PATTERN = re.compile(
+    r"\b(schema|schema_version|column\s+name|column\s+names|naming|format)\b",
     re.IGNORECASE,
 )
 _ACTION_NEGATION_PATTERN = re.compile(
@@ -2618,6 +2634,45 @@ def _has_non_negated_action(text: str, pattern: re.Pattern[str]) -> bool:
         if _ACTION_NEGATION_PATTERN.search(prefix):
             continue
         return True
+    return False
+
+
+def _has_non_negated_feature_scaling_action(text: str) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    for match in _SCALE_ACTION_PATTERN.finditer(text):
+        clause_start = max(
+            text.rfind("\n", 0, match.start()),
+            text.rfind(".", 0, match.start()),
+            text.rfind(";", 0, match.start()),
+            text.rfind(":", 0, match.start()),
+        )
+        clause_start = 0 if clause_start < 0 else clause_start + 1
+        clause_end_candidates = [
+            idx for idx in (
+                text.find("\n", match.end()),
+                text.find(".", match.end()),
+                text.find(";", match.end()),
+                text.find(":", match.end()),
+            ) if idx >= 0
+        ]
+        clause_end = min(clause_end_candidates) if clause_end_candidates else len(text)
+        clause = text[clause_start:clause_end]
+        prefix = clause[max(0, match.start() - clause_start - 36): match.start() - clause_start]
+        if _ACTION_NEGATION_PATTERN.search(prefix):
+            continue
+        action_start = match.start() - clause_start
+        action_end = match.end() - clause_start
+        target_matches = list(_SCALE_TARGET_PATTERN.finditer(clause))
+        target_is_local = any(
+            min(abs(target.start() - action_end), abs(action_start - target.end())) <= 24
+            for target in target_matches
+        )
+        if target_is_local:
+            return True
+        # Ignore schema/format standardization; that is structural cleaning, not feature scaling.
+        if _SCHEMA_STANDARDIZATION_PATTERN.search(clause):
+            continue
     return False
 
 
@@ -3688,7 +3743,7 @@ def validate_contract_minimal_readonly(
 
         runbook_text = _flatten_runbook_text(contract.get("data_engineer_runbook"))
         runbook_has_drop_columns = _has_non_negated_action(runbook_text, _DROP_COLUMN_DIRECTIVE_PATTERN)
-        runbook_has_scale_columns = _has_non_negated_action(runbook_text, _SCALE_COLUMN_DIRECTIVE_PATTERN)
+        runbook_has_scale_columns = _has_non_negated_feature_scaling_action(runbook_text)
         if runbook_has_drop_columns and not (drop_cols or selector_drop_reasons):
             issues.append(
                 _strict_issue(
