@@ -120,12 +120,20 @@ class ResultsAdvisorAgent:
             self.fe_advice_mode in {"llm", "hybrid"}
             or self.critique_mode in {"llm", "hybrid"}
         ):
-            (
-                self.fe_provider,
-                self.fe_client,
-                self.fe_model_name,
-                self.fe_model_warning,
-            ) = init_reviewer_llm(None)
+            if self.client is not None:
+                self.fe_provider = "mimo"
+                self.fe_client = self.client
+                self.fe_model_name = str(
+                    os.getenv("RESULTS_ADVISOR_LLM_MODEL", self.model_name)
+                ).strip() or self.model_name
+                self.fe_model_warning = None
+            else:
+                (
+                    self.fe_provider,
+                    self.fe_client,
+                    self.fe_model_name,
+                    self.fe_model_warning,
+                ) = init_reviewer_llm(None)
 
     def _generation_config_for_critique(self) -> Dict[str, Any]:
         config = dict(self._generation_config)
@@ -727,15 +735,25 @@ class ResultsAdvisorAgent:
             return {}
 
         phase = str(context.get("phase") or "baseline_review").strip() or "baseline_review"
+        primary_metric_name = str(context.get("primary_metric_name") or "primary_metric").strip() or "primary_metric"
+        baseline_metrics = self._resolve_metrics_payload_candidate(
+            context.get("baseline_metrics"),
+            primary_metric_name=primary_metric_name,
+        )
+        candidate_metrics = self._resolve_metrics_payload_candidate(
+            context.get("candidate_metrics"),
+            primary_metric_name=primary_metric_name,
+            fallback=baseline_metrics,
+        )
         payload = {
             "run_id": str(context.get("run_id") or "unknown_run"),
             "iteration": int(context.get("iteration") or 0),
             "phase": phase,
-            "primary_metric_name": str(context.get("primary_metric_name") or "primary_metric"),
+            "primary_metric_name": primary_metric_name,
             "higher_is_better": bool(context.get("higher_is_better", True)),
             "min_delta": float(context.get("min_delta", 0.0005) or 0.0005),
-            "baseline_metrics": context.get("baseline_metrics") if isinstance(context.get("baseline_metrics"), dict) else {},
-            "candidate_metrics": context.get("candidate_metrics") if isinstance(context.get("candidate_metrics"), dict) else {},
+            "baseline_metrics": baseline_metrics,
+            "candidate_metrics": candidate_metrics,
             "active_gates_context": context.get("active_gates_context") if isinstance(context.get("active_gates_context"), list) else [],
             "dataset_profile": context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {},
             "column_roles": context.get("column_roles") if isinstance(context.get("column_roles"), dict) else {},
@@ -1039,12 +1057,15 @@ class ResultsAdvisorAgent:
             min_delta = 0.0005
         min_delta = max(0.0, float(min_delta))
 
-        baseline_metrics = context.get("baseline_metrics")
-        if not isinstance(baseline_metrics, dict):
-            baseline_metrics = {}
-        candidate_metrics = context.get("candidate_metrics")
-        if not isinstance(candidate_metrics, dict):
-            candidate_metrics = baseline_metrics
+        baseline_metrics = self._resolve_metrics_payload_candidate(
+            context.get("baseline_metrics"),
+            primary_metric_name=primary_metric_name,
+        )
+        candidate_metrics = self._resolve_metrics_payload_candidate(
+            context.get("candidate_metrics"),
+            primary_metric_name=primary_metric_name,
+            fallback=baseline_metrics,
+        )
 
         baseline_value = self._extract_metric_value_for_name(baseline_metrics, primary_metric_name)
         candidate_value = self._extract_metric_value_for_name(candidate_metrics, primary_metric_name)
@@ -1292,7 +1313,11 @@ class ResultsAdvisorAgent:
         error_artifacts = self._find_artifacts_by_type(artifact_index, "error_analysis")
         importances_artifacts = self._find_artifacts_by_type(artifact_index, "feature_importances")
 
-        metrics_payload = self._safe_load_json(metrics_artifacts[0]) if metrics_artifacts else {}
+        metrics_payload, canonical_metric_artifacts = self._resolve_metrics_payload_for_insights(
+            context,
+            artifact_index,
+            objective_type,
+        )
         predictions_summary = self._summarize_csv(predictions_artifacts[0]) if predictions_artifacts else {}
         error_payload = self._safe_load_json(error_artifacts[0]) if error_artifacts else {}
         importances_payload = self._safe_load_json(importances_artifacts[0]) if importances_artifacts else {}
@@ -1317,11 +1342,11 @@ class ResultsAdvisorAgent:
         recommendations = []
         summary_lines: List[str] = []
 
-        metrics_present = bool(metrics_artifacts) and isinstance(metrics_payload, dict)
+        metrics_present = self._metrics_payload_has_signal(metrics_payload, objective_type=objective_type)
         if not metrics_summary and not metrics_present:
             risks.append("Metrics artifact missing or empty; evaluation confidence is limited.")
             recommendations.append("Generate a metrics artifact aligned to the objective type.")
-        elif not metrics_summary and metrics_present:
+        elif not metrics_summary and (metrics_present or bool(canonical_metric_artifacts)):
             recommendations.append("Metrics artifact present but no numeric metrics detected; populate key metrics.")
         if predictions_summary:
             summary_lines.append(
@@ -1367,7 +1392,7 @@ class ResultsAdvisorAgent:
         iteration_recommendation: Dict[str, Any] = {}
 
         artifacts_used = []
-        for path in (metrics_artifacts + predictions_artifacts + error_artifacts + importances_artifacts):
+        for path in (canonical_metric_artifacts + predictions_artifacts + error_artifacts + importances_artifacts):
             artifacts_used.append(path)
 
         segment_pricing_summary = self._build_segment_pricing_summary(predictions_artifacts[0]) if predictions_artifacts else []
@@ -2177,14 +2202,29 @@ class ResultsAdvisorAgent:
         normalized: List[Dict[str, Any]] = []
         for item in entries or []:
             if isinstance(item, dict) and item.get("path"):
-                normalized.append(item)
+                entry = dict(item)
+                path = str(entry.get("path") or "").strip()
+                inferred_type = self._infer_artifact_type(path)
+                current_type = str(entry.get("artifact_type") or "").strip().lower()
+                if not current_type or current_type in {"artifact", "json", "report"}:
+                    entry["artifact_type"] = inferred_type
+                normalized.append(entry)
             elif isinstance(item, str):
-                normalized.append({"path": item, "artifact_type": "artifact"})
+                normalized.append({"path": item, "artifact_type": self._infer_artifact_type(item)})
         return normalized
 
     def _infer_artifact_type(self, path: str) -> str:
         lower = str(path).lower()
-        if "metrics" in lower:
+        if any(
+            token in lower
+            for token in (
+                "evaluation_summary",
+                "evaluation_report",
+                "evaluation_metrics",
+                "cv_metrics",
+                "metrics",
+            )
+        ):
             return "metrics"
         if "alignment" in lower:
             return "report"
@@ -2192,7 +2232,7 @@ class ResultsAdvisorAgent:
             return "error_analysis"
         if "importance" in lower:
             return "feature_importances"
-        if "scored_rows" in lower or "predictions" in lower:
+        if "scored_rows" in lower or "predictions" in lower or "oof_predictions" in lower:
             return "predictions"
         return "artifact"
 
@@ -2201,9 +2241,137 @@ class ResultsAdvisorAgent:
         for item in entries or []:
             if not isinstance(item, dict):
                 continue
-            if item.get("artifact_type") == artifact_type and item.get("path"):
-                matches.append(item["path"])
+            path = item.get("path")
+            if not path:
+                continue
+            current_type = str(item.get("artifact_type") or "").strip().lower()
+            inferred_type = self._infer_artifact_type(path)
+            if current_type == artifact_type or inferred_type == artifact_type:
+                matches.append(path)
         return matches
+
+    def _metrics_payload_has_signal(
+        self,
+        payload: Any,
+        *,
+        primary_metric_name: str = "",
+        objective_type: str = "unknown",
+    ) -> bool:
+        if not isinstance(payload, dict) or not payload:
+            return False
+        metric_name = str(
+            primary_metric_name
+            or payload.get("primary_metric_name")
+            or payload.get("primary_metric")
+            or ""
+        ).strip()
+        if metric_name and self._extract_metric_value_for_name(payload, metric_name) is not None:
+            return True
+        if self._extract_metrics_summary(payload, objective_type):
+            return True
+        nested_metrics = payload.get("metrics")
+        if (
+            isinstance(nested_metrics, dict)
+            and nested_metrics
+            and self._metrics_payload_has_signal(
+                nested_metrics,
+                primary_metric_name=metric_name,
+                objective_type=objective_type,
+            )
+        ):
+            return True
+        return False
+
+    def _resolve_metrics_payload_candidate(
+        self,
+        payload: Any,
+        *,
+        primary_metric_name: str = "",
+        objective_type: str = "unknown",
+        fallback: Any = None,
+    ) -> Dict[str, Any]:
+        if self._metrics_payload_has_signal(
+            payload,
+            primary_metric_name=primary_metric_name,
+            objective_type=objective_type,
+        ):
+            return dict(payload)
+        if self._metrics_payload_has_signal(
+            fallback,
+            primary_metric_name=primary_metric_name,
+            objective_type=objective_type,
+        ):
+            return dict(fallback)
+        return {}
+
+    def _resolve_metrics_payload_for_insights(
+        self,
+        context: Dict[str, Any],
+        artifact_index: List[Dict[str, Any]],
+        objective_type: str,
+    ) -> tuple[Dict[str, Any], List[str]]:
+        metrics_artifacts = self._find_artifacts_by_type(artifact_index, "metrics")
+        metrics_payload = self._resolve_metrics_payload_candidate(
+            context.get("metrics"),
+            objective_type=objective_type,
+        )
+        artifacts_used: List[str] = []
+
+        primary_metric_state = (
+            context.get("primary_metric_state")
+            if isinstance(context.get("primary_metric_state"), dict)
+            else {}
+        )
+        primary_metric_snapshot = (
+            context.get("primary_metric_snapshot")
+            if isinstance(context.get("primary_metric_snapshot"), dict)
+            else {}
+        )
+        for source in (
+            metrics_payload.get("source"),
+            primary_metric_state.get("primary_metric_source"),
+            primary_metric_snapshot.get("primary_metric_source"),
+        ):
+            source_text = str(source or "").strip()
+            if source_text.lower().startswith("artifact:"):
+                path = source_text.split(":", 1)[1].strip()
+                if path and path not in artifacts_used:
+                    artifacts_used.append(path)
+        for path in metrics_artifacts:
+            if path not in artifacts_used:
+                artifacts_used.append(path)
+
+        if not self._metrics_payload_has_signal(metrics_payload, objective_type=objective_type):
+            for path in artifacts_used:
+                payload = self._safe_load_json(path)
+                if self._metrics_payload_has_signal(payload, objective_type=objective_type):
+                    metrics_payload = payload
+                    break
+
+        if not self._metrics_payload_has_signal(metrics_payload, objective_type=objective_type):
+            synthetic = {}
+            metric_name = str(
+                primary_metric_state.get("primary_metric_name")
+                or primary_metric_snapshot.get("primary_metric_name")
+                or ""
+            ).strip()
+            metric_value = self._coerce_number(
+                primary_metric_state.get("primary_metric_value")
+                if isinstance(primary_metric_state, dict)
+                else None,
+                ".",
+            )
+            if metric_name and metric_value is not None:
+                synthetic = {
+                    "primary_metric_name": metric_name,
+                    "primary_metric_value": float(metric_value),
+                }
+                source_text = str(primary_metric_state.get("primary_metric_source") or "").strip()
+                if source_text:
+                    synthetic["source"] = source_text
+            metrics_payload = synthetic if synthetic else {}
+
+        return metrics_payload, artifacts_used
 
     def _fallback(self, context: Dict[str, Any]) -> str:
         lines: List[str] = []

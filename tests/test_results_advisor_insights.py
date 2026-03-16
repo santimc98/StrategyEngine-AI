@@ -87,3 +87,54 @@ def test_results_advisor_is_pure_critic_and_does_not_emit_iteration_decisions():
         }
     )
     assert insights.get("iteration_recommendation") == {}
+
+
+def test_results_advisor_insights_reclassifies_legacy_json_metrics_artifact(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "evaluation_summary.json"), "w", encoding="utf-8") as handle:
+        handle.write(
+            '{"status":"success","primary_metric":"mean_multi_horizon_log_loss","mean_multi_horizon_log_loss":0.330041811925438}'
+        )
+
+    advisor = ResultsAdvisorAgent(api_key="")
+    insights = advisor.generate_insights(
+        {
+            "artifact_index": [
+                {"path": "data/evaluation_summary.json", "artifact_type": "json"},
+            ],
+            "objective_type": "predictive",
+        }
+    )
+
+    assert insights.get("metrics_summary")
+    assert "Metrics artifact missing or empty" not in " ".join(insights.get("risks", []))
+    assert "data/evaluation_summary.json" in (insights.get("artifacts_used") or [])
+
+
+def test_results_advisor_insights_prefers_context_metrics_payload(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    advisor = ResultsAdvisorAgent(api_key="")
+    insights = advisor.generate_insights(
+        {
+            "artifact_index": [
+                {"path": "artifacts/ml/evaluation_summary.json", "artifact_type": "json"},
+            ],
+            "objective_type": "predictive",
+            "metrics": {
+                "status": "success",
+                "primary_metric": "mean_multi_horizon_log_loss",
+                "mean_multi_horizon_log_loss": 0.330041811925438,
+                "source": "artifact:artifacts/ml/evaluation_summary.json",
+            },
+            "primary_metric_state": {
+                "primary_metric_name": "mean_multi_horizon_log_loss",
+                "primary_metric_value": 0.330041811925438,
+                "primary_metric_source": "artifact:artifacts/ml/evaluation_summary.json",
+            },
+        }
+    )
+
+    assert insights.get("metrics_summary")
+    assert "Metrics artifact missing or empty" not in " ".join(insights.get("risks", []))
+    assert "artifacts/ml/evaluation_summary.json" in (insights.get("artifacts_used") or [])

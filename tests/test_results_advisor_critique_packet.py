@@ -114,3 +114,30 @@ def test_generate_critique_packet_repairs_schema_drift_without_deterministic_fal
     assert packet.get("error_modes", [{}])[0].get("severity") == "high"
     assert packet.get("error_modes", [{}])[0].get("metric_impact_direction") == "negative"
     assert (advisor.last_critique_meta or {}).get("source") in {"llm_repair_normalized", "llm_repair_pass"}
+
+
+def test_generate_critique_packet_treats_empty_candidate_metrics_as_missing() -> None:
+    advisor = ResultsAdvisorAgent(api_key="")
+    advisor.critique_mode = "deterministic"
+    packet = advisor.generate_critique_packet(
+        {
+            "run_id": "run_test",
+            "iteration": 3,
+            "primary_metric_name": "mean_multi_horizon_log_loss",
+            "higher_is_better": False,
+            "min_delta": 0.0005,
+            "baseline_metrics": {
+                "primary_metric": "mean_multi_horizon_log_loss",
+                "mean_multi_horizon_log_loss": 0.330041811925438,
+            },
+            "candidate_metrics": {},
+            "active_gates_context": ["required_artifacts_present"],
+            "dataset_profile": {"n_rows": 316},
+        }
+    )
+
+    valid, errors = validate_advisor_critique_packet(packet)
+    assert valid is True, errors
+    comparison = packet.get("metric_comparison", {})
+    assert comparison.get("baseline_value") == comparison.get("candidate_value")
+    assert comparison.get("meets_min_delta") is False

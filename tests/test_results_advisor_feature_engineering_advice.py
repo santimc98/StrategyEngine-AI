@@ -58,6 +58,7 @@ class _FakeGeminiClient:
 
 def test_generate_feature_engineering_advice_hybrid_uses_llm_when_available(monkeypatch) -> None:
     monkeypatch.setenv("RESULTS_ADVISOR_FE_MODE", "hybrid")
+    monkeypatch.delenv("MIMO_API_KEY", raising=False)
 
     def _fake_init(_api_key):
         return (
@@ -87,6 +88,7 @@ def test_generate_feature_engineering_advice_hybrid_uses_llm_when_available(monk
 
 def test_generate_feature_engineering_advice_hybrid_fallbacks_to_deterministic_on_llm_error(monkeypatch) -> None:
     monkeypatch.setenv("RESULTS_ADVISOR_FE_MODE", "hybrid")
+    monkeypatch.delenv("MIMO_API_KEY", raising=False)
 
     def _fake_init(_api_key):
         return (
@@ -111,3 +113,24 @@ def test_generate_feature_engineering_advice_hybrid_fallbacks_to_deterministic_o
     )
     assert "build_features" in advice
     assert advisor.last_fe_advice_meta.get("source") == "deterministic_fallback"
+
+
+def test_results_advisor_prefers_own_client_for_llm_paths(monkeypatch) -> None:
+    monkeypatch.setenv("RESULTS_ADVISOR_FE_MODE", "hybrid")
+    monkeypatch.setenv("RESULTS_ADVISOR_CRITIQUE_MODE", "hybrid")
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def _unexpected_init(_api_key):
+        raise AssertionError("init_reviewer_llm should not be used when ResultsAdvisor already has its own client")
+
+    monkeypatch.setattr("src.agents.results_advisor.OpenAI", _FakeOpenAI)
+    monkeypatch.setattr("src.agents.results_advisor.init_reviewer_llm", _unexpected_init)
+
+    advisor = ResultsAdvisorAgent(api_key="test-key")
+
+    assert advisor.fe_provider == "mimo"
+    assert advisor.fe_model_name == "mimo-v2-flash"
+    assert advisor.fe_client is advisor.client
