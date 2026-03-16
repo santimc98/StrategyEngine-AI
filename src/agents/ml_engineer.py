@@ -2942,17 +2942,11 @@ class MLEngineerAgent:
                 )
 
         lines.append("")
-        lines.append("CRITICAL RULES:")
-        if n_test is not None:
-            lines.append(
-                f"  - Any artifact with expected_row_count={n_test:,} MUST contain TEST/SCORING rows only. NEVER write the full dataframe."
-            )
-        if n_total is not None:
-            lines.append(
-                f"  - Any artifact with expected_row_count={n_total:,} MUST contain ALL rows."
-            )
+        lines.append("ARTIFACT VERIFICATION:")
         lines.append(
-            "  - Always filter to the correct subset BEFORE calling .to_csv(). Add an explicit len() assertion after writing each artifact."
+            "  - After writing each artifact, assert its row count against the contract-expected"
+            " number shown above (e.g., assert written_rows == 95). Do NOT assert against the"
+            " DataFrame variable you just wrote — that is a tautology and catches nothing."
         )
         return "\n".join(lines)
 
@@ -4280,25 +4274,18 @@ class MLEngineerAgent:
         collections, itertools, functools, typing, warnings, re, datetime, pathlib.Path, uuid
         If you need sys.stdout or sys.exit, use print() and raise SystemExit instead.
 
-        DTYPE SAFETY PATTERNS
-        - cleaned_data.csv is already typed by the Data Engineer. Read it respecting its dtypes:
-          Use pd.read_csv(path, sep=sep, decimal=decimal) without forcing dtype=str.
-        - After loading, verify dtypes match column_dtype_targets; fix mismatches with pd.to_numeric(errors='coerce').
-        - For nullable integers, use pandas nullable Int64 instead of plain int64 casts.
-        - Never assume clean target dtype without verifying nullability and domain.
-        - Enforce column_dtype_targets when present (column-level and selector-family targets).
-        - Before calling any ML framework's fit/train, print and verify all feature dtypes.
-          Every framework has dtype constraints — validate compatibility before fitting.
-
-        OUTPUT SAFETY PATTERNS
-        - Ensure parent directories exist before each artifact write.
-        - Use explicit column selections for scored outputs; avoid accidental reorder/mutation.
-        - Serialize JSON with a default handler for numpy/pandas scalar and NaN types.
-
-        WIDE DATASET PATTERNS
-        - Prefer selector/set-based feature handling over manual column enumeration.
-        - Apply vectorized transforms and bounded diagnostics for high-dimensional inputs.
-        - Use aggregated family summaries when many columns share the same profile.
+        DATA AND OUTPUT INTEGRITY
+        Think like a senior engineer reviewing your own code before merge:
+        - The Data Engineer already typed the CSV. Read it naturally (pd.read_csv with dialect)
+          and verify dtypes match expectations before fitting — fix mismatches, don't mask them.
+        - Before writing any output artifact, know exactly which rows it should contain and why.
+          Construct each output DataFrame from the correct source data from the start rather
+          than building it and then filtering retroactively — retroactive filters are fragile
+          and can silently produce empty or wrong-sized results if indices diverge.
+        - After writing each artifact, verify the written file has the expected row count by
+          reading it back or asserting against the contract-expected number (not against the
+          DataFrame you just wrote, which would be a tautology).
+        - Use a JSON serializer helper for numpy/pandas scalars, arrays, NaN, and bool types.
 
         CONTRACT-FIRST EXECUTION MAP (MANDATORY)
         - Before training/inference, build and print CONTRACT_EXECUTION_MAP with:
@@ -4333,7 +4320,6 @@ class MLEngineerAgent:
         - If contract says requires_target=false, do not fit supervised models; still emit required artifacts with explicit no-train status.
         - Choose preprocessing, validation, and scoring logic that matches the data structure rather than generic boilerplate.
         - Handle outliers with data-driven, non-destructive methods unless contract says otherwise.
-        - Array shapes must match the subset they index (e.g., OOF predictions sized to training rows, not the full dataset).
 
         FEATURE GOVERNANCE
         - Use only contract-allowed features:
