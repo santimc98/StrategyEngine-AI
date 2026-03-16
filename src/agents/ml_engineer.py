@@ -1551,80 +1551,6 @@ class MLEngineerAgent:
             max_list_items=8,
         )
 
-    def _build_editor_enforcement_block(
-        self,
-        handoff_payload: Dict[str, Any] | None,
-    ) -> str:
-        handoff_payload = handoff_payload if isinstance(handoff_payload, dict) else {}
-        constraints = (
-            handoff_payload.get("editor_constraints")
-            if isinstance(handoff_payload.get("editor_constraints"), dict)
-            else {}
-        )
-        must_apply = bool(constraints.get("must_apply_hypothesis"))
-        forbid_noop = bool(constraints.get("forbid_noop"))
-        patch_intensity = str(constraints.get("patch_intensity") or "incremental").strip() or "incremental"
-        scope_policy = str(constraints.get("scope_policy") or "").strip().lower()
-        allow_strategy_changes = bool(constraints.get("allow_strategy_changes"))
-        freeze_unimplicated = bool(constraints.get("freeze_unimplicated_regions"))
-        optimization_context = (
-            handoff_payload.get("optimization_context")
-            if isinstance(handoff_payload.get("optimization_context"), dict)
-            else {}
-        )
-        repair_scope = (
-            handoff_payload.get("repair_scope")
-            if isinstance(handoff_payload.get("repair_scope"), dict)
-            else {}
-        )
-        if scope_policy == "patch_only":
-            phase = str(repair_scope.get("phase") or "compliance_runtime").strip() or "compliance_runtime"
-            editable_targets = [
-                str(item)
-                for item in (repair_scope.get("editable_targets") or [])
-                if str(item).strip()
-            ]
-            protected_regions = [
-                str(item)
-                for item in (repair_scope.get("protected_regions") or [])
-                if str(item).strip()
-            ]
-            invariants = [
-                str(item)
-                for item in (repair_scope.get("must_preserve_invariants") or [])
-                if str(item).strip()
-            ]
-            lines: List[str] = [
-                f"- {phase} patch-only mode is ACTIVE.",
-                "- Use the full script only as context. Do not redesign strategy, model family, or healthy pipeline sections.",
-                "- Edit only reviewer-audited findings and verified failing blocks from REPAIR SCOPE.",
-                f"- Patch intensity: {patch_intensity}.",
-            ]
-            if freeze_unimplicated:
-                lines.append("- Treat all regions outside REPAIR SCOPE as frozen unless new verified runtime evidence directly contradicts them.")
-            if not allow_strategy_changes:
-                lines.append("- Strategy changes are NOT allowed in this mode.")
-            if optimization_context:
-                lines.append("- Active optimization hypothesis is deferred in patch-only mode; repair the incumbent defect first and preserve hypothesis context without implementing broader metric changes.")
-            if editable_targets:
-                lines.append("- Editable targets: " + "; ".join(editable_targets[:4]) + ".")
-            if protected_regions:
-                lines.append("- Protected regions: " + "; ".join(protected_regions[:4]) + ".")
-            if invariants:
-                lines.append("- Preserve invariants: " + "; ".join(invariants[:3]) + ".")
-            return "\n".join(lines)
-        if not (must_apply or forbid_noop):
-            return "- Standard editor mode. Apply patch objectives and keep minimal safe edits."
-
-        lines: List[str] = [
-            "- Metric-improvement round enforcement is ACTIVE.",
-            "- You must apply the active hypothesis with material code edits.",
-            "- Returning baseline-equivalent code or NO_OP is invalid in this round.",
-            "- Keep strategy lock, model family, CV protocol, and output contract paths unchanged.",
-            f"- Patch intensity: {patch_intensity}.",
-        ]
-        return "\n".join(lines)
-
     def _resolve_optimization_mode_inputs(
         self,
         handoff_payload: Dict[str, Any] | None,
@@ -4915,123 +4841,83 @@ class MLEngineerAgent:
 
         USER_EDITOR_TEMPLATE = """
         MODE: CODE_EDITOR_MODE
-        You are editing an existing script under tight constraints.
-        Do not regenerate a new solution from zero and do not re-plan strategy.
+        You are editing an existing script. Do not regenerate from zero.
 
-        PHASE CLASSIFICATION:
-        $phase_classification
-
-        ERROR FEEDBACK:
+        WHAT FAILED (phase: $phase_classification):
         $error_feedback
 
-        LAST RUN MEMORY (most recent attempts):
-        $last_run_memory
-
-        STRATEGY LOCK (immutable):
-        $strategy_lock
-
-        ITERATION HANDOFF:
-        $iteration_handoff_json
-
-        REPAIR GROUND TRUTH (verified environment facts, authoritative):
+        VERIFIED ENVIRONMENT FACTS (authoritative — trust these over assumptions):
         $repair_ground_truth
 
-        REPAIR SCOPE (authoritative edit boundaries):
+        EDIT SCOPE:
         $repair_scope
 
-        STRUCTURED CRITIQUE PACKET:
-        $critic_packet_json
-
-        STRUCTURED HYPOTHESIS PACKET (apply one hypothesis only):
-        $hypothesis_packet_json
-
-        PATCH OBJECTIVES:
+        WHAT TO CHANGE:
         $patch_objectives
 
-        MUST PRESERVE:
-        $must_preserve
+        ADDITIONAL CONTEXT:
+        - Critique: $critic_packet_json
+        - Hypothesis: $hypothesis_packet_json
+        - Iteration handoff: $iteration_handoff_json
+        - Recent attempts: $last_run_memory
 
-        EDITOR ENFORCEMENT:
-        $editor_enforcement
+        WHAT TO PROTECT:
+        $must_preserve
 
         PREVIOUS SCRIPT:
         $previous_code
 
-        EDITOR TASK:
-        - Return ONLY the full updated Python script. No markdown, no explanation.
-        - Keep script structure and apply the smallest coherent edits required by patch objectives and enforcement.
-        - Keep strategy/objective/contract paths unchanged.
-        - Treat phase as the current focus, not as a pre-scripted recipe.
-        - Treat REPAIR GROUND TRUTH as environment truth; do not override it with guessed library behavior.
-        - If REPAIR SCOPE says patch_only, use the whole script only as context and edit only the scoped targets/findings unless new verified runtime evidence forces a narrow expansion.
-        - If phase is "runtime_repair", restore runnable behavior and required outputs before deferred metric-improvement work.
-          If the failure is a timeout or OOM, reduce compute cost within the same model family before changing strategy.
-        - If phase is "persistence", keep training/model selection logic stable unless a contract violation forces a broader fix.
+        YOUR TASK:
+        Return ONLY the full updated Python script. No markdown, no explanation.
+        Think through the failure evidence, identify the root cause, and apply the
+        smallest coherent fix. Your priority order is: (1) make the script run
+        without errors, (2) produce all contract-required artifacts with correct
+        row counts, (3) then pursue any deferred metric improvement. Do not
+        pursue a later priority if an earlier one is still broken.
         """
 
         USER_EDITOR_OPTIMIZATION_TEMPLATE = """
-        MODE: OPTIMIZATION_MODE
-        MODE: CODE_EDITOR_MODE_OPTIMIZATION
-        You are editing an existing script for one focused optimization move.
-        Think like a senior engineer: keep the incumbent stable, use the round evidence, and change only what this round truly requires.
-        Do not regenerate a new solution from zero and do not re-plan strategy.
+        MODE: METRIC_IMPROVEMENT
+        You are editing an incumbent script to improve its metric. Do not regenerate from zero.
 
-        CURRENT PHASE:
-        $phase_classification
+        CURRENT STATE (phase: $phase_classification):
+        - Round context: $optimization_round_brief
+        - Evidence so far: $current_evidence_brief
+        - Recent attempts: $recent_tracker
+        - Feedback digest: $optimization_feedback_brief
 
-        CURRENT ROUND BRIEF:
-        $optimization_round_brief
-
-        ACTIVE HYPOTHESIS BRIEF:
+        HYPOTHESIS TO TEST:
         $active_hypothesis_brief
 
-        CURRENT EVIDENCE BRIEF:
-        $current_evidence_brief
-
-        REPAIR GROUND TRUTH:
-        $repair_ground_truth
-
-        REPAIR SCOPE:
-        $repair_scope
-
-        PARAMETER / IMPLEMENTATION HINTS:
+        IMPLEMENTATION HINTS:
         $optimization_blueprint_hint
 
-        LOCKED INVARIANTS:
-        $invariants_lock
+        VERIFIED ENVIRONMENT FACTS (authoritative):
+        $repair_ground_truth
 
-        ACTION FAMILY GUIDELINES:
-        $action_family_guidelines
+        EDIT SCOPE:
+        $repair_scope
 
-        RECENT ATTEMPT MEMORY:
-        $recent_tracker
-
-        OPTIMIZATION FEEDBACK DIGEST:
-        $optimization_feedback_brief
-
-        PATCH OBJECTIVES:
+        WHAT TO CHANGE:
         $patch_objectives
 
-        MUST PRESERVE:
+        WHAT TO PROTECT:
         $must_preserve
-
-        EDITOR ENFORCEMENT:
-        $editor_enforcement
+        Locked invariants: $invariants_lock
 
         PREVIOUS SCRIPT:
         $previous_code
 
-        OPTIMIZATION TASK:
-        - Return ONLY the full updated Python script. No markdown, no explanation.
-        - Apply one coherent optimization move that matches the active hypothesis.
-        - Treat the previous script as the incumbent and preserve working behavior by default.
-        - Keep contract paths, split logic, expected row counts, target semantics, and model family unchanged unless the invariant block explicitly allows otherwise.
-        - Use the evidence brief to target the weakest part of the incumbent instead of inventing a new plan.
-        - If the current phase is runtime_repair or persistence with patch_only scope, the hypothesis is deferred context only: repair the scoped defect first and do not implement broader metric changes unless the failing block is exactly where the hypothesis applies.
-        - If CURRENT PHASE is runtime_repair or persistence, fix the verified blocker first using REPAIR GROUND TRUTH and REPAIR SCOPE, then preserve the active optimization lane.
-        - If the primary metric is defined as a mean and the contract does not provide explicit weights, compute a simple arithmetic mean.
-        - Avoid unrelated refactors; edit only the regions needed for metric improvement.
-        - Prefer the cheapest valid implementation that tests the idea without destabilizing working behavior.
+        YOUR TASK:
+        Return ONLY the full updated Python script. No markdown, no explanation.
+        Apply one coherent optimization move that tests the active hypothesis.
+        Your priority order is: (1) make the script run without errors,
+        (2) produce all contract-required artifacts with correct row counts,
+        (3) then implement the metric improvement hypothesis. If the script has
+        a runtime failure, fix that first — a broken script cannot test any
+        hypothesis. Use the evidence to target the weakest part of the incumbent
+        rather than inventing a new plan. Prefer the cheapest valid change that
+        tests the idea without destabilizing working behavior.
         """
 
         USER_IMPROVE_TEMPLATE = """
@@ -5130,12 +5016,6 @@ class MLEngineerAgent:
             )
             previous_code_block = self._truncate_code_for_patch(previous_code)
             last_run_memory_block = self._build_last_run_memory_block(last_run_memory)
-            strategy_lock_block = self._serialize_json_for_prompt(
-                strategy_lock or {},
-                max_chars=1800,
-                max_str_len=260,
-                max_list_items=40,
-            )
             critic_packet_block = self._serialize_json_for_prompt(
                 handoff_payload.get("critic_packet") if isinstance(handoff_payload.get("critic_packet"), dict) else {},
                 max_chars=2200,
@@ -5148,7 +5028,6 @@ class MLEngineerAgent:
                 max_str_len=260,
                 max_list_items=30,
             )
-            editor_enforcement_block = self._build_editor_enforcement_block(handoff_payload)
             repair_ground_truth_block = self._serialize_json_for_prompt(
                 handoff_payload.get("repair_ground_truth")
                 if isinstance(handoff_payload.get("repair_ground_truth"), dict)
@@ -5175,10 +5054,6 @@ class MLEngineerAgent:
                     optimization_inputs=optimization_inputs,
                     feedback_text=feedback_text,
                 )
-                action_family_guidelines = optimization_inputs.get("action_family_guidelines") or []
-                action_family_guidelines_block = "\n".join(
-                    [f"- {str(item)}" for item in action_family_guidelines if str(item).strip()]
-                ) or "- Keep targeted edits with contract invariants preserved."
                 user_message = render_prompt(
                     USER_EDITOR_OPTIMIZATION_TEMPLATE,
                     phase_classification=phase_classification,
@@ -5189,12 +5064,10 @@ class MLEngineerAgent:
                     repair_scope=repair_scope_block or "{}",
                     optimization_blueprint_hint=optimization_briefs.get("optimization_blueprint_hint") or "[]",
                     invariants_lock=optimization_briefs.get("invariants_lock") or "{}",
-                    action_family_guidelines=action_family_guidelines_block,
                     recent_tracker=optimization_briefs.get("recent_tracker") or "[]",
                     optimization_feedback_brief=optimization_briefs.get("optimization_feedback_brief") or "No optimization feedback provided.",
                     patch_objectives=patch_objectives_block,
                     must_preserve=must_preserve_block,
-                    editor_enforcement=editor_enforcement_block,
                     previous_code=previous_code_block,
                 )
             else:
@@ -5203,7 +5076,6 @@ class MLEngineerAgent:
                     phase_classification=phase_classification,
                     error_feedback=feedback_text or "No structured feedback provided.",
                     last_run_memory=last_run_memory_block,
-                    strategy_lock=strategy_lock_block,
                     iteration_handoff_json=handoff_payload_json,
                     repair_ground_truth=repair_ground_truth_block or "{}",
                     repair_scope=repair_scope_block or "{}",
@@ -5211,7 +5083,6 @@ class MLEngineerAgent:
                     hypothesis_packet_json=hypothesis_packet_block,
                     patch_objectives=patch_objectives_block,
                     must_preserve=must_preserve_block,
-                    editor_enforcement=editor_enforcement_block,
                     previous_code=previous_code_block,
                 )
         elif improve_mode_active:
