@@ -1142,6 +1142,10 @@ def _infer_kind_from_path(path: str) -> str:
             return "manifest"
         if "evaluation_report" in lower:
             return "metrics"
+        if "evaluation_summary" in lower:
+            return "metrics"
+        if "cv_metrics" in lower:
+            return "metrics"
         if "metrics" in lower:
             return "metrics"
         if "weights" in lower:
@@ -1446,7 +1450,13 @@ def get_declared_artifact_path(
     if target_norm and kind_norm and filtered:
         target_alias = target_base or os.path.basename(target_norm)
         canonical_kind_aliases = {
-            "metrics": {"metrics.json", "evaluation_report.json", "evaluation_metrics.json"},
+            "metrics": {
+                "metrics.json",
+                "evaluation_report.json",
+                "evaluation_summary.json",
+                "evaluation_metrics.json",
+                "cv_metrics.json",
+            },
             "submission": {"submission.csv"},
             "manifest": {"cleaning_manifest.json", "clean_manifest.json"},
             "dataset": {"cleaned_dataset.csv", "cleaned_data.csv"},

@@ -83,6 +83,34 @@ def test_declared_artifact_resolution_treats_evaluation_report_as_metrics_artifa
     )
 
 
+def test_declared_artifact_resolution_treats_evaluation_summary_as_metrics_artifact():
+    contract = {
+        "required_outputs": ["artifacts/ml/evaluation_summary.json"],
+        "artifact_requirements": {
+            "required_files": [{"path": "artifacts/ml/evaluation_summary.json"}],
+        },
+    }
+
+    assert (
+        get_declared_artifact_path(contract, "metrics.json", kind="metrics")
+        == "artifacts/ml/evaluation_summary.json"
+    )
+
+
+def test_declared_artifact_resolution_treats_cv_metrics_as_metrics_artifact():
+    contract = {
+        "required_outputs": ["artifacts/ml/cv_metrics.json"],
+        "artifact_requirements": {
+            "required_files": [{"path": "artifacts/ml/cv_metrics.json"}],
+        },
+    }
+
+    assert (
+        get_declared_artifact_path(contract, "metrics.json", kind="metrics")
+        == "artifacts/ml/cv_metrics.json"
+    )
+
+
 def test_clean_artifact_resolution_handles_clean_dataset_aliases_from_required_outputs():
     contract = {
         "required_outputs": [

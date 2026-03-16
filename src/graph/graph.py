@@ -1192,6 +1192,54 @@ def _load_declared_artifact_payload(
         kind=kind,
     )
     payload = _load_json_safe(path) if path else {}
+    if kind == "metrics" and (not isinstance(payload, dict) or not payload):
+        metric_candidates: List[str] = []
+
+        def _add_metric_candidate(candidate_path: Any) -> None:
+            normalized = normalize_artifact_path(candidate_path)
+            if (
+                normalized
+                and normalized not in metric_candidates
+                and _is_metrics_like_path(normalized)
+            ):
+                metric_candidates.append(normalized)
+
+        _add_metric_candidate(path)
+        for candidate_path in get_required_outputs(contract):
+            _add_metric_candidate(candidate_path)
+        artifact_requirements = get_artifact_requirements(contract)
+        if isinstance(artifact_requirements, dict):
+            required_files = artifact_requirements.get("required_files")
+            if isinstance(required_files, list):
+                for item in required_files:
+                    if isinstance(item, dict):
+                        _add_metric_candidate(item.get("path"))
+                    else:
+                        _add_metric_candidate(item)
+            file_schemas = artifact_requirements.get("file_schemas")
+            if isinstance(file_schemas, dict):
+                for schema_path in file_schemas.keys():
+                    _add_metric_candidate(schema_path)
+        for candidate_group in (
+            state.get("ml_improvement_output_paths"),
+            state.get("required_outputs"),
+        ):
+            if not isinstance(candidate_group, list):
+                continue
+            for item in candidate_group:
+                _add_metric_candidate(item)
+        artifact_index = state.get("artifact_index")
+        if isinstance(artifact_index, list):
+            for item in artifact_index:
+                if isinstance(item, dict):
+                    _add_metric_candidate(item.get("path"))
+
+        for candidate_path in metric_candidates:
+            candidate_payload = _load_json_safe(candidate_path)
+            if isinstance(candidate_payload, dict) and candidate_payload:
+                payload = candidate_payload
+                path = candidate_path
+                break
     return (payload if isinstance(payload, dict) else {}), path
 
 
@@ -28083,10 +28131,11 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             state,
             "METRIC_IMPROVEMENT_REVIEW_OVERRIDE: reviewer status treated as advisory in guarded mode.",
         )
-    improved_by_metric = (
-        bool(meets_min_delta_packet)
-        if isinstance(meets_min_delta_packet, bool)
-        else _is_improvement(baseline_value, improved_value, higher_is_better, min_delta)
+    raw_metric_improved = _is_improvement(
+        baseline_value,
+        improved_value,
+        higher_is_better,
+        min_delta,
     )
     stability_ok = _metric_round_stability_ok(
         critique_packet,
@@ -28095,7 +28144,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         disallow_high_variance=bool(disallow_high_variance),
     )
     if force_finalize:
-        improved_by_metric = False
+        raw_metric_improved = False
         stability_ok = False
     baseline_tradeoff = _extract_metric_round_tradeoff(baseline_value, {})
     candidate_tradeoff = _extract_metric_round_tradeoff(improved_value, critique_packet)
@@ -28122,28 +28171,49 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         min_delta=float(min_delta),
     )
     incumbent_selection = dict(incumbent_selection if isinstance(incumbent_selection, dict) else {})
+    candidate_selection_entry = {}
+    for candidate_entry in incumbent_selection.get("candidates") or []:
+        if (
+            isinstance(candidate_entry, dict)
+            and str(candidate_entry.get("label") or "").strip().lower() == "candidate"
+        ):
+            candidate_selection_entry = dict(candidate_entry)
+            break
+    winner_entry = (
+        incumbent_selection.get("winner")
+        if isinstance(incumbent_selection.get("winner"), dict)
+        else {}
+    )
+    selection_metric_improved = bool(candidate_selection_entry.get("meets_min_delta"))
+    selected_label = str(incumbent_selection.get("selected_label") or "").strip().lower()
+    selected_candidate_eligible = bool(
+        selected_label == "candidate"
+        and isinstance(winner_entry, dict)
+        and bool(winner_entry.get("eligible"))
+    )
     incumbent_selection.update(
         {
             "metric_name": metric_name,
             "higher_is_better": bool(higher_is_better),
             "min_delta": float(min_delta),
             "approved": bool(approved),
-            "improved_by_metric": bool(improved_by_metric),
+            "improved_by_metric": bool(selection_metric_improved),
             "stability_ok": bool(stability_ok),
             "deterministic_blockers": bool(deterministic_blockers),
             "advisory_review_mode": bool(advisory_review_mode),
             "runtime_failed": bool(runtime_failed),
             "force_finalize": bool(force_finalize),
             "force_finalize_reason": force_finalize_reason if force_finalize else "",
+            "raw_metric_improved": bool(raw_metric_improved),
+            "advisor_meets_min_delta": (
+                bool(meets_min_delta_packet)
+                if isinstance(meets_min_delta_packet, bool)
+                else None
+            ),
         }
     )
-    selected_label = str(incumbent_selection.get("selected_label") or "").strip().lower()
-    improved = bool(
-        selected_label == "candidate"
-        and bool(approved)
-        and bool(improved_by_metric)
-        and bool(stability_ok)
-    )
+    improved_by_metric = bool(selection_metric_improved)
+    improved = bool(selected_candidate_eligible)
     state["opt_incumbent_selection"] = incumbent_selection
     if not improved:
         _restore_ml_outputs(snapshot_dir, output_paths)
