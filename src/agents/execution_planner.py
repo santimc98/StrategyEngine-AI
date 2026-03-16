@@ -153,6 +153,9 @@ Phased contract compilation protocol (use internally as a guide, not as a rigid 
 Output discipline:
 - Return only the final contract JSON object.
 - Do not output phase traces, reasoning notes, or chain-of-thought.
+- You are emitting the canonical execution contract itself, not a summary.
+- Never return {} or placeholder-empty top-level sections.
+- Populate every required top-level section with grounded content from the inputs.
 
 Return format:
 - Return ONLY valid JSON (no markdown, no code fences, no comments).
@@ -688,6 +691,153 @@ def _unwrap_execution_contract_transport(payload: Any) -> Dict[str, Any] | None:
     if isinstance(contract, dict):
         return contract
     return payload
+
+
+def _is_meaningful_contract_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return True
+
+
+def _build_transport_validation(payload: Any) -> Dict[str, Any]:
+    issues: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "contract.transport_payload_not_object",
+                "message": "Planner tool payload must be a JSON object.",
+                "item": type(payload).__name__ if payload is not None else None,
+            }
+        )
+        return {
+            "status": "error",
+            "accepted": False,
+            "issues": issues,
+            "summary": {"error_count": 1, "warning_count": 0, "phase": "transport"},
+        }
+
+    if not payload:
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "contract.transport_payload_empty",
+                "message": "Planner returned an empty JSON object; no canonical contract was transported.",
+                "item": {},
+            }
+        )
+        return {
+            "status": "error",
+            "accepted": False,
+            "issues": issues,
+            "summary": {"error_count": 1, "warning_count": 0, "phase": "transport"},
+        }
+
+    core_keys = (
+        "scope",
+        "strategy_title",
+        "business_objective",
+        "canonical_columns",
+        "required_outputs",
+        "column_roles",
+        "allowed_feature_sets",
+        "task_semantics",
+        "artifact_requirements",
+    )
+    present_keys = [key for key in core_keys if key in payload]
+    meaningful_keys = [key for key in present_keys if _is_meaningful_contract_value(payload.get(key))]
+
+    if not present_keys:
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "contract.transport_payload_missing_core_keys",
+                "message": "Planner tool payload omitted all canonical top-level contract sections.",
+                "item": sorted(list(payload.keys()))[:20],
+            }
+        )
+    elif not meaningful_keys:
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "contract.transport_payload_trivial",
+                "message": "Planner tool payload contains core keys but all are empty or placeholder values.",
+                "item": present_keys,
+            }
+        )
+
+    error_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() in {"error", "fail"}])
+    warning_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() == "warning"])
+    return {
+        "status": "ok" if error_count == 0 else "error",
+        "accepted": error_count == 0,
+        "issues": issues,
+        "summary": {"error_count": error_count, "warning_count": warning_count, "phase": "transport"},
+    }
+
+
+def _transport_validation_accepted(result: Dict[str, Any] | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if not bool(result.get("accepted", False)):
+        return False
+    summary = result.get("summary")
+    if isinstance(summary, dict):
+        try:
+            if int(summary.get("error_count", 0) or 0) > 0:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _split_validation_issues_by_phase(validation_result: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(validation_result, dict):
+        return {}
+    issues = validation_result.get("issues")
+    if not isinstance(issues, list):
+        issues = []
+    projection_prefixes = (
+        "contract.de_view_",
+        "contract.ml_view_",
+        "contract.reviewer_view_",
+        "contract.qa_view_",
+        "contract.view_projection_",
+    )
+    projection_rules = {"contract.view_projection_exception"}
+    canonical_issues: List[Dict[str, Any]] = []
+    projection_issues: List[Dict[str, Any]] = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        rule = str(issue.get("rule") or "")
+        if rule in projection_rules or any(rule.startswith(prefix) for prefix in projection_prefixes):
+            projection_issues.append(issue)
+        else:
+            canonical_issues.append(issue)
+
+    def _pack(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        error_count = len(
+            [issue for issue in items if str(issue.get("severity") or "").lower() in {"error", "fail"}]
+        )
+        warning_count = len(
+            [issue for issue in items if str(issue.get("severity") or "").lower() == "warning"]
+        )
+        return {
+            "status": "ok" if error_count == 0 else "error",
+            "accepted": error_count == 0,
+            "issues": items,
+            "summary": {"error_count": error_count, "warning_count": warning_count},
+        }
+
+    return {
+        "canonical_validation": _pack(canonical_issues),
+        "projection_validation": _pack(projection_issues),
+    }
 
 
 def _normalize_strategy_feature_engineering_payload(strategy: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -7283,7 +7433,7 @@ class ExecutionPlannerAgent:
         )
         tool = self._build_function_tool(
             _EXECUTION_CONTRACT_PATCH_TOOL_NAME if tool_mode == "patch" else _EXECUTION_CONTRACT_TOOL_NAME,
-            "Return the final execution planner JSON payload.",
+            "Return the complete canonical execution contract JSON object.",
             schema,
         )
         messages = [{"role": "user", "content": prompt}]
@@ -8690,10 +8840,41 @@ class ExecutionPlannerAgent:
                 "unknown_top_level_keys": [],
                 "validation": {},
             }
+            transport_validation = None
+            if isinstance(planner_candidate_invalid_meta, dict):
+                candidate_transport = planner_candidate_invalid_meta.get("transport_validation")
+                if isinstance(candidate_transport, dict):
+                    transport_validation = candidate_transport
+            if isinstance(transport_validation, dict):
+                diagnostics["transport_validation"] = transport_validation
             if not isinstance(contract, dict):
                 diagnostics["validation"] = {
                     "status": "error",
                     "issues": [{"severity": "error", "rule": "contract_not_object", "message": "Contract is not a dictionary"}],
+                }
+                return diagnostics
+
+            if (
+                isinstance(transport_validation, dict)
+                and not _transport_validation_accepted(transport_validation)
+                and (not contract or not any(_is_meaningful_contract_value(value) for value in contract.values()))
+            ):
+                diagnostics["validation"] = transport_validation
+                split_phases = _split_validation_issues_by_phase(transport_validation)
+                diagnostics.update(split_phases)
+                issues = transport_validation.get("issues") if isinstance(transport_validation, dict) else []
+                diagnostics["quality_profile"] = {
+                    "top_error_rules": [
+                        str(issue.get("rule"))
+                        for issue in (issues or [])
+                        if isinstance(issue, dict) and str(issue.get("severity") or "").lower() in {"error", "fail"}
+                    ][:8],
+                    "top_warning_rules": [],
+                }
+                diagnostics["summary"] = {
+                    "status": "error",
+                    "issue_count": len(issues) if isinstance(issues, list) else 0,
+                    "accepted": False,
                 }
                 return diagnostics
 
@@ -8731,6 +8912,7 @@ class ExecutionPlannerAgent:
                             print(f"  - [{issue.get('severity')}] {issue.get('rule')}: {issue.get('message')}")
 
             diagnostics["validation"] = validation_result if isinstance(validation_result, dict) else {}
+            diagnostics.update(_split_validation_issues_by_phase(validation_result))
             error_rules: List[str] = []
             warning_rules: List[str] = []
             if isinstance(issues, list):
@@ -8759,7 +8941,11 @@ class ExecutionPlannerAgent:
             return diagnostics
 
         def _finalize_and_persist(contract, where, llm_success: bool):
-            if isinstance(contract, dict) and contract:
+            if (
+                isinstance(contract, dict)
+                and contract
+                and any(_is_meaningful_contract_value(value) for value in contract.values())
+            ):
                 contract = _apply_planner_structural_support(contract)
 
                 def _llm_minimal_repair_provider(
@@ -9147,6 +9333,7 @@ domain_expert_critique:
                     finish_reason = None
                     usage_metadata = None
                     generation_config_used = None
+                    transport_validation_result: Dict[str, Any] | None = None
                     validation_result: Dict[str, Any] | None = None
                     quality_accepted = False
 
@@ -9185,11 +9372,24 @@ domain_expert_critique:
                         parse_error = parse_exc
 
                     parsed = _unwrap_execution_contract_transport(parsed_payload)
+                    transport_validation_result = _build_transport_validation(parsed)
                     had_json_parse_error = parsed is None or not isinstance(parsed, dict)
                     if parsed_payload is not None and not isinstance(parsed_payload, dict):
                         parse_error = ValueError("Parsed JSON is not an object")
                     elif parsed is None:
                         parse_error = ValueError("Parsed tool payload is missing a contract object")
+                    elif not _transport_validation_accepted(transport_validation_result):
+                        transport_issue = None
+                        issues = transport_validation_result.get("issues")
+                        if isinstance(issues, list):
+                            for issue in issues:
+                                if isinstance(issue, dict) and issue.get("rule"):
+                                    transport_issue = str(issue.get("rule"))
+                                    break
+                        parse_error = ValueError(
+                            f"Transport payload invalid: {transport_issue or 'empty_or_trivial_contract'}"
+                        )
+                        parsed = None
 
                     quality_error_message = None
                     if parsed is not None and isinstance(parsed, dict):
@@ -9258,6 +9458,11 @@ domain_expert_critique:
                         parse_feedback = _build_parse_feedback(response_text, parse_error)
                         latest_response_text_for_repair = response_text
                         latest_parse_feedback_for_repair = parse_feedback
+                        planner_candidate_invalid_meta = {
+                            "transport_validation": transport_validation_result,
+                            "attempt_count": len(planner_diag) + 1,
+                            "fallback_mode": "transport_failure",
+                        }
                         if best_response_text is None:
                             best_response_text = response_text
                             best_parse_feedback = parse_feedback
@@ -9273,6 +9478,20 @@ domain_expert_critique:
                             "generation_config": generation_config_used,
                             "usage_metadata": usage_metadata,
                             "had_json_parse_error": bool(had_json_parse_error),
+                            "transport_status": (
+                                str(transport_validation_result.get("status") or "").lower()
+                                if isinstance(transport_validation_result, dict)
+                                else None
+                            ),
+                            "transport_issue_rules": (
+                                [
+                                    str(issue.get("rule"))
+                                    for issue in (transport_validation_result.get("issues") or [])
+                                    if isinstance(issue, dict) and issue.get("rule")
+                                ][:12]
+                                if isinstance(transport_validation_result, dict)
+                                else []
+                            ),
                             "parse_error_type": type(parse_error).__name__ if parse_error else None,
                             "parse_error_message": str(parse_error) if parse_error else None,
                             "quality_status": (
@@ -9368,6 +9587,7 @@ domain_expert_critique:
             )
             planner_candidate_invalid = invalid_contract
             planner_candidate_invalid_raw = invalid_raw
+            previous_invalid_meta = planner_candidate_invalid_meta if isinstance(planner_candidate_invalid_meta, dict) else {}
             planner_candidate_invalid_meta = {
                 "best_validation": best_validation if isinstance(best_validation, dict) else None,
                 "latest_validation": (
@@ -9378,9 +9598,12 @@ domain_expert_critique:
                 "attempt_count": len(planner_diag),
                 "fallback_mode": "llm_candidates_only",
             }
-            contract = _apply_planner_structural_support(
-                invalid_contract if isinstance(invalid_contract, dict) else {}
-            )
+            if isinstance(previous_invalid_meta, dict) and previous_invalid_meta:
+                planner_candidate_invalid_meta = {**previous_invalid_meta, **planner_candidate_invalid_meta}
+            if isinstance(invalid_contract, dict) and any(_is_meaningful_contract_value(value) for value in invalid_contract.values()):
+                contract = _apply_planner_structural_support(invalid_contract)
+            else:
+                contract = {}
             if isinstance(invalid_contract, dict):
                 planner_contract_canonical = copy.deepcopy(invalid_contract)
             llm_success = False

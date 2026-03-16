@@ -94,12 +94,13 @@ def test_execution_planner_invalid_json_failure_does_not_invent_deterministic_co
     )
 
     assert isinstance(contract, dict)
-    assert contract.get("artifact_requirements")
-    assert isinstance(contract.get("column_dtype_targets"), dict)
-    assert not contract.get("scope")
+    assert contract == {}
     diagnostics = agent.last_contract_diagnostics or {}
     summary = diagnostics.get("summary") if isinstance(diagnostics, dict) else {}
     assert summary.get("accepted") is False
+    transport = diagnostics.get("transport_validation") if isinstance(diagnostics, dict) else {}
+    assert isinstance(transport, dict)
+    assert transport.get("accepted") is False
     assert agent.last_contract_min is None
 
 

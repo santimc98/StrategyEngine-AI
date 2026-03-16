@@ -101,3 +101,26 @@ def test_planner_structural_support_projects_clean_dataset_from_canonical_contra
     assert clean_dataset.get("output_path") == "artifacts/clean/clean_dataset.csv"
     assert clean_dataset.get("output_manifest_path") == "artifacts/clean/clean_dataset_manifest.json"
     assert set(clean_dataset.get("required_columns") or []) >= {"event_id", "__split", "feature_a", "target"}
+
+
+def test_empty_tool_payload_is_classified_as_transport_failure(monkeypatch):
+    planner = ExecutionPlannerAgent(api_key="mock_key")
+    response = MagicMock()
+    response.text = "{}"
+    response.candidates = []
+    response.usage_metadata = None
+    planner.client = MagicMock()
+    planner.client.generate_content.return_value = response
+
+    contract = planner.generate_contract(
+        strategy={"required_columns": ["id", "feature", "target"], "title": "Transport failure"},
+        business_objective="Predict target.",
+        column_inventory=["id", "feature", "target"],
+    )
+
+    assert contract == {}
+    diagnostics = planner.last_contract_diagnostics or {}
+    transport = diagnostics.get("transport_validation") or {}
+    assert transport.get("accepted") is False
+    issues = transport.get("issues") or []
+    assert any(issue.get("rule") == "contract.transport_payload_empty" for issue in issues if isinstance(issue, dict))

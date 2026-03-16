@@ -44,10 +44,11 @@ def test_execution_planner_generation_config_includes_response_schema_when_enabl
     assert "response_schema" in cfg
     schema = cfg.get("response_schema") or {}
     assert schema.get("type") == "object"
-    assert "contract" in ((schema.get("properties") or {}).keys())
-    contract_schema = (schema.get("properties") or {}).get("contract") or {}
-    assert contract_schema.get("type") == "object"
-    assert contract_schema.get("additionalProperties") is True
+    props = schema.get("properties") or {}
+    assert "scope" in props
+    assert "task_semantics" in props
+    assert "column_roles" in props
+    assert "artifact_requirements" in props
 
 
 def test_execution_planner_generate_content_retries_without_response_schema(monkeypatch):
@@ -118,3 +119,13 @@ def test_execution_planner_unwraps_transport_payload():
     from src.agents.execution_planner import _unwrap_execution_contract_transport
 
     assert _unwrap_execution_contract_transport(payload) == payload["contract"]
+
+
+def test_execution_planner_transport_validation_rejects_empty_payload():
+    from src.agents.execution_planner import _build_transport_validation
+
+    result = _build_transport_validation({})
+
+    assert result.get("accepted") is False
+    issues = result.get("issues") or []
+    assert any(issue.get("rule") == "contract.transport_payload_empty" for issue in issues if isinstance(issue, dict))

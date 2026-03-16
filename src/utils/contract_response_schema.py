@@ -1,4 +1,4 @@
-"""Execution Planner structured-output transport schemas."""
+"""Execution Planner canonical contract transport schemas."""
 
 from typing import Any, Dict
 import copy
@@ -140,18 +140,149 @@ EXECUTION_CONTRACT_V42_MIN_SCHEMA["properties"]["optimization_policy"] = copy.de
 )
 
 
-EXECUTION_CONTRACT_TRANSPORT_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "required": ["contract"],
-    "properties": {
-        "contract": {
-            "type": "object",
-            "description": (
-                "Complete execution contract JSON object. "
-                "Preserve every semantically grounded field required by downstream views and validation."
-            ),
-            "additionalProperties": True,
-        }
-    },
-    "additionalProperties": False,
+_RUNBOOK_SCHEMA: Dict[str, Any] = {
+    "anyOf": [
+        {"type": "object", "additionalProperties": True},
+        {"type": "array", "items": {}},
+        {"type": "string", "minLength": 1},
+    ]
 }
+
+
+_GATE_LIST_SCHEMA: Dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "anyOf": [
+            {"type": "string", "minLength": 1},
+            {"type": "object", "additionalProperties": True},
+        ]
+    },
+}
+
+
+_COLUMN_DTYPE_TARGETS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": {
+        "type": "object",
+        "properties": {
+            "target_dtype": {"type": "string"},
+            "nullable": {"type": "boolean"},
+            "role": {"type": "string"},
+            "source": {"type": "string"},
+        },
+        "required": ["target_dtype"],
+        "additionalProperties": True,
+    },
+}
+
+
+EXECUTION_CONTRACT_CANONICAL_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "contract_version",
+        "scope",
+        "strategy_title",
+        "business_objective",
+        "output_dialect",
+        "canonical_columns",
+        "required_outputs",
+        "column_roles",
+        "allowed_feature_sets",
+        "task_semantics",
+        "artifact_requirements",
+        "column_dtype_targets",
+        "cleaning_gates",
+        "qa_gates",
+        "reviewer_gates",
+        "validation_requirements",
+        "data_engineer_runbook",
+        "ml_engineer_runbook",
+        "evaluation_spec",
+        "iteration_policy",
+        "optimization_policy",
+    ],
+    "properties": {
+        "contract_version": {"type": "string", "enum": ["4.1", "4.2"]},
+        "scope": {"type": "string", "enum": ["cleaning_only", "ml_only", "full_pipeline"]},
+        "strategy_title": {"type": "string", "minLength": 1},
+        "business_objective": {"type": "string", "minLength": 1},
+        "output_dialect": {
+            "type": "object",
+            "required": ["sep", "decimal", "encoding"],
+            "properties": {
+                "sep": {"type": "string"},
+                "decimal": {"type": "string"},
+                "encoding": {"type": "string"},
+            },
+            "additionalProperties": True,
+        },
+        "canonical_columns": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "required_outputs": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "column_roles": {
+            "type": "object",
+            "required": [
+                "pre_decision",
+                "decision",
+                "outcome",
+                "post_decision_audit_only",
+                "unknown",
+                "identifiers",
+                "time_columns",
+            ],
+            "properties": {
+                "pre_decision": {"type": "array", "items": {"type": "string"}},
+                "decision": {"type": "array", "items": {"type": "string"}},
+                "outcome": {"type": "array", "items": {"type": "string"}},
+                "post_decision_audit_only": {"type": "array", "items": {"type": "string"}},
+                "unknown": {"type": "array", "items": {"type": "string"}},
+                "identifiers": {"type": "array", "items": {"type": "string"}},
+                "time_columns": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": True,
+        },
+        "allowed_feature_sets": {
+            "type": "object",
+            "required": [
+                "segmentation_features",
+                "model_features",
+                "forbidden_features",
+                "audit_only_features",
+            ],
+            "properties": {
+                "segmentation_features": {"type": "array", "items": {"type": "string"}},
+                "model_features": {"type": "array", "items": {"type": "string"}},
+                "forbidden_features": {"type": "array", "items": {"type": "string"}},
+                "audit_only_features": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": True,
+        },
+        "task_semantics": {
+            "type": "object",
+            "required": ["problem_family", "objective_type"],
+            "properties": {
+                "problem_family": {"type": "string"},
+                "objective_type": {"type": "string"},
+                "primary_target": {"type": "string"},
+                "target_columns": {"type": "array", "items": {"type": "string"}},
+                "prediction_unit": {"type": "string"},
+                "output_schema": {"type": "object", "additionalProperties": True},
+            },
+            "additionalProperties": True,
+        },
+        "artifact_requirements": {"type": "object", "additionalProperties": True},
+        "column_dtype_targets": _COLUMN_DTYPE_TARGETS_SCHEMA,
+        "cleaning_gates": _GATE_LIST_SCHEMA,
+        "qa_gates": _GATE_LIST_SCHEMA,
+        "reviewer_gates": _GATE_LIST_SCHEMA,
+        "validation_requirements": {"type": "object", "additionalProperties": True},
+        "data_engineer_runbook": _RUNBOOK_SCHEMA,
+        "ml_engineer_runbook": _RUNBOOK_SCHEMA,
+        "evaluation_spec": {"type": "object", "additionalProperties": True},
+        "iteration_policy": {"type": "object", "additionalProperties": True},
+        "optimization_policy": copy.deepcopy(OPTIMIZATION_POLICY_MIN_SCHEMA),
+    },
+    "additionalProperties": True,
+}
+
+
+EXECUTION_CONTRACT_TRANSPORT_SCHEMA: Dict[str, Any] = copy.deepcopy(EXECUTION_CONTRACT_CANONICAL_SCHEMA)
