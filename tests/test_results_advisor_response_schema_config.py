@@ -1,4 +1,5 @@
 from src.agents.results_advisor import ResultsAdvisorAgent
+from src.agents import results_advisor as results_advisor_mod
 
 
 def test_results_advisor_generation_config_includes_response_schema_when_enabled(monkeypatch):
@@ -43,3 +44,22 @@ def test_results_advisor_generate_gemini_retries_without_response_schema(monkeyp
     assert "response_schema" in first_cfg
     assert "response_schema" not in second_cfg
     assert "response_schema" not in used_config
+
+
+def test_results_advisor_critique_defaults_to_openrouter_gpt54(monkeypatch):
+    captured = {}
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.delenv("RESULTS_ADVISOR_CRITIQUE_MODEL", raising=False)
+    monkeypatch.setattr(results_advisor_mod, "OpenAI", _FakeOpenAI)
+
+    agent = ResultsAdvisorAgent()
+
+    assert agent.critique_mode == "llm"
+    assert agent.critique_provider == "openrouter"
+    assert agent.critique_model_name == "openai/gpt-5.4"
+    assert captured.get("base_url") == "https://openrouter.ai/api/v1"

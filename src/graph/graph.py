@@ -29003,7 +29003,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             delta_value: Optional[float] = None
             if baseline_value is not None and improved_value is not None:
                 delta_value = float(improved_value - baseline_value)
-            if critique_packet:
+            if critique_packet or critique_meta:
                 log_run_event(
                     run_id,
                     "metric_improvement_candidate_critique",
@@ -29015,6 +29015,17 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                         "model": critique_meta.get("model"),
                         "analysis_summary": str(critique_packet.get("analysis_summary") or "")[:280],
                         "meets_min_delta": bool(improved_by_metric),
+                        "packet_present": bool(critique_packet),
+                        "validation_errors": (
+                            critique_meta.get("validation_errors")[:3]
+                            if isinstance(critique_meta.get("validation_errors"), list)
+                            else []
+                        ),
+                        "llm_error_stage": (
+                            critique_meta.get("llm_error", {}).get("stage")
+                            if isinstance(critique_meta.get("llm_error"), dict)
+                            else None
+                        ),
                     },
                 )
             log_run_event(

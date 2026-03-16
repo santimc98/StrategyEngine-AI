@@ -72,8 +72,12 @@ class ResultsAdvisorAgent:
         self.fe_client = None
         self.fe_model_name = None
         self.fe_model_warning = None
+        self.critique_provider = "none"
+        self.critique_client = None
+        self.critique_model_name = None
+        self.critique_model_warning = None
         self.critique_mode = self._normalize_critique_mode(
-            os.getenv("RESULTS_ADVISOR_CRITIQUE_MODE", "hybrid")
+            os.getenv("RESULTS_ADVISOR_CRITIQUE_MODE", "llm")
         )
         self._generation_config = {
             "temperature": float(
@@ -116,6 +120,18 @@ class ResultsAdvisorAgent:
         # Tests frequently instantiate with api_key="" to force non-network mode.
         if explicit_api_key is not None and str(explicit_api_key).strip() == "":
             return
+        critique_api_key = os.getenv("OPENROUTER_API_KEY")
+        if critique_api_key:
+            self.critique_provider = "openrouter"
+            self.critique_client = OpenAI(
+                api_key=critique_api_key,
+                base_url="https://openrouter.ai/api/v1",
+                timeout=None,
+            )
+            self.critique_model_name = (
+                str(os.getenv("RESULTS_ADVISOR_CRITIQUE_MODEL", "openai/gpt-5.4")).strip()
+                or "openai/gpt-5.4"
+            )
         if (
             self.fe_advice_mode in {"llm", "hybrid"}
             or self.critique_mode in {"llm", "hybrid"}
@@ -142,6 +158,16 @@ class ResultsAdvisorAgent:
                 build_results_advisor_critique_response_schema()
             )
         return config
+
+    def _openai_response_format_for_critique(self) -> Dict[str, Any]:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "advisor_critique_packet",
+                "strict": True,
+                "schema": copy.deepcopy(build_results_advisor_critique_response_schema()),
+            },
+        }
 
     @staticmethod
     def _is_response_schema_unsupported_error(err: Exception) -> bool:
@@ -280,16 +306,16 @@ class ResultsAdvisorAgent:
         return "hybrid"
 
     def generate_critique_packet(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        deterministic = self._generate_critique_packet_deterministic(context)
         mode = self.critique_mode
         self.last_critique_error = {}
         self.last_critique_meta = {
             "mode": mode,
             "source": "deterministic",
-            "provider": self.fe_provider,
-            "model": self.fe_model_name,
+            "provider": self.critique_provider,
+            "model": self.critique_model_name,
         }
         if mode == "deterministic":
+            deterministic = self._generate_critique_packet_deterministic(context)
             self.last_critique_packet = deterministic
             return deterministic
 
@@ -299,51 +325,74 @@ class ResultsAdvisorAgent:
             self.last_critique_meta = {
                 "mode": mode,
                 "source": "llm",
-                "provider": self.fe_provider,
-                "model": self.fe_model_name,
+                "provider": self.critique_provider,
+                "model": self.critique_model_name,
             }
             self.last_critique_packet = llm_packet
             return llm_packet
 
-        repaired_packet, repair_meta = self._repair_critique_packet(
-            llm_packet=llm_packet,
-            deterministic_packet=deterministic,
-            context=context,
-            validation_errors=validation_errors,
-        )
-        if isinstance(repaired_packet, dict):
-            repaired_ok, repaired_errors = validate_advisor_critique_packet(repaired_packet)
-            if repaired_ok:
+        repair_meta: Dict[str, Any] = {}
+        if isinstance(llm_packet, dict) and llm_packet:
+            normalized_packet = self._normalize_critique_packet_candidate(llm_packet, {}, context)
+            normalized_ok, normalized_errors = validate_advisor_critique_packet(normalized_packet)
+            repair_meta = {
+                "attempted": True,
+                "source": "normalize",
+                "provider": self.critique_provider,
+                "model": self.critique_model_name,
+                "input_errors": list(validation_errors or [])[:8],
+            }
+            if normalized_ok:
                 self.last_critique_meta = {
                     "mode": mode,
-                    "source": str(repair_meta.get("source") or "llm_repaired"),
-                    "provider": self.fe_provider,
-                    "model": self.fe_model_name,
+                    "source": "llm_repair_normalized",
+                    "provider": self.critique_provider,
+                    "model": self.critique_model_name,
                     "repair_meta": repair_meta,
+                }
+                self.last_critique_packet = normalized_packet
+                return normalized_packet
+            validation_errors = normalized_errors
+            repaired_packet, repair_trace = self._repair_critique_packet(
+                llm_packet=llm_packet,
+                deterministic_packet={},
+                context=context,
+                validation_errors=list(validation_errors or []),
+            )
+            repair_meta = repair_trace
+            repaired_ok, repaired_errors = validate_advisor_critique_packet(repaired_packet)
+            if repaired_ok and isinstance(repaired_packet, dict) and repaired_packet:
+                self.last_critique_meta = {
+                    "mode": mode,
+                    "source": str(repair_trace.get("source") or "llm_repair_pass"),
+                    "provider": self.critique_provider,
+                    "model": self.critique_model_name,
+                    "repair_meta": repair_trace,
                 }
                 self.last_critique_packet = repaired_packet
                 return repaired_packet
-            validation_errors = repaired_errors
+            if isinstance(repaired_errors, list) and repaired_errors:
+                validation_errors = repaired_errors
 
         if llm_packet:
             print(
                 "RESULTS_ADVISOR_CRITIQUE_SCHEMA_INVALID: "
-                + f"provider={self.fe_provider} model={self.fe_model_name} "
+                + f"provider={self.critique_provider} model={self.critique_model_name} "
                 + f"errors={validation_errors[:4]}"
             )
         self.last_critique_meta = {
             "mode": mode,
-            "source": "deterministic_fallback",
-            "provider": self.fe_provider,
-            "model": self.fe_model_name,
+            "source": "llm_schema_failure" if llm_packet else "llm_transport_failure",
+            "provider": self.critique_provider,
+            "model": self.critique_model_name,
             "validation_errors": validation_errors[:6],
         }
         if repair_meta:
             self.last_critique_meta["repair_meta"] = repair_meta
         if self.last_critique_error:
             self.last_critique_meta["llm_error"] = dict(self.last_critique_error)
-        self.last_critique_packet = deterministic
-        return deterministic
+        self.last_critique_packet = {}
+        return {}
 
     def _repair_critique_packet(
         self,
@@ -356,8 +405,8 @@ class ResultsAdvisorAgent:
         trace: Dict[str, Any] = {
             "attempted": False,
             "source": None,
-            "provider": self.fe_provider,
-            "model": self.fe_model_name,
+            "provider": self.critique_provider,
+            "model": self.critique_model_name,
             "input_errors": list(validation_errors or [])[:8],
         }
         if not isinstance(llm_packet, dict) or not llm_packet:
@@ -371,14 +420,14 @@ class ResultsAdvisorAgent:
             trace["normalized_only"] = True
             print(
                 "RESULTS_ADVISOR_CRITIQUE_REPAIR: "
-                + f"source=normalize success=True provider={self.fe_provider} model={self.fe_model_name}"
+                + f"source=normalize success=True provider={self.critique_provider} model={self.critique_model_name}"
             )
             return normalized, trace
 
         trace["attempted"] = True
         trace["normalized_only"] = False
         trace["normalize_errors"] = normalized_errors[:6]
-        if not self.fe_client or self.fe_provider == "none":
+        if not self.critique_client or self.critique_provider == "none":
             print(
                 "RESULTS_ADVISOR_CRITIQUE_REPAIR: "
                 + "source=normalize success=False reason=llm_unavailable"
@@ -389,12 +438,12 @@ class ResultsAdvisorAgent:
         schema_json = self._truncate(json.dumps(schema, ensure_ascii=True), 10000)
         llm_packet_json = self._truncate(json.dumps(llm_packet or {}, ensure_ascii=True), 10000)
         raw_preview = self._truncate(str(self.last_response or ""), 8000)
-        deterministic_json = self._truncate(json.dumps(deterministic_packet, ensure_ascii=True), 8000)
         errors_json = self._truncate(json.dumps(validation_errors[:8], ensure_ascii=True), 2000)
         repair_prompt = (
             "You are a strict JSON repair tool. Return ONLY one JSON object, no markdown.\n"
             "Repair the candidate packet so it strictly matches TARGET_SCHEMA.\n"
-            "Keep semantic intent. When fields are missing/invalid, use deterministic fallback packet.\n"
+            "Keep semantic intent. Infer conservatively from the candidate packet and context. "
+            "Do not invent claims that are not supported by the evidence.\n"
             "TARGET_SCHEMA:\n"
             + schema_json
             + "\nVALIDATION_ERRORS:\n"
@@ -403,12 +452,12 @@ class ResultsAdvisorAgent:
             + llm_packet_json
             + "\nRAW_RESPONSE_PREVIEW:\n"
             + raw_preview
-            + "\nDETERMINISTIC_FALLBACK_PACKET:\n"
-            + deterministic_json
+            + "\nCONTEXT_JSON:\n"
+            + self._truncate(json.dumps(context if isinstance(context, dict) else {}, ensure_ascii=True), 10000)
         )
 
         try:
-            if self.fe_provider == "gemini":
+            if self.critique_provider == "gemini":
                 generation_config = self._generation_config_for_critique()
                 generation_config["response_schema"] = copy.deepcopy(schema)
                 repaired_text, used_config = self._generate_gemini_json(
@@ -417,21 +466,35 @@ class ResultsAdvisorAgent:
                 )
                 trace["used_response_schema"] = "response_schema" in used_config
             else:
-                response = self.fe_client.chat.completions.create(
-                    model=self.fe_model_name,
-                    messages=[
+                call_kwargs = {
+                    "model": self.critique_model_name,
+                    "messages": [
                         {"role": "system", "content": "Return only valid JSON."},
                         {"role": "user", "content": repair_prompt},
                     ],
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
-                )
+                    "temperature": 0.0,
+                }
+                if self._use_response_schema:
+                    call_kwargs["response_format"] = self._openai_response_format_for_critique()
+                try:
+                    response = self.critique_client.chat.completions.create(**call_kwargs)
+                except TypeError:
+                    retry_kwargs = dict(call_kwargs)
+                    retry_kwargs.pop("temperature", None)
+                    response = self.critique_client.chat.completions.create(**retry_kwargs)
+                except Exception as err:
+                    if self._use_response_schema and self._is_response_schema_unsupported_error(err):
+                        fallback_kwargs = dict(call_kwargs)
+                        fallback_kwargs.pop("response_format", None)
+                        response = self.critique_client.chat.completions.create(**fallback_kwargs)
+                    else:
+                        raise
                 repaired_text = response.choices[0].message.content
-                trace["used_response_schema"] = False
+                trace["used_response_schema"] = self._use_response_schema
             repaired_packet = self._parse_json_object(repaired_text)
             normalized_repaired = self._normalize_critique_packet_candidate(
                 repaired_packet,
-                deterministic_packet,
+                {},
                 context,
             )
             repaired_ok, repaired_errors = validate_advisor_critique_packet(normalized_repaired)
@@ -441,7 +504,7 @@ class ResultsAdvisorAgent:
                 trace["source"] = "llm_repair_pass"
                 print(
                     "RESULTS_ADVISOR_CRITIQUE_REPAIR: "
-                    + f"source=llm_repair_pass success=True provider={self.fe_provider} model={self.fe_model_name}"
+                    + f"source=llm_repair_pass success=True provider={self.critique_provider} model={self.critique_model_name}"
                 )
                 return normalized_repaired, trace
         except Exception as exc:
@@ -449,7 +512,7 @@ class ResultsAdvisorAgent:
 
         print(
             "RESULTS_ADVISOR_CRITIQUE_REPAIR: "
-            + f"source=llm_repair_pass success=False provider={self.fe_provider} model={self.fe_model_name}"
+            + f"source=llm_repair_pass success=False provider={self.critique_provider} model={self.critique_model_name}"
         )
         return None, trace
 
@@ -708,8 +771,8 @@ class ResultsAdvisorAgent:
         payload: Dict[str, Any] = {
             "stage": str(stage or "unknown"),
             "detail": str(detail or "")[:260],
-            "provider": self.fe_provider,
-            "model": self.fe_model_name,
+            "provider": self.critique_provider,
+            "model": self.critique_model_name,
         }
         if raw_preview:
             payload["raw_preview"] = self._truncate(str(raw_preview), 260)
@@ -727,10 +790,10 @@ class ResultsAdvisorAgent:
         if not isinstance(context, dict):
             self._record_critique_error(stage="invalid_context", detail="Context is not a dictionary.")
             return {}
-        if not self.fe_client or self.fe_provider == "none":
+        if not self.critique_client or self.critique_provider == "none":
             self._record_critique_error(
                 stage="client_unavailable",
-                detail="Reviewer LLM client is unavailable or provider is none.",
+                detail="Critique LLM client is unavailable or provider is none.",
             )
             return {}
 
@@ -783,7 +846,7 @@ class ResultsAdvisorAgent:
         )
 
         try:
-            if self.fe_provider == "gemini":
+            if self.critique_provider == "gemini":
                 generation_config = self._generation_config_for_critique()
                 raw_text, used_config = self._generate_gemini_json(
                     system_prompt + "\n\n" + user_prompt,
@@ -792,17 +855,32 @@ class ResultsAdvisorAgent:
                 if "response_schema" in generation_config and "response_schema" not in used_config:
                     print(
                         "RESULTS_ADVISOR_CRITIQUE_SCHEMA_FALLBACK: "
-                        + f"provider={self.fe_provider} model={self.fe_model_name} reason=response_schema_unsupported"
+                        + f"provider={self.critique_provider} model={self.critique_model_name} reason=response_schema_unsupported"
                     )
             else:
-                response = self.fe_client.chat.completions.create(
-                    model=self.fe_model_name,
-                    messages=[
+                call_kwargs = {
+                    "model": self.critique_model_name,
+                    "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    temperature=0.0,
-                )
+                    "temperature": 0.0,
+                }
+                if self._use_response_schema:
+                    call_kwargs["response_format"] = self._openai_response_format_for_critique()
+                try:
+                    response = self.critique_client.chat.completions.create(**call_kwargs)
+                except TypeError:
+                    retry_kwargs = dict(call_kwargs)
+                    retry_kwargs.pop("temperature", None)
+                    response = self.critique_client.chat.completions.create(**retry_kwargs)
+                except Exception as err:
+                    if self._use_response_schema and self._is_response_schema_unsupported_error(err):
+                        fallback_kwargs = dict(call_kwargs)
+                        fallback_kwargs.pop("response_format", None)
+                        response = self.critique_client.chat.completions.create(**fallback_kwargs)
+                    else:
+                        raise
                 raw_text = response.choices[0].message.content
         except Exception as exc:
             self._record_critique_error(

@@ -4,6 +4,7 @@ from src.utils.actor_critic_schemas import validate_advisor_critique_packet
 
 def test_generate_critique_packet_includes_holdout_validation_signals() -> None:
     advisor = ResultsAdvisorAgent(api_key="")
+    advisor.critique_mode = "deterministic"
     packet = advisor.generate_critique_packet(
         {
             "run_id": "run_test",
@@ -39,6 +40,9 @@ def test_generate_critique_packet_includes_holdout_validation_signals() -> None:
 def test_generate_critique_packet_repairs_schema_drift_without_deterministic_fallback(monkeypatch) -> None:
     advisor = ResultsAdvisorAgent(api_key="")
     advisor.critique_mode = "hybrid"
+    advisor.critique_provider = "openrouter"
+    advisor.critique_model_name = "openai/gpt-5.4"
+    advisor.critique_client = object()
     broken_packet = {
         "packet_type": "advisor_critique_packet",
         "packet_version": "1.0",
@@ -82,6 +86,58 @@ def test_generate_critique_packet_repairs_schema_drift_without_deterministic_fal
         "strictly_no_code_advice": True,
     }
     monkeypatch.setattr(advisor, "_generate_critique_packet_llm", lambda context: broken_packet)
+    monkeypatch.setattr(
+        advisor,
+        "_repair_critique_packet",
+        lambda **kwargs: (
+            {
+                "packet_type": "advisor_critique_packet",
+                "packet_version": "1.0",
+                "run_id": "run_test",
+                "iteration": 2,
+                "timestamp_utc": "2026-01-01T00:00:00Z",
+                "primary_metric_name": "roc_auc",
+                "higher_is_better": True,
+                "metric_comparison": {
+                    "baseline_value": 0.8000,
+                    "candidate_value": 0.8010,
+                    "delta_abs": 0.0010,
+                    "delta_rel": 0.00125,
+                    "min_delta_required": 0.0005,
+                    "meets_min_delta": True,
+                },
+                "validation_signals": {
+                    "validation_mode": "holdout",
+                    "holdout": {
+                        "metric_value": 0.799,
+                        "split_name": "holdout",
+                        "sample_count": 100,
+                        "class_distribution_shift": "low",
+                    },
+                },
+                "error_modes": [
+                    {
+                        "id": "overfit_risk",
+                        "severity": "high",
+                        "confidence": 0.8,
+                        "evidence": "large gap",
+                        "affected_scope": "model",
+                        "metric_impact_direction": "negative",
+                    }
+                ],
+                "risk_flags": ["overfit_risk"],
+                "active_gates_context": ["required_artifacts_present"],
+                "analysis_summary": "Schema drift packet",
+                "strictly_no_code_advice": True,
+            },
+            {
+                "attempted": True,
+                "source": "llm_repair_pass",
+                "provider": "openrouter",
+                "model": "openai/gpt-5.4",
+            },
+        ),
+    )
 
     packet = advisor.generate_critique_packet(
         {
@@ -113,7 +169,7 @@ def test_generate_critique_packet_repairs_schema_drift_without_deterministic_fal
     assert valid is True, errors
     assert packet.get("error_modes", [{}])[0].get("severity") == "high"
     assert packet.get("error_modes", [{}])[0].get("metric_impact_direction") == "negative"
-    assert (advisor.last_critique_meta or {}).get("source") in {"llm_repair_normalized", "llm_repair_pass"}
+    assert (advisor.last_critique_meta or {}).get("source") == "llm_repair_pass"
 
 
 def test_generate_critique_packet_treats_empty_candidate_metrics_as_missing() -> None:
@@ -141,3 +197,33 @@ def test_generate_critique_packet_treats_empty_candidate_metrics_as_missing() ->
     comparison = packet.get("metric_comparison", {})
     assert comparison.get("baseline_value") == comparison.get("candidate_value")
     assert comparison.get("meets_min_delta") is False
+
+
+def test_generate_critique_packet_llm_failure_is_explicit_and_not_silent_deterministic_fallback() -> None:
+    advisor = ResultsAdvisorAgent(api_key="")
+    advisor.critique_mode = "hybrid"
+    advisor.critique_provider = "openrouter"
+    advisor.critique_model_name = "openai/gpt-5.4"
+    advisor.critique_client = object()
+
+    advisor._generate_critique_packet_llm = lambda _context: {}
+
+    packet = advisor.generate_critique_packet(
+        {
+            "run_id": "run_test",
+            "iteration": 4,
+            "primary_metric_name": "roc_auc",
+            "higher_is_better": True,
+            "min_delta": 0.0005,
+            "baseline_metrics": {"model_performance": {"cv_roc_auc": 0.8, "cv_std": 0.01}},
+            "candidate_metrics": {"model_performance": {"cv_roc_auc": 0.801, "cv_std": 0.02}},
+            "active_gates_context": ["required_artifacts_present"],
+            "dataset_profile": {"n_rows": 900},
+        }
+    )
+
+    assert packet == {}
+    meta = advisor.last_critique_meta or {}
+    assert meta.get("source") == "llm_transport_failure"
+    assert meta.get("provider") == "openrouter"
+    assert meta.get("model") == "openai/gpt-5.4"
