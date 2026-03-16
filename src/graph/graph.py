@@ -1449,6 +1449,34 @@ def _metric_loop_controller(loop_state: Dict[str, Any] | None) -> Dict[str, Any]
     )
 
 
+def _metric_loop_is_closed_for_routing(state: Dict[str, Any] | Any) -> bool:
+    state_obj = state if isinstance(state, dict) else {}
+    if bool(state_obj.get("ml_improvement_loop_complete")):
+        return True
+    loop_state = _load_metric_loop_state(state_obj, None)
+    if not isinstance(loop_state, dict) or not loop_state:
+        return False
+    controller = _metric_loop_controller(loop_state)
+    selection = loop_state.get("selection") if isinstance(loop_state.get("selection"), dict) else {}
+    round_payload = loop_state.get("round") if isinstance(loop_state.get("round"), dict) else {}
+    try:
+        round_id = int(round_payload.get("round_id") or 0)
+    except Exception:
+        round_id = 0
+    active = (
+        bool(controller.get("active"))
+        if isinstance(controller.get("active"), bool)
+        else bool(state_obj.get("ml_improvement_round_active"))
+    )
+    continue_round = (
+        bool(controller.get("continue_round"))
+        if isinstance(controller.get("continue_round"), bool)
+        else bool(state_obj.get("ml_improvement_continue"))
+    )
+    selected_label = str(selection.get("selected_label") or "").strip()
+    return bool((not active) and (not continue_round) and round_id > 0 and selected_label)
+
+
 def _metric_loop_artifacts(loop_state: Dict[str, Any] | None) -> Dict[str, Any]:
     return (
         loop_state.get("artifacts")
@@ -27886,7 +27914,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             f"cumulative_delta={degradation_info['cumulative_delta']} "
             f"metric={metric_name}"
         )
-        return state
+        return False
 
     if _is_duplicate_noop_hypothesis(hypothesis_packet):
         # Before terminating, attempt blueprint fallback recovery: if the
@@ -29162,7 +29190,8 @@ def run_metric_improvement_bootstrap(state: AgentState) -> AgentState:
     )
     activated = _bootstrap_metric_improvement_round(working_state, contract)
     updates = _collect_state_updates(before, working_state)
-    updates["metric_improvement_nodes_managed"] = True
+    loop_closed = _metric_loop_is_closed_for_routing(working_state)
+    updates["metric_improvement_nodes_managed"] = False if loop_closed else True
     updates["metric_improvement_bootstrapped"] = bool(activated)
     updates["metric_improvement_finalized"] = False
     return updates
@@ -29324,6 +29353,8 @@ def check_review_board_opt_route(state: AgentState) -> str:
 
 
 def check_run_quick_eval_route(state: AgentState) -> str:
+    if _metric_loop_is_closed_for_routing(state):
+        return check_evaluation(state)
     if bool(state.get("metric_improvement_bootstrapped")):
         _log_metric_round_retry_decision(state, "METRIC_IMPROVEMENT_ROUND")
         return "retry"
@@ -29331,6 +29362,8 @@ def check_run_quick_eval_route(state: AgentState) -> str:
 
 
 def check_finalize_opt_loop_route(state: AgentState) -> str:
+    if _metric_loop_is_closed_for_routing(state):
+        return check_evaluation(state)
     if _should_continue_opt_loop(state):
         _log_metric_round_retry_decision(state, "METRIC_IMPROVEMENT_ROUND")
         return "bootstrap_opt_round"

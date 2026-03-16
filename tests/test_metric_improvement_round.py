@@ -1145,6 +1145,42 @@ def test_bootstrap_metric_round_ignores_uninitialized_legacy_defaults_and_uses_e
     assert metric_snapshot.get("best_metric_so_far") == pytest.approx(0.21735549007130867, abs=1e-12)
 
 
+def test_check_run_quick_eval_route_stops_when_metric_loop_is_canonically_closed(monkeypatch) -> None:
+    monkeypatch.setattr(graph_mod, "check_evaluation", lambda _state: "approved")
+
+    state = {
+        "metric_improvement_bootstrapped": True,
+        "ml_improvement_loop_complete": False,
+        "metric_loop_state": {
+            "schema_version": "v1",
+            "round": {"round_id": 3, "status": "active"},
+            "selection": {"selected_label": "incumbent"},
+            "controller": {"active": False, "continue_round": False},
+        },
+    }
+
+    assert graph_mod.check_run_quick_eval_route(state) == "approved"
+
+
+def test_run_metric_improvement_bootstrap_releases_node_management_when_loop_is_already_closed(monkeypatch) -> None:
+    monkeypatch.setattr(graph_mod, "_bootstrap_metric_improvement_round", lambda _state, _contract: False)
+
+    updates = run_metric_improvement_bootstrap(
+        {
+            "execution_contract": {},
+            "metric_loop_state": {
+                "schema_version": "v1",
+                "round": {"round_id": 2, "status": "complete"},
+                "selection": {"selected_label": "incumbent"},
+                "controller": {"active": False, "continue_round": False},
+            },
+        }
+    )
+
+    assert updates["metric_improvement_bootstrapped"] is False
+    assert updates["metric_improvement_nodes_managed"] is False
+
+
 def test_finalize_metric_round_persists_canonical_metric_loop_state_without_mixing_baseline_and_candidate(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     metrics_path = Path("data/metrics.json")

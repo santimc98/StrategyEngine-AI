@@ -160,3 +160,56 @@ def test_run_summary_prefers_state_metric_snapshot_over_stale_metrics_file(tmp_p
     metric_improvement = summary.get("metric_improvement") or {}
     assert metric_improvement.get("metric_name") == "mean_multi_horizon_log_loss"
     assert metric_improvement.get("final_metric_artifact") == 0.330705410118
+
+
+def test_run_summary_uses_metric_loop_state_to_clear_stale_pipeline_abort_and_build_metric_improvement(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"missing": []}, f)
+    with open("data/data_adequacy_report.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "status": "insufficient_signal",
+                "reasons": ["pipeline_aborted_before_metrics"],
+                "recommendations": ["legacy"],
+                "quality_gates_alignment": {"status": "partial", "mapped_gates": {}, "unmapped_gates": {}},
+            },
+            f,
+        )
+
+    state = {
+        "review_verdict": "APPROVED",
+        "metrics_report": {
+            "primary_metric_name": "mean_multi_horizon_log_loss",
+            "primary_metric_value": 0.033403701215064016,
+        },
+        "metric_loop_state": {
+            "schema_version": "v1",
+            "target": {"name": "mean_multi_horizon_log_loss"},
+            "round": {
+                "round_id": 3,
+                "baseline": {"metric_value": 0.033403701215064016},
+            },
+            "candidate": {"metric_value": 0.3950342981965467},
+            "incumbent": {
+                "label": "incumbent",
+                "metric_name": "mean_multi_horizon_log_loss",
+                "metric_value": 0.033403701215064016,
+            },
+            "selection": {"selected_label": "incumbent", "reason": "monotonic_metric_degradation"},
+            "controller": {"active": False, "continue_round": False, "force_finalize_reason": "monotonic_metric_degradation"},
+        },
+    }
+
+    summary = build_run_summary(state)
+
+    adequacy = summary.get("data_adequacy") or {}
+    metric_improvement = summary.get("metric_improvement") or {}
+    assert adequacy.get("status") == "ok"
+    assert adequacy.get("reasons") == []
+    assert metric_improvement.get("metric_name") == "mean_multi_horizon_log_loss"
+    assert metric_improvement.get("kept") == "incumbent"
+    assert metric_improvement.get("final_metric_reported") == 0.033403701215064016

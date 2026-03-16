@@ -18,6 +18,15 @@ def _safe_load_json(path: str) -> Dict[str, Any]:
         return {}
 
 
+def _load_metric_loop_state(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    state_obj = state if isinstance(state, dict) else {}
+    payload = state_obj.get("metric_loop_state")
+    if isinstance(payload, dict) and payload:
+        return dict(payload)
+    loaded = _safe_load_json("data/metric_loop_state.json")
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def _load_metrics_report(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Load metrics from the first available canonical metrics artifact path."""
     state_obj = state if isinstance(state, dict) else {}
@@ -106,6 +115,15 @@ def _metric_higher_is_better(name: str) -> bool:
 
 def _normalize_metric_token(name: Any) -> str:
     return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
 
 
 def _extract_metric_value_by_name(metric_pool: Dict[str, float], metric_name: Any) -> Any:
@@ -278,6 +296,79 @@ def _normalize_failed_gates_for_summary(state: Dict[str, Any], failed_gates: Lis
     return normalized
 
 
+def _metric_loop_has_activity(loop_state: Dict[str, Any] | None) -> bool:
+    if not isinstance(loop_state, dict) or not loop_state:
+        return False
+    round_payload = loop_state.get("round") if isinstance(loop_state.get("round"), dict) else {}
+    selection = loop_state.get("selection") if isinstance(loop_state.get("selection"), dict) else {}
+    target = loop_state.get("target") if isinstance(loop_state.get("target"), dict) else {}
+    try:
+        round_id = int(round_payload.get("round_id") or 0)
+    except Exception:
+        round_id = 0
+    selected_label = str(selection.get("selected_label") or "").strip()
+    return bool(target or round_id > 0 or selected_label)
+
+
+def _normalize_data_adequacy_for_metric_loop(
+    adequacy_summary: Dict[str, Any],
+    loop_state: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    summary = dict(adequacy_summary) if isinstance(adequacy_summary, dict) else {}
+    if not summary or not _metric_loop_has_activity(loop_state):
+        return summary
+    reasons = [str(item) for item in (summary.get("reasons") or []) if str(item).strip()]
+    summary["reasons"] = [
+        item for item in reasons if str(item).split(":", 1)[0] != "pipeline_aborted_before_metrics"
+    ]
+    if not summary["reasons"] and summary.get("status") in {"data_limited", "insufficient_signal"}:
+        summary["status"] = "ok"
+        summary["recommendations"] = []
+    return summary
+
+
+def _build_metric_improvement_summary_from_loop_state(
+    loop_state: Dict[str, Any] | None,
+    metric_pool: Dict[str, float],
+) -> Dict[str, Any]:
+    if not _metric_loop_has_activity(loop_state):
+        return {}
+    loop_obj = loop_state if isinstance(loop_state, dict) else {}
+    target = loop_obj.get("target") if isinstance(loop_obj.get("target"), dict) else {}
+    selection = loop_obj.get("selection") if isinstance(loop_obj.get("selection"), dict) else {}
+    controller = loop_obj.get("controller") if isinstance(loop_obj.get("controller"), dict) else {}
+    round_payload = loop_obj.get("round") if isinstance(loop_obj.get("round"), dict) else {}
+    baseline = round_payload.get("baseline") if isinstance(round_payload.get("baseline"), dict) else {}
+    candidate = loop_obj.get("candidate") if isinstance(loop_obj.get("candidate"), dict) else {}
+    incumbent = loop_obj.get("incumbent") if isinstance(loop_obj.get("incumbent"), dict) else {}
+    final_entry = loop_obj.get("final") if isinstance(loop_obj.get("final"), dict) else {}
+    kept = str(final_entry.get("label") or selection.get("selected_label") or incumbent.get("label") or "").strip()
+    metric_name = str(
+        target.get("name") or baseline.get("metric_name") or incumbent.get("metric_name") or ""
+    ).strip()
+    entries = {
+        "baseline": baseline,
+        "round_baseline": baseline,
+        "candidate": candidate,
+        "incumbent": incumbent,
+        "final": final_entry,
+    }
+    kept_entry = entries.get(kept) if kept else {}
+    final_metric = _coerce_float(final_entry.get("metric_value"))
+    if final_metric is None and isinstance(kept_entry, dict):
+        final_metric = _coerce_float(kept_entry.get("metric_value"))
+    summary = {
+        "kept": kept or None,
+        "metric_name": metric_name or None,
+        "baseline_metric": _coerce_float(baseline.get("metric_value")),
+        "candidate_metric": _coerce_float(candidate.get("metric_value")),
+        "final_metric_reported": final_metric,
+        "final_metric_artifact": _extract_metric_value_by_name(metric_pool, metric_name),
+        "reason": str(controller.get("force_finalize_reason") or selection.get("reason") or "").strip(),
+    }
+    return summary if any(value is not None and value != "" for value in summary.values()) else {}
+
+
 def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
     output_contract = _safe_load_json("data/output_contract_report.json")
@@ -393,12 +484,14 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Contract and metrics for ceiling detection (preserved)
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
+    metric_loop_state = _load_metric_loop_state(state)
     metrics_report = _load_metrics_report(state)
     weights_report = _safe_load_json("data/weights.json")
     metric_pool: Dict[str, float] = {}
     metric_pool.update(_flatten_metrics(metrics_report))
     metric_pool = _merge_explicit_primary_metric(metric_pool, metrics_report)
     metric_pool.update(_flatten_metrics(weights_report))
+    adequacy_summary = _normalize_data_adequacy_for_metric_loop(adequacy_summary, metric_loop_state)
     baseline_vs_model = _extract_baseline_vs_model(metric_pool)
     thresholds = {
         "auc": float(os.getenv("CEILING_DELTA_AUC", "0.02")),
@@ -503,6 +596,8 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
             "final_metric_artifact": _extract_metric_value_by_name(metric_pool, metric_name),
             "reason": metric_round_finalization.get("force_finalize_reason") or "",
         }
+    if not metric_improvement_summary:
+        metric_improvement_summary = _build_metric_improvement_summary_from_loop_state(metric_loop_state, metric_pool)
 
     return {
         "run_id": state.get("run_id"),
