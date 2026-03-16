@@ -244,9 +244,100 @@ def _score_metric_candidate(metric_name: str, key: str) -> int | None:
     return score
 
 
+def _metric_names_match(requested_metric: str, candidate_metric: str) -> bool:
+    requested = str(requested_metric or "").strip()
+    candidate = str(candidate_metric or "").strip()
+    if not requested or not candidate:
+        return False
+    requested_norm = _norm_token(requested)
+    candidate_norm = _norm_token(candidate)
+    if requested_norm and requested_norm == candidate_norm:
+        return True
+    requested_canonical = canonicalize_metric_name(requested)
+    candidate_canonical = canonicalize_metric_name(candidate)
+    if requested_canonical and candidate_canonical and requested_canonical == candidate_canonical:
+        return True
+    return False
+
+
+def _resolve_explicit_primary_metric(metrics_json: Dict[str, Any], metric_name: str) -> Dict[str, Any]:
+    if not isinstance(metrics_json, dict):
+        return {}
+
+    explicit_candidates: List[Tuple[str, str, Any]] = []
+
+    top_level_metric = metrics_json.get("primary_metric")
+    if isinstance(top_level_metric, dict):
+        explicit_candidates.append(
+            (
+                "primary_metric",
+                str(
+                    top_level_metric.get("name")
+                    or top_level_metric.get("metric")
+                    or top_level_metric.get("id")
+                    or metric_name
+                ).strip(),
+                top_level_metric.get("value"),
+            )
+        )
+    else:
+        explicit_candidates.append(
+            (
+                "primary_metric_value",
+                str(metrics_json.get("primary_metric_name") or top_level_metric or metric_name).strip(),
+                metrics_json.get("primary_metric_value"),
+            )
+        )
+
+    model_perf = metrics_json.get("model_performance")
+    if isinstance(model_perf, dict):
+        model_perf_primary = model_perf.get("primary_metric")
+        if isinstance(model_perf_primary, dict):
+            explicit_candidates.append(
+                (
+                    "model_performance.primary_metric",
+                    str(
+                        model_perf_primary.get("name")
+                        or model_perf_primary.get("metric")
+                        or model_perf_primary.get("id")
+                        or metric_name
+                    ).strip(),
+                    model_perf_primary.get("value"),
+                )
+            )
+        explicit_candidates.append(
+            (
+                "model_performance.primary_metric_value",
+                str(model_perf.get("primary_metric_name") or model_perf_primary or metric_name).strip(),
+                model_perf.get("primary_metric_value"),
+            )
+        )
+
+    for matched_key, candidate_name, raw_value in explicit_candidates:
+        value = _coerce_float(raw_value)
+        if value is None:
+            continue
+        if candidate_name and not _metric_names_match(metric_name, candidate_name):
+            continue
+        chosen_name = candidate_name or str(metric_name or "").strip() or matched_key
+        return {
+            "metric_name": chosen_name,
+            "canonical_name": canonicalize_metric_name(chosen_name),
+            "matched_key": matched_key,
+            "value": float(value),
+            "score": 100000,
+        }
+
+    return {}
+
+
 def resolve_metric_value(metrics_json: Dict[str, Any], metric_name: str) -> Dict[str, Any]:
     if not isinstance(metrics_json, dict):
         return {}
+
+    explicit_primary = _resolve_explicit_primary_metric(metrics_json, metric_name)
+    if explicit_primary:
+        return explicit_primary
 
     flat = flatten_numeric_metrics(metrics_json)
     best_key: str | None = None

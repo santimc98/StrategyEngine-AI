@@ -1,5 +1,6 @@
 from src.graph import graph as graph_mod
 import pytest
+from src.utils.metric_eval import resolve_metric_value
 
 
 def test_extract_primary_metric_for_board_prefers_contract_metric_over_heuristic(tmp_path, monkeypatch):
@@ -174,6 +175,73 @@ def test_extract_primary_metric_for_board_supports_string_numeric_metrics(tmp_pa
 
     assert primary.get("value") == pytest.approx(0.9342, abs=1e-12)
     assert primary.get("source") != "contract.primary_metric_missing"
+
+
+def test_resolve_metric_value_prefers_explicit_primary_metric_value_over_nested_logloss_details() -> None:
+    metrics_report = {
+        "primary_metric_name": "mean_multi_horizon_log_loss",
+        "primary_metric_value": 0.13175253791631902,
+        "per_horizon_log_loss": {
+            "label_12h": 0.24156589678725365,
+            "label_24h": 0.12465146604581857,
+            "label_48h": 0.09324487589139654,
+            "label_72h": 0.06754791294080732,
+        },
+        "horizon_details": [
+            {"target": "label_12h", "oof_log_loss_raw": 0.24156589678725365},
+        ],
+        "feature_engineering": {
+            "interaction_gate": {
+                "baseline_mean_log_loss": 0.3375940863668576,
+                "candidate_mean_log_loss": 0.3211599042940719,
+            }
+        },
+    }
+
+    resolved = resolve_metric_value(metrics_report, "mean_multi_horizon_log_loss")
+
+    assert resolved.get("value") == pytest.approx(0.13175253791631902, abs=1e-12)
+    assert resolved.get("matched_key") == "primary_metric_value"
+
+
+def test_extract_primary_metric_for_board_prefers_explicit_primary_metric_value_for_cv_metrics_shape(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    state = {
+        "execution_contract": {
+            "evaluation_spec": {
+                "objective_type": "predictive",
+                "primary_metric": "mean_multi_horizon_log_loss",
+            }
+        }
+    }
+    metrics_report = {
+        "source": "artifacts/ml/cv_metrics.json",
+        "primary_metric_name": "mean_multi_horizon_log_loss",
+        "primary_metric_value": 0.13175253791631902,
+        "per_horizon_log_loss": {
+            "label_12h": 0.24156589678725365,
+            "label_24h": 0.12465146604581857,
+            "label_48h": 0.09324487589139654,
+            "label_72h": 0.06754791294080732,
+        },
+        "horizon_details": [
+            {"target": "label_12h", "oof_log_loss_raw": 0.24156589678725365},
+        ],
+        "feature_engineering": {
+            "interaction_gate": {
+                "baseline_mean_log_loss": 0.3375940863668576,
+                "candidate_mean_log_loss": 0.3211599042940719,
+            }
+        },
+    }
+
+    primary = graph_mod._extract_primary_metric_for_board(state, metrics_report)
+
+    assert primary.get("name") == "mean_multi_horizon_log_loss"
+    assert primary.get("value") == pytest.approx(0.13175253791631902, abs=1e-12)
+    assert primary.get("matched_key") == "primary_metric_value"
 
 
 def test_extract_primary_metric_for_board_resolves_contract_alias_to_nested_auc_key(tmp_path, monkeypatch):

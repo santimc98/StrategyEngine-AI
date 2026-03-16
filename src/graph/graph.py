@@ -878,6 +878,17 @@ def _normalize_metrics_report_payload(payload: Dict[str, Any] | None) -> Dict[st
         metric_name = primary_metric.get("name") or primary_metric.get("metric")
         _merge_model_performance_entry(model_perf, str(metric_name or ""), primary_metric.get("value"))
 
+    explicit_primary_name = (
+        payload.get("primary_metric_name")
+        or (primary_metric if isinstance(primary_metric, str) else None)
+    )
+    if explicit_primary_name and payload.get("primary_metric_value") is not None:
+        _merge_model_performance_entry(
+            model_perf,
+            str(explicit_primary_name),
+            payload.get("primary_metric_value"),
+        )
+
     for block_name in ("cv_summary", "all_metrics", "metrics", "summary"):
         block = payload.get(block_name)
         if not isinstance(block, dict):
