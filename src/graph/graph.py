@@ -966,22 +966,48 @@ def _resolve_output_contract_report_for_facts(state: Dict[str, Any]) -> Dict[str
 
 def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     candidates: List[tuple[Dict[str, Any], str]] = []
-    metrics_path = _resolve_declared_artifact_path_from_state(
-        state,
-        "metrics.json",
-        kind="metrics",
-    )
-
+    metric_round_active = bool(state.get("ml_improvement_round_active"))
     state_metrics = state.get("metrics_report")
-    if isinstance(state_metrics, dict) and state_metrics:
+    state_metrics_snapshot = state.get("metrics_artifact_snapshot")
+    snapshot_role = (
+        str(state_metrics_snapshot.get("role") or "").strip().lower()
+        if isinstance(state_metrics_snapshot, dict)
+        else ""
+    )
+    if isinstance(state_metrics, dict) and state_metrics and (
+        (not metric_round_active) or snapshot_role == "candidate"
+    ):
         candidates.append((state_metrics, "state.metrics_report"))
 
-    file_metrics = _load_json_safe(metrics_path) if metrics_path else {}
-    if isinstance(file_metrics, dict) and file_metrics:
-        candidates.append((file_metrics, metrics_path))
+    if not metric_round_active and isinstance(state_metrics_snapshot, dict):
+        snapshot_payload = (
+            state_metrics_snapshot.get("metrics_payload")
+            if isinstance(state_metrics_snapshot.get("metrics_payload"), dict)
+            else {}
+        )
+        if snapshot_payload:
+            snapshot_source = str(
+                state_metrics_snapshot.get("source")
+                or state_metrics_snapshot.get("path")
+                or "state.metrics_artifact_snapshot"
+            ).strip()
+            candidates.append((snapshot_payload, snapshot_source))
+    elif metric_round_active and isinstance(state_metrics_snapshot, dict) and snapshot_role == "candidate":
+        snapshot_payload = (
+            state_metrics_snapshot.get("metrics_payload")
+            if isinstance(state_metrics_snapshot.get("metrics_payload"), dict)
+            else {}
+        )
+        if snapshot_payload:
+            snapshot_source = str(
+                state_metrics_snapshot.get("source")
+                or state_metrics_snapshot.get("path")
+                or "state.metrics_artifact_snapshot"
+            ).strip()
+            candidates.append((snapshot_payload, snapshot_source))
 
     insights = _load_json_safe("data/insights.json")
-    if isinstance(insights, dict) and insights:
+    if not metric_round_active and isinstance(insights, dict) and insights:
         candidates.append((insights, "data/insights.json"))
 
     for payload, source in candidates:
@@ -1002,24 +1028,45 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
         seen_paths.add(rel)
         artifact_paths.append(rel)
 
-    oc_report = _resolve_output_contract_report_for_facts(state)
-    if isinstance(oc_report, dict):
-        for path in oc_report.get("present", []) or []:
-            _add_path(path)
-
     artifact_index = state.get("artifact_index")
     if not isinstance(artifact_index, list):
         artifact_index = state.get("produced_artifact_index")
     if not isinstance(artifact_index, list):
         artifact_index = _load_json_safe("data/produced_artifact_index.json")
     if isinstance(artifact_index, list):
-        for entry in artifact_index:
+        for entry in reversed(artifact_index):
             if isinstance(entry, dict):
                 path = entry.get("path")
                 if isinstance(path, str):
                     _add_path(path)
             elif isinstance(entry, str):
                 _add_path(entry)
+
+    for path in artifact_paths:
+        if not _is_metrics_like_path(path):
+            continue
+        payload = _load_json_safe(path)
+        normalized = _normalize_metrics_report_payload(payload if isinstance(payload, dict) else {})
+        if _metrics_report_has_values(normalized):
+            normalized.setdefault("source", f"artifact:{path}")
+            return normalized
+
+    metrics_path = _resolve_declared_artifact_path_from_state(
+        state,
+        "metrics.json",
+        kind="metrics",
+    )
+    file_metrics = _load_json_safe(metrics_path) if metrics_path else {}
+    if isinstance(file_metrics, dict) and file_metrics:
+        normalized = _normalize_metrics_report_payload(file_metrics)
+        if _metrics_report_has_values(normalized):
+            normalized.setdefault("source", metrics_path)
+            return normalized
+
+    oc_report = _resolve_output_contract_report_for_facts(state)
+    if isinstance(oc_report, dict):
+        for path in oc_report.get("present", []) or []:
+            _add_path(path)
 
     contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
     for path in _resolve_required_outputs(contract, state):
@@ -1265,6 +1312,135 @@ def _load_metric_snapshot_payload(
     return {}, None
 
 
+def _metrics_snapshot_payload(snapshot: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {}
+    payload = snapshot.get("metrics_payload")
+    return copy.deepcopy(payload) if isinstance(payload, dict) and payload else {}
+
+
+def _build_metrics_artifact_snapshot(
+    *,
+    state: Dict[str, Any] | None,
+    role: str,
+    metrics_payload: Dict[str, Any] | None,
+    path: str | None = None,
+    source: str | None = None,
+    metric_name: str | None = None,
+    higher_is_better: bool | None = None,
+    round_id: Any = None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    payload = copy.deepcopy(metrics_payload) if isinstance(metrics_payload, dict) else {}
+    normalized_path = normalize_artifact_path(path)
+    resolved_metric = _resolve_metric_payload(
+        payload,
+        metric_name,
+        source_hint=str(source or normalized_path or "metrics_snapshot"),
+    )
+    try:
+        normalized_round_id = int(round_id) if round_id is not None else None
+    except Exception:
+        normalized_round_id = None
+    snapshot = {
+        "schema_version": "v1",
+        "role": str(role or "").strip() or "unknown",
+        "run_id": str(state.get("run_id") or "").strip() or None,
+        "iteration_id": int(state.get("iteration_count", 0) or 0) + 1 if isinstance(state, dict) else None,
+        "attempt_id": int(state.get("execution_attempt", 0) or 0) if isinstance(state, dict) else None,
+        "round_id": normalized_round_id,
+        "path": normalized_path or None,
+        "source": str(source or normalized_path or "").strip() or None,
+        "payload_hash": _hash_json(payload) if payload else "",
+        "metrics_payload": payload,
+        "primary_metric_name": None,
+        "primary_metric_canonical_name": None,
+        "primary_metric_value": None,
+        "higher_is_better": bool(higher_is_better) if isinstance(higher_is_better, bool) else None,
+    }
+    if isinstance(resolved_metric, dict) and resolved_metric.get("value") is not None:
+        snapshot["primary_metric_name"] = str(
+            resolved_metric.get("name")
+            or resolved_metric.get("matched_key")
+            or metric_name
+            or ""
+        ).strip() or None
+        snapshot["primary_metric_canonical_name"] = str(
+            resolved_metric.get("canonical_name")
+            or _metric_canonical_name(snapshot.get("primary_metric_name"))
+        ).strip() or None
+        snapshot["primary_metric_value"] = float(resolved_metric.get("value"))
+    return snapshot
+
+
+def _resolve_metrics_snapshot_from_state(
+    state: Dict[str, Any] | None,
+    *,
+    preferred_roles: List[str] | None = None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    role_order = [str(item or "").strip().lower() for item in (preferred_roles or []) if str(item or "").strip()]
+    candidates: List[Dict[str, Any]] = []
+
+    explicit_snapshot = state.get("metrics_artifact_snapshot")
+    if isinstance(explicit_snapshot, dict) and (
+        _metrics_snapshot_payload(explicit_snapshot) or explicit_snapshot.get("path")
+    ):
+        candidates.append(copy.deepcopy(explicit_snapshot))
+
+    loop_state = (
+        state.get("metric_loop_state")
+        if isinstance(state.get("metric_loop_state"), dict)
+        else {}
+    )
+    if not loop_state:
+        loaded_loop_state = _load_json_safe("data/metric_loop_state.json")
+        if isinstance(loaded_loop_state, dict):
+            loop_state = loaded_loop_state
+
+    artifacts_block = loop_state.get("artifacts") if isinstance(loop_state.get("artifacts"), dict) else {}
+    snapshots_block = artifacts_block.get("snapshots") if isinstance(artifacts_block.get("snapshots"), dict) else {}
+    for value in snapshots_block.values():
+        if isinstance(value, dict) and (_metrics_snapshot_payload(value) or value.get("path")):
+            candidates.append(copy.deepcopy(value))
+
+    round_payload = loop_state.get("round") if isinstance(loop_state.get("round"), dict) else {}
+    loop_entries = {
+        "final": loop_state.get("final"),
+        "candidate": loop_state.get("candidate"),
+        "incumbent": loop_state.get("incumbent"),
+        "round_baseline": round_payload.get("baseline"),
+    }
+    for role_name, entry in loop_entries.items():
+        if not isinstance(entry, dict):
+            continue
+        snapshot = entry.get("artifact_snapshot") if isinstance(entry.get("artifact_snapshot"), dict) else {}
+        if not snapshot:
+            payload = entry.get("metrics_payload") if isinstance(entry.get("metrics_payload"), dict) else {}
+            path = entry.get("path")
+            if payload or path:
+                snapshot = _build_metrics_artifact_snapshot(
+                    state=state,
+                    role=role_name,
+                    metrics_payload=payload,
+                    path=str(path or ""),
+                    source=str(entry.get("source") or ""),
+                    metric_name=str(entry.get("metric_name") or ""),
+                    round_id=entry.get("round_id"),
+                )
+        if snapshot and (_metrics_snapshot_payload(snapshot) or snapshot.get("path")):
+            candidates.append(snapshot)
+
+    if not candidates:
+        return {}
+    if role_order:
+        for role in role_order:
+            for snapshot in candidates:
+                if str(snapshot.get("role") or "").strip().lower() == role:
+                    return copy.deepcopy(snapshot)
+    return copy.deepcopy(candidates[0])
+
+
 def _metric_loop_controller(loop_state: Dict[str, Any] | None) -> Dict[str, Any]:
     return (
         loop_state.get("controller")
@@ -1307,6 +1483,7 @@ def _build_metric_loop_entry(
     round_id: Any = None,
     status: str | None = None,
     review_verdict: str | None = None,
+    artifact_snapshot: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     payload = metrics_payload if isinstance(metrics_payload, dict) else {}
     metric_value = _resolve_metric_loop_value(metric_name, payload, fallback_value)
@@ -1325,6 +1502,11 @@ def _build_metric_loop_entry(
         "round_id": round_id_int,
         "status": str(status or "").strip() or None,
         "review_verdict": str(review_verdict or "").strip() or None,
+        "artifact_snapshot": (
+            copy.deepcopy(artifact_snapshot)
+            if isinstance(artifact_snapshot, dict) and artifact_snapshot
+            else {}
+        ),
     }
 
 
@@ -1478,8 +1660,33 @@ def _build_metric_loop_state(
         status="active" if active else "stable",
         review_verdict=baseline_review_verdict,
     )
+    incumbent_payload_for_snapshot = (
+        incumbent.get("metrics_payload")
+        if isinstance(incumbent.get("metrics_payload"), dict)
+        else {}
+    )
+    incumbent["artifact_snapshot"] = _build_metrics_artifact_snapshot(
+        state=state,
+        role="incumbent",
+        metrics_payload=incumbent_payload_for_snapshot,
+        path=str(incumbent.get("path") or ""),
+        source=str(incumbent.get("source") or ""),
+        metric_name=metric_name,
+        higher_is_better=bool(higher_is_better),
+        round_id=round_id,
+    )
     round_baseline = copy.deepcopy(incumbent)
     round_baseline["label"] = "round_baseline"
+    round_baseline["artifact_snapshot"] = _build_metrics_artifact_snapshot(
+        state=state,
+        role="round_baseline",
+        metrics_payload=round_baseline.get("metrics_payload") if isinstance(round_baseline.get("metrics_payload"), dict) else {},
+        path=str(round_baseline.get("path") or ""),
+        source=str(round_baseline.get("source") or ""),
+        metric_name=metric_name,
+        higher_is_better=bool(higher_is_better),
+        round_id=round_id,
+    )
 
     candidate = _build_metric_loop_entry(
         label="candidate",
@@ -1492,6 +1699,16 @@ def _build_metric_loop_state(
         round_id=round_id,
         status=candidate_status or ("pending" if active else None),
         review_verdict=None,
+    )
+    candidate["artifact_snapshot"] = _build_metrics_artifact_snapshot(
+        state=state,
+        role="candidate",
+        metrics_payload=candidate.get("metrics_payload") if isinstance(candidate.get("metrics_payload"), dict) else {},
+        path=str(candidate.get("path") or ""),
+        source=str(candidate.get("source") or ""),
+        metric_name=metric_name,
+        higher_is_better=bool(higher_is_better),
+        round_id=round_id,
     )
 
     best_value = _coerce_float(best_observed_value)
@@ -1513,6 +1730,17 @@ def _build_metric_loop_state(
             round_id=round_id,
             status="selected" if final_label else None,
             review_verdict=None,
+        )
+        final_role = str(final_entry.get("label") or "final").strip() or "final"
+        final_entry["artifact_snapshot"] = _build_metrics_artifact_snapshot(
+            state=state,
+            role=final_role,
+            metrics_payload=final_entry.get("metrics_payload") if isinstance(final_entry.get("metrics_payload"), dict) else {},
+            path=str(final_entry.get("path") or ""),
+            source=str(final_entry.get("source") or ""),
+            metric_name=metric_name,
+            higher_is_better=bool(higher_is_better),
+            round_id=round_id,
         )
 
     normalized_output_paths: List[str] = []
@@ -1566,6 +1794,12 @@ def _build_metric_loop_state(
             "metrics_path": normalize_artifact_path(final_path or candidate_path or incumbent_path),
             "output_paths": normalized_output_paths[:16],
             "snapshot_dir": str(snapshot_dir or "").strip() or None,
+            "snapshots": {
+                "round_baseline": copy.deepcopy(round_baseline.get("artifact_snapshot") or {}),
+                "incumbent": copy.deepcopy(incumbent.get("artifact_snapshot") or {}),
+                "candidate": copy.deepcopy(candidate.get("artifact_snapshot") or {}),
+                "final": copy.deepcopy(final_entry.get("artifact_snapshot") or {}),
+            },
         },
     }
 
@@ -1803,16 +2037,25 @@ def _resolve_metric_payload(
 ) -> Dict[str, Any]:
     metric_name = str(metric_name or "").strip()
     payload = metrics_report if isinstance(metrics_report, dict) else {}
-    if not metric_name or not payload:
+    if not payload:
         return {}
     resolved = metric_eval_resolve_metric_value(payload, metric_name)
     if not isinstance(resolved, dict) or resolved.get("value") is None:
         return {}
     source = str(source_hint or payload.get("source") or "metrics.resolve_metric")
     matched_key = str(resolved.get("matched_key") or metric_name).strip()
+    resolved_name = str(
+        resolved.get("metric_name")
+        or resolved.get("matched_key")
+        or metric_name
+        or ""
+    ).strip()
     return {
-        "name": metric_name,
-        "canonical_name": str(resolved.get("canonical_name") or _metric_canonical_name(metric_name)),
+        "name": resolved_name or metric_name,
+        "canonical_name": str(
+            resolved.get("canonical_name")
+            or _metric_canonical_name(resolved_name or metric_name)
+        ),
         "value": float(resolved.get("value")),
         "matched_key": matched_key,
         "score": int(resolved.get("score", 0) or 0),
@@ -1847,7 +2090,7 @@ def _build_primary_metric_state(
     primary: Dict[str, Any] | None = None
     if resolved_primary:
         primary = {
-            "name": target_name or resolved_primary.get("matched_key"),
+            "name": target_name or resolved_primary.get("name") or resolved_primary.get("matched_key"),
             "canonical_name": resolved_primary.get("canonical_name") or target_canonical_name,
             "value": resolved_primary.get("value"),
             "matched_key": resolved_primary.get("matched_key"),
@@ -9366,6 +9609,25 @@ def _coerce_float(value: Any) -> float | None:
         return float(value)
     return None
 
+
+def _is_governance_metric_candidate(name: Any) -> bool:
+    normalized = _normalize_metric_key(name)
+    if not normalized:
+        return False
+    blocked_tokens = (
+        "qagates",
+        "reviewergates",
+        "submissionschema",
+        "outputcontract",
+        "alignmentcheck",
+        "casealignment",
+        "integrityaudit",
+        "requiredartifacts",
+        "schemaissues",
+    )
+    return any(token in normalized for token in blocked_tokens)
+
+
 def _collect_metric_candidates(metrics_report: Dict[str, Any], weights_report: Dict[str, Any]) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
 
@@ -9377,7 +9639,7 @@ def _collect_metric_candidates(metrics_report: Dict[str, Any], weights_report: D
     ) -> None:
         metric_name = str(name or "").strip()
         num = _coerce_float(value)
-        if not metric_name or num is None:
+        if not metric_name or num is None or _is_governance_metric_candidate(metric_name):
             return
         candidates.append(
             {
@@ -13148,6 +13410,8 @@ class AgentState(TypedDict):
     ml_journal_written_ids: List[str]
     metrics_signature: str
     weights_signature: str
+    metrics_report: Dict[str, Any]
+    metrics_artifact_snapshot: Dict[str, Any]
     primary_metric_state: Dict[str, Any]
     primary_metric_snapshot: Dict[str, Any]
     metric_loop_state: Dict[str, Any]
@@ -13841,6 +14105,8 @@ def run_steward(state: AgentState) -> AgentState:
         "attempt_ledger": [],
         "phase_cycle_counts": {"compliance": 0, "metric": 0, "runtime": 0, "other": 0},
         "ml_journal_written_ids": [],
+        "metrics_report": {},
+        "metrics_artifact_snapshot": {},
         "primary_metric_state": {},
         "primary_metric_snapshot": {},
         "metric_loop_state": {},
@@ -24126,6 +24392,29 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "hard_qa_retry_count": hard_qa_retry_count,
         "iteration_handoff": iteration_handoff,
     }
+    metrics_snapshot_role = "candidate" if metric_improvement_round_active else "execution"
+    metrics_artifact_snapshot = _build_metrics_artifact_snapshot(
+        state=state if isinstance(state, dict) else {},
+        role=metrics_snapshot_role,
+        metrics_payload=metrics_report if isinstance(metrics_report, dict) else {},
+        path=metrics_path,
+        source=str((metrics_report or {}).get("source") or metrics_path or "result_evaluator").strip(),
+        metric_name=(
+            primary_metric_state.get("primary_metric_name")
+            if isinstance(primary_metric_state, dict)
+            else ""
+        ),
+        higher_is_better=(
+            primary_metric_state.get("higher_is_better")
+            if isinstance(primary_metric_state, dict)
+            else None
+        ),
+        round_id=state.get("ml_improvement_current_round_id"),
+    )
+    if isinstance(metrics_report, dict) and metrics_report:
+        result_state["metrics_report"] = copy.deepcopy(metrics_report)
+    if metrics_artifact_snapshot:
+        result_state["metrics_artifact_snapshot"] = metrics_artifact_snapshot
     if metric_improvement_round_active:
         result_state["ml_improvement_review_mode"] = metric_round_review_mode
     if isinstance(gate_context.get("feedback_record"), dict):
@@ -27204,12 +27493,19 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         loop_target=prior_loop_target,
         primary_metric_state=metric_state,
     )
-    baseline_metrics, metrics_path = _load_declared_artifact_payload(
-        contract,
+    baseline_snapshot = _resolve_metrics_snapshot_from_state(
         state if isinstance(state, dict) else {},
-        "metrics.json",
-        kind="metrics",
+        preferred_roles=["final", "incumbent", "round_baseline", "candidate"],
     )
+    baseline_metrics = _metrics_snapshot_payload(baseline_snapshot)
+    metrics_path = str(baseline_snapshot.get("path") or "").strip() or None
+    if not baseline_metrics:
+        baseline_metrics, metrics_path = _load_declared_artifact_payload(
+            contract,
+            state if isinstance(state, dict) else {},
+            "metrics.json",
+            kind="metrics",
+        )
 
     baseline_value = _extract_primary_metric(baseline_metrics, metric_name)
     if baseline_value is None:
@@ -28002,12 +28298,47 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     baseline_verdict = normalize_review_status(controller.get("baseline_review_verdict") or "APPROVED")
     force_finalize_reason = str(controller.get("force_finalize_reason") or "").strip().lower()
     force_finalize = bool(force_finalize_reason)
-    current_metrics, metrics_path = _load_declared_artifact_payload(
-        contract,
-        state if isinstance(state, dict) else {},
-        "metrics.json",
-        kind="metrics",
+    current_metrics_snapshot = _build_metrics_artifact_snapshot(
+        state=state if isinstance(state, dict) else {},
+        role="candidate",
+        metrics_payload=(
+            state.get("metrics_report")
+            if isinstance(state.get("metrics_report"), dict)
+            else {}
+        ),
+        path=(
+            state.get("metrics_artifact_snapshot", {}).get("path")
+            if isinstance(state.get("metrics_artifact_snapshot"), dict)
+            else ""
+        ),
+        source=(
+            state.get("metrics_artifact_snapshot", {}).get("source")
+            if isinstance(state.get("metrics_artifact_snapshot"), dict)
+            else "state.metrics_report"
+        ),
+        metric_name=metric_name,
+        higher_is_better=bool(higher_is_better),
+        round_id=round_id,
     )
+    current_metrics = _metrics_snapshot_payload(current_metrics_snapshot)
+    metrics_path = str(current_metrics_snapshot.get("path") or "").strip() or None
+    if not current_metrics:
+        current_metrics, metrics_path = _load_declared_artifact_payload(
+            contract,
+            state if isinstance(state, dict) else {},
+            "metrics.json",
+            kind="metrics",
+        )
+        current_metrics_snapshot = _build_metrics_artifact_snapshot(
+            state=state if isinstance(state, dict) else {},
+            role="candidate",
+            metrics_payload=current_metrics,
+            path=metrics_path,
+            source="candidate_round_output",
+            metric_name=metric_name,
+            higher_is_better=bool(higher_is_better),
+            round_id=round_id,
+        )
     improved_value = _extract_primary_metric(current_metrics, metric_name)
     if improved_value is None:
         metric_state = _load_primary_metric_state(state)
@@ -28250,6 +28581,20 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         "metrics.json",
         kind="metrics",
     )
+    baseline_metrics_snapshot = (
+        round_baseline_entry.get("artifact_snapshot")
+        if isinstance(round_baseline_entry.get("artifact_snapshot"), dict)
+        else _build_metrics_artifact_snapshot(
+            state=state if isinstance(state, dict) else {},
+            role="round_baseline",
+            metrics_payload=baseline_metrics_payload,
+            path=str(round_baseline_entry.get("path") or ""),
+            source=str(round_baseline_entry.get("source") or "round_baseline"),
+            metric_name=metric_name,
+            higher_is_better=bool(higher_is_better),
+            round_id=round_id,
+        )
+    )
     final_metrics_payload = current_metrics if improved else baseline_metrics_payload
     if not isinstance(final_metrics_payload, dict) or not final_metrics_payload:
         loaded_final_payload = _load_json_safe(metrics_path) if metrics_path else {}
@@ -28258,6 +28603,17 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     if final_metric_value is None:
         final_metric_value = improved_value if improved else baseline_value
     selected_label_for_loop = "candidate" if improved else "baseline"
+    final_metrics_snapshot = (
+        current_metrics_snapshot
+        if improved
+        else baseline_metrics_snapshot
+    )
+    final_metrics_path = str(
+        final_metrics_snapshot.get("path")
+        or metrics_path
+        or round_baseline_entry.get("path")
+        or ""
+    ).strip() or None
     if improved and _metric_loop_value_is_better(improved_value, best_metric_value, bool(higher_is_better)):
         best_metric_value = improved_value
         state["ml_improvement_best_round"] = int(round_id or 0)
@@ -28326,12 +28682,12 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             final_metrics_payload if improved else baseline_metrics_payload
         ),
         incumbent_fallback_value=(final_metric_value if improved else baseline_value),
-        incumbent_path=metrics_path,
+        incumbent_path=final_metrics_path,
         incumbent_source="candidate_kept" if improved else "restored_round_baseline",
         baseline_review_verdict=baseline_verdict,
         candidate_metrics_payload=current_metrics,
         candidate_fallback_value=improved_value,
-        candidate_path=metrics_path,
+        candidate_path=str(current_metrics_snapshot.get("path") or metrics_path or "").strip() or None,
         candidate_source="candidate_round_output",
         candidate_status="selected" if improved else "rejected",
         best_observed_value=best_metric_value,
@@ -28340,7 +28696,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         final_label=selected_label_for_loop,
         final_metrics_payload=final_metrics_payload,
         final_fallback_value=final_metric_value,
-        final_path=metrics_path,
+        final_path=final_metrics_path,
         final_source="candidate_kept" if improved else "restored_round_baseline",
         selection=incumbent_selection,
         output_paths=output_paths,
@@ -28511,6 +28867,17 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         "metric_snapshot": _build_metric_loop_prompt_snapshot(finalized_metric_loop_state),
         "metric_loop_state": finalized_metric_loop_state,
     }
+    state["metrics_report"] = copy.deepcopy(final_metrics_payload) if isinstance(final_metrics_payload, dict) else {}
+    state["metrics_artifact_snapshot"] = _build_metrics_artifact_snapshot(
+        state=state if isinstance(state, dict) else {},
+        role=selected_label_for_loop,
+        metrics_payload=final_metrics_payload,
+        path=final_metrics_path,
+        source=str(final_metrics_snapshot.get("source") or ("candidate_kept" if improved else "restored_round_baseline")),
+        metric_name=metric_name,
+        higher_is_better=bool(higher_is_better),
+        round_id=round_id,
+    )
     state["ml_improvement_continue"] = bool(continue_round)
 
     decision_note = (

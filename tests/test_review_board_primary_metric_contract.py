@@ -266,3 +266,29 @@ def test_extract_primary_metric_for_board_resolves_contract_alias_to_nested_auc_
     assert primary.get("name") == "ROC-AUC"
     assert primary.get("value") == pytest.approx(0.9160376006743025, abs=1e-12)
     assert primary.get("source") != "contract.primary_metric_missing"
+
+
+def test_build_primary_metric_state_prefers_explicit_primary_metric_when_contract_metric_is_unavailable() -> None:
+    metrics_report = {
+        "source": "artifact:artifacts/reports/evaluation_summary.json",
+        "primary_metric_name": "mean_multi_horizon_log_loss",
+        "primary_metric_value": 0.330705410118,
+        "qa_gates": {
+            "submission_schema_exact": {
+                "rows": 95,
+            }
+        },
+    }
+
+    metric_state = graph_mod._build_primary_metric_state(
+        state={},
+        metrics_report=metrics_report,
+        weights_report={},
+        objective_type="predictive",
+        evaluation_spec={},
+        contract={},
+    )
+
+    assert metric_state.get("primary_metric_name") == "mean_multi_horizon_log_loss"
+    assert metric_state.get("primary_metric_value") == pytest.approx(0.330705410118, abs=1e-12)
+    assert metric_state.get("primary_metric_path") == "primary_metric_value"

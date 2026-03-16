@@ -317,7 +317,7 @@ def _resolve_explicit_primary_metric(metrics_json: Dict[str, Any], metric_name: 
         value = _coerce_float(raw_value)
         if value is None:
             continue
-        if candidate_name and not _metric_names_match(metric_name, candidate_name):
+        if metric_name and candidate_name and not _metric_names_match(metric_name, candidate_name):
             continue
         chosen_name = candidate_name or str(metric_name or "").strip() or matched_key
         return {

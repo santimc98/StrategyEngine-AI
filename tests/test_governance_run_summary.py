@@ -124,3 +124,39 @@ def test_run_summary_ignores_stale_pipeline_aborted_reason_when_metrics_exist(tm
     summary = build_run_summary({"review_verdict": "APPROVED"})
     assert summary.get("metrics", {}).get("metric_pool_size", 0) > 0
     assert summary.get("metric_ceiling_detected") is False
+
+
+def test_run_summary_prefers_state_metric_snapshot_over_stale_metrics_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open("data/metrics.json", "w", encoding="utf-8") as f:
+        json.dump({"qa_gates": {"submission_schema_exact": {"rows": 95}}}, f)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"missing": []}, f)
+    with open("data/review_board_verdict.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "metric_round_finalization": {
+                    "metric_name": "mean_multi_horizon_log_loss",
+                    "kept": "baseline",
+                    "baseline_metric": 0.330705410118,
+                    "candidate_metric": 0.37590299155,
+                    "final_metric": 0.330705410118,
+                }
+            },
+            f,
+        )
+
+    state = {
+        "review_verdict": "APPROVED",
+        "metrics_report": {
+            "primary_metric_name": "mean_multi_horizon_log_loss",
+            "primary_metric_value": 0.330705410118,
+        },
+    }
+
+    summary = build_run_summary(state)
+
+    metric_improvement = summary.get("metric_improvement") or {}
+    assert metric_improvement.get("metric_name") == "mean_multi_horizon_log_loss"
+    assert metric_improvement.get("final_metric_artifact") == 0.330705410118

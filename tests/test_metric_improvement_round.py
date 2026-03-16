@@ -1257,5 +1257,58 @@ def test_finalize_metric_round_persists_canonical_metric_loop_state_without_mixi
     assert loop_state.get("final", {}).get("metric_value") == pytest.approx(0.0862, abs=1e-12)
     assert loop_state.get("incumbent", {}).get("metric_value") == pytest.approx(0.0862, abs=1e-12)
     assert loop_state.get("best_observed", {}).get("metric_value") == pytest.approx(0.0862, abs=1e-12)
+    assert state.get("metrics_report", {}).get("mean_multi_horizon_log_loss") == pytest.approx(0.0862, abs=1e-12)
+    assert state.get("metrics_artifact_snapshot", {}).get("role") == "baseline"
     persisted_loop_state = json.loads(Path("data/metric_loop_state.json").read_text(encoding="utf-8"))
     assert persisted_loop_state.get("final", {}).get("label") == "baseline"
+
+
+def test_resolve_metrics_report_for_facts_prefers_current_round_artifact_index_over_stale_declared_metrics_file(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path("sandbox/current/output/artifacts/reports").mkdir(parents=True, exist_ok=True)
+
+    Path("data/metrics.json").write_text(
+        json.dumps(
+            {
+                "primary_metric_name": "mean_multi_horizon_log_loss",
+                "primary_metric_value": 0.330705410118,
+            }
+        ),
+        encoding="utf-8",
+    )
+    Path("sandbox/current/output/artifacts/reports/evaluation_summary.json").write_text(
+        json.dumps(
+            {
+                "primary_metric_name": "mean_multi_horizon_log_loss",
+                "primary_metric_value": 0.37590299155,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = {
+        "ml_improvement_round_active": True,
+        "execution_contract": {
+            "artifact_requirements": {
+                "required_files": [{"path": "data/metrics.json"}],
+            },
+            "required_outputs": ["data/metrics.json"],
+        },
+        "artifact_index": [
+            {"path": "data/metrics.json", "artifact_type": "metrics"},
+            {
+                "path": "sandbox/current/output/artifacts/reports/evaluation_summary.json",
+                "artifact_type": "json",
+            },
+        ],
+    }
+
+    resolved = graph_mod._resolve_metrics_report_for_facts(state)
+
+    assert resolved.get("primary_metric_value") == pytest.approx(0.37590299155, abs=1e-12)
+    assert str(resolved.get("source") or "").endswith(
+        "sandbox/current/output/artifacts/reports/evaluation_summary.json"
+    )

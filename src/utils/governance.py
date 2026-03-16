@@ -18,8 +18,28 @@ def _safe_load_json(path: str) -> Dict[str, Any]:
         return {}
 
 
-def _load_metrics_report() -> Dict[str, Any]:
+def _load_metrics_report(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Load metrics from the first available canonical metrics artifact path."""
+    state_obj = state if isinstance(state, dict) else {}
+    state_metrics = state_obj.get("metrics_report")
+    if isinstance(state_metrics, dict) and state_metrics:
+        return dict(state_metrics)
+
+    metrics_snapshot = state_obj.get("metrics_artifact_snapshot")
+    if isinstance(metrics_snapshot, dict):
+        snapshot_payload = metrics_snapshot.get("metrics_payload")
+        if isinstance(snapshot_payload, dict) and snapshot_payload:
+            return dict(snapshot_payload)
+
+    loop_state = state_obj.get("metric_loop_state")
+    if isinstance(loop_state, dict):
+        final_entry = loop_state.get("final") if isinstance(loop_state.get("final"), dict) else {}
+        incumbent_entry = loop_state.get("incumbent") if isinstance(loop_state.get("incumbent"), dict) else {}
+        for entry in (final_entry, incumbent_entry):
+            payload = entry.get("metrics_payload") if isinstance(entry.get("metrics_payload"), dict) else {}
+            if payload:
+                return dict(payload)
+
     candidates = [
         "data/metrics.json",
         "reports/evaluation_metrics.json",
@@ -54,6 +74,27 @@ def _flatten_metrics(obj: Any, prefix: str = "", out: Dict[str, float] | None = 
         elif isinstance(value, dict):
             _flatten_metrics(value, f"{metric_key}.", out)
     return out
+
+
+def _merge_explicit_primary_metric(metric_pool: Dict[str, float], metrics_report: Dict[str, Any]) -> Dict[str, float]:
+    if not isinstance(metric_pool, dict):
+        metric_pool = {}
+    if not isinstance(metrics_report, dict):
+        return metric_pool
+
+    primary_name = str(metrics_report.get("primary_metric_name") or "").strip()
+    primary_value = metrics_report.get("primary_metric_value")
+    if primary_name and _is_number(primary_value):
+        metric_pool.setdefault(primary_name, float(primary_value))
+
+    model_perf = metrics_report.get("model_performance")
+    if isinstance(model_perf, dict):
+        model_primary_name = str(model_perf.get("primary_metric_name") or "").strip()
+        model_primary_value = model_perf.get("primary_metric_value")
+        if model_primary_name and _is_number(model_primary_value):
+            metric_pool.setdefault(model_primary_name, float(model_primary_value))
+
+    return metric_pool
 
 
 def _metric_higher_is_better(name: str) -> bool:
@@ -352,10 +393,11 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Contract and metrics for ceiling detection (preserved)
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
-    metrics_report = _load_metrics_report()
+    metrics_report = _load_metrics_report(state)
     weights_report = _safe_load_json("data/weights.json")
     metric_pool: Dict[str, float] = {}
     metric_pool.update(_flatten_metrics(metrics_report))
+    metric_pool = _merge_explicit_primary_metric(metric_pool, metrics_report)
     metric_pool.update(_flatten_metrics(weights_report))
     baseline_vs_model = _extract_baseline_vs_model(metric_pool)
     thresholds = {
