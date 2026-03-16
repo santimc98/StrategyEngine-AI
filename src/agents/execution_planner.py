@@ -52,6 +52,7 @@ from src.utils.contract_schema_registry import (
     apply_contract_schema_registry_repairs,
 )
 from src.utils.contract_response_schema import (
+    EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS,
     EXECUTION_CONTRACT_TRANSPORT_SCHEMA,
 )
 from src.utils.problem_capabilities import (
@@ -105,14 +106,17 @@ _JSON_PATCH_VALUE_SCHEMA: Dict[str, Any] = {
 _EXECUTION_CONTRACT_PATCH_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
+    "anyOf": [{"required": ["changes"]}, {"required": ["patch"]}],
     "properties": {
         "changes": {
             "type": "object",
+            "minProperties": 1,
             "additionalProperties": _JSON_PATCH_VALUE_SCHEMA,
             "description": "Minimal nested fields to deep-merge into the current contract.",
         },
         "patch": {
             "type": "array",
+            "minItems": 1,
             "description": "Optional JSON Patch operations.",
             "items": {
                 "type": "object",
@@ -155,12 +159,14 @@ Output discipline:
 - Do not output phase traces, reasoning notes, or chain-of-thought.
 - You are emitting the canonical execution contract itself, not a summary.
 - Never return {} or placeholder-empty top-level sections.
-- Populate every required top-level section with grounded content from the inputs.
+- Populate every required canonical section with grounded content from the inputs.
+- Keep the canonical contract semantic-first: include grounded intent and interfaces, not filler.
+- Operational sections that are mechanically derivable from canonical semantics may be omitted instead of invented.
 
 Return format:
 - Return ONLY valid JSON (no markdown, no code fences, no comments).
 
-Minimal contract interface:
+Canonical contract interface (required top-level sections):
 - scope: one of ["cleaning_only", "ml_only", "full_pipeline"]
   - cleaning_only: Use ONLY for pure ETL/data quality tasks where no modeling, analysis, or prediction is requested.
   - full_pipeline: The STANDARD for predictive/prescriptive constraints. Use this whenever a model or analysis is the goal, even if data is dirty (the pipeline handles cleaning automatically).
@@ -188,7 +194,6 @@ Minimal contract interface:
 - column_dtype_targets: object mapping column -> dtype spec.
   Each value MUST be an object with key "target_dtype" (NOT "type").
 - artifact_requirements: object
-- iteration_policy: object with practical retry/iteration limits (small, numeric, and actionable)
 - optimization_policy (recommended for v4.2, backward-compatible): object with:
   - enabled, max_rounds, quick_eval_folds, full_eval_folds, min_delta, patience,
     allow_model_switch, allow_ensemble, allow_hpo, allow_feature_engineering, allow_calibration
@@ -231,11 +236,11 @@ Scope-dependent required fields:
 - If scope includes ML ("ml_only" or "full_pipeline"):
   - qa_gates: list of gate objects
   - reviewer_gates: list of gate objects
-  - validation_requirements: object
   - ml_engineer_runbook: object/list/string with actionable steps
-  - evaluation_spec: non-empty object for ML execution/review context
-  - objective_analysis.problem_type OR evaluation_spec.objective_type must be present
-  - column_dtype_targets must be coherent with evaluation/training expectations (nullable targets where labels can be missing).
+  - evaluation_spec: strongly recommended when the strategy implies a specific metric/split protocol
+  - validation_requirements: strongly recommended when the strategy implies a specific benchmark protocol
+  - objective_analysis.problem_type OR evaluation_spec.objective_type OR task_semantics.objective_type must be present
+  - column_dtype_targets should be provided when grounded by the data/profile; otherwise the runtime will project anchor dtypes conservatively from the canonical contract.
 
 Gate object contract (for cleaning_gates / qa_gates / reviewer_gates):
 - preferred shape: {"name": string, "severity": "HARD"|"SOFT", "params": object}
@@ -267,6 +272,7 @@ Hard rules:
   [-128, 127]).
 - Every requirement must be consumable by at least one downstream agent view.
 - Follow evidence_policy from INPUTS: use direct evidence first, grounded inference second, and avoid unsupported assumptions.
+- Prefer omitting non-grounded operational detail over inventing it. Downstream runtime may project conservative operational defaults from the canonical contract, but it must not invent business intent.
 - You may add extra fields if useful, but do not omit required minimum fields.
 
 CAPABILITY DETECTION (reason from objective and strategy, do NOT use keyword matching):
@@ -573,15 +579,17 @@ def _apply_planner_structural_support(contract: Dict[str, Any] | None) -> Dict[s
     """
     Apply only non-semantic structural support to planner output.
 
-    This helper is intentionally narrow: it may normalize contract shape and
-    artifact path plumbing, but it must not infer/repair scope, targets,
-    deliverables, gates, or other semantic choices that belong to the LLM.
+    This helper is intentionally narrow: it may project operational fields that
+    are mechanically derivable from canonical semantics and normalize contract
+    shape / artifact path plumbing, but it must not invent business intent or
+    override semantic choices that belong to the LLM.
     """
     if not isinstance(contract, dict):
         return {}
-    supported = ensure_v41_schema(copy.deepcopy(contract))
-    supported = normalize_artifact_requirements(supported)
+    supported = copy.deepcopy(contract)
     supported = _project_operational_contract_from_canonical(supported)
+    supported = normalize_artifact_requirements(supported)
+    supported = ensure_v41_schema(supported)
     return supported
 
 
@@ -628,13 +636,310 @@ def _derive_clean_dataset_required_columns(contract: Dict[str, Any]) -> List[str
     return required
 
 
+def _contract_mapping_has_meaningful_values(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(_is_meaningful_contract_value(item) for item in value.values())
+
+
+def _project_evaluation_spec_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
+    existing = contract.get("evaluation_spec")
+    spec = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    task_semantics = contract.get("task_semantics")
+    if not isinstance(task_semantics, dict) or not task_semantics:
+        task_semantics = _synthesize_task_semantics(contract)
+    objective_type = str(
+        spec.get("objective_type")
+        or task_semantics.get("objective_type")
+        or task_semantics.get("problem_family")
+        or ""
+    ).strip()
+    if objective_type:
+        spec.setdefault("objective_type", objective_type)
+
+    primary_target = str(
+        spec.get("primary_target")
+        or spec.get("target_column")
+        or task_semantics.get("primary_target")
+        or contract.get("primary_target")
+        or contract.get("target_column")
+        or ""
+    ).strip()
+    target_columns = _collect_targetish_columns(
+        spec.get("target_columns")
+        or spec.get("primary_targets")
+        or task_semantics.get("target_columns")
+        or contract.get("target_columns")
+        or contract.get("outcome_columns")
+    )
+    if primary_target:
+        spec.setdefault("primary_target", primary_target)
+        spec.setdefault("target_column", primary_target)
+        spec.setdefault("label_column", primary_target)
+    if target_columns:
+        if len(target_columns) > 1:
+            spec.setdefault("target_columns", list(target_columns))
+            spec.setdefault("primary_targets", list(target_columns))
+            spec.setdefault("label_columns", list(target_columns))
+        elif target_columns[0]:
+            spec.setdefault("target_column", target_columns[0])
+            spec.setdefault("primary_target", target_columns[0])
+            spec.setdefault("label_column", target_columns[0])
+
+    partitioning = task_semantics.get("partitioning") if isinstance(task_semantics.get("partitioning"), dict) else {}
+    split_column = str(
+        spec.get("split_column")
+        or partitioning.get("split_column")
+        or ((contract.get("split_spec") or {}).get("split_column") if isinstance(contract.get("split_spec"), dict) else "")
+        or ""
+    ).strip()
+    if split_column:
+        spec.setdefault("split_column", split_column)
+
+    output_schema = task_semantics.get("output_schema") if isinstance(task_semantics.get("output_schema"), dict) else {}
+    prediction_artifact = str(
+        spec.get("prediction_artifact")
+        or output_schema.get("prediction_artifact")
+        or ""
+    ).strip()
+    if prediction_artifact:
+        spec.setdefault("prediction_artifact", prediction_artifact)
+    required_prediction_columns = [
+        str(col).strip()
+        for col in (output_schema.get("required_prediction_columns") or [])
+        if str(col).strip()
+    ]
+    if required_prediction_columns and not spec.get("required_prediction_columns"):
+        spec["required_prediction_columns"] = required_prediction_columns
+    return spec
+
+
+def _infer_primary_metric_from_canonical(
+    contract: Dict[str, Any],
+    evaluation_spec: Dict[str, Any],
+    task_semantics: Dict[str, Any],
+) -> str:
+    for source in (
+        evaluation_spec.get("primary_metric"),
+        contract.get("success_metric"),
+        _extract_kpi_from_text(str(contract.get("business_objective") or "")),
+        _extract_kpi_from_text(str(contract.get("strategy_title") or "")),
+    ):
+        normalized = _normalize_kpi_metric(source)
+        if normalized:
+            return normalized
+
+    required_prediction_columns = [
+        str(col).strip().lower()
+        for col in (evaluation_spec.get("required_prediction_columns") or [])
+        if str(col).strip()
+    ]
+    if any(col.startswith("prob_") for col in required_prediction_columns):
+        return "log_loss"
+
+    objective_type = str(
+        evaluation_spec.get("objective_type")
+        or task_semantics.get("objective_type")
+        or task_semantics.get("problem_family")
+        or ""
+    ).strip().lower()
+    if any(token in objective_type for token in ("regression", "forecast")):
+        return "rmse"
+    if "ranking" in objective_type:
+        return "ndcg"
+    if "class" in objective_type:
+        return "roc_auc"
+    return ""
+
+
+def _project_validation_requirements_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
+    existing = contract.get("validation_requirements")
+    validation = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    task_semantics = contract.get("task_semantics")
+    if not isinstance(task_semantics, dict) or not task_semantics:
+        task_semantics = _synthesize_task_semantics(contract)
+    evaluation_spec = _project_evaluation_spec_from_canonical(contract)
+
+    method = str(validation.get("method") or "").strip().lower()
+    if not method:
+        method = "holdout" if str(evaluation_spec.get("split_column") or "").strip() else "cross_validation"
+        validation["method"] = method
+
+    primary_metric = _normalize_kpi_metric(validation.get("primary_metric"))
+    if not primary_metric:
+        primary_metric = _infer_primary_metric_from_canonical(contract, evaluation_spec, task_semantics)
+    if primary_metric:
+        validation["primary_metric"] = primary_metric
+
+    metrics_to_report = [
+        _normalize_kpi_metric(metric)
+        for metric in (validation.get("metrics_to_report") or validation.get("metrics") or [])
+        if _normalize_kpi_metric(metric)
+    ]
+    if primary_metric and primary_metric not in metrics_to_report:
+        metrics_to_report.insert(0, primary_metric)
+    if metrics_to_report:
+        validation["metrics_to_report"] = list(dict.fromkeys(metrics_to_report))
+    elif primary_metric:
+        validation["metrics_to_report"] = [primary_metric]
+
+    params = copy.deepcopy(validation.get("params")) if isinstance(validation.get("params"), dict) else {}
+    if str(evaluation_spec.get("split_column") or "").strip():
+        params.setdefault("split_column", str(evaluation_spec.get("split_column")).strip())
+    target_columns = _collect_targetish_columns(
+        evaluation_spec.get("target_columns")
+        or evaluation_spec.get("primary_targets")
+        or task_semantics.get("target_columns")
+    )
+    primary_target = str(
+        evaluation_spec.get("primary_target")
+        or evaluation_spec.get("target_column")
+        or task_semantics.get("primary_target")
+        or ""
+    ).strip()
+    if target_columns:
+        if len(target_columns) > 1:
+            params.setdefault("target_columns", list(target_columns))
+        elif target_columns[0]:
+            params.setdefault("target_column", target_columns[0])
+    if primary_target:
+        params.setdefault("target_column", primary_target)
+    if params:
+        validation["params"] = params
+    return validation
+
+
+def _project_iteration_policy_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
+    existing = contract.get("iteration_policy")
+    if isinstance(existing, str):
+        text = existing.strip()
+        if text:
+            existing = {"summary": text}
+        else:
+            existing = {}
+    if isinstance(existing, dict) and existing:
+        return copy.deepcopy(existing)
+
+    scope = normalize_contract_scope(contract.get("scope"))
+    if scope == "cleaning_only":
+        return {
+            "max_iterations": 4,
+            "metric_improvement_max": 0,
+            "runtime_fix_max": 3,
+            "compliance_bootstrap_max": 2,
+        }
+    if scope == "ml_only":
+        return {
+            "max_iterations": 5,
+            "metric_improvement_max": 4,
+            "runtime_fix_max": 3,
+            "compliance_bootstrap_max": 2,
+        }
+    return {
+        "max_iterations": 6,
+        "metric_improvement_max": 4,
+        "runtime_fix_max": 3,
+        "compliance_bootstrap_max": 2,
+    }
+
+
+def _project_column_dtype_targets_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
+    existing = contract.get("column_dtype_targets")
+    if isinstance(existing, dict) and existing:
+        return copy.deepcopy(existing)
+
+    task_semantics = contract.get("task_semantics")
+    if not isinstance(task_semantics, dict) or not task_semantics:
+        task_semantics = _synthesize_task_semantics(contract)
+    objective_type = str(
+        task_semantics.get("objective_type")
+        or task_semantics.get("problem_family")
+        or ""
+    ).strip().lower()
+    regression_like = any(token in objective_type for token in ("regression", "forecast"))
+
+    column_roles = get_column_roles(contract)
+    dtype_targets: Dict[str, Any] = {}
+
+    def _set_dtype(columns: Any, *, target_dtype: str, nullable: bool, role: str) -> None:
+        for column in _collect_targetish_columns(columns):
+            if column in dtype_targets:
+                continue
+            dtype_targets[column] = {
+                "target_dtype": target_dtype,
+                "nullable": nullable,
+                "role": role,
+                "source": "projected_from_canonical",
+            }
+
+    if isinstance(column_roles, dict):
+        _set_dtype(column_roles.get("identifiers"), target_dtype="string", nullable=False, role="identifier")
+        _set_dtype(column_roles.get("time_columns"), target_dtype="string", nullable=True, role="time")
+        _set_dtype(column_roles.get("decision"), target_dtype="string", nullable=True, role="decision")
+        _set_dtype(
+            column_roles.get("outcome"),
+            target_dtype="float64" if regression_like else "string",
+            nullable=True,
+            role="outcome",
+        )
+
+    partitioning = task_semantics.get("partitioning") if isinstance(task_semantics.get("partitioning"), dict) else {}
+    split_column = str(partitioning.get("split_column") or "").strip()
+    if split_column and split_column not in dtype_targets:
+        dtype_targets[split_column] = {
+            "target_dtype": "string",
+            "nullable": False,
+            "role": "split",
+            "source": "projected_from_canonical",
+        }
+
+    if not dtype_targets:
+        fallback_columns = [
+            str(col).strip()
+            for col in (contract.get("canonical_columns") or [])
+            if str(col).strip()
+        ][:3]
+        for column in fallback_columns:
+            dtype_targets[column] = {
+                "target_dtype": "string",
+                "nullable": True,
+                "role": "anchor",
+                "source": "projected_from_canonical",
+            }
+    return dtype_targets
+
+
 def _project_operational_contract_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return {}
 
     scope = normalize_contract_scope(contract.get("scope"))
-    if scope not in {"cleaning_only", "full_pipeline"}:
+    if scope not in {"cleaning_only", "ml_only", "full_pipeline"}:
         return contract
+
+    task_semantics = contract.get("task_semantics")
+    if not isinstance(task_semantics, dict) or not task_semantics:
+        synthesized = _synthesize_task_semantics(contract)
+        if synthesized:
+            contract["task_semantics"] = synthesized
+
+    if not _contract_mapping_has_meaningful_values(contract.get("column_dtype_targets")):
+        projected_dtypes = _project_column_dtype_targets_from_canonical(contract)
+        if projected_dtypes:
+            contract["column_dtype_targets"] = projected_dtypes
+
+    if not _contract_mapping_has_meaningful_values(contract.get("iteration_policy")):
+        contract["iteration_policy"] = _project_iteration_policy_from_canonical(contract)
+
+    if scope in {"ml_only", "full_pipeline"}:
+        if not _contract_mapping_has_meaningful_values(contract.get("evaluation_spec")):
+            projected_eval = _project_evaluation_spec_from_canonical(contract)
+            if projected_eval:
+                contract["evaluation_spec"] = projected_eval
+        if not _contract_mapping_has_meaningful_values(contract.get("validation_requirements")):
+            projected_validation = _project_validation_requirements_from_canonical(contract)
+            if projected_validation:
+                contract["validation_requirements"] = projected_validation
 
     artifact_requirements = contract.get("artifact_requirements")
     if not isinstance(artifact_requirements, dict):
@@ -737,16 +1042,8 @@ def _build_transport_validation(payload: Any) -> Dict[str, Any]:
             "summary": {"error_count": 1, "warning_count": 0, "phase": "transport"},
         }
 
-    core_keys = (
-        "scope",
-        "strategy_title",
-        "business_objective",
-        "canonical_columns",
-        "required_outputs",
-        "column_roles",
-        "allowed_feature_sets",
-        "task_semantics",
-        "artifact_requirements",
+    core_keys = tuple(
+        key for key in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS if key != "contract_version"
     )
     present_keys = [key for key in core_keys if key in payload]
     meaningful_keys = [key for key in present_keys if _is_meaningful_contract_value(payload.get(key))]
@@ -769,6 +1066,54 @@ def _build_transport_validation(payload: Any) -> Dict[str, Any]:
                 "item": present_keys,
             }
         )
+
+    error_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() in {"error", "fail"}])
+    warning_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() == "warning"])
+    return {
+        "status": "ok" if error_count == 0 else "error",
+        "accepted": error_count == 0,
+        "issues": issues,
+        "summary": {"error_count": error_count, "warning_count": warning_count, "phase": "transport"},
+    }
+
+
+def _build_patch_transport_validation(payload: Any) -> Dict[str, Any]:
+    issues: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "contract.patch_payload_not_object",
+                "message": "Planner repair payload must be a JSON object.",
+                "item": type(payload).__name__ if payload is not None else None,
+            }
+        )
+    elif not payload:
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "contract.patch_payload_empty",
+                "message": "Planner repair payload was empty; no incremental repair was transported.",
+                "item": {},
+            }
+        )
+    else:
+        patch_ops = payload.get("patch")
+        changes = payload.get("changes")
+        has_patch_ops = isinstance(patch_ops, list) and len(patch_ops) > 0
+        has_changes = isinstance(changes, dict) and any(
+            _is_meaningful_contract_value(value) for value in changes.values()
+        )
+        is_single_op = {"op", "path"}.issubset(set(payload.keys()))
+        if not (has_patch_ops or has_changes or is_single_op):
+            issues.append(
+                {
+                    "severity": "error",
+                    "rule": "contract.patch_payload_trivial",
+                    "message": "Planner repair payload must include non-empty changes or patch operations.",
+                    "item": sorted(list(payload.keys()))[:20],
+                }
+            )
 
     error_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() in {"error", "fail"}])
     warning_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() == "warning"])
@@ -7433,7 +7778,11 @@ class ExecutionPlannerAgent:
         )
         tool = self._build_function_tool(
             _EXECUTION_CONTRACT_PATCH_TOOL_NAME if tool_mode == "patch" else _EXECUTION_CONTRACT_TOOL_NAME,
-            "Return the complete canonical execution contract JSON object.",
+            (
+                "Return a minimal repair payload for the current canonical execution contract."
+                if tool_mode == "patch"
+                else "Return the complete canonical execution contract JSON object."
+            ),
             schema,
         )
         messages = [{"role": "user", "content": prompt}]
@@ -8542,17 +8891,7 @@ class ExecutionPlannerAgent:
             previous_parse_feedback: str | None,
             original_inputs_text: str | None,
         ) -> str:
-            required_top_level = [
-                "scope",
-                "strategy_title",
-                "business_objective",
-                "output_dialect",
-                "canonical_columns",
-                "required_outputs",
-                "column_roles",
-                "artifact_requirements",
-                "iteration_policy",
-            ]
+            required_top_level = list(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)
             validation_feedback = _compact_validation_feedback(previous_validation)
             parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
             previous_payload = (
@@ -8575,7 +8914,10 @@ class ExecutionPlannerAgent:
             )
             return (
                 "Repair the previous execution contract.\n"
-                "Return ONLY one valid JSON object (no markdown, no comments, no code fences).\n"
+                "Return ONLY one valid JSON patch object for the patch tool (no markdown, no comments, no code fences).\n"
+                "Preferred shape: {\"changes\": {...}} with only the minimal nested fields to deep-merge.\n"
+                "Alternative shape: {\"patch\": [{\"op\":\"replace\",\"path\":\"/a/b\",\"value\":...}]}\n"
+                "Do NOT regenerate the full contract.\n"
                 "Use a repair workflow: re-ground facts, patch only the affected contract fields, then self-check.\n"
                 "Patch policy: keep unchanged valid fields stable; modify ONLY fields needed to resolve listed issues.\n"
                 "Schema registry examples:\n"
@@ -8617,7 +8959,7 @@ class ExecutionPlannerAgent:
                 "{name, severity, params} (severity in HARD|SOFT). If using metric/check/rule language, "
                 "map it to name and keep semantic details in params.\n"
                 "Gate example: {\"name\": \"no_nulls_target\", \"severity\": \"HARD\", \"params\": {\"column\": \"target\"}}.\n"
-                "Top-level minimum keys (required interface for executable views): "
+                "Canonical top-level minimum keys to preserve: "
                 + json.dumps(required_top_level)
                 + "\n\nTargeted fixes to apply first:\n"
                 + targeted_actions
@@ -9301,12 +9643,14 @@ domain_expert_critique:
         contract: Dict[str, Any] | None = None
         llm_success = False
         best_candidate: Dict[str, Any] | None = None
+        best_canonical_candidate: Dict[str, Any] | None = None
         best_validation: Dict[str, Any] | None = None
         best_response_text: str | None = None
         best_parse_feedback: str | None = None
         best_error_count: Optional[int] = None
         best_warning_count: Optional[int] = None
         latest_candidate_for_repair: Dict[str, Any] | None = None
+        latest_canonical_for_repair: Dict[str, Any] | None = None
         latest_validation_for_repair: Dict[str, Any] | None = None
         latest_response_text_for_repair: str | None = None
         latest_parse_feedback_for_repair: str | None = None
@@ -9319,6 +9663,7 @@ domain_expert_critique:
 
         current_prompt = full_prompt
         current_prompt_name = "prompt_attempt_1.txt"
+        current_tool_mode = "contract"
         attempt_counter = 0
 
         if contract is None:
@@ -9352,7 +9697,7 @@ domain_expert_critique:
                                 current_prompt,
                                 output_token_floor=3072 * quality_round,
                                 model_name=model_name,
-                                tool_mode="contract",
+                                tool_mode=current_tool_mode,
                             )
                             response_text = self._extract_openai_response_text(response)
                             self.last_response = response_text
@@ -9371,25 +9716,52 @@ domain_expert_critique:
                     if parse_exc:
                         parse_error = parse_exc
 
-                    parsed = _unwrap_execution_contract_transport(parsed_payload)
-                    transport_validation_result = _build_transport_validation(parsed)
-                    had_json_parse_error = parsed is None or not isinstance(parsed, dict)
-                    if parsed_payload is not None and not isinstance(parsed_payload, dict):
-                        parse_error = ValueError("Parsed JSON is not an object")
-                    elif parsed is None:
-                        parse_error = ValueError("Parsed tool payload is missing a contract object")
-                    elif not _transport_validation_accepted(transport_validation_result):
-                        transport_issue = None
-                        issues = transport_validation_result.get("issues")
-                        if isinstance(issues, list):
-                            for issue in issues:
-                                if isinstance(issue, dict) and issue.get("rule"):
-                                    transport_issue = str(issue.get("rule"))
-                                    break
-                        parse_error = ValueError(
-                            f"Transport payload invalid: {transport_issue or 'empty_or_trivial_contract'}"
+                    parsed: Dict[str, Any] | None = None
+                    had_json_parse_error = parsed_payload is None or not isinstance(parsed_payload, dict)
+                    if current_tool_mode == "patch":
+                        transport_validation_result = _build_patch_transport_validation(parsed_payload)
+                        repair_base = (
+                            latest_canonical_for_repair
+                            if isinstance(latest_canonical_for_repair, dict)
+                            else best_canonical_candidate
                         )
-                        parsed = None
+                        if parsed_payload is not None and not isinstance(parsed_payload, dict):
+                            parse_error = ValueError("Parsed JSON patch is not an object")
+                        elif not isinstance(repair_base, dict) or not repair_base:
+                            parse_error = ValueError("Patch repair requested without a canonical base contract")
+                        elif not _transport_validation_accepted(transport_validation_result):
+                            patch_issue = None
+                            issues = transport_validation_result.get("issues")
+                            if isinstance(issues, list):
+                                for issue in issues:
+                                    if isinstance(issue, dict) and issue.get("rule"):
+                                        patch_issue = str(issue.get("rule"))
+                                        break
+                            parse_error = ValueError(
+                                f"Patch payload invalid: {patch_issue or 'empty_or_trivial_patch'}"
+                            )
+                        else:
+                            parsed = _apply_minimal_contract_patch(repair_base, parsed_payload)
+                            had_json_parse_error = False
+                    else:
+                        parsed = _unwrap_execution_contract_transport(parsed_payload)
+                        transport_validation_result = _build_transport_validation(parsed)
+                        if parsed_payload is not None and not isinstance(parsed_payload, dict):
+                            parse_error = ValueError("Parsed JSON is not an object")
+                        elif parsed is None:
+                            parse_error = ValueError("Parsed tool payload is missing a contract object")
+                        elif not _transport_validation_accepted(transport_validation_result):
+                            transport_issue = None
+                            issues = transport_validation_result.get("issues")
+                            if isinstance(issues, list):
+                                for issue in issues:
+                                    if isinstance(issue, dict) and issue.get("rule"):
+                                        transport_issue = str(issue.get("rule"))
+                                        break
+                            parse_error = ValueError(
+                                f"Transport payload invalid: {transport_issue or 'empty_or_trivial_contract'}"
+                            )
+                            parsed = None
 
                     quality_error_message = None
                     if parsed is not None and isinstance(parsed, dict):
@@ -9412,6 +9784,7 @@ domain_expert_critique:
                                 "summary": {"error_count": 1, "warning_count": 0},
                             }
                         latest_candidate_for_repair = candidate_for_validation
+                        latest_canonical_for_repair = copy.deepcopy(parsed)
                         latest_validation_for_repair = validation_result if isinstance(validation_result, dict) else None
                         latest_response_text_for_repair = response_text
                         latest_parse_feedback_for_repair = None
@@ -9449,6 +9822,7 @@ domain_expert_critique:
                                 )
                             ):
                                 best_candidate = candidate_for_validation
+                                best_canonical_candidate = copy.deepcopy(parsed)
                                 best_validation = validation_result
                                 best_response_text = response_text
                                 best_error_count = error_count
@@ -9458,11 +9832,23 @@ domain_expert_critique:
                         parse_feedback = _build_parse_feedback(response_text, parse_error)
                         latest_response_text_for_repair = response_text
                         latest_parse_feedback_for_repair = parse_feedback
+                        previous_invalid_meta = (
+                            copy.deepcopy(planner_candidate_invalid_meta)
+                            if isinstance(planner_candidate_invalid_meta, dict)
+                            else {}
+                        )
                         planner_candidate_invalid_meta = {
                             "transport_validation": transport_validation_result,
                             "attempt_count": len(planner_diag) + 1,
                             "fallback_mode": "transport_failure",
                         }
+                        if (
+                            current_tool_mode == "patch"
+                            and isinstance(previous_invalid_meta.get("transport_validation"), dict)
+                        ):
+                            planner_candidate_invalid_meta["transport_validation"] = previous_invalid_meta.get(
+                                "transport_validation"
+                            )
                         if best_response_text is None:
                             best_response_text = response_text
                             best_parse_feedback = parse_feedback
@@ -9541,10 +9927,11 @@ domain_expert_critique:
                     break
 
                 current_prompt_name = f"prompt_attempt_{quality_round + 1}_repair.txt"
+                current_tool_mode = "patch"
                 repair_contract = (
-                    latest_candidate_for_repair
-                    if isinstance(latest_candidate_for_repair, dict)
-                    else best_candidate
+                    latest_canonical_for_repair
+                    if isinstance(latest_canonical_for_repair, dict)
+                    else best_canonical_candidate
                 )
                 repair_validation = (
                     latest_validation_for_repair
@@ -9576,9 +9963,9 @@ domain_expert_critique:
 
         if contract is None:
             invalid_contract = (
-                latest_candidate_for_repair
-                if isinstance(latest_candidate_for_repair, dict) and latest_candidate_for_repair
-                else (best_candidate if isinstance(best_candidate, dict) and best_candidate else None)
+                latest_canonical_for_repair
+                if isinstance(latest_canonical_for_repair, dict) and latest_canonical_for_repair
+                else (best_canonical_candidate if isinstance(best_canonical_candidate, dict) and best_canonical_candidate else None)
             )
             invalid_raw = (
                 latest_response_text_for_repair

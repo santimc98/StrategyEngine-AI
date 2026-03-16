@@ -1,6 +1,6 @@
 """Execution Planner canonical contract transport schemas."""
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 import copy
 
 
@@ -140,6 +140,21 @@ EXECUTION_CONTRACT_V42_MIN_SCHEMA["properties"]["optimization_policy"] = copy.de
 )
 
 
+EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS: List[str] = [
+    "contract_version",
+    "scope",
+    "strategy_title",
+    "business_objective",
+    "output_dialect",
+    "canonical_columns",
+    "required_outputs",
+    "column_roles",
+    "allowed_feature_sets",
+    "task_semantics",
+    "artifact_requirements",
+]
+
+
 _RUNBOOK_SCHEMA: Dict[str, Any] = {
     "anyOf": [
         {"type": "object", "additionalProperties": True},
@@ -178,29 +193,7 @@ _COLUMN_DTYPE_TARGETS_SCHEMA: Dict[str, Any] = {
 
 EXECUTION_CONTRACT_CANONICAL_SCHEMA: Dict[str, Any] = {
     "type": "object",
-    "required": [
-        "contract_version",
-        "scope",
-        "strategy_title",
-        "business_objective",
-        "output_dialect",
-        "canonical_columns",
-        "required_outputs",
-        "column_roles",
-        "allowed_feature_sets",
-        "task_semantics",
-        "artifact_requirements",
-        "column_dtype_targets",
-        "cleaning_gates",
-        "qa_gates",
-        "reviewer_gates",
-        "validation_requirements",
-        "data_engineer_runbook",
-        "ml_engineer_runbook",
-        "evaluation_spec",
-        "iteration_policy",
-        "optimization_policy",
-    ],
+    "required": list(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS),
     "properties": {
         "contract_version": {"type": "string", "enum": ["4.1", "4.2"]},
         "scope": {"type": "string", "enum": ["cleaning_only", "ml_only", "full_pipeline"]},
