@@ -292,3 +292,29 @@ def test_build_primary_metric_state_prefers_explicit_primary_metric_when_contrac
     assert metric_state.get("primary_metric_name") == "mean_multi_horizon_log_loss"
     assert metric_state.get("primary_metric_value") == pytest.approx(0.330705410118, abs=1e-12)
     assert metric_state.get("primary_metric_path") == "primary_metric_value"
+
+
+def test_build_primary_metric_state_keeps_contract_mean_metric_when_payload_primary_name_is_wrong() -> None:
+    metrics_report = {
+        "source": "artifact:artifacts/ml/cv_metrics.json",
+        "metric_name": "mean_multi_horizon_log_loss",
+        "primary_metric_name": "per_horizon.label_12h.oof_log_loss_raw",
+        "mean_multi_horizon_log_loss": 0.330705410118,
+        "per_horizon": {
+            "label_12h": {"oof_log_loss_raw": 0.20169210514337835},
+            "label_24h": {"oof_log_loss_raw": 0.12675962448829395},
+        },
+    }
+
+    metric_state = graph_mod._build_primary_metric_state(
+        state={},
+        metrics_report=metrics_report,
+        weights_report={},
+        objective_type="predictive",
+        evaluation_spec={"primary_metric": "mean_multi_horizon_log_loss"},
+        contract={"validation_requirements": {"primary_metric": "mean_multi_horizon_log_loss"}},
+    )
+
+    assert metric_state.get("target_metric_name") == "mean_multi_horizon_log_loss"
+    assert metric_state.get("primary_metric_name") == "mean_multi_horizon_log_loss"
+    assert metric_state.get("primary_metric_value") == pytest.approx(0.330705410118, abs=1e-12)

@@ -84,6 +84,42 @@ def test_projection_ml_view_includes_contract_context_blocks():
     assert (ml_view.get("task_semantics") or {}).get("primary_target") == "target"
 
 
+def test_ml_view_exposes_primary_metric_and_metric_rule_from_contract():
+    contract = {
+        "scope": "full_pipeline",
+        "canonical_columns": ["feature_a", "label_12h", "label_24h"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "outcome": ["label_12h", "label_24h"],
+        },
+        "required_outputs": ["artifacts/ml/cv_metrics.json", "artifacts/submission/submission.csv"],
+        "evaluation_spec": {
+            "objective_type": "predictive",
+            "primary_metric": "mean_multi_horizon_log_loss",
+            "metric_definition_rule": "Use a simple arithmetic mean unless the contract explicitly provides weights.",
+        },
+        "validation_requirements": {
+            "primary_metric": "mean_multi_horizon_log_loss",
+            "metric_definition_rule": "Use a simple arithmetic mean unless the contract explicitly provides weights.",
+        },
+        "task_semantics": {
+            "problem_family": "multi_output_classification",
+            "objective_type": "multi_output_classification",
+            "primary_target": "label_12h",
+            "target_columns": ["label_12h", "label_24h"],
+            "multi_target": True,
+        },
+    }
+
+    projected = build_contract_views_projection(contract, artifact_index=[])
+    ml_view = projected.get("ml_view") or {}
+
+    assert ml_view.get("primary_metric") == "mean_multi_horizon_log_loss"
+    assert ml_view.get("metric_definition_rule") == (
+        "Use a simple arithmetic mean unless the contract explicitly provides weights."
+    )
+
+
 def test_projection_uses_task_semantics_objective_when_objective_analysis_is_unknown():
     contract = {
         "scope": "full_pipeline",

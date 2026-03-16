@@ -711,6 +711,15 @@ def _project_evaluation_spec_from_canonical(contract: Dict[str, Any]) -> Dict[st
     ]
     if required_prediction_columns and not spec.get("required_prediction_columns"):
         spec["required_prediction_columns"] = required_prediction_columns
+    primary_metric = _normalize_kpi_metric(spec.get("primary_metric"))
+    if not primary_metric:
+        primary_metric = _infer_primary_metric_from_canonical(contract, spec, task_semantics)
+    if primary_metric:
+        spec.setdefault("primary_metric", primary_metric)
+        metric_rule = str(spec.get("metric_definition_rule") or "").strip()
+        derived_rule = _derive_metric_definition_rule(primary_metric)
+        if not metric_rule and derived_rule:
+            spec["metric_definition_rule"] = derived_rule
     return spec
 
 
@@ -729,13 +738,34 @@ def _infer_primary_metric_from_canonical(
         if normalized:
             return normalized
 
+    target_columns = _collect_targetish_columns(
+        evaluation_spec.get("target_columns")
+        or evaluation_spec.get("primary_targets")
+        or task_semantics.get("target_columns")
+        or contract.get("target_columns")
+        or contract.get("outcome_columns")
+    )
+    multi_target = bool(len(target_columns) > 1 or task_semantics.get("multi_target"))
+
+    text_hints = _collect_metric_hint_texts(
+        contract.get("qa_gates"),
+        contract.get("reviewer_gates"),
+        contract.get("ml_engineer_runbook"),
+        contract.get("data_engineer_runbook"),
+        contract.get("notes_for_engineers"),
+        contract.get("objective_analysis"),
+        task_semantics,
+    )
+    for hint in text_hints:
+        normalized = _extract_kpi_from_text(hint)
+        if normalized:
+            return normalized
+
     required_prediction_columns = [
         str(col).strip().lower()
         for col in (evaluation_spec.get("required_prediction_columns") or [])
         if str(col).strip()
     ]
-    if any(col.startswith("prob_") for col in required_prediction_columns):
-        return "log_loss"
 
     objective_type = str(
         evaluation_spec.get("objective_type")
@@ -743,6 +773,15 @@ def _infer_primary_metric_from_canonical(
         or task_semantics.get("problem_family")
         or ""
     ).strip().lower()
+    if multi_target and any(
+        token in objective_type for token in ("class", "probabilistic", "predictive")
+    ):
+        if any(col.startswith("prob_") for col in required_prediction_columns):
+            if _targets_look_horizon_like(target_columns) or "horizon" in objective_type:
+                return "mean_multi_horizon_log_loss"
+            return "mean_multi_target_log_loss"
+    if any(col.startswith("prob_") for col in required_prediction_columns):
+        return "log_loss"
     if any(token in objective_type for token in ("regression", "forecast")):
         return "rmse"
     if "ranking" in objective_type:
@@ -770,6 +809,10 @@ def _project_validation_requirements_from_canonical(contract: Dict[str, Any]) ->
         primary_metric = _infer_primary_metric_from_canonical(contract, evaluation_spec, task_semantics)
     if primary_metric:
         validation["primary_metric"] = primary_metric
+        metric_rule = str(validation.get("metric_definition_rule") or "").strip()
+        derived_rule = _derive_metric_definition_rule(primary_metric)
+        if not metric_rule and derived_rule:
+            validation["metric_definition_rule"] = derived_rule
 
     metrics_to_report = [
         _normalize_kpi_metric(metric)
@@ -2417,6 +2460,27 @@ def _apply_qa_gate_policy(
 _KPI_ALIASES = {
     "accuracy": ["accuracy", "acc", "balanced accuracy", "balanced_accuracy"],
     "auc": ["auc", "auroc", "roc auc", "roc_auc"],
+    "mean_multi_horizon_log_loss": [
+        "mean_multi_horizon_log_loss",
+        "mean multi horizon log loss",
+        "average multi horizon log loss",
+        "aggregated multi horizon log loss",
+        "mean multi-horizon log loss",
+        "average multi-horizon log loss",
+        "aggregated multi-horizon log loss",
+    ],
+    "mean_multi_target_log_loss": [
+        "mean_multi_target_log_loss",
+        "mean multi target log loss",
+        "average multi target log loss",
+        "aggregated multi target log loss",
+        "mean multi-target log loss",
+        "average multi-target log loss",
+        "aggregated multi-target log loss",
+        "mean multi output log loss",
+        "average multi output log loss",
+        "mean multi-output log loss",
+    ],
     "normalized_gini": [
         "normalized gini",
         "normalized_gini",
@@ -2449,6 +2513,32 @@ def _normalize_kpi_metric(value: Any) -> str:
             alias_norm = re.sub(r"[^a-z0-9]+", " ", alias).strip()
             if raw == alias_norm:
                 return canonical
+    tokens = [token for token in raw.split() if token]
+    metric_like_tokens = {
+        "metric",
+        "metrics",
+        "score",
+        "scores",
+        "loss",
+        "logloss",
+        "auc",
+        "gini",
+        "error",
+        "rmse",
+        "mae",
+        "mape",
+        "r2",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "concordance",
+        "ndcg",
+        "map",
+        "mrr",
+    }
+    if 1 <= len(tokens) <= 6 and any(token in metric_like_tokens for token in tokens):
+        return "_".join(tokens)
     return ""
 
 
@@ -2475,6 +2565,49 @@ def _extract_kpi_from_text(text: str) -> str:
             pattern = r"\b" + re.escape(alias.lower()) + r"\b"
             if re.search(pattern, lower):
                 return canonical
+    return ""
+
+
+def _collect_metric_hint_texts(*sources: Any) -> List[str]:
+    hints: List[str] = []
+
+    def _append(node: Any) -> None:
+        if isinstance(node, str):
+            text = node.strip()
+            if text:
+                hints.append(text)
+            return
+        if isinstance(node, dict):
+            for value in node.values():
+                _append(value)
+            return
+        if isinstance(node, list):
+            for item in node:
+                _append(item)
+
+    for source in sources:
+        _append(source)
+    return hints
+
+
+def _targets_look_horizon_like(target_columns: List[str]) -> bool:
+    for column in target_columns:
+        text = str(column or "").strip().lower()
+        if not text:
+            continue
+        if re.search(r"\b\d+\s*h\b", text) or re.search(r"_(\d+h|\d+d|\d+w)\b", text):
+            return True
+        if any(token in text for token in ("horizon", "12h", "24h", "48h", "72h")):
+            return True
+    return False
+
+
+def _derive_metric_definition_rule(primary_metric: Any) -> str:
+    metric = str(primary_metric or "").strip().lower()
+    if metric.startswith("mean_") and (
+        "log_loss" in metric or "logloss" in metric or metric.endswith("_loss")
+    ):
+        return "Use a simple arithmetic mean unless the contract explicitly provides weights."
     return ""
 
 

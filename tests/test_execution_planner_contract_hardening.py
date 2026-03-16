@@ -151,12 +151,81 @@ def test_planner_structural_support_projects_missing_ml_operational_sections_fro
     supported = _apply_planner_structural_support(contract)
 
     assert (supported.get("evaluation_spec") or {}).get("objective_type") == "binary_classification"
-    assert (supported.get("validation_requirements") or {}).get("primary_metric") == "log_loss"
+    assert (supported.get("validation_requirements") or {}).get("primary_metric") == "logloss"
     assert (supported.get("validation_requirements") or {}).get("method") == "holdout"
     assert (supported.get("iteration_policy") or {}).get("max_iterations") >= 1
     dtype_targets = supported.get("column_dtype_targets") or {}
     assert "__split" in dtype_targets
     assert "churned" in dtype_targets
+
+
+def test_planner_structural_support_projects_mean_multi_horizon_primary_metric_from_canonical_semantics():
+    contract = {
+        "scope": "full_pipeline",
+        "strategy_title": "Multi-horizon wildfire risk",
+        "business_objective": "Predict risk within 12h, 24h, 48h and 72h for each event.",
+        "canonical_columns": ["event_id", "__split", "feature_a", "label_12h", "label_24h", "label_48h", "label_72h"],
+        "required_outputs": ["artifacts/ml/cv_metrics.json", "artifacts/submission/submission.csv"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "decision": [],
+            "outcome": ["label_12h", "label_24h", "label_48h", "label_72h"],
+            "post_decision_audit_only": [],
+            "unknown": [],
+            "identifiers": ["event_id"],
+            "time_columns": [],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature_a"],
+            "segmentation_features": [],
+            "forbidden_features": ["label_12h", "label_24h", "label_48h", "label_72h"],
+            "audit_only_features": ["__split"],
+        },
+        "task_semantics": {
+            "problem_family": "probabilistic multi-horizon supervised classification",
+            "objective_type": "predictive",
+            "primary_target": "label_12h",
+            "target_columns": ["label_12h", "label_24h", "label_48h", "label_72h"],
+            "multi_target": True,
+            "partitioning": {"split_column": "__split"},
+            "output_schema": {
+                "prediction_artifact": "artifacts/submission/submission.csv",
+                "required_prediction_columns": ["prob_12h", "prob_24h", "prob_48h", "prob_72h"],
+            },
+        },
+        "qa_gates": [
+            {
+                "name": "metric_selection",
+                "severity": "HARD",
+                "params": {"rule": "optimize model selection on mean multi-horizon log loss"},
+            }
+        ],
+        "reviewer_gates": [
+            {
+                "name": "review_metrics",
+                "severity": "HARD",
+                "params": {"rule": "review OOF mean multi-horizon log loss and per-horizon metrics"},
+            }
+        ],
+        "data_engineer_runbook": "Preserve split and labels.",
+        "ml_engineer_runbook": (
+            "Select models using aggregated out-of-fold mean multi-horizon log loss and keep submission schema exact."
+        ),
+    }
+
+    supported = _apply_planner_structural_support(contract)
+
+    evaluation_spec = supported.get("evaluation_spec") or {}
+    validation = supported.get("validation_requirements") or {}
+
+    assert evaluation_spec.get("primary_metric") == "mean_multi_horizon_log_loss"
+    assert validation.get("primary_metric") == "mean_multi_horizon_log_loss"
+    assert evaluation_spec.get("metric_definition_rule") == (
+        "Use a simple arithmetic mean unless the contract explicitly provides weights."
+    )
+    assert validation.get("metric_definition_rule") == (
+        "Use a simple arithmetic mean unless the contract explicitly provides weights."
+    )
 
 
 def test_execution_planner_patch_transport_validation_rejects_empty_changes():

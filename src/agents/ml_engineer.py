@@ -2015,8 +2015,13 @@ class MLEngineerAgent:
         primary_metric = (
             validation_requirements.get("primary_metric")
             or evaluation_spec.get("primary_metric")
+            or ml_view.get("primary_metric")
         )
-        metric_rule = evaluation_spec.get("metric_definition_rule")
+        metric_rule = (
+            evaluation_spec.get("metric_definition_rule")
+            or validation_requirements.get("metric_definition_rule")
+            or ml_view.get("metric_definition_rule")
+        )
         if (
             not metric_rule
             and isinstance(primary_metric, str)

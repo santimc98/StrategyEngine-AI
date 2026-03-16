@@ -64,6 +64,8 @@ class DEView(TypedDict, total=False):
 class MLView(TypedDict, total=False):
     role: str
     objective_type: str
+    primary_metric: str
+    metric_definition_rule: str
     task_semantics: Dict[str, Any]
     canonical_columns: List[str]
     derived_features: List[str]
@@ -2136,6 +2138,11 @@ def build_contract_views_projection(
     primary_metric = validation_requirements.get("primary_metric")
     if isinstance(primary_metric, str) and primary_metric.strip():
         expected_metrics.append(primary_metric.strip())
+    metric_definition_rule = str(
+        (evaluation_spec.get("metric_definition_rule") if isinstance(evaluation_spec, dict) else "")
+        or (validation_requirements.get("metric_definition_rule") if isinstance(validation_requirements, dict) else "")
+        or ""
+    ).strip()
     metrics_to_report = validation_requirements.get("metrics_to_report")
     if isinstance(metrics_to_report, list):
         for metric in metrics_to_report:
@@ -2188,6 +2195,8 @@ def build_contract_views_projection(
     ml_view: MLView = {
         "role": "ml_engineer",
         "objective_type": objective_type,
+        "primary_metric": str(primary_metric).strip() if isinstance(primary_metric, str) and primary_metric.strip() else "",
+        "metric_definition_rule": metric_definition_rule,
         "task_semantics": task_semantics,
         "canonical_columns": canonical_columns,
         "derived_features": [c for c in derived_columns if c in set(model_features + segmentation_features)],
