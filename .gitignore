@@ -128,3 +128,6 @@ tools/wids_2026_prep/input/*
 !tools/wids_2026_prep/input/.gitkeep
 tools/wids_2026_prep/output/*
 !tools/wids_2026_prep/output/.gitkeep
+
+# Product roadmap (internal only)
+PRODUCT_ROADMAP.md
