@@ -36,6 +36,15 @@ from src.utils.run_status import (
     request_run_abort as _request_run_abort,
     write_worker_input as _write_worker_input,
 )
+from src.utils.api_keys_store import (
+    API_KEY_REGISTRY,
+    apply_keys_to_env,
+    load_keys as _load_api_keys,
+    mask_key as _mask_api_key,
+    save_keys as _save_api_keys,
+    test_key_connectivity as _test_api_key,
+)
+from src.utils.run_history import list_runs as _list_runs, load_run_result as _load_run_result
 
 # Auto-heal cwd when prior run crashed inside runs/<run_id>/work.
 recover_orphaned_workspace_cwd(project_root=APP_ROOT)
@@ -44,12 +53,15 @@ try:
 except Exception as cwd_err:
     print(f"APP_CWD_WARNING: {cwd_err}")
 
+# Apply stored API keys to environment on startup
+apply_keys_to_env()
+
 _SIGNAL_HANDLER_INSTALLED = False
 
 AGENT_MODEL_LABELS: Dict[str, str] = {
-    "strategist": "Strategist",
-    "data_engineer": "Data Engineer",
-    "ml_engineer": "ML Engineer",
+    "strategist": "Estratega",
+    "data_engineer": "Ingeniero de Datos",
+    "ml_engineer": "Ingeniero ML",
 }
 MODEL_PRESET_OPTIONS: List[Tuple[str, str]] = [
     ("z-ai/glm-5", "GLM-5"),
@@ -209,7 +221,7 @@ def _save_agent_model_overrides(overrides: Dict[str, Any]) -> None:
 
 def _model_option_label(option_id: str) -> str:
     if option_id == CUSTOM_MODEL_OPTION:
-        return "Personalizado (ID OpenRouter)"
+        return "Personalizado (ID de modelo)"
     return MODEL_PRESET_LABELS.get(option_id, option_id)
 
 
@@ -758,18 +770,28 @@ section[data-testid="stSidebar"] .stButton > button:hover {
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Header
+# Header (with home button when viewing results)
 # ---------------------------------------------------------------------------
-st.markdown("""
-<div style="padding: 0.5rem 0 0.25rem;">
-    <h1 style="margin:0; font-size:2rem; font-weight:800;">
-        <span class="hero-gradient">StrategyEngine AI</span>
-    </h1>
-    <p style="margin:0.25rem 0 0; color:#6c757d; font-size:0.95rem;">
-        Plataforma de Inteligencia de Negocio Autonoma &mdash; Multi-Agent AI
-    </p>
-</div>
-""", unsafe_allow_html=True)
+_header_col1, _header_col2 = st.columns([5, 1])
+with _header_col1:
+    st.markdown("""
+    <div style="padding: 0.5rem 0 0.25rem;">
+        <h1 style="margin:0; font-size:2rem; font-weight:800;">
+            <span class="hero-gradient">StrategyEngine AI</span>
+        </h1>
+        <p style="margin:0.25rem 0 0; color:#6c757d; font-size:0.95rem;">
+            Inteligencia Artificial Aut&oacute;noma para Decisiones de Negocio
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+with _header_col2:
+    if st.session_state.get("analysis_complete"):
+        if st.button("\U0001f3e0 Inicio", key="header_home_btn", use_container_width=True):
+            st.session_state["analysis_complete"] = False
+            st.session_state["analysis_result"] = None
+            st.session_state["dismissed_latest_run"] = True
+            st.session_state.pop("viewing_run_id", None)
+            st.rerun()
 st.markdown("---")
 
 # ---------------------------------------------------------------------------
@@ -780,11 +802,11 @@ with st.sidebar:
     <div style="text-align:center; padding: 0.5rem 0 1rem;">
         <span style="font-size:1.6rem; font-weight:800;" class="hero-gradient">StrategyEngine AI</span>
         <br>
-        <span style="font-size:0.72rem; color:#8b949e; letter-spacing:0.05em;">v2.0 &bull; Enterprise AI Platform</span>
+        <span style="font-size:0.72rem; color:#8b949e; letter-spacing:0.05em;">v2.0 &bull; Plataforma IA Empresarial</span>
     </div>
     """, unsafe_allow_html=True)
 
-    if st.button("⚙ Ajustes de modelos", key="toggle_model_settings", use_container_width=True):
+    if st.button("⚙ Ajustes de Modelos", key="toggle_model_settings", use_container_width=True):
         st.session_state["show_model_settings"] = not bool(st.session_state.get("show_model_settings"))
 
     active_models = _merge_agent_model_maps(
@@ -798,7 +820,7 @@ with st.sidebar:
     st.markdown(
         f"""
         <div class="sidebar-settings-panel">
-            <div class="ssp-title">Modelos activos</div>
+            <div class="ssp-title">Modelos Activos</div>
             <div class="ssp-desc">{active_model_lines}</div>
         </div>
         """,
@@ -809,8 +831,8 @@ with st.sidebar:
         st.markdown(
             """
             <div class="sidebar-settings-panel">
-                <div class="ssp-title">Configuracion de modelos por agente</div>
-                <div class="ssp-desc">Selecciona el modelo principal para cada agente (ruteado por OpenRouter).</div>
+                <div class="ssp-title">Configuraci&oacute;n de Modelos por Agente</div>
+                <div class="ssp-desc">Selecciona el modelo de IA principal para cada agente del pipeline.</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -836,9 +858,9 @@ with st.sidebar:
             if selected_option == CUSTOM_MODEL_OPTION:
                 custom_default = "" if current_is_preset else current_model
                 custom_model = st.text_input(
-                    f"ID OpenRouter ({agent_label})",
+                    f"ID del modelo ({agent_label})",
                     value=custom_default,
-                    placeholder="proveedor/modelo",
+                    placeholder="proveedor/nombre-modelo",
                     key=f"model_custom_{agent_key}",
                 )
                 pending_models[agent_key] = str(custom_model or "").strip()
@@ -854,7 +876,7 @@ with st.sidebar:
         if apply_models_btn:
             missing_agents = [AGENT_MODEL_LABELS[k] for k, v in pending_models.items() if not str(v or "").strip()]
             if missing_agents:
-                st.error(f"Falta definir modelo para: {', '.join(missing_agents)}")
+                st.error(f"Falta seleccionar un modelo para: {', '.join(missing_agents)}")
             else:
                 merged_models = _merge_agent_model_maps(
                     st.session_state.get("base_agent_models", {}),
@@ -866,7 +888,7 @@ with st.sidebar:
                     applied_models,
                 )
                 _save_agent_model_overrides(st.session_state["agent_model_overrides"])
-                st.success("Configuracion aplicada.")
+                st.success("Configuraci\u00f3n aplicada correctamente.")
                 st.rerun()
 
         if reset_models_btn:
@@ -881,14 +903,113 @@ with st.sidebar:
                     del st.session_state[option_key]
                 if custom_key in st.session_state:
                     del st.session_state[custom_key]
-            st.success("Modelos restablecidos.")
+            st.success("Modelos restablecidos a valores por defecto.")
             st.rerun()
 
     st.markdown("---")
-    st.markdown("##### Fuente de Datos")
+
+    # ---- API Keys Panel ----
+    if "show_api_keys" not in st.session_state:
+        st.session_state["show_api_keys"] = False
+
+    if st.button("\U0001f511 Claves API", key="toggle_api_keys", use_container_width=True):
+        st.session_state["show_api_keys"] = not bool(st.session_state.get("show_api_keys"))
+
+    # Show summary of configured keys
+    stored_keys = _load_api_keys()
+    configured_count = sum(1 for reg in API_KEY_REGISTRY if stored_keys.get(reg["env_var"]))
+    required_count = sum(1 for reg in API_KEY_REGISTRY if reg.get("required"))
+    total_count = len(API_KEY_REGISTRY)
+
+    if configured_count >= required_count:
+        key_status_color = "#a6e3a1"
+        key_status_text = f"{configured_count}/{total_count} configuradas"
+    elif configured_count > 0:
+        key_status_color = "#f9e2af"
+        key_status_text = f"{configured_count}/{total_count} configuradas"
+    else:
+        key_status_color = "#f38ba8"
+        key_status_text = "Sin configurar"
+
+    st.markdown(
+        f"""
+        <div class="sidebar-settings-panel">
+            <div class="ssp-title">Claves API</div>
+            <div class="ssp-desc" style="color:{key_status_color};">{key_status_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state.get("show_api_keys"):
+        st.markdown(
+            """
+            <div class="sidebar-settings-panel">
+                <div class="ssp-title">Configuraci&oacute;n de Claves API</div>
+                <div class="ssp-desc">Introduce las claves de los proveedores de IA. Se almacenan de forma segura en tu m&aacute;quina.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        pending_keys: Dict[str, str] = {}
+        for reg in API_KEY_REGISTRY:
+            env_var = reg["env_var"]
+            label = reg["label"]
+            desc = reg["description"]
+            required = reg.get("required", False)
+            existing = stored_keys.get(env_var, "")
+            req_badge = " *" if required else ""
+
+            st.markdown(
+                f'<span style="color:#e6edf3; font-size:0.82rem; font-weight:600;">'
+                f'{label}{req_badge}</span>'
+                f'<br><span style="color:#6c7086; font-size:0.72rem;">{desc}</span>',
+                unsafe_allow_html=True,
+            )
+            new_value = st.text_input(
+                f"Clave {label}",
+                value=existing,
+                type="password",
+                placeholder=reg.get("placeholder", ""),
+                key=f"api_key_{env_var}",
+                label_visibility="collapsed",
+            )
+            pending_keys[env_var] = new_value
+
+            # Show connection status inline
+            if existing:
+                st.markdown(
+                    f'<span style="color:#a6e3a1; font-size:0.7rem;">\u2713 {_mask_api_key(existing)}</span>',
+                    unsafe_allow_html=True,
+                )
+
+        col_save, col_test = st.columns(2)
+        with col_save:
+            if st.button("Guardar claves", key="save_api_keys", use_container_width=True):
+                _save_api_keys(pending_keys)
+                apply_keys_to_env(pending_keys)
+                st.success("Claves guardadas.")
+                st.rerun()
+
+        with col_test:
+            if st.button("Verificar", key="test_api_keys", use_container_width=True):
+                for reg in API_KEY_REGISTRY:
+                    env_var = reg["env_var"]
+                    value = pending_keys.get(env_var, "").strip()
+                    if not value:
+                        continue
+                    ok, msg = _test_api_key(env_var, value)
+                    if ok:
+                        st.success(f"{reg['label']}: {msg}")
+                    else:
+                        st.error(f"{reg['label']}: {msg}")
+
+    st.markdown("---")
+    st.markdown("##### Origen de Datos")
 
     data_source = st.radio(
-        "Selecciona la fuente de datos",
+        "Selecciona el origen de datos",
         ["Archivo Local", "Salesforce", "HubSpot"],
         label_visibility="collapsed",
     )
@@ -897,7 +1018,7 @@ with st.sidebar:
 
     # ---- Archivo Local ----
     if data_source == "Archivo Local":
-        uploaded_file = st.file_uploader("Cargar archivo CSV o Excel", type=["csv", "xlsx", "xls"])
+        uploaded_file = st.file_uploader("Sube tu archivo CSV o Excel", type=["csv", "xlsx", "xls"])
         if uploaded_file is not None:
             file_size = uploaded_file.size
             if file_size < 1024:
@@ -910,7 +1031,7 @@ with st.sidebar:
 
     # ---- Salesforce ----
     elif data_source == "Salesforce":
-        sf_auth_mode = st.selectbox("Modo de autenticacion", ["Token API", "OAuth (Access Token)"], key="sf_auth_mode")
+        sf_auth_mode = st.selectbox("Modo de autenticaci\u00f3n", ["Token API", "OAuth (Access Token)"], key="sf_auth_mode")
 
         if sf_auth_mode == "Token API":
             sf_username = st.text_input("Username", key="sf_username")
@@ -961,8 +1082,8 @@ with st.sidebar:
             crm_objects = st.session_state.get("crm_objects", [])
             if crm_objects:
                 obj_labels = [f"{o['label']} ({o['name']})" for o in crm_objects]
-                selected_idx = st.selectbox("Objeto CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="sf_obj_select")
-                max_recs = st.number_input("Max registros", min_value=100, max_value=50000, value=10000, step=500, key="sf_max_recs")
+                selected_idx = st.selectbox("Tabla CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="sf_obj_select")
+                max_recs = st.number_input("M\u00e1x. registros", min_value=100, max_value=50000, value=10000, step=500, key="sf_max_recs")
                 fetch_btn = st.button("Extraer Datos", key="sf_fetch")
 
                 if fetch_btn:
@@ -971,16 +1092,16 @@ with st.sidebar:
                         connector = st.session_state["crm_connector"]
                         df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
                         if df_crm.empty:
-                            st.warning(f"El objeto '{selected_obj}' no contiene registros.")
+                            st.warning(f"El objeto '{selected_obj}' no contiene datos.")
                         else:
                             os.makedirs("data", exist_ok=True)
                             crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")
                             df_crm.to_csv(crm_csv, index=False, encoding="utf-8")
                             st.session_state["crm_data_path"] = crm_csv
                             st.session_state["crm_preview_df"] = df_crm
-                            st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extraidos</span>', unsafe_allow_html=True)
+                            st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extra\u00eddos</span>', unsafe_allow_html=True)
                     except Exception as exc:
-                        st.error(f"Error al extraer datos: {exc}")
+                        st.error(f"Error al obtener los datos: {exc}")
 
             if st.session_state.get("crm_data_path"):
                 preview_df = st.session_state.get("crm_preview_df")
@@ -989,7 +1110,7 @@ with st.sidebar:
 
     # ---- HubSpot ----
     elif data_source == "HubSpot":
-        hs_auth_mode = st.selectbox("Modo de autenticacion", ["Private App Token", "OAuth (Access Token)"], key="hs_auth_mode")
+        hs_auth_mode = st.selectbox("Modo de autenticaci\u00f3n", ["Private App Token", "OAuth (Access Token)"], key="hs_auth_mode")
         hs_token = st.text_input("Token", type="password", key="hs_token")
         hs_connect = st.button("Conectar a HubSpot", key="hs_connect")
 
@@ -1010,8 +1131,8 @@ with st.sidebar:
             crm_objects = st.session_state.get("crm_objects", [])
             if crm_objects:
                 obj_labels = [f"{o['label']} ({o['name']})" for o in crm_objects]
-                selected_idx = st.selectbox("Objeto CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="hs_obj_select")
-                max_recs = st.number_input("Max registros", min_value=100, max_value=50000, value=10000, step=500, key="hs_max_recs")
+                selected_idx = st.selectbox("Tabla CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="hs_obj_select")
+                max_recs = st.number_input("M\u00e1x. registros", min_value=100, max_value=50000, value=10000, step=500, key="hs_max_recs")
                 fetch_btn = st.button("Extraer Datos", key="hs_fetch")
 
                 if fetch_btn:
@@ -1020,16 +1141,16 @@ with st.sidebar:
                         connector = st.session_state["crm_connector"]
                         df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
                         if df_crm.empty:
-                            st.warning(f"El objeto '{selected_obj}' no contiene registros.")
+                            st.warning(f"El objeto '{selected_obj}' no contiene datos.")
                         else:
                             os.makedirs("data", exist_ok=True)
                             crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")
                             df_crm.to_csv(crm_csv, index=False, encoding="utf-8")
                             st.session_state["crm_data_path"] = crm_csv
                             st.session_state["crm_preview_df"] = df_crm
-                            st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extraidos</span>', unsafe_allow_html=True)
+                            st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extra\u00eddos</span>', unsafe_allow_html=True)
                     except Exception as exc:
-                        st.error(f"Error al extraer datos: {exc}")
+                        st.error(f"Error al obtener los datos: {exc}")
 
             if st.session_state.get("crm_data_path"):
                 preview_df = st.session_state.get("crm_preview_df")
@@ -1047,7 +1168,7 @@ with st.sidebar:
     )
 
     st.markdown("")  # spacer
-    start_btn = st.button("Iniciar Analisis", use_container_width=True)
+    start_btn = st.button("Iniciar An\u00e1lisis", use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # Session State init
@@ -1072,15 +1193,17 @@ if not st.session_state.get("analysis_complete"):
     if _reconnect_run:
         st.session_state["active_run_id"] = _reconnect_run
     elif not st.session_state.get("active_run_id"):
-        # Check if latest run completed while session was disconnected
-        _latest = _get_latest_run_id()
-        if _latest:
-            _latest_status = _read_run_status(_latest)
-            if _latest_status and _latest_status.get("status") == "complete":
-                _final = _read_final_state(_latest)
-                if _final:
-                    st.session_state["analysis_result"] = _final
-                    st.session_state["analysis_complete"] = True
+        # Check if latest run completed while session was disconnected.
+        # Skip if user explicitly dismissed the results (clicked "Nuevo an\u00e1lisis").
+        if not st.session_state.get("dismissed_latest_run"):
+            _latest = _get_latest_run_id()
+            if _latest:
+                _latest_status = _read_run_status(_latest)
+                if _latest_status and _latest_status.get("status") == "complete":
+                    _final = _read_final_state(_latest)
+                    if _final:
+                        st.session_state["analysis_result"] = _final
+                        st.session_state["analysis_complete"] = True
 
 # ---------------------------------------------------------------------------
 # Resolve data_path from any source
@@ -1112,10 +1235,10 @@ elif data_source in ("Salesforce", "HubSpot"):
 if data_path is None and not st.session_state.get("analysis_complete"):
     st.markdown("""
     <div class="hero fade-in">
-        <h1><span class="hero-gradient">Inteligencia de Negocio Autonoma</span></h1>
+        <h1><span class="hero-gradient">Inteligencia de Negocio Aut&oacute;noma</span></h1>
         <p class="hero-subtitle">
             Sube tus datos, define un objetivo y deja que nuestro equipo de agentes IA
-            audite, diseñe estrategias, construya modelos y genere un reporte ejecutivo&nbsp;&mdash; todo en minutos.
+            audite, dise&ntilde;e estrategias, construya modelos y genere un informe ejecutivo&nbsp;&mdash; todo de forma aut&oacute;noma.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -1125,8 +1248,8 @@ if data_path is None and not st.session_state.get("analysis_complete"):
         st.markdown("""
         <div class="feature-card fade-in">
             <div class="feature-icon">&#128269;</div>
-            <div class="feature-title">Auditoria de Datos</div>
-            <div class="feature-desc">Analisis automatico de calidad, integridad y distribucion de tus datos con recomendaciones accionables.</div>
+            <div class="feature-title">Auditor&iacute;a de Datos</div>
+            <div class="feature-desc">An&aacute;lisis autom&aacute;tico de calidad, integridad y distribuci&oacute;n de tus datos con recomendaciones accionables.</div>
         </div>
         """, unsafe_allow_html=True)
     with col_f2:
@@ -1134,7 +1257,7 @@ if data_path is None and not st.session_state.get("analysis_complete"):
         <div class="feature-card fade-in">
             <div class="feature-icon">&#127919;</div>
             <div class="feature-title">Estrategia IA</div>
-            <div class="feature-desc">Generacion y evaluacion de multiples estrategias analiticas con deliberacion experta para seleccionar la optima.</div>
+            <div class="feature-desc">Generaci&oacute;n y evaluaci&oacute;n de m&uacute;ltiples estrategias anal&iacute;ticas con deliberaci&oacute;n experta para seleccionar la &oacute;ptima.</div>
         </div>
         """, unsafe_allow_html=True)
     with col_f3:
@@ -1142,7 +1265,7 @@ if data_path is None and not st.session_state.get("analysis_complete"):
         <div class="feature-card fade-in">
             <div class="feature-icon">&#9881;&#65039;</div>
             <div class="feature-title">ML Automatizado</div>
-            <div class="feature-desc">Ingenieria de datos, entrenamiento de modelos y evaluacion iterativa con generacion de reportes ejecutivos.</div>
+            <div class="feature-desc">Ingenier&iacute;a de datos, entrenamiento de modelos y evaluaci&oacute;n iterativa con generaci&oacute;n de informes ejecutivos.</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1154,14 +1277,59 @@ if data_path is None and not st.session_state.get("analysis_complete"):
         </div>
         <div class="step-item">
             <div class="step-number">2</div>
-            <div class="step-text"><strong>Define tu objetivo</strong>Describe que quieres lograr con tus datos.</div>
+            <div class="step-text"><strong>Define tu objetivo</strong>Describe qu&eacute; quieres lograr con tus datos.</div>
         </div>
         <div class="step-item">
             <div class="step-number">3</div>
-            <div class="step-text"><strong>Obtiene resultados</strong>Recibe un reporte ejecutivo con insights accionables.</div>
+            <div class="step-text"><strong>Obt&eacute;n resultados</strong>Recibe un informe ejecutivo con insights accionables.</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ---- Run History on Welcome Screen ----
+    recent_runs = _list_runs(limit=10)
+    if recent_runs:
+        st.markdown("---")
+        st.markdown("#### Historial de Ejecuciones")
+
+        _STATUS_ICONS = {
+            "complete": "\u2705",
+            "error": "\u274c",
+            "aborted": "\u26a0\ufe0f",
+        }
+        _VERDICT_LABELS_HIST = {
+            "APPROVED": "Aprobado",
+            "NEEDS_IMPROVEMENT": "Necesita Mejoras",
+        }
+
+        for run in recent_runs:
+            icon = _STATUS_ICONS.get(run["status"], "\u2753")
+            verdict_label = _VERDICT_LABELS_HIST.get(run["verdict"], run["verdict"] or "—")
+            metric_display = ""
+            if run["metric_value"]:
+                metric_display = f' | {run["metric_name"]}: **{run["metric_value"]}**'
+
+            col_info, col_action = st.columns([5, 1])
+            with col_info:
+                st.markdown(
+                    f'{icon} **{run["run_id"]}** — {run["started_str"] or "Fecha desconocida"}'
+                    f' | {run["elapsed"] or "—"}'
+                    f' | {verdict_label}'
+                    f'{metric_display}'
+                    f' | Iteraciones: {run["iterations"] or 0}'
+                )
+            with col_action:
+                if run["status"] == "complete" and st.button(
+                    "Ver", key=f"view_run_{run['run_id']}", use_container_width=True
+                ):
+                    loaded = _load_run_result(run["run_id"])
+                    if loaded:
+                        st.session_state["analysis_result"] = loaded
+                        st.session_state["analysis_complete"] = True
+                        st.session_state["viewing_run_id"] = run["run_id"]
+                        st.rerun()
+                    else:
+                        st.error("No se pudieron cargar los resultados de esta ejecuci\u00f3n.")
 
 # ---------------------------------------------------------------------------
 # Unified preview for any data source
@@ -1199,19 +1367,19 @@ if data_path is not None:
             st.dataframe(df_preview.head(10), use_container_width=True, height=300)
             st.markdown('</div>', unsafe_allow_html=True)
         elif df_preview is not None:
-            st.warning("El dataset parece tener solo una columna. Verifica el formato del archivo.")
+            st.warning("El dataset parece tener solo una columna. Verifica el formato y separador del archivo.")
 
 # ---------------------------------------------------------------------------
 # Pipeline steps definition (for visual tracker)
 # ---------------------------------------------------------------------------
 PIPELINE_STEPS = [
-    ("steward",        "Steward",    "&#128270;"),
-    ("strategist",     "Strategist", "&#129504;"),
-    ("domain_expert",  "Expert",     "&#127942;"),
-    ("data_engineer",  "Data Eng",   "&#128295;"),
-    ("engineer",       "ML Eng",     "&#9881;"),
-    ("evaluate_results","Reviewer",  "&#128269;"),
-    ("translator",     "Report",     "&#128202;"),
+    ("steward",        "Auditor",      "&#128270;"),
+    ("strategist",     "Estratega",    "&#129504;"),
+    ("domain_expert",  "Experto",      "&#127942;"),
+    ("data_engineer",  "Ing. Datos",   "&#128295;"),
+    ("engineer",       "Ing. ML",      "&#9881;"),
+    ("evaluate_results","Revisor",     "&#128269;"),
+    ("translator",     "Informe",      "&#128202;"),
 ]
 
 def _render_pipeline(completed_steps: set, active_step: str | None = None, iter_info: str = ""):
@@ -1260,11 +1428,11 @@ _STEP_PROGRESS = {
 _STAGE_NAMES = {
     "steward": "Auditando datos",
     "strategist": "Generando estrategias",
-    "domain_expert": "Deliberacion experta",
-    "data_engineer": "Limpieza de datos",
+    "domain_expert": "Deliberaci\u00f3n experta",
+    "data_engineer": "Procesando datos",
     "engineer": "Entrenando modelo ML",
     "evaluate_results": "Evaluando resultados",
-    "translator": "Generando reporte",
+    "translator": "Generando informe",
     None: "Completado",
 }
 
@@ -1316,11 +1484,11 @@ def _run_polling_ui(run_id: str) -> None:
     progress_header_placeholder = st.empty()
     abort_col1, abort_col2, abort_col3 = st.columns([3, 1, 3])
     with abort_col2:
-        if st.button("Cancelar ejecucion", type="secondary", use_container_width=True):
+        if st.button("Cancelar ejecuci\u00f3n", type="secondary", use_container_width=True):
             _request_run_abort(run_id)
             _kill_worker(run_id)
             st.session_state.pop("active_run_id", None)
-            st.warning("Ejecucion cancelada.")
+            st.warning("Ejecuci\u00f3n cancelada.")
             time.sleep(1)
             st.rerun()
             return
@@ -1388,7 +1556,7 @@ def _run_polling_ui(run_id: str) -> None:
         iter_info = ""
         if iteration >= 1:
             parts = [
-                f'<span class="iter-badge-label">Iteracion</span>',
+                f'<span class="iter-badge-label">Iteraci\u00f3n</span>',
                 f'<span class="iter-badge-value">{iteration}/{max_iterations}</span>',
             ]
             if metric_value:
@@ -1413,7 +1581,7 @@ def _run_polling_ui(run_id: str) -> None:
         metric_display = f"{metric_name}: {metric_value}" if metric_value else "--"
         sidebar_status_placeholder.markdown(f"""
         <div class="sidebar-run-status">
-            <div class="srs-title">Ejecucion en Curso</div>
+            <div class="srs-title">Ejecuci&oacute;n en Curso</div>
             <div class="srs-row">
                 <span class="srs-label">Etapa</span>
                 <span class="srs-step">{stage_name}</span>
@@ -1427,7 +1595,7 @@ def _run_polling_ui(run_id: str) -> None:
                 <span class="srs-timer">{elapsed_str}</span>
             </div>
             <div class="srs-row">
-                <span class="srs-label">Iteracion ML</span>
+                <span class="srs-label">Iteraci&oacute;n ML</span>
                 <span class="srs-value">{iter_display}</span>
             </div>
             <div class="srs-row">
@@ -1452,10 +1620,10 @@ def _run_polling_ui(run_id: str) -> None:
 
         if run_status in ("error", "aborted"):
             if run_status == "aborted":
-                st.warning("Ejecucion cancelada por el usuario.")
+                st.warning("Ejecuci\u00f3n cancelada por el usuario.")
             else:
                 error = status.get("error", "Error desconocido")
-                st.error(f"Error en la ejecucion: {error}")
+                st.error(f"Error en la ejecuci\u00f3n: {error}")
             final = _read_final_state(run_id)
             if final:
                 st.session_state["analysis_result"] = final
@@ -1470,7 +1638,7 @@ def _run_polling_ui(run_id: str) -> None:
         # Check if worker process died unexpectedly
         pid = status.get("pid")
         if pid and not _is_process_alive(pid):
-            st.error("El proceso de ejecucion ha terminado inesperadamente.")
+            st.error("El proceso de ejecuci\u00f3n ha terminado inesperadamente.")
             final = _read_final_state(run_id)
             if final:
                 st.session_state["analysis_result"] = final
@@ -1494,12 +1662,14 @@ if st.session_state.get("active_run_id") and not st.session_state.get("analysis_
 
 elif start_btn:
     if data_path is None:
-        st.sidebar.error("Por favor carga datos: sube un archivo o conecta un CRM.")
+        st.sidebar.error("Sube un archivo de datos o conecta un CRM para comenzar.")
     elif not business_objective:
-        st.sidebar.error("Por favor define un objetivo de negocio.")
+        st.sidebar.error("Define un objetivo de negocio antes de iniciar el an\u00e1lisis.")
     else:
         st.session_state["analysis_complete"] = False
         st.session_state["analysis_result"] = None
+        st.session_state.pop("dismissed_latest_run", None)
+        st.session_state.pop("viewing_run_id", None)
         clear_abort()
 
         # Kill any previously running worker before starting a new one
@@ -1543,20 +1713,40 @@ elif start_btn:
 if st.session_state.get("analysis_complete") and st.session_state.get("analysis_result"):
     result = st.session_state["analysis_result"]
 
+    # Back to home button — always visible in results dashboard
+    viewing_run = st.session_state.get("viewing_run_id")
+    run_id_display = viewing_run or result.get("run_id", "")
+
+    col_back, col_run_label = st.columns([1, 5])
+    with col_back:
+        if st.button("\u2190 Nuevo an\u00e1lisis", key="back_to_home", use_container_width=True):
+            st.session_state["analysis_complete"] = False
+            st.session_state["analysis_result"] = None
+            st.session_state["dismissed_latest_run"] = True
+            st.session_state.pop("viewing_run_id", None)
+            st.rerun()
+    with col_run_label:
+        if run_id_display:
+            st.markdown(
+                f'<span style="color:var(--text-secondary); font-size:0.9rem;">'
+                f'Ejecuci\u00f3n: <strong>{run_id_display}</strong></span>',
+                unsafe_allow_html=True,
+            )
+
     # Success Banner
     verdict = result.get('review_verdict', 'APPROVED')
     if verdict == "NEEDS_IMPROVEMENT":
         st.markdown("""
         <div class="result-banner error fade-in">
             <div class="result-banner-icon">&#9888;&#65039;</div>
-            <div class="result-banner-text">Analisis completado con observaciones del revisor</div>
+            <div class="result-banner-text">An&aacute;lisis completado con observaciones del revisor</div>
         </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown("""
         <div class="result-banner success fade-in">
             <div class="result-banner-icon">&#9989;</div>
-            <div class="result-banner-text">Analisis completado exitosamente</div>
+            <div class="result-banner-text">An&aacute;lisis completado exitosamente</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1564,6 +1754,10 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
     iteration_count = result.get('iteration_count', result.get('current_iteration', 'N/A'))
     selected_strat = result.get('selected_strategy', {})
     strat_title = selected_strat.get('title', 'N/A') if isinstance(selected_strat, dict) else 'N/A'
+
+    # Map verdict and gate labels to Spanish
+    _VERDICT_LABELS = {"APPROVED": "Aprobado", "NEEDS_IMPROVEMENT": "Necesita Mejoras"}
+    _GATE_LABELS = {"PASSED": "Superado", "FAILED": "No Superado"}
 
     mc1, mc2, mc3, mc4 = st.columns(4)
     with mc1:
@@ -1582,47 +1776,52 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         """, unsafe_allow_html=True)
     with mc3:
         rv = result.get('review_verdict', 'N/A')
+        rv_label = _VERDICT_LABELS.get(rv, rv)
         badge_cls = "badge-success" if rv == "APPROVED" else "badge-warning"
         st.markdown(f"""
         <div class="card fade-in" style="text-align:center;">
             <div class="card-header">Veredicto</div>
-            <div style="margin-top:0.5rem;"><span class="badge {badge_cls}">{rv}</span></div>
+            <div style="margin-top:0.5rem;"><span class="badge {badge_cls}">{rv_label}</span></div>
         </div>
         """, unsafe_allow_html=True)
     with mc4:
-        gate_status = "Pass" if result.get('gate_status', '') == 'PASSED' else result.get('gate_status', 'N/A')
+        raw_gate = result.get('gate_status', 'N/A')
+        gate_label = _GATE_LABELS.get(raw_gate, raw_gate)
         st.markdown(f"""
         <div class="card fade-in" style="text-align:center;">
-            <div class="card-header">Gate Status</div>
-            <div style="font-size:1rem; font-weight:700; color:var(--text-primary);">{gate_status}</div>
+            <div class="card-header">Control de Calidad</div>
+            <div style="font-size:1rem; font-weight:700; color:var(--text-primary);">{gate_label}</div>
         </div>
         """, unsafe_allow_html=True)
 
     # Tabs
     tab1, tab2, tab_de, tab3, tab4 = st.tabs([
-        "Auditoria de Datos",
+        "Auditor\u00eda de Datos",
         "Estrategia",
-        "Ingenieria de Datos",
-        "ML Engineer",
-        "Reporte Ejecutivo"
+        "Ingenier\u00eda de Datos",
+        "Modelo ML",
+        "Informe Ejecutivo"
     ])
 
     # --- Tab 1: Data Audit ---
     with tab1:
-        st.markdown("#### Auditoria de Datos")
-        data_summary = result.get('data_summary', 'No disponible')
-        st.markdown(f'<div class="card fade-in">{data_summary}</div>', unsafe_allow_html=True)
+        st.markdown("#### Auditor\u00eda de Datos")
+        data_summary = result.get('data_summary', '')
+        if data_summary:
+            st.markdown(f'<div class="card fade-in">{data_summary}</div>', unsafe_allow_html=True)
+        else:
+            st.info("No se gener\u00f3 un resumen de auditor\u00eda para esta ejecuci\u00f3n.")
 
     # --- Tab 2: Strategy ---
     with tab2:
-        st.markdown("#### Plan Estrategico")
+        st.markdown("#### Plan Estrat\u00e9gico")
         strategies = result.get('strategies', {})
 
         if isinstance(strategies, dict) and 'strategies' in strategies:
             for i, strat in enumerate(strategies['strategies'], 1):
                 with st.expander(f"Estrategia {i}: {strat.get('title')}", expanded=(i == 1)):
-                    st.write(f"**Hipotesis:** {strat.get('hypothesis')}")
-                    st.write(f"**Dificultad:** {strat.get('estimated_difficulty')}")
+                    st.write(f"**Hip\u00f3tesis:** {strat.get('hypothesis')}")
+                    st.write(f"**Dificultad estimada:** {strat.get('estimated_difficulty')}")
                     st.write(f"**Razonamiento:** {strat.get('reasoning')}")
         else:
             st.json(strategies)
@@ -1633,79 +1832,92 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         if selected:
             st.markdown(f"""
             <div class="winner-card fade-in">
-                <strong>Estrategia Ganadora:</strong> {selected.get('title', 'N/A')}<br>
-                <span style="color:var(--text-secondary);">{result.get('selection_reason', 'N/A')}</span>
+                <strong>Estrategia Seleccionada:</strong> {selected.get('title', 'N/A')}<br>
+                <span style="color:var(--text-secondary);">{result.get('selection_reason', '')}</span>
             </div>
             """, unsafe_allow_html=True)
 
         if reviews:
-            st.markdown("#### Deliberacion del Experto")
+            st.markdown("#### Deliberaci\u00f3n del Experto")
             for rev in reviews:
                 score = rev.get('score', 'N/A')
                 badge_cls = "badge-success" if isinstance(score, (int, float)) and score >= 7 else "badge-warning"
-                with st.expander(f"{rev.get('title')} — Score: {score}/10"):
+                with st.expander(f"{rev.get('title')} \u2014 Puntuaci\u00f3n: {score}/10"):
                     st.write(f"**Razonamiento:** {rev.get('reasoning')}")
                     st.write(f"**Riesgos:** {rev.get('risks')}")
-                    st.write(f"**Recomendacion:** {rev.get('recommendation')}")
+                    st.write(f"**Recomendaci\u00f3n:** {rev.get('recommendation')}")
 
     # --- Tab 3: Data Engineering ---
     with tab_de:
-        st.markdown("#### Ingenieria de Datos")
+        st.markdown("#### Ingenier\u00eda de Datos")
 
-        code = result.get('cleaning_code', '# No code available')
-        preview = result.get('cleaned_data_preview', 'No preview available')
+        code = result.get('cleaning_code', '')
+        preview = result.get('cleaned_data_preview', '')
 
         col_de_code, col_de_preview = st.columns(2)
 
         with col_de_code:
-            st.markdown("**Script de Limpieza Generado**")
-            st.code(code, language='python')
+            st.markdown("**Script de Procesamiento Generado**")
+            if code:
+                st.code(code, language='python')
+            else:
+                st.info("No se gener\u00f3 c\u00f3digo de procesamiento en esta ejecuci\u00f3n.")
 
         with col_de_preview:
-            st.markdown("**Vista Previa (Cleaned Data)**")
+            st.markdown("**Vista Previa de Datos Procesados**")
             if isinstance(preview, str) and preview.strip().startswith('{'):
                 try:
                     from io import StringIO
                     st.dataframe(pd.read_json(StringIO(preview), orient='split'), use_container_width=True)
-                except Exception as e:
-                    st.write(f"Cannot render dataframe: {e}")
+                except Exception:
                     st.write(preview)
-            else:
+            elif preview:
                 st.write(preview)
+            else:
+                st.info("No hay vista previa disponible.")
 
-    # --- Tab 4: ML Engineer ---
+    # --- Tab 4: ML Model ---
     with tab3:
-        st.markdown("#### ML Engineer")
+        st.markdown("#### Modelo ML")
 
         col_code, col_out = st.columns(2)
 
         with col_code:
-            st.markdown("**Codigo Generado**")
-            ml_code = result.get('generated_code', '# No code')
+            st.markdown("**C\u00f3digo del Modelo**")
+            ml_code = result.get('generated_code', '')
             if ml_code.strip() == "# Generation Failed":
                 ml_code = result.get('last_generated_code', ml_code)
-            st.code(ml_code, language='python')
+            if ml_code:
+                st.code(ml_code, language='python')
+            else:
+                st.info("No se gener\u00f3 c\u00f3digo de modelo en esta ejecuci\u00f3n.")
 
         with col_out:
-            st.markdown("**Salida de Consola**")
+            st.markdown("**Registro de Ejecuci\u00f3n**")
             ml_output = result.get('execution_output', '')
             last_ok = result.get('last_successful_execution_output')
             if "BUDGET_EXCEEDED" in str(ml_output) and last_ok:
-                ml_output = f"{ml_output}\n\n--- Last successful execution output ---\n{last_ok}"
-            # Render in dark console style
+                ml_output = f"{ml_output}\n\n--- \u00daltima ejecuci\u00f3n exitosa ---\n{last_ok}"
             import html as html_mod
             escaped_output = html_mod.escape(str(ml_output))
-            st.markdown(f'<div class="console-output">{escaped_output}</div>', unsafe_allow_html=True)
+            if escaped_output.strip():
+                st.markdown(f'<div class="console-output">{escaped_output}</div>', unsafe_allow_html=True)
+            else:
+                st.info("No hay registro de ejecuci\u00f3n disponible.")
 
     # --- Tab 5: Executive Report ---
     with tab4:
         st.markdown("#### Informe Ejecutivo")
-        st.markdown(result.get('final_report', 'No disponible'))
+        final_report = result.get('final_report', '')
+        if final_report:
+            st.markdown(final_report)
+        else:
+            st.info("No se gener\u00f3 un informe ejecutivo para esta ejecuci\u00f3n.")
 
         # Plot gallery
         plots = glob.glob("static/plots/*.png")
         if plots:
-            st.markdown("#### Visualizaciones")
+            st.markdown("#### Gr\u00e1ficos y Visualizaciones")
             cols = st.columns(min(len(plots), 3))
             for i, plot_path in enumerate(plots):
                 with cols[i % len(cols)]:
@@ -1713,7 +1925,7 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
 
         # Downloads section
         st.markdown("---")
-        st.markdown("#### Descargas")
+        st.markdown("#### Descargar Resultados")
         dl_col1, dl_col2 = st.columns(2)
 
         # PDF Download
@@ -1724,15 +1936,15 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
                     with open(pdf_path, "rb") as pdf_file:
                         st.session_state['pdf_binary'] = pdf_file.read()
                 except Exception as e:
-                    st.warning(f"Could not reload PDF: {e}")
+                    st.warning(f"No se pudo cargar el PDF: {e}")
 
         with dl_col1:
             if 'pdf_binary' in st.session_state:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M')
                 st.download_button(
-                    label="Descargar Reporte PDF",
+                    label="Descargar Informe PDF",
                     data=st.session_state['pdf_binary'],
-                    file_name=f"Reporte_Ejecutivo_{timestamp}.pdf",
+                    file_name=f"Informe_Ejecutivo_{timestamp}.pdf",
                     mime="application/pdf",
                     use_container_width=True
                 )
@@ -1752,20 +1964,20 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
                 zip_buffer.seek(0)
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M')
                 st.download_button(
-                    label="Descargar Entregables ML (ZIP)",
+                    label="Descargar Artefactos ML (ZIP)",
                     data=zip_buffer.getvalue(),
                     file_name=f"Entregables_ML_{timestamp}.zip",
                     mime="application/zip",
                     use_container_width=True
                 )
             else:
-                st.info("No se encontraron entregables ML en esta ejecucion.")
+                st.info("No se encontraron artefactos ML en esta ejecuci\u00f3n.")
 
 # ---------------------------------------------------------------------------
 # Footer
 # ---------------------------------------------------------------------------
 st.markdown("""
 <div class="footer">
-    <span>&copy; 2025 StrategyEngine AI &mdash; Powered by Multi-Agent AI</span>
+    <span>&copy; 2026 StrategyEngine AI &mdash; Plataforma de IA Multi-Agente</span>
 </div>
 """, unsafe_allow_html=True)

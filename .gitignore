@@ -131,3 +131,6 @@ tools/wids_2026_prep/output/*
 
 # Product roadmap (internal only)
 PRODUCT_ROADMAP.md
+
+# Encrypted API keys store (never commit)
+data/api_keys.enc
