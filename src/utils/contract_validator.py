@@ -2532,6 +2532,10 @@ _SCHEMA_STANDARDIZATION_PATTERN = re.compile(
     r"\b(schema|schema_version|column\s+name|column\s+names|naming|format)\b",
     re.IGNORECASE,
 )
+_DTYPE_QUALIFIER_PATTERN = re.compile(
+    r"\b(dtype|dtypes|data\s*type|data\s*types|tipo\s*de\s*dato|tipos\s*de\s*datos)\b",
+    re.IGNORECASE,
+)
 _ACTION_NEGATION_PATTERN = re.compile(
     r"(do\s+not|don't|must\s+not|never|avoid|forbid|forbidden|prohibido|no\s+debe|no\b|sin\b)",
     re.IGNORECASE,
@@ -2668,6 +2672,9 @@ def _has_non_negated_feature_scaling_action(text: str) -> bool:
             min(abs(target.start() - action_end), abs(action_start - target.end())) <= 24
             for target in target_matches
         )
+        # "dtype normalization" / "data type normalization" is type coercion, not feature scaling.
+        if _DTYPE_QUALIFIER_PATTERN.search(clause):
+            continue
         if target_is_local:
             return True
         # Ignore schema/format standardization; that is structural cleaning, not feature scaling.

@@ -3798,6 +3798,85 @@ def _deterministic_repair_column_dtype_targets(contract: Dict[str, Any]) -> Dict
     return contract
 
 
+def _synthesize_selectors_from_allowed_feature_sets(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Synthesize required_feature_selectors from allowed_feature_sets selector
+    references and column_roles.  When allowed_feature_sets.model_features
+    contains tokens like ``selector:NUMERIC_PREDICTORS``, we resolve them
+    against column_roles.pre_decision (the canonical source for predictor
+    columns in the contract).
+    """
+    if not isinstance(contract, dict):
+        return []
+    allowed = contract.get("allowed_feature_sets")
+    if not isinstance(allowed, dict):
+        return []
+
+    # Collect selector:NAME references from model_features / segmentation_features
+    selector_refs: Dict[str, str] = {}
+    for key in ("model_features", "segmentation_features"):
+        entries = allowed.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            token = str(entry or "").strip()
+            if token.lower().startswith("selector:"):
+                name = token.split(":", 1)[1].strip()
+                if name:
+                    selector_refs[name] = token
+
+    if not selector_refs:
+        return []
+
+    # Resolve each selector name against column_roles
+    column_roles = contract.get("column_roles")
+    if not isinstance(column_roles, dict):
+        return []
+
+    # Build a map from selector family names to column lists.
+    # Convention: NUMERIC_PREDICTORS → pre_decision columns.
+    # For other names, attempt heuristic mapping via role buckets.
+    _FAMILY_TO_ROLES: Dict[str, List[str]] = {
+        "numeric_predictors": ["pre_decision"],
+        "predictors": ["pre_decision"],
+        "features": ["pre_decision"],
+        "targets": ["outcome"],
+        "multi_horizon_targets": ["outcome"],
+        "auxiliary_signals": ["post_decision_audit_only"],
+    }
+
+    synthesized: List[Dict[str, Any]] = []
+    for name in selector_refs:
+        name_lower = name.lower().replace("-", "_").replace(" ", "_")
+        role_keys = _FAMILY_TO_ROLES.get(name_lower)
+        if not role_keys:
+            # Try partial match
+            for family_key, roles in _FAMILY_TO_ROLES.items():
+                if family_key in name_lower or name_lower in family_key:
+                    role_keys = roles
+                    break
+        if not role_keys:
+            continue
+
+        columns: List[str] = []
+        for role_key in role_keys:
+            role_cols = column_roles.get(role_key)
+            if isinstance(role_cols, list):
+                for col in role_cols:
+                    col_str = str(col or "").strip()
+                    if col_str and col_str not in columns:
+                        columns.append(col_str)
+
+        if columns:
+            synthesized.append({
+                "type": "list",
+                "columns": columns,
+                "name": name,
+            })
+
+    return synthesized
+
+
 def _deterministic_repair_required_feature_selectors(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return contract
@@ -3807,6 +3886,20 @@ def _deterministic_repair_required_feature_selectors(contract: Dict[str, Any]) -
         return contract
 
     selectors_raw = clean_dataset.get("required_feature_selectors")
+
+    # ── Synthesize selectors from allowed_feature_sets when missing ──
+    # If required_feature_selectors is absent/empty but allowed_feature_sets
+    # contains selector:* references, we can resolve them using column_roles
+    # (pre_decision columns map to the selector family).
+    if not selectors_raw or (isinstance(selectors_raw, list) and len(selectors_raw) == 0):
+        synthesized = _synthesize_selectors_from_allowed_feature_sets(contract)
+        if synthesized:
+            selectors_raw = synthesized
+            clean_dataset["required_feature_selectors"] = synthesized
+        else:
+            if selectors_raw is None:
+                return contract
+
     if selectors_raw is None:
         return contract
     if isinstance(selectors_raw, dict):
@@ -4747,6 +4840,7 @@ def _validate_repair_revalidate_loop(
     attempts = max(0, int(max_iterations)) + 1
     for attempt in range(1, attempts + 1):
         working = _apply_planner_structural_support(working)
+        working = _apply_deterministic_repairs(working)
         if preserved_deliverables is not None:
             spec_obj = working.get("spec_extraction")
             if not isinstance(spec_obj, dict):
