@@ -24914,7 +24914,27 @@ def _collect_board_deterministic_blockers(board_context: Dict[str, Any]) -> List
     for issue in output_contract.get("schema_issues") or []:
         _add(f"output_schema_issue:{issue}")
 
+    # During metric improvement rounds in advisory review mode, reviewer and
+    # qa_reviewer packets are stale — they were generated for a prior script
+    # earlier in the iteration and are NOT re-executed each round.  Treating
+    # them as deterministic blockers would veto metric improvements that the
+    # new script may have already fixed.  The result_evaluator IS re-executed
+    # each round, so it remains authoritative.  Runtime and output contract
+    # checks above are also fresh (derived from the current execution).
+    metric_ctx = (
+        board_context.get("metric_improvement_context")
+        if isinstance(board_context.get("metric_improvement_context"), dict)
+        else {}
+    )
+    advisory_review_active = (
+        bool(metric_ctx.get("active"))
+        and str(metric_ctx.get("review_mode") or "").strip().lower()
+        in {"hybrid_guarded", "advisor_only"}
+    )
+
     for key in ("result_evaluator", "reviewer", "qa_reviewer"):
+        if advisory_review_active and key in ("reviewer", "qa_reviewer"):
+            continue
         packet = board_context.get(key) if isinstance(board_context.get(key), dict) else {}
         status = str(packet.get("status") or "").strip().upper()
         status_blockers = {"REJECTED", "FAIL", "FAILED", "ERROR", "CRASH"}
@@ -26121,7 +26141,14 @@ def _metric_improvement_skip_reason(state: Dict[str, Any], contract: Dict[str, A
         )
         if blocking_retry:
             return "review_verdict_not_approved"
-    if not _has_real_baseline_reviewer_approval(state):
+    # In advisory review mode the reviewer/qa_reviewer packets are stale —
+    # they were evaluated against an earlier script in this iteration and are
+    # not re-executed each metric round.  Requiring their approval here would
+    # block continuation even when the new script already fixed the issue.
+    # The result_evaluator (re-run every round) and runtime/output contract
+    # checks remain authoritative.
+    advisory = _is_metric_round_advisory_review_mode(state, contract)
+    if not advisory and not _has_real_baseline_reviewer_approval(state):
         return "baseline_reviewer_pair_not_approved"
     if bool(state.get("execution_error")):
         return "execution_error_present"
@@ -26335,11 +26362,36 @@ def _collect_active_gate_names(contract: Dict[str, Any], phase: Any = None) -> L
 def _is_metric_round_advisory_review_mode(state: Dict[str, Any], contract: Dict[str, Any] | None = None) -> bool:
     if not isinstance(state, dict):
         return False
-    mode = str(
-        state.get("ml_improvement_review_mode")
-        or _resolve_metric_round_review_mode(contract if isinstance(contract, dict) else {})
-    ).strip().lower()
-    return mode in {"hybrid_guarded", "advisor_only"}
+    state_mode = str(state.get("ml_improvement_review_mode") or "").strip().lower()
+    if state_mode:
+        return state_mode in {"hybrid_guarded", "advisor_only"}
+
+    if bool(state.get("ml_improvement_round_active")):
+        mode = _resolve_metric_round_review_mode(contract if isinstance(contract, dict) else {})
+        return mode in {"hybrid_guarded", "advisor_only"}
+
+    policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
+    if not isinstance(policy, dict):
+        policy = {}
+    contract_mode = str(policy.get("metric_round_review_mode") or "").strip().lower()
+    if contract_mode not in {"hybrid_guarded", "advisor_only"}:
+        return False
+
+    # Do not treat the process-wide default review mode as active advisory
+    # behavior outside an actual metric-improvement loop. That would relax the
+    # baseline approval gate globally and leak advisory semantics into
+    # non-metric routing.
+    loop_context_present = any(
+        (
+            bool(state.get("ml_improvement_round_active")),
+            bool(state.get("ml_improvement_output_paths")),
+            bool(state.get("ml_improvement_snapshot_dir")),
+            isinstance(state.get("metric_loop_state"), dict) and bool(state.get("metric_loop_state")),
+            isinstance(state.get("ml_improvement_round_history"), list) and bool(state.get("ml_improvement_round_history")),
+            str(state.get("last_iteration_type") or "").strip().lower() == "metric",
+        )
+    )
+    return loop_context_present
 
 
 def _review_board_blocker_matches_current_state(
