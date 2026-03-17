@@ -27691,6 +27691,15 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     )
     snapshot_dir = Path("work") / f"ml_incumbent_snapshot_r{round_id}"
     _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    # ── Clear stale candidate metrics from previous round ──────────────
+    # Without this, the consolidation node's _resolve_metrics_report_for_facts
+    # reads state["metrics_report"] (left over from the prior round's candidate)
+    # instead of loading fresh artifacts produced by the new candidate.
+    # This caused genuinely improved candidates to be discarded (delta=0).
+    state.pop("metrics_report", None)
+    state.pop("metrics_artifact_snapshot", None)
+
     prior_loop_state = prior_metric_loop_state
     best_metric_so_far = _coerce_float(
         ((prior_loop_state.get("best_observed") or {}).get("metric_value"))

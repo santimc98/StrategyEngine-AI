@@ -348,6 +348,13 @@ def resolve_metric_value(metrics_json: Dict[str, Any], metric_name: str) -> Dict
         score = _score_metric_candidate(metric_name, key)
         if score is None:
             continue
+        # Penalize deeply nested keys — top-level metrics (depth 0) are almost
+        # always the intended primary metric.  Without this, preferred-token
+        # bonuses (e.g. "oof", "cv") on deeply nested per-fold/per-seed values
+        # can outscore the correct shallow aggregate key.
+        depth = key.count(".")
+        if depth > 0:
+            score = max(1, score - depth * 8)
         if best_score is None or score > best_score or (score == best_score and len(key) < len(best_key or key)):
             best_key = str(key)
             best_value = float(value)
