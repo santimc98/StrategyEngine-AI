@@ -1663,6 +1663,73 @@ class BusinessTranslatorAgent:
         run_summary = _safe_load_json("data/run_summary.json") or {}
         recommendations_preview = _safe_load_json("reports/recommendations_preview.json") or {}
         metrics_payload = _safe_load_json("data/metrics.json") or {}
+
+        # ── Canonical metric correction ──────────────────────────────
+        # After metric loop baseline restoration, insights.json and
+        # metrics.json on disk may reflect the LAST attempt (a regression)
+        # rather than the selected incumbent.  state["primary_metric_state"]
+        # is the authoritative source — updated by _finalize_metric_improvement_round.
+        _pms = state.get("primary_metric_state") if isinstance(state.get("primary_metric_state"), dict) else {}
+        _canonical_metric_name = str(_pms.get("primary_metric_name") or "").strip()
+        _canonical_metric_value = _pms.get("primary_metric_value")
+        metric_loop_context: Dict[str, Any] = {}
+        if _canonical_metric_name and _canonical_metric_value is not None:
+            # Patch metrics_payload so all downstream consumers see the correct value
+            if isinstance(metrics_payload, dict) and metrics_payload:
+                _disk_value = metrics_payload.get(_canonical_metric_name)
+                if _disk_value is not None:
+                    try:
+                        if abs(float(_disk_value) - float(_canonical_metric_value)) > 1e-9:
+                            metrics_payload[_canonical_metric_name] = _canonical_metric_value
+                            model_perf = metrics_payload.get("model_performance")
+                            if isinstance(model_perf, dict) and _canonical_metric_name in model_perf:
+                                model_perf[_canonical_metric_name] = _canonical_metric_value
+                    except (TypeError, ValueError):
+                        pass
+            # Patch insights metrics_summary
+            if isinstance(insights, dict) and isinstance(insights.get("metrics_summary"), list):
+                for _ms_item in insights["metrics_summary"]:
+                    if isinstance(_ms_item, dict) and str(_ms_item.get("metric") or "").strip() == _canonical_metric_name:
+                        try:
+                            if abs(float(_ms_item.get("value", 0)) - float(_canonical_metric_value)) > 1e-9:
+                                _ms_item["value"] = _canonical_metric_value
+                        except (TypeError, ValueError):
+                            pass
+                        break
+
+        # ── Metric loop narrative context ────────────────────────────
+        # Load metric_loop_state for round-by-round narrative so the
+        # translator can explain what the optimization loop explored.
+        _mls = _safe_load_json("data/metric_loop_state.json") or {}
+        if isinstance(_mls, dict) and _mls:
+            _incumbent = _mls.get("incumbent") if isinstance(_mls.get("incumbent"), dict) else {}
+            _best_obs = _mls.get("best_observed") if isinstance(_mls.get("best_observed"), dict) else {}
+            _round = _mls.get("round") if isinstance(_mls.get("round"), dict) else {}
+            metric_loop_context = {
+                "active": bool(_mls.get("active")),
+                "incumbent_value": _incumbent.get("metric_value"),
+                "incumbent_source": _incumbent.get("source"),
+                "best_observed_value": _best_obs.get("metric_value"),
+                "best_observed_label": _best_obs.get("label"),
+                "round_id": _round.get("round_id"),
+                "rounds_allowed": _round.get("rounds_allowed"),
+                "no_improve_streak": _round.get("no_improve_streak"),
+                "patience": _round.get("patience"),
+            }
+        round_history = state.get("ml_improvement_round_history")
+        if isinstance(round_history, list) and round_history:
+            metric_loop_context["round_history"] = [
+                {
+                    "round_id": r.get("round_id"),
+                    "baseline_metric": r.get("baseline_metric"),
+                    "candidate_metric": r.get("candidate_metric"),
+                    "kept": r.get("kept"),
+                    "hypothesis": r.get("hypothesis"),
+                }
+                for r in round_history
+                if isinstance(r, dict)
+            ]
+
         steward_signal_pack = _extract_steward_signal_pack(
             steward_summary=steward_summary,
             data_profile=data_profile,
@@ -2131,6 +2198,11 @@ class BusinessTranslatorAgent:
             "artifacts_summary": manifest.get("summary", {}) if isinstance(manifest, dict) else {},
             "decisioning_columns": decisioning_columns,
             "metrics_preview": _flatten_metrics(metrics_payload)[:14] if isinstance(metrics_payload, dict) else [],
+            "canonical_primary_metric": {
+                "name": _canonical_metric_name,
+                "value": _canonical_metric_value,
+                "source": "primary_metric_state (authoritative)",
+            } if _canonical_metric_name and _canonical_metric_value is not None else None,
         }
 
         context_appendix = {
@@ -2151,6 +2223,7 @@ class BusinessTranslatorAgent:
             "plot_insights_json": plot_insights,
             "recommendations_preview": recommendations_preview,
             "run_timeline_context": run_timeline_context,
+            "metric_loop_context": metric_loop_context if metric_loop_context else None,
         }
 
         SYSTEM_PROMPT_TEMPLATE = Template("""
