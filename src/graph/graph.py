@@ -23876,6 +23876,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         for gate in qa_gate_specs
         if isinstance(gate, dict) and str(gate.get("severity") or "HARD").upper() == "HARD"
     }
+    reviewer_gate_specs = (
+        get_reviewer_gates(review_contract) if isinstance(review_contract, dict) else []
+    ) or []
+    hard_reviewer_gates: set[str] = {
+        str(gate.get("name")).lower()
+        for gate in reviewer_gate_specs
+        if isinstance(gate, dict) and str(gate.get("severity") or "HARD").upper() == "HARD"
+    }
 
     column_gate_eval = _evaluate_column_presence_gates(qa_gate_specs)
     if column_gate_eval:
@@ -23957,6 +23965,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                         review_result,
                         reviewer_active_gate_names,
                         actor="reviewer",
+                        hard_gate_names=hard_reviewer_gates,
                     )
                     if metric_round_review_guarded:
                         review_result = _coerce_review_packet_to_nonblocking(
@@ -24046,6 +24055,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                         qa_result,
                         qa_active_gate_names,
                         actor="qa_reviewer",
+                        hard_gate_names=hard_qa_gates,
                     )
                     if metric_round_review_guarded:
                         qa_result = _coerce_review_packet_to_nonblocking(

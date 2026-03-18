@@ -66,12 +66,14 @@ def apply_contract_first_gate_policy(
     packet: Dict[str, Any],
     active_gate_names: List[str],
     actor: str,
+    hard_gate_names: Set[str] | None = None,
 ) -> Dict[str, Any]:
     if not isinstance(packet, dict):
         return {}
 
     result = dict(packet)
     active_set = _normalize_active_gates(active_gate_names)
+    hard_set: Set[str] = {g.lower() for g in (hard_gate_names or set())}
 
     raw_failed = [_extract_gate_name(item) for item in (result.get("failed_gates") or [])]
     raw_hard = [_extract_gate_name(item) for item in (result.get("hard_failures") or [])]
@@ -79,6 +81,7 @@ def apply_contract_first_gate_policy(
 
     failed_active: List[str] = []
     hard_active: List[str] = []
+    soft_active: List[str] = []
     downgraded_gates: List[str] = []
 
     for gate in raw_failed:
@@ -86,6 +89,10 @@ def apply_contract_first_gate_policy(
             continue
         if gate.lower() in active_set:
             failed_active.append(gate)
+            if gate.lower() in hard_set:
+                hard_active.append(gate)
+            else:
+                soft_active.append(gate)
         else:
             downgraded_gates.append(gate)
 
@@ -93,7 +100,10 @@ def apply_contract_first_gate_policy(
         if not gate:
             continue
         if gate.lower() in active_set:
-            hard_active.append(gate)
+            if gate not in hard_active:
+                hard_active.append(gate)
+            if gate not in failed_active:
+                failed_active.append(gate)
         else:
             downgraded_gates.append(gate)
 
@@ -110,6 +120,7 @@ def apply_contract_first_gate_policy(
     downgraded_gates = _dedupe_keep_order(downgraded_gates + downgraded_fixes)
     failed_active = _dedupe_keep_order(failed_active)
     hard_active = _dedupe_keep_order(hard_active)
+    soft_active = _dedupe_keep_order(soft_active)
 
     result["failed_gates"] = failed_active
     result["hard_failures"] = hard_active
@@ -118,6 +129,10 @@ def apply_contract_first_gate_policy(
     result["required_fixes"] = filtered_fixes
 
     warnings = [str(item) for item in (result.get("warnings") or []) if str(item).strip()]
+    if soft_active:
+        soft_note = f"{actor}: soft gate failures kept as advisory -> {sorted([g.lower() for g in soft_active])}"
+        if soft_note not in warnings:
+            warnings.append(soft_note)
     if downgraded_gates:
         downgrade_note = f"{actor}: downgraded non-active gates -> {sorted([g.lower() for g in downgraded_gates])}"
         if downgrade_note not in warnings:
@@ -129,10 +144,15 @@ def apply_contract_first_gate_policy(
     approved_statuses = {"APPROVED", "APPROVE_WITH_WARNINGS", "APPROVED_WITH_WARNINGS", "PASS", "OK", "SUCCESS"}
     rejected_statuses = {"REJECTED", "NEEDS_IMPROVEMENT", "FAIL", "FAILED", "ERROR", "CRASH"}
 
-    has_active_blockers = bool(failed_active or hard_active)
-    if status in approved_statuses and has_active_blockers:
+    has_hard_blockers = bool(hard_active)
+    has_only_soft_failures = bool(failed_active) and not hard_active
+    if status in approved_statuses and has_hard_blockers:
         result["status"] = "REJECTED"
-    elif status in rejected_statuses and not has_active_blockers and downgraded_gates:
+    elif status in approved_statuses and has_only_soft_failures:
+        result["status"] = "APPROVE_WITH_WARNINGS"
+    elif status in rejected_statuses and not has_hard_blockers and downgraded_gates:
+        result["status"] = "APPROVE_WITH_WARNINGS"
+    elif status in rejected_statuses and not has_hard_blockers and has_only_soft_failures:
         result["status"] = "APPROVE_WITH_WARNINGS"
 
     return result

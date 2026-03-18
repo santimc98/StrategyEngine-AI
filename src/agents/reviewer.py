@@ -101,13 +101,21 @@ def apply_reviewer_gate_filter(result: Dict[str, Any], reviewer_gates: List[Any]
         for name in (_normalize_reviewer_gate_name(g) for g in (reviewer_gates or []))
         if name
     ]
+    hard_gate_names: set[str] = {
+        _normalize_reviewer_gate_name(g).lower()
+        for g in (reviewer_gates or [])
+        if isinstance(g, dict) and str(g.get("severity") or "HARD").upper() == "HARD"
+        and _normalize_reviewer_gate_name(g)
+    }
     for invariant_gate in _REVIEWER_INVARIANT_GATES:
         if invariant_gate not in active_gate_names:
             active_gate_names.append(invariant_gate)
+        hard_gate_names.add(invariant_gate.lower())
     return apply_contract_first_gate_policy(
         dict(result),
         active_gate_names,
         actor="reviewer",
+        hard_gate_names=hard_gate_names,
     )
 
 
