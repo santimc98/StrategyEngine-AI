@@ -58,16 +58,16 @@ class DataEngineerAgent:
 
         self.model_name = (
             os.getenv("OPENROUTER_DE_PRIMARY_MODEL")
-            or "moonshotai/kimi-k2.5"
+            or "minimax/minimax-m2.7"
         ).strip()
         self.fallback_model_name = (
             os.getenv("OPENROUTER_DE_FALLBACK_MODEL")
-            or "minimax/minimax-m2.5"
+            or "moonshotai/kimi-k2.5"
         ).strip()
         if not self.model_name:
-            self.model_name = "moonshotai/kimi-k2.5"
+            self.model_name = "minimax/minimax-m2.7"
         if not self.fallback_model_name:
-            self.fallback_model_name = "minimax/minimax-m2.5"
+            self.fallback_model_name = "moonshotai/kimi-k2.5"
         self.logger.info(
             "DATA_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s",
             self.model_name,
@@ -489,7 +489,8 @@ class DataEngineerAgent:
             tail_len = 50000
             data_audit = data_audit[:head_len] + "\n...[AUDIT TRUNCATED FOR CONTEXT SAFETY]...\n" + data_audit[-tail_len:]
         SYSTEM_TEMPLATE = """
-        You are a Senior Data Engineer producing a deterministic cleaning script.
+        You are a Senior Data Engineer. Your mission is to produce one deterministic,
+        executable Python cleaning script for the dataset described below.
 
         === SENIOR ENGINEERING PROTOCOL ===
         $senior_engineering_protocol
@@ -497,112 +498,142 @@ class DataEngineerAgent:
         OPERATING_MODE: $operating_mode
         MODE_NOTE: $repair_notes
 
-        SOURCE-OF-TRUTH PRECEDENCE:
-        1) CLEANING_GATES_CONTEXT + required_columns + required_feature_selectors from DE_VIEW_CONTEXT
-        2) COLUMN_TRANSFORMATIONS_CONTEXT
-        3) ROLE RUNBOOK (advisory)
+        ===================================================================
+        MISSION
+        ===================================================================
+        - Return one complete, runnable Python script that cleans the input CSV
+          and writes the cleaned output + manifest.
+        - Follow the execution contract and cleaning gates as source of truth.
+        - Be universal and adaptive to any CSV and business objective.
 
-        CORE CONSTRAINTS:
-        - Output valid Python code only (no markdown/code fences, no prose, no JSON plans).
-        - No network/system calls (requests/subprocess/os.system forbidden).
-        - No pandas private APIs.
-        - Use only dependencies allowed by RUNTIME_DEPENDENCY_CONTEXT.
-        - Script must parse as valid Python.
+        ===================================================================
+        SOURCE OF TRUTH AND PRECEDENCE
+        ===================================================================
+        1) CLEANING_GATES_CONTEXT + required_columns + required_feature_selectors (authoritative)
+        2) COLUMN_DTYPE_TARGETS_CONTEXT + COLUMN_TRANSFORMATIONS_CONTEXT (authoritative)
+        3) ROLE RUNBOOK (advisory — informs reasoning, does not override gates)
 
-        SANDBOX SECURITY - BLOCKED IMPORTS (HARD CONSTRAINT):
-        These imports are FORBIDDEN and will cause immediate script rejection:
-        - sys, subprocess, socket, requests, httpx, urllib, ftplib
-        - paramiko, selenium, playwright, openai, google.generativeai, builtins
-        - eval(), exec(), compile(), __import__()
-        ALLOWED imports: pandas, numpy, sklearn, scipy, xgboost, lightgbm,
-        matplotlib, seaborn, json, os.path, os.makedirs, csv, math, statistics,
-        collections, itertools, functools, typing, warnings, re, datetime, pathlib.Path
-        If you need sys.stdout or sys.exit, use print() and raise SystemExit instead.
+        ===================================================================
+        ENGINEERING REASONING WORKFLOW (MANDATORY)
+        ===================================================================
+        Before writing any code, reason through the cleaning plan by analyzing the
+        contract inputs. Write your reasoning as comment blocks at the top of the
+        script. This is not optional — it is how you prevent sequencing bugs.
 
-        DTYPE SAFETY PATTERNS:
-        - Read raw CSV with dtype=str and convert explicitly where needed.
-        - Use pd.to_numeric(..., errors='coerce') before numeric casts.
-        - Never cast to int/float directly if nulls are possible.
-        - Use pandas nullable Int64 for integer columns that may contain nulls.
+        # EXECUTION PLAN (reason about these in order):
+        #
+        # 1. LOAD & VALIDATE: Read CSV with dtype=str. Verify required columns exist.
+        #
+        # 2. NULL HANDLING (BEFORE type conversion):
+        #    For each cleaning gate with impute/null semantics, handle nulls NOW.
+        #    CRITICAL: After reading with dtype=str, null cells are real NaN objects
+        #    detectable by .isna(). If you convert to str first (.astype(str)),
+        #    NaN becomes the literal string "nan" and .isna() returns False —
+        #    the imputation silently does nothing. Always impute BEFORE converting
+        #    string columns to their final types.
+        #    - List each column that needs null handling and the strategy.
+        #
+        # 3. TYPE CONVERSION (AFTER null handling):
+        #    Apply COLUMN_DTYPE_TARGETS. Use pd.to_numeric(errors='coerce') for
+        #    numeric columns. For string columns, convert only after nulls are resolved.
+        #    Use pandas nullable Int64/Float64 for nullable integer/float columns.
+        #
+        # 4. CONSTRAINT VALIDATION:
+        #    - HARD gates: check and raise ValueError("CLEANING_GATE_FAILED: ...") if violated.
+        #    - SOFT gates: check and warn if thresholds exceeded, but do not block.
+        #    - Non-nullable columns: verify no unexpected nulls after conversion.
+        #
+        # 5. OUTPUT: Write cleaned CSV and manifest with actual operations performed.
 
-        OUTPUT SAFETY PATTERNS:
-        - Create parent directories before each required write path.
-        - Preserve deterministic column order in cleaned output.
-        - Use robust JSON serialization for numpy/pandas scalar types.
-        - Validate required artifacts exist at exact contract paths.
+        Your Decision Log, Assumptions, and Risks blocks should reflect the specific
+        reasoning you did for THIS dataset — not generic boilerplate.
 
-        WIDE DATASET PATTERNS:
-        - Resolve feature selectors against actual header and verify matched_count > 0.
-        - Prefer vectorized transforms over per-column procedural loops.
-        - Do not enumerate huge homogeneous families manually; use selectors/patterns.
-
-        SCOPE:
-        - Cleaning only (no modeling/scoring/optimization/analytics).
+        ===================================================================
+        HARD CONSTRAINTS
+        ===================================================================
+        - Output valid Python code only. No markdown, no code fences, no prose.
+        - Scope: cleaning only (no modeling, scoring, optimization, or analytics).
         - Read input with pd.read_csv(..., dtype=str, low_memory=False, sep, decimal, encoding from inputs).
         - Write cleaned CSV to $de_output_path.
         - Write manifest to $de_manifest_path.
-        - If outlier policy is enabled for data_engineer/both, write report to $outlier_report_path.
+        - If outlier policy is enabled, write report to $outlier_report_path.
+        - Do not fabricate columns. Do not overwrite the input file.
+        - Missing required columns → fail fast with ValueError.
+        - Use only dependencies from RUNTIME_DEPENDENCY_CONTEXT.
 
-        REQUIRED MANIFEST CONTENT:
-        - output_dialect
-        - row_counts
-        - conversions
-        - contract_conflicts_resolved (empty list if none)
+        SANDBOX SECURITY — BLOCKED IMPORTS:
+        sys, subprocess, socket, requests, httpx, urllib, ftplib, paramiko,
+        selenium, playwright, openai, google.generativeai, builtins,
+        eval(), exec(), compile(), __import__()
+        ALLOWED: pandas, numpy, sklearn, scipy, xgboost, lightgbm, matplotlib,
+        seaborn, json, os.path, os.makedirs, csv, math, statistics, collections,
+        itertools, functools, typing, warnings, re, datetime, pathlib.Path
 
-        COLUMN BEHAVIOR:
-        - required_columns are anchor columns.
-        - Expand required_feature_selectors against input header; expanded columns are required unless
-          explicitly dropped by COLUMN_TRANSFORMATIONS_CONTEXT + allowed drop_policy evidence.
-        - Enforce COLUMN_DTYPE_TARGETS_CONTEXT when provided. For selector-level dtype targets, apply casts
-          over the matched family with null-safe conversions.
-        - Keep optional passthrough columns only if listed and present.
-        - Missing required columns -> fail fast with ValueError.
-        - Never fabricate columns.
+        ===================================================================
+        DATA INTEGRITY PRINCIPLES
+        ===================================================================
+        Think like a senior engineer reviewing your own cleaning code before merge:
 
-        TARGET/PARTITION SAFETY:
-        - Do not impute outcome/target columns unless contract explicitly requests it.
-        - Preserve missingness for partially labeled targets.
-        - Preserve split/partition columns when present.
-        - If integer target can include nulls, use pandas nullable integer dtype.
+        - The operation order matters: null handling → type conversion → validation.
+          Getting this wrong silently corrupts data. Reason about dependencies.
+        - Do not impute outcome/target columns unless the contract explicitly requests it.
+          Preserve missingness for partially labeled targets (e.g., test set rows).
+        - Preserve split/partition columns exactly as-is.
+        - For wide datasets, resolve feature selectors against actual header; prefer
+          vectorized transforms over per-column procedural loops.
+        - Create parent directories before writing. Preserve deterministic column order.
+        - The manifest must reflect ACTUAL operations performed, not planned ones.
+          If an imputation ran, log it. If it was skipped (no nulls found), say so.
 
         REPAIR RULES (when OPERATING_MODE is REPAIR):
-        - Use RUNTIME_ERROR_CONTEXT/PREFLIGHT_ERROR_CONTEXT to fix root causes first.
-        - Keep already-correct logic stable; avoid unrelated rewrites.
+        - Read RUNTIME_ERROR_CONTEXT/PREFLIGHT_ERROR_CONTEXT and diagnose root cause first.
+        - Keep already-correct logic stable; fix only what failed.
         - Prioritize executable syntax and required artifacts.
 
-        TOP-OF-SCRIPT COMMENT BLOCKS (required):
-        # Decision Log:
-        # Assumptions:
-        # Risks & Checks:
+        ===================================================================
+        MANIFEST REQUIREMENTS
+        ===================================================================
+        The manifest JSON must include:
+        - output_dialect: {encoding, sep, decimal}
+        - row_counts: {input, output}
+        - conversions: list of actual transformations applied
+        - contract_conflicts_resolved: list (empty if none)
+        - cleaning_gates_status: {gate_name: "PASSED"|"WARNING_.."|"FAILED_.."}
 
-        INPUT PARAMETERS:
-        - Input: '$input_path'
-        - Encoding: '$csv_encoding' | Sep: '$csv_sep' | Decimal: '$csv_decimal'
-        - DE Cleaning Objective: "$business_objective"
-        - Required Columns (DE View): $required_columns
-        - Optional Passthrough Columns (keep if present): $optional_passthrough_columns
-        - DE_VIEW_CONTEXT (json): $de_view_context
-        - OUTLIER_POLICY_CONTEXT (json): $outlier_policy_context
-        - COLUMN_TRANSFORMATIONS_CONTEXT (json): $column_transformations_context
-        - COLUMN_DTYPE_TARGETS_CONTEXT (json): $column_dtype_targets_context
-        - EXECUTION_CONTRACT_CONTEXT (json): $execution_contract_context
-        - CLEANING_GATES_CONTEXT (json): $cleaning_gates_context
-        - RUNTIME_DEPENDENCY_CONTEXT (json): $runtime_dependency_context
-        - SELECTOR_EXPANSION_CONTEXT (json): $selector_expansion_context
-        - DATA_SAMPLE_CONTEXT (json): $data_sample_context
-        - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook
+        ===================================================================
+        AUTHORITATIVE CONTEXT
+        ===================================================================
+        Input: '$input_path'
+        Encoding: '$csv_encoding' | Sep: '$csv_sep' | Decimal: '$csv_decimal'
+        DE Cleaning Objective: "$business_objective"
+
+        Required Columns (DE View): $required_columns
+        Optional Passthrough Columns: $optional_passthrough_columns
+
+        DE_VIEW_CONTEXT: $de_view_context
+        EXECUTION_CONTRACT_CONTEXT: $execution_contract_context
+        CLEANING_GATES_CONTEXT: $cleaning_gates_context
+        COLUMN_DTYPE_TARGETS_CONTEXT: $column_dtype_targets_context
+        COLUMN_TRANSFORMATIONS_CONTEXT: $column_transformations_context
+        OUTLIER_POLICY_CONTEXT: $outlier_policy_context
+        RUNTIME_DEPENDENCY_CONTEXT: $runtime_dependency_context
+        SELECTOR_EXPANSION_CONTEXT: $selector_expansion_context
+        DATA_SAMPLE_CONTEXT: $data_sample_context
+        ROLE RUNBOOK (Data Engineer): $data_engineer_runbook
 
         DATA AUDIT:
         $data_audit
 
-        CONTRACT-CHECKLIST BEFORE RETURNING (silent self-check):
-        - Python parses without SyntaxError.
-        - Required output paths are used.
-        - HARD gates fail with ValueError("CLEANING_GATE_FAILED: ...") when violated.
-        - No markdown/code fences in output.
+        Return Python code only.
         """
 
-        USER_TEMPLATE = "Generate the cleaning script following Principles."
+        USER_TEMPLATE = (
+            "Analyze the cleaning gates, column dtype targets, and data sample. "
+            "Reason about the correct operation order for THIS specific dataset — "
+            "which columns need null handling before type conversion, which gates "
+            "impose constraints, what the runbook advises. "
+            "Then generate the complete cleaning script."
+        )
 
         # Rendering
         required_columns_payload = de_view.get("required_columns") or strategy.get("required_columns", [])
