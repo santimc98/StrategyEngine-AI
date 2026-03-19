@@ -283,9 +283,45 @@ def test_execution_planner_quality_repair_switches_to_incremental_patch(monkeypa
             "ml_engineer_runbook": "train",
         },
         {
-            "changes": {
-                "qa_gates": [{"name": "metrics_present", "severity": "HARD", "params": {}}],
-            }
+            "contract_version": "4.2",
+            "scope": "full_pipeline",
+            "strategy_title": "Incremental Repair",
+            "business_objective": "Predict churn probability.",
+            "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
+            "canonical_columns": ["customer_id", "__split", "feature_a", "churned"],
+            "required_outputs": ["artifacts/ml/submission.csv"],
+            "column_roles": {
+                "pre_decision": ["feature_a"],
+                "decision": [],
+                "outcome": ["churned"],
+                "post_decision_audit_only": [],
+                "unknown": [],
+                "identifiers": ["customer_id"],
+                "time_columns": [],
+            },
+            "allowed_feature_sets": {
+                "model_features": ["feature_a"],
+                "segmentation_features": [],
+                "forbidden_features": ["churned"],
+                "audit_only_features": ["__split"],
+            },
+            "task_semantics": {
+                "problem_family": "classification",
+                "objective_type": "binary_classification",
+                "primary_target": "churned",
+                "target_columns": ["churned"],
+            },
+            "artifact_requirements": {},
+            "cleaning_gates": [{"name": "no_null_target", "severity": "HARD", "params": {"column": "churned"}}],
+            "qa_gates": [{"name": "metrics_present", "severity": "HARD", "params": {}}],
+            "reviewer_gates": [{"name": "strategy_followed", "severity": "HARD", "params": {}}],
+            "data_engineer_runbook": "clean",
+            "ml_engineer_runbook": "train",
+            "model_features": ["feature_a"],
+            "evaluation_spec": {"objective_type": "binary_classification", "primary_metric": "roc_auc", "primary_target": "churned", "label_columns": ["churned"]},
+            "validation_requirements": {"method": "cross_validation", "primary_metric": "roc_auc", "metrics_to_report": ["roc_auc"]},
+            "iteration_policy": {"max_iterations": 6, "metric_improvement_max": 4},
+            "column_dtype_targets": {"churned": {"target_dtype": "int64", "nullable": False}},
         },
     ]
 
@@ -308,7 +344,7 @@ def test_execution_planner_quality_repair_switches_to_incremental_patch(monkeypa
         column_inventory=["customer_id", "__split", "feature_a", "churned"],
     )
 
-    assert calls[:2] == ["contract", "patch"]
+    assert calls[:2] == ["contract", "contract"]
     assert (contract.get("qa_gates") or [])[0]["name"] == "metrics_present"
 
 

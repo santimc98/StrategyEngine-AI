@@ -8071,14 +8071,13 @@ class ExecutionPlannerAgent:
                 head=15000,
                 tail=5000,
             )
+            _required_keys_csv = ", ".join(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)
             return (
-                "Repair the previous execution contract.\n"
-                "Return ONLY one valid JSON patch object for the patch tool (no markdown, no comments, no code fences).\n"
-                "Preferred shape: {\"changes\": {...}} with only the minimal nested fields to deep-merge.\n"
-                "Alternative shape: {\"patch\": [{\"op\":\"replace\",\"path\":\"/a/b\",\"value\":...}]}\n"
-                "Do NOT regenerate the full contract.\n"
-                "Use a repair workflow: re-ground facts, patch only the affected contract fields, then self-check.\n"
-                "Patch policy: keep unchanged valid fields stable; modify ONLY fields needed to resolve listed issues.\n"
+                "Repair the previous execution contract by returning the COMPLETE corrected contract.\n"
+                "Return ONLY valid JSON (no markdown, no comments, no code fences).\n"
+                "Include ALL sections from the previous contract that were valid, plus fix the issues listed below.\n"
+                "Every key listed here MUST be present: " + _required_keys_csv + ".\n"
+                "Do NOT return a patch — return the full contract with fixes applied.\n"
                 "Schema registry examples:\n"
                 + CONTRACT_SCHEMA_EXAMPLES_TEXT
                 + "\n"
@@ -9101,7 +9100,7 @@ domain_expert_critique:
                     break
 
                 current_prompt_name = f"prompt_attempt_{quality_round + 1}_repair.txt"
-                current_tool_mode = "patch"
+                current_tool_mode = "contract"
                 repair_contract = (
                     latest_canonical_for_repair
                     if isinstance(latest_canonical_for_repair, dict)
