@@ -748,6 +748,35 @@ def _apply_schema_coercion(contract: Dict[str, Any]) -> Dict[str, Any]:
                     except (json.JSONDecodeError, ValueError):
                         pass
 
+    # Coerce fields with well-known container types: if the LLM returned a
+    # non-container value (e.g. -1, "none", null) where a list or dict is
+    # expected, replace with the empty container.  This is pure transport
+    # normalization — it preserves "empty" semantics without inventing content.
+    _LIST_KEYS = (
+        "canonical_columns", "required_outputs", "model_features",
+        "cleaning_gates", "qa_gates", "reviewer_gates",
+    )
+    _DICT_KEYS = (
+        "output_dialect", "column_roles", "allowed_feature_sets",
+        "task_semantics", "artifact_requirements", "evaluation_spec",
+        "validation_requirements", "iteration_policy", "column_dtype_targets",
+    )
+    for k in _LIST_KEYS:
+        if k in contract and not isinstance(contract[k], list):
+            contract[k] = []
+    for k in _DICT_KEYS:
+        if k in contract and not isinstance(contract[k], dict):
+            contract[k] = {}
+    # Same for nested fields inside known dicts
+    for nested_dict_key in _DICT_KEYS:
+        obj = contract.get(nested_dict_key)
+        if isinstance(obj, dict):
+            for sub_key, sub_val in list(obj.items()):
+                if sub_key.endswith(("_to_report", "_columns", "_features")) and not isinstance(sub_val, list):
+                    obj[sub_key] = [] if sub_val is not None and sub_val != "" else []
+                elif sub_key == "params" and not isinstance(sub_val, dict):
+                    obj[sub_key] = {}
+
     # Schema registry: dtype key aliases, selector type, gate shape
     contract = apply_contract_schema_registry_repairs(contract)
 

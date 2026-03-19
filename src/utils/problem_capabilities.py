@@ -330,12 +330,15 @@ def infer_problem_capabilities(
     ]
     family = _first_known_family(explicit_candidates)
 
-    metrics = list(validation.get("metrics_to_report") or [])
-    if validation.get("primary_metric"):
-        metrics.append(validation.get("primary_metric"))
-    if eval_spec.get("primary_metric"):
-        metrics.append(eval_spec.get("primary_metric"))
-    metrics.extend(eval_spec.get("metrics_to_report") or [])
+    _vr_metrics = validation.get("metrics_to_report")
+    metrics = list(_vr_metrics) if isinstance(_vr_metrics, list) else []
+    if validation.get("primary_metric") and isinstance(validation["primary_metric"], str):
+        metrics.append(validation["primary_metric"])
+    if eval_spec.get("primary_metric") and isinstance(eval_spec["primary_metric"], str):
+        metrics.append(eval_spec["primary_metric"])
+    _es_metrics = eval_spec.get("metrics_to_report")
+    if isinstance(_es_metrics, list):
+        metrics.extend(_es_metrics)
 
     if family == _UNKNOWN_FAMILY:
         family = _infer_family_from_metrics(metrics)
