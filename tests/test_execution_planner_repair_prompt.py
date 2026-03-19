@@ -32,6 +32,21 @@ def test_minimal_contract_prompt_declares_phased_compilation():
     assert "Phase 4 VALIDATOR_REPAIR" in prompt
 
 
+def test_minimal_contract_prompt_enforces_semantic_closure():
+    prompt = MINIMAL_CONTRACT_COMPILER_PROMPT
+    assert "Phase 2B SEMANTIC_CLOSURE" in prompt
+    assert "Do not leave critical meaning stranded" in prompt
+    assert "Semantic closure rules:" in prompt
+    assert "must be reflected in both" in prompt
+
+
+def test_minimal_contract_prompt_marks_ml_sections_as_required_not_recommended():
+    prompt = MINIMAL_CONTRACT_COMPILER_PROMPT
+    assert "evaluation_spec: REQUIRED finalized section for ML scopes" in prompt
+    assert "validation_requirements: REQUIRED finalized section for ML scopes" in prompt
+    assert "column_dtype_targets MUST include anchor columns for ML scopes" in prompt
+
+
 def test_execution_planner_main_prompt_no_longer_includes_deterministic_scaffold(monkeypatch):
     monkeypatch.delenv("EXECUTION_PLANNER_SECTION_FIRST", raising=False)
     monkeypatch.delenv("EXECUTION_PLANNER_PROGRESSIVE_MODE", raising=False)

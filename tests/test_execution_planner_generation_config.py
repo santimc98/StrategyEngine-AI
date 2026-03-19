@@ -37,19 +37,12 @@ def test_execution_planner_dynamic_budget_respects_context_window(monkeypatch):
 
 
 def test_execution_planner_generation_config_includes_response_schema_when_enabled(monkeypatch):
-    monkeypatch.setenv("EXECUTION_PLANNER_USE_RESPONSE_SCHEMA", "1")
     agent = ExecutionPlannerAgent(api_key=None)
 
     cfg = agent._generation_config_for_prompt("short prompt")
 
-    assert "response_schema" in cfg
-    schema = cfg.get("response_schema") or {}
-    assert schema.get("type") == "object"
-    props = schema.get("properties") or {}
-    assert "scope" in props
-    assert "task_semantics" in props
-    assert "column_roles" in props
-    assert "artifact_requirements" in props
+    assert "response_schema" not in cfg
+    assert cfg.get("response_mime_type") == "application/json"
 
 
 def test_execution_planner_canonical_schema_required_surface_is_semantic_first():
@@ -63,7 +56,6 @@ def test_execution_planner_canonical_schema_required_surface_is_semantic_first()
 
 
 def test_execution_planner_generate_content_retries_without_response_schema(monkeypatch):
-    monkeypatch.setenv("EXECUTION_PLANNER_USE_RESPONSE_SCHEMA", "1")
     agent = ExecutionPlannerAgent(api_key=None)
 
     class _FakeModel:
@@ -72,53 +64,61 @@ def test_execution_planner_generate_content_retries_without_response_schema(monk
 
         def generate_content(self, prompt, generation_config=None):
             self.calls.append({"prompt": prompt, "generation_config": generation_config})
-            if isinstance(generation_config, dict) and "response_schema" in generation_config:
-                raise ValueError("Unknown field response_schema")
             return type("_Resp", (), {"text": "{}"})()
 
     fake_model = _FakeModel()
     response, used_config = agent._generate_content_with_budget(fake_model, "prompt")
 
     assert getattr(response, "text", "") == "{}"
-    assert len(fake_model.calls) == 2
+    assert len(fake_model.calls) == 1
     first_cfg = fake_model.calls[0].get("generation_config") or {}
-    second_cfg = fake_model.calls[1].get("generation_config") or {}
-    assert "response_schema" in first_cfg
-    assert "response_schema" not in second_cfg
-    assert "response_schema" not in used_config
-    assert used_config.get("response_mime_type") == "application/json"
+    assert "tools" in first_cfg
+    assert "tool_config" in first_cfg
+    assert "response_mime_type" not in first_cfg
+    assert "response_schema" not in first_cfg
+    assert "tools" in used_config
+    assert "tool_config" in used_config
 
 
-def test_execution_planner_defaults_to_openai_function_calling_stack(monkeypatch):
-    monkeypatch.delenv("EXECUTION_PLANNER_PROVIDER", raising=False)
+def test_execution_planner_defaults_to_google_function_calling_stack(monkeypatch):
     monkeypatch.delenv("EXECUTION_PLANNER_PRIMARY_MODEL", raising=False)
     monkeypatch.delenv("EXECUTION_PLANNER_MODEL", raising=False)
 
     agent = ExecutionPlannerAgent(api_key=None)
 
-    assert agent.provider == "openrouter"
-    assert agent.model_name == "openai/gpt-5.4"
+    assert agent.provider == "google"
+    assert agent.model_name == "gemini-3.1-pro-preview"
 
 
-def test_execution_planner_forces_openrouter_even_if_provider_env_requests_openai(monkeypatch):
-    monkeypatch.setenv("EXECUTION_PLANNER_PROVIDER", "openai")
+def test_execution_planner_uses_google_api_key_env(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
 
-    agent = ExecutionPlannerAgent(api_key=None)
+    captured = {}
 
-    assert agent.provider == "openrouter"
-    assert agent.base_url == "https://openrouter.ai/api/v1"
+    class _FakeAdapter:
+        def __init__(self, api_key, model_name):
+            captured["api_key"] = api_key
+            captured["model_name"] = model_name
+
+    monkeypatch.setattr(
+        "src.agents.execution_planner._GeminiGenerateContentAdapter",
+        _FakeAdapter,
+    )
+
+    agent = ExecutionPlannerAgent()
+
+    assert agent.provider == "google"
+    assert captured.get("api_key") == "test-google-key"
+    assert captured.get("model_name") == "gemini-3.1-pro-preview"
 
 
 def test_execution_planner_extracts_tool_call_arguments():
     agent = ExecutionPlannerAgent(api_key=None)
 
-    function_obj = type("_Fn", (), {"arguments": '{"scope":"full_pipeline"}'})()
-    tool_call = type("_ToolCall", (), {"function": function_obj})()
-    message = type("_Msg", (), {"tool_calls": [tool_call], "content": None})()
-    choice = type("_Choice", (), {"message": message})()
-    response = type("_Resp", (), {"choices": [choice]})()
+    function_call = type("_FnCall", (), {"args": {"scope": "full_pipeline"}})()
+    response = type("_Resp", (), {"function_calls": [function_call]})()
 
-    assert agent._extract_openai_response_text(response) == '{"scope":"full_pipeline"}'
+    assert agent._extract_openai_response_text(response) == '{"scope": "full_pipeline"}'
 
 
 def test_execution_planner_unwraps_transport_payload():

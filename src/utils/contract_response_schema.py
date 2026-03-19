@@ -273,6 +273,7 @@ EXECUTION_CONTRACT_CANONICAL_SCHEMA: Dict[str, Any] = {
             "additionalProperties": True,
         },
         "artifact_requirements": {"type": "object", "additionalProperties": True},
+        "model_features": {"type": "array", "items": {"type": "string"}},
         "column_dtype_targets": _COLUMN_DTYPE_TARGETS_SCHEMA,
         "cleaning_gates": _GATE_LIST_SCHEMA,
         "qa_gates": _GATE_LIST_SCHEMA,

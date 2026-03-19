@@ -9,7 +9,8 @@ import re
 import difflib
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from google import genai
+from google.genai import types as genai_types
 from src.utils.contract_validation import (
     DEFAULT_DATA_ENGINEER_RUNBOOK,
     DEFAULT_ML_ENGINEER_RUNBOOK,
@@ -132,6 +133,57 @@ _EXECUTION_CONTRACT_PATCH_SCHEMA: Dict[str, Any] = {
     },
 }
 
+
+class _GeminiGenerateContentAdapter:
+    """Small adapter to preserve the repo's generate_content-style call surface."""
+
+    def __init__(self, api_key: str, model_name: str):
+        self.api_key = str(api_key or "").strip()
+        self.model_name = str(model_name or "").strip()
+        self._client = genai.Client(api_key=self.api_key)
+
+    @staticmethod
+    def _normalize_generation_config(
+        generation_config: Dict[str, Any] | genai_types.GenerateContentConfig | None,
+    ) -> genai_types.GenerateContentConfig | None:
+        if generation_config is None:
+            return None
+        if isinstance(generation_config, genai_types.GenerateContentConfig):
+            return generation_config
+        if not isinstance(generation_config, dict):
+            return None
+        payload: Dict[str, Any] = {}
+        key_map = {
+            "temperature": "temperature",
+            "top_p": "topP",
+            "top_k": "topK",
+            "candidate_count": "candidateCount",
+            "max_output_tokens": "maxOutputTokens",
+            "stop_sequences": "stopSequences",
+            "response_mime_type": "responseMimeType",
+            "response_schema": "responseSchema",
+            "response_json_schema": "responseJsonSchema",
+            "tools": "tools",
+            "tool_config": "toolConfig",
+            "automatic_function_calling": "automaticFunctionCalling",
+            "thinking_config": "thinkingConfig",
+        }
+        for src_key, dst_key in key_map.items():
+            value = generation_config.get(src_key)
+            if value is None and src_key != dst_key:
+                value = generation_config.get(dst_key)
+            if value is not None:
+                payload[dst_key] = value
+        return genai_types.GenerateContentConfig(**payload)
+
+    def generate_content(self, prompt: str, generation_config: Dict[str, Any] | None = None):
+        config = self._normalize_generation_config(generation_config)
+        return self._client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config=config,
+        )
+
 MINIMAL_CONTRACT_COMPILER_PROMPT = """
 You are an Execution Contract Compiler for a multi-agent business intelligence system.
 
@@ -147,6 +199,11 @@ Phased contract compilation protocol (use internally as a guide, not as a rigid 
 - Phase 2 CONTRACT_BUILDER:
   - Turn the grounded facts into executable fields that downstream agents can consume.
   - Keep interfaces consumable by data_engineer, ml_engineer, QA, reviewers, and translator views.
+- Phase 2B SEMANTIC_CLOSURE:
+  - Close all dependent canonical sections implied by the semantics you already declared.
+  - Do not leave critical meaning stranded in strategy text, task_semantics, gates, or runbooks.
+  - If you state a target, metric, split protocol, feature set, or anchor column anywhere,
+    mirror it into the canonical sections that downstream agents execute against.
 - Phase 3 GATE_COMPOSER:
   - Compose only the gates justified by the contract and risk surface, using stable semantics (name/severity/params).
   - Prefer universal gate primitives; avoid one-off ad hoc gates when an equivalent primitive exists.
@@ -162,6 +219,8 @@ Output discipline:
 - Populate every required canonical section with grounded content from the inputs.
 - Keep the canonical contract semantic-first: include grounded intent and interfaces, not filler.
 - You MUST populate every required section listed below. No section will be auto-filled or projected after your output. If you omit a required section, it will be missing in the final contract and downstream agents will fail.
+- A senior planner never leaves a contract semantically half-compiled.  If one section implies another,
+  you must close that dependency inside the contract you return.
 
 Return format:
 - Return ONLY valid JSON (no markdown, no code fences, no comments).
@@ -182,6 +241,8 @@ Sections you MUST generate yourself (previously auto-projected, now YOUR respons
   - metric_definition_rule: string (human-readable description of how the metric is calculated)
   - label_columns: list[str] (all target/label columns used for training)
   Derive these from task_semantics, column_roles.outcome, and the business objective.
+  If the metric or protocol appears in strategy, qa_gates, reviewer_gates, or runbooks,
+  it MUST also be materialized here.  Do not leave metric semantics only in gate prose.
 
 - validation_requirements: object with keys:
   - method: string ("cross_validation" or "holdout")
@@ -189,16 +250,20 @@ Sections you MUST generate yourself (previously auto-projected, now YOUR respons
   - metrics_to_report: list[str] (metrics to compute and report)
   - params: object (e.g. {"n_splits": 5, "n_repeats": 2, "stratify": true} for CV)
   Derive from task_semantics and the nature of the problem.
+  If you define a validation protocol anywhere else in the contract, close it here explicitly.
 
 - iteration_policy: object with keys:
   - max_iterations: int (total pipeline attempts; default 6 for full_pipeline, 3 for cleaning_only)
   - metric_improvement_max: int (max metric improvement rounds; default 4 for full_pipeline)
   - runtime_fix_max: int (max runtime error retries; default 3)
   - compliance_bootstrap_max: int (max compliance fix attempts; default 2)
+  Choose values that fit the scope and difficulty, but always return a complete policy object.
 
 - column_dtype_targets: object mapping column_name -> {"target_dtype": string, "nullable": bool, "role": string, "source": string}.
   MUST include at least: all outcome columns, identifier columns, split columns, time columns, and decision columns.
   For wide feature families, you may use a representative subset.
+  If explicit physical dtypes are not directly stated, infer contract-safe dtypes from semantic role,
+  observed values/profile context, and downstream usage.  Do not leave anchor dtypes unspecified.
 
 - model_features: list[str] — the explicit list of column names the ML engineer should use as model inputs.
   This MUST match allowed_feature_sets.model_features. Having it as a top-level key ensures downstream
@@ -209,6 +274,8 @@ Sections you MUST generate yourself (previously auto-projected, now YOUR respons
   CRITICAL: Do NOT include "decision" role columns here. Decision columns (e.g. predicted probabilities)
   are MODEL OUTPUTS that do not exist in the raw data. Including them would create empty placeholder
   columns that contaminate the feature set.
+  If you declare model_features / allowed_feature_sets / column_roles, you must close clean_dataset coverage
+  from those declarations instead of leaving coverage implicit.
 
 Canonical contract interface (required top-level sections):
 - scope: one of ["cleaning_only", "ml_only", "full_pipeline"]
@@ -281,10 +348,10 @@ Scope-dependent required fields:
   - qa_gates: list of gate objects
   - reviewer_gates: list of gate objects
   - ml_engineer_runbook: object/list/string with actionable steps
-  - evaluation_spec: strongly recommended when the strategy implies a specific metric/split protocol
-  - validation_requirements: strongly recommended when the strategy implies a specific benchmark protocol
+  - evaluation_spec: REQUIRED finalized section for ML scopes
+  - validation_requirements: REQUIRED finalized section for ML scopes
   - objective_analysis.problem_type OR evaluation_spec.objective_type OR task_semantics.objective_type must be present
-  - column_dtype_targets should be provided when grounded by the data/profile; otherwise the runtime will project anchor dtypes conservatively from the canonical contract.
+  - column_dtype_targets MUST include anchor columns for ML scopes; infer conservative but explicit anchor dtypes yourself when needed.
 
 Gate object contract (for cleaning_gates / qa_gates / reviewer_gates):
 - preferred shape: {"name": string, "severity": "HARD"|"SOFT", "params": object}
@@ -317,6 +384,15 @@ Hard rules:
 - Every requirement must be consumable by at least one downstream agent view.
 - Follow evidence_policy from INPUTS: use direct evidence first, grounded inference second, and avoid unsupported assumptions.
 - Prefer omitting non-grounded operational detail over inventing it. Downstream runtime may project conservative operational defaults from the canonical contract, but it must not invent business intent.
+- Prefer grounded inference over omission for dependent canonical sections. If the contract already contains enough semantic evidence
+  to derive evaluation, validation, required clean coverage, or anchor dtypes, you must derive and materialize them.
+- Semantic closure rules:
+  - Targets declared in task_semantics / column_roles.outcome must be reflected in evaluation_spec.primary_target and evaluation_spec.label_columns.
+  - The optimization metric declared or implied anywhere in strategy, business objective, or gates must be reflected in both
+    evaluation_spec.primary_metric and validation_requirements.primary_metric.
+  - Validation protocol declared or implied anywhere in strategy, gates, or runbooks must be reflected in validation_requirements.method and params.
+  - Model features and role buckets must close artifact_requirements.clean_dataset.required_columns for all non-decision columns needed by ML.
+  - Anchor columns (outcome, identifiers, split, time, decision) must have explicit entries in column_dtype_targets.
 - You may add extra fields if useful, but do not omit required minimum fields.
 
 CAPABILITY DETECTION (reason from objective and strategy, do NOT use keyword matching):
@@ -619,6 +695,24 @@ def normalize_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     return contract
 
 
+def _safe_json_serializable(obj: Any) -> Any:
+    """Sanitize an object for JSON serialization, replacing non-serializable values."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            try:
+                json.dumps(v)
+                result[k] = v
+            except (TypeError, ValueError):
+                result[k] = str(type(v).__name__)
+        return result
+    if isinstance(obj, (list, tuple)):
+        return [_safe_json_serializable(item) for item in obj]
+    return str(obj)
+
+
 def _apply_schema_coercion(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     Mechanical type/shape coercion only — no semantic invention.
@@ -632,6 +726,27 @@ def _apply_schema_coercion(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(contract, dict):
         return {}
+
+    # Deserialize double-encoded JSON strings: some LLMs return nested objects
+    # as stringified JSON (e.g. "clean_dataset": "{\"output_path\": ...}").
+    # This is a mechanical transport artifact, not a semantic issue.
+    for key, value in list(contract.items()):
+        if isinstance(value, str) and value.strip().startswith("{"):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, dict):
+                    contract[key] = parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+        elif isinstance(value, dict):
+            for sub_key, sub_value in list(value.items()):
+                if isinstance(sub_value, str) and sub_value.strip().startswith(("{", "[")):
+                    try:
+                        parsed = json.loads(sub_value)
+                        if isinstance(parsed, (dict, list)):
+                            value[sub_key] = parsed
+                    except (json.JSONDecodeError, ValueError):
+                        pass
 
     # Schema registry: dtype key aliases, selector type, gate shape
     contract = apply_contract_schema_registry_repairs(contract)
@@ -6749,14 +6864,11 @@ class ExecutionPlannerAgent:
         # Explicit `api_key=None` means "disable external LLM client" (used by tests/fallback paths).
         # Omitting the argument keeps env-based resolution for runtime behavior.
         if api_key is _API_KEY_SENTINEL:
-            resolved_api_key = (
-                os.getenv("EXECUTION_PLANNER_API_KEY")
-                or os.getenv("OPENROUTER_API_KEY")
-            )
+            resolved_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         else:
             resolved_api_key = api_key
         self.api_key = str(resolved_api_key).strip() if resolved_api_key not in (None, "") else None
-        self.provider = "openrouter"
+        self.provider = "google"
         max_output_tokens = 16384
         try:
             max_output_tokens = int(os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "16384"))
@@ -6775,35 +6887,18 @@ class ExecutionPlannerAgent:
             "response_mime_type": "application/json",
             "max_output_tokens": self._default_max_output_tokens,
         }
-        schema_flag = str(os.getenv("EXECUTION_PLANNER_USE_RESPONSE_SCHEMA", "0")).strip().lower()
-        self._use_response_schema = schema_flag not in {"0", "false", "no", "off", ""}
-        base_url = os.getenv("EXECUTION_PLANNER_BASE_URL", "").strip()
-        if not base_url:
-            base_url = "https://openrouter.ai/api/v1"
-        self.base_url = base_url or None
         self.model_name = (
             os.getenv("EXECUTION_PLANNER_PRIMARY_MODEL")
             or os.getenv("EXECUTION_PLANNER_MODEL")
-            or "openai/gpt-5.4"
+            or "gemini-3.1-pro-preview"
         ).strip()
         if not self.model_name:
-            self.model_name = "openai/gpt-5.4"
+            self.model_name = "gemini-3.1-pro-preview"
+        self.base_url = None
         if not self.api_key:
             self.client = None
         else:
-            client_kwargs: Dict[str, Any] = {"api_key": self.api_key}
-            if self.base_url:
-                client_kwargs["base_url"] = self.base_url
-            headers: Dict[str, str] = {}
-            referer = os.getenv("OPENROUTER_HTTP_REFERER")
-            if referer:
-                headers["HTTP-Referer"] = referer
-            title = os.getenv("OPENROUTER_X_TITLE")
-            if title:
-                headers["X-Title"] = title
-            if headers:
-                client_kwargs["default_headers"] = headers
-            self.client = OpenAI(**client_kwargs)
+            self.client = _GeminiGenerateContentAdapter(self.api_key, self.model_name)
         chain_raw = os.getenv("EXECUTION_PLANNER_MODEL_CHAIN", "")
         chain: List[str] = [self.model_name]
         if isinstance(chain_raw, str) and chain_raw.strip():
@@ -6833,41 +6928,61 @@ class ExecutionPlannerAgent:
             budgeted_max = min(self._default_max_output_tokens, max(floor, int(available)))
         config = dict(self._generation_config)
         config["max_output_tokens"] = int(budgeted_max)
-        if self._use_response_schema:
-            config["response_schema"] = copy.deepcopy(EXECUTION_CONTRACT_TRANSPORT_SCHEMA)
         return config
 
     @staticmethod
-    def _is_response_schema_unsupported_error(err: Exception) -> bool:
-        message = str(err or "").lower()
-        if "response_schema" not in message and "json_schema" not in message and "tool" not in message:
-            return False
-        unsupported_tokens = (
-            "unknown field",
-            "unknown name",
-            "not supported",
-            "unsupported",
-            "unrecognized",
-            "no such field",
-            "schema not supported",
+    def _build_gemini_function_tool(name: str, description: str, schema: Dict[str, Any]) -> genai_types.Tool:
+        return genai_types.Tool(
+            functionDeclarations=[
+                genai_types.FunctionDeclaration(
+                    name=name,
+                    description=description,
+                    parametersJsonSchema=copy.deepcopy(schema),
+                )
+            ]
         )
-        return any(token in message for token in unsupported_tokens)
 
     @staticmethod
-    def _build_function_tool(name: str, description: str, schema: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": copy.deepcopy(schema),
-            },
-        }
+    def _build_gemini_tool_config(name: str) -> genai_types.ToolConfig:
+        return genai_types.ToolConfig(
+            functionCallingConfig=genai_types.FunctionCallingConfig(
+                mode="ANY",
+                allowedFunctionNames=[name],
+            )
+        )
 
     @staticmethod
     def _extract_openai_response_text(response: Any) -> str:
         if response is None:
             return ""
+        try:
+            function_calls = getattr(response, "function_calls", None)
+            if isinstance(function_calls, list) and function_calls:
+                first_call = function_calls[0]
+                args = getattr(first_call, "args", None)
+                if isinstance(args, dict):
+                    return json.dumps(args, ensure_ascii=False)
+                if isinstance(args, str) and args.strip():
+                    return args.strip()
+        except Exception:
+            pass
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            if candidates:
+                first_candidate = candidates[0]
+                content = getattr(first_candidate, "content", None)
+                parts = getattr(content, "parts", None) if content is not None else None
+                if isinstance(parts, list):
+                    for part in parts:
+                        function_call = getattr(part, "function_call", None) or getattr(part, "functionCall", None)
+                        if function_call is not None:
+                            args = getattr(function_call, "args", None)
+                            if isinstance(args, dict):
+                                return json.dumps(args, ensure_ascii=False)
+                            if isinstance(args, str) and args.strip():
+                                return args.strip()
+        except Exception:
+            pass
         try:
             choices = getattr(response, "choices", None) or []
             if choices:
@@ -6891,6 +7006,13 @@ class ExecutionPlannerAgent:
     @staticmethod
     def _extract_openai_finish_reason(response: Any) -> Any:
         try:
+            candidates = getattr(response, "candidates", None) or []
+            if candidates:
+                first_candidate = candidates[0]
+                return getattr(first_candidate, "finish_reason", None) or getattr(first_candidate, "finishReason", None)
+        except Exception:
+            return None
+        try:
             choices = getattr(response, "choices", None) or []
             if choices:
                 return getattr(choices[0], "finish_reason", None)
@@ -6909,78 +7031,40 @@ class ExecutionPlannerAgent:
     ):
         generation_config = self._generation_config_for_prompt(prompt, output_token_floor=output_token_floor)
         if hasattr(model_client, "generate_content"):
-            try:
-                response = model_client.generate_content(prompt, generation_config=generation_config)
-            except TypeError:
-                response = model_client.generate_content(prompt)
-            except Exception as err:
-                if (
-                    "response_schema" in generation_config
-                    and self._is_response_schema_unsupported_error(err)
-                ):
-                    retry_config = dict(generation_config)
-                    retry_config.pop("response_schema", None)
-                    try:
-                        response = model_client.generate_content(prompt, generation_config=retry_config)
-                    except TypeError:
-                        response = model_client.generate_content(prompt)
-                    generation_config = retry_config
-                else:
-                    raise
-            return response, generation_config
-
-        selected_model = str(model_name or self.model_name or "").strip() or self.model_name
-        schema = (
-            copy.deepcopy(_EXECUTION_CONTRACT_PATCH_SCHEMA)
-            if tool_mode == "patch"
-            else copy.deepcopy(EXECUTION_CONTRACT_TRANSPORT_SCHEMA)
-        )
-        tool = self._build_function_tool(
-            _EXECUTION_CONTRACT_PATCH_TOOL_NAME if tool_mode == "patch" else _EXECUTION_CONTRACT_TOOL_NAME,
-            (
+            used_config = dict(generation_config or {})
+            used_config.pop("response_mime_type", None)
+            used_config.pop("response_schema", None)
+            tool_name = _EXECUTION_CONTRACT_PATCH_TOOL_NAME if tool_mode == "patch" else _EXECUTION_CONTRACT_TOOL_NAME
+            tool_schema = (
+                copy.deepcopy(_EXECUTION_CONTRACT_PATCH_SCHEMA)
+                if tool_mode == "patch"
+                else copy.deepcopy(EXECUTION_CONTRACT_TRANSPORT_SCHEMA)
+            )
+            tool_description = (
                 "Return a minimal repair payload for the current canonical execution contract."
                 if tool_mode == "patch"
                 else "Return the complete canonical execution contract JSON object."
-            ),
-            schema,
-        )
-        messages = [{"role": "user", "content": prompt}]
-        call_kwargs: Dict[str, Any] = {
-            "model": selected_model,
-            "messages": messages,
-            "temperature": float(generation_config.get("temperature", 0.0)),
-            "max_tokens": int(generation_config.get("max_output_tokens", self._default_max_output_tokens)),
-            "tools": [tool],
-            "tool_choice": {
-                "type": "function",
-                "function": {
-                    "name": _EXECUTION_CONTRACT_PATCH_TOOL_NAME if tool_mode == "patch" else _EXECUTION_CONTRACT_TOOL_NAME
-                },
-            },
-        }
-        top_p = generation_config.get("top_p")
-        if top_p is not None:
-            call_kwargs["top_p"] = top_p
-        try:
-            response = model_client.chat.completions.create(**call_kwargs)
-        except TypeError:
-            retry_kwargs = dict(call_kwargs)
-            retry_kwargs.pop("temperature", None)
-            retry_kwargs.pop("top_p", None)
-            response = model_client.chat.completions.create(**retry_kwargs)
-        except Exception as err:
-            if self._is_response_schema_unsupported_error(err):
-                fallback_kwargs = dict(call_kwargs)
-                fallback_kwargs.pop("tool_choice", None)
-                response = model_client.chat.completions.create(**fallback_kwargs)
-            else:
+            )
+            used_config["tools"] = [self._build_gemini_function_tool(tool_name, tool_description, tool_schema)]
+            used_config["tool_config"] = self._build_gemini_tool_config(tool_name)
+            try:
+                response = model_client.generate_content(prompt, generation_config=used_config)
+            except TypeError:
+                response = model_client.generate_content(prompt)
+            except Exception:
                 raise
-        return response, generation_config
+            return response, used_config
+
+        raise TypeError("Execution planner model client must expose generate_content for Google function calling.")
 
     def _build_model_client(self, model_name: str) -> Any:
         if not self.api_key:
             return None
-        return self.client
+        if not isinstance(self.client, _GeminiGenerateContentAdapter):
+            return self.client
+        if str(model_name or "").strip() == str(self.client.model_name or "").strip():
+            return self.client
+        return _GeminiGenerateContentAdapter(self.api_key, model_name)
 
     def generate_contract(
         self,
@@ -7568,6 +7652,9 @@ class ExecutionPlannerAgent:
                 "candidates_token_count",
                 "completion_token_count",
                 "total_token_count",
+                "promptTokenCount",
+                "candidatesTokenCount",
+                "totalTokenCount",
                 "prompt_tokens",
                 "completion_tokens",
                 "total_tokens",
@@ -7586,6 +7673,12 @@ class ExecutionPlannerAgent:
                 usage_payload["completion_token_count"] = usage_payload.get("completion_tokens")
             if "total_tokens" in usage_payload and "total_token_count" not in usage_payload:
                 usage_payload["total_token_count"] = usage_payload.get("total_tokens")
+            if "promptTokenCount" in usage_payload and "prompt_token_count" not in usage_payload:
+                usage_payload["prompt_token_count"] = usage_payload.get("promptTokenCount")
+            if "candidatesTokenCount" in usage_payload and "candidates_token_count" not in usage_payload:
+                usage_payload["candidates_token_count"] = usage_payload.get("candidatesTokenCount")
+            if "totalTokenCount" in usage_payload and "total_token_count" not in usage_payload:
+                usage_payload["total_token_count"] = usage_payload.get("totalTokenCount")
             return usage_payload or {"value": str(raw_usage)}
 
         def _build_parse_feedback(raw_text: str | None, parse_error: Exception | None) -> str:
@@ -8800,7 +8893,13 @@ domain_expert_critique:
             "If any key is missing, add it now.  Omitting a required section will fail validation.\n"
             "For sections where you lack explicit input evidence, reason from the business objective, "
             "task_semantics, and column_roles to derive sensible defaults — a senior planner always "
-            "produces a complete contract, never a partial one."
+            "produces a complete contract, never a partial one.\n"
+            "Semantic closure self-check:\n"
+            "- If targets are declared, evaluation_spec must name the primary target and label columns.\n"
+            "- If a metric appears anywhere in strategy/objective/gates/runbooks, it must appear in both evaluation_spec.primary_metric and validation_requirements.primary_metric.\n"
+            "- If a validation protocol is implied anywhere, validation_requirements must close it explicitly.\n"
+            "- If model_features / allowed_feature_sets / column_roles imply ML input columns, artifact_requirements.clean_dataset.required_columns must cover them.\n"
+            "- If anchor columns exist (outcome, identifiers, split, time, decision), column_dtype_targets must include explicit entries for those anchors."
         )
 
         full_prompt = (
@@ -8921,7 +9020,7 @@ domain_expert_critique:
                         transport_validation_result = _build_transport_validation(parsed)
                         if parsed_payload is not None and not isinstance(parsed_payload, dict):
                             parse_error = ValueError("Parsed JSON is not an object")
-                        elif parsed is None:
+                        elif parsed is None and parse_error is None:
                             parse_error = ValueError("Parsed tool payload is missing a contract object")
                         elif not _transport_validation_accepted(transport_validation_result):
                             transport_issue = None
@@ -9034,7 +9133,7 @@ domain_expert_critique:
                             "prompt_char_len": len(current_prompt or ""),
                             "response_char_len": len(response_text or ""),
                             "finish_reason": str(finish_reason) if finish_reason is not None else None,
-                            "generation_config": generation_config_used,
+                            "generation_config": _safe_json_serializable(generation_config_used),
                             "usage_metadata": usage_metadata,
                             "had_json_parse_error": bool(had_json_parse_error),
                             "transport_status": (
@@ -9121,18 +9220,27 @@ domain_expert_critique:
                     if isinstance(latest_parse_feedback_for_repair, str)
                     else best_parse_feedback
                 )
-                current_prompt = _build_quality_repair_prompt(
-                    previous_contract=repair_contract,
-                    previous_validation=repair_validation,
-                    previous_response_text=repair_response_text,
-                    previous_parse_feedback=repair_parse_feedback,
-                    original_inputs_text=user_input,
+                # Repair uses the full original prompt (with all context including
+                # column_inventory) plus validation feedback appended.  This ensures
+                # the LLM has the same information as attempt 1 and can reason about
+                # all columns, not just those that survived text compression.
+                validation_feedback = _compact_validation_feedback(repair_validation)
+                targeted_actions = _build_targeted_repair_actions(repair_validation)
+                repair_suffix = (
+                    "\n\n--- REPAIR FEEDBACK FROM PREVIOUS ATTEMPT ---\n"
+                    "Your previous contract was rejected. Fix the issues below and return the COMPLETE corrected contract.\n"
+                    f"Every required key MUST be present: {', '.join(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)}.\n"
                 )
+                if targeted_actions.strip():
+                    repair_suffix += f"\nTargeted fixes:\n{targeted_actions}\n"
+                if validation_feedback.strip() and validation_feedback != "No validation feedback available.":
+                    repair_suffix += f"\nValidation issues:\n{validation_feedback}\n"
+                parse_fb = (repair_parse_feedback or "").strip()
+                if parse_fb:
+                    repair_suffix += f"\nParse diagnostics:\n{parse_fb}\n"
                 if not round_has_candidate:
-                    current_prompt = (
-                        current_prompt
-                        + "\n\nPrevious attempts failed JSON parsing. Repair by returning syntactically valid JSON only."
-                    )
+                    repair_suffix += "\nPrevious attempts failed JSON parsing. Return syntactically valid JSON only.\n"
+                current_prompt = full_prompt + repair_suffix
 
         if contract is None:
             invalid_contract = (
