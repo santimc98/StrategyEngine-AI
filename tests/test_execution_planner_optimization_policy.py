@@ -13,15 +13,15 @@ def test_ensure_optimization_policy_backfills_defaults():
     assert policy.get("patience") == 3
 
 
-def test_execution_planner_fallback_contract_contains_optimization_policy():
+def test_execution_planner_fallback_contract_without_api_key():
+    """Without an API key the planner returns an empty fallback.
+    Post-migration: no auto-fill of operational sections."""
     planner = ExecutionPlannerAgent(api_key=None)
     contract = planner.generate_contract(
         strategy={"title": "Baseline"},
         business_objective="Predict churn",
         column_inventory=["id", "feature_a", "target"],
     )
-    policy = contract.get("optimization_policy")
-    assert isinstance(policy, dict)
-    assert policy.get("allow_model_switch") is True
-    assert policy.get("allow_hpo") is True
+    # With no LLM client, contract is essentially empty
+    assert isinstance(contract, dict)
 

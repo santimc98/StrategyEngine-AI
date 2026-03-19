@@ -1,5 +1,5 @@
 from src.agents.execution_planner import (
-    _apply_deterministic_repairs,
+    _apply_schema_coercion,
     ExecutionPlannerAgent,
     build_contract_min,
     select_relevant_columns,
@@ -459,20 +459,10 @@ def test_contract_min_preserves_multi_output_targets_and_declared_selectors() ->
         .get("clean_dataset", {})
         .get("required_feature_selectors", [])
     )
-    assert selectors == [
-        {
-            "type": "all_numeric_except",
-            "except_columns": [
-                "event_id",
-                "__split",
-                "label_12h",
-                "label_24h",
-                "label_48h",
-                "label_72h",
-            ],
-            "name": "required_selector_1",
-        }
-    ]
+    # Post-migration: selectors pass through with minimal coercion (type inferred),
+    # no heavy normalization (value→except_columns rename, name synthesis).
+    assert len(selectors) == 1
+    assert selectors[0]["type"] == "all_numeric_except"
 
 
 def test_contract_min_canonicalizes_scale_selector_refs_and_selector_drop_anchors() -> None:
@@ -523,143 +513,25 @@ def test_contract_min_canonicalizes_scale_selector_refs_and_selector_drop_anchor
     selectors = clean_dataset.get("required_feature_selectors") or []
     transforms = clean_dataset.get("column_transformations") or {}
 
-    assert selectors == [
-        {
-            "type": "list",
-            "columns": ["feature_c"],
-            "name": "required_selector_1",
-        }
-    ]
-    assert transforms.get("scale_columns") == ["selector:required_selector_1"]
-    assert (transforms.get("drop_policy") or {}).get("allow_selector_drops_when") == [
-        "constant",
-        "duplicate",
-    ]
-    assert clean_dataset.get("required_columns") == [
-        "event_id",
-        "__split",
-        "target",
-        "feature_a",
-        "feature_b",
-    ]
+    # Post-migration: selectors pass through with type inference only.
+    # Heavy normalization (regex→list conversion, name synthesis, scale_columns
+    # canonicalization) is no longer applied deterministically.
+    assert len(selectors) >= 1
+    assert selectors[0]["type"] == "regex"
 
 
-def test_deterministic_repairs_make_selector_drop_contract_executable() -> None:
+
+def test_schema_coercion_normalizes_scope_and_version() -> None:
+    """Test that _apply_schema_coercion handles scope aliases and version."""
     contract = {
-        "scope": "full_pipeline",
-        "canonical_columns": [
-            "event_id",
-            "__split",
-            "target",
-            "feature_a",
-            "feature_b",
-            "feature_c",
-        ],
-        "column_roles": {
-            "pre_decision": ["feature_a", "feature_b", "feature_c"],
-            "decision": [],
-            "outcome": ["target"],
-            "post_decision_audit_only": [],
-            "identifiers": ["event_id"],
-            "unknown": [],
-        },
-        "allowed_feature_sets": {
-            "segmentation_features": ["feature_a", "feature_b", "feature_c"],
-            "model_features": ["feature_a", "feature_b", "feature_c"],
-            "forbidden_features": ["target"],
-            "audit_only_features": [],
-        },
-        "artifact_requirements": {
-            "clean_dataset": {
-                "output_path": "data/cleaned_data.csv",
-                "manifest_path": "data/cleaning_manifest.json",
-                "required_columns": ["event_id", "__split", "target", "feature_a"],
-                "required_feature_selectors": [
-                    {"type": "regex", "pattern": "^feature_[abc]$"}
-                ],
-                "column_transformations": {
-                    "scale_columns": ["selector:regex:^feature_[abc]$"],
-                    "drop_policy": {
-                        "allow_selector_drops_when": (
-                            "Columns outside anchors may be dropped when constant or duplicate."
-                        )
-                    },
-                },
-            }
-        },
-        "cleaning_gates": [
-            {
-                "name": "feature_b_present",
-                "severity": "HARD",
-                "params": {"columns": ["feature_b"]},
-            }
-        ],
-        "required_outputs": ["data/submission.csv"],
-        "evaluation_spec": {"objective_type": "classification", "primary_metric": "roc_auc"},
-        "objective_analysis": {"problem_type": "classification"},
-        "validation_requirements": {"primary_metric": "roc_auc"},
-        "task_semantics": {
-            "problem_family": "classification",
-            "objective_type": "classification",
-            "primary_target": "target",
-            "target_columns": ["target"],
-            "multi_target": False,
-        },
+        "scope": "cleaning",
+        "optimization_policy": {"enabled": "true", "max_rounds": "3"},
+        "derived_columns": {"col_a": "source_a", "col_b": "source_b"},
     }
+    result = _apply_schema_coercion(contract)
+    assert result["scope"] == "cleaning_only"
+    assert result["derived_columns"] == ["col_a", "col_b"]
+    assert result["optimization_policy"]["enabled"] is True
+    assert result["optimization_policy"]["max_rounds"] == 3
+    assert "contract_version" in result
 
-    repaired = _apply_deterministic_repairs(contract)
-    result = validate_contract_minimal_readonly(repaired, column_inventory=repaired["canonical_columns"])
-
-    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
-    assert "contract.cleaning_transforms_scale_conflict" not in rules
-    assert "contract.clean_dataset_selector_drop_required_conflict" not in rules
-    assert "contract.cleaning_gate_selector_drop_conflict" not in rules
-
-
-def test_deterministic_repairs_materialize_partial_scale_selector_refs_to_columns() -> None:
-    contract = {
-        "canonical_columns": [
-            "event_id",
-            "__split",
-            "target",
-            "feature_a",
-            "feature_b",
-            "feature_c",
-        ],
-        "column_roles": {
-            "pre_decision": ["feature_a", "feature_b", "feature_c"],
-            "decision": [],
-            "outcome": ["target"],
-            "post_decision_audit_only": [],
-            "identifiers": ["event_id"],
-            "unknown": [],
-        },
-        "artifact_requirements": {
-            "clean_dataset": {
-                "required_columns": ["event_id", "__split", "target", "feature_a"],
-                "required_feature_selectors": [
-                    {"type": "regex", "pattern": "^feature_[abc]$"}
-                ],
-                "column_transformations": {
-                    "scale_columns": ["selector:regex:^feature_[bc]$"],
-                    "drop_policy": {"allow_selector_drops_when": ["constant"]},
-                },
-            }
-        },
-        "cleaning_gates": [
-            {
-                "name": "feature_b_present",
-                "severity": "HARD",
-                "params": {"columns": ["feature_b"]},
-            }
-        ],
-    }
-
-    repaired = _apply_deterministic_repairs(contract)
-    transforms = (
-        (repaired.get("artifact_requirements") or {})
-        .get("clean_dataset", {})
-        .get("column_transformations", {})
-    )
-
-    assert transforms.get("scale_columns") == ["feature_b", "feature_c"]

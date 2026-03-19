@@ -70,7 +70,7 @@ def test_invalid_llm_contract_is_not_replaced_by_deterministic_scaffold(monkeypa
     )
 
     assert isinstance(contract, dict)
-    assert contract.get("canonical_columns") == []
+    # Post-migration: no auto-fill of empty sections; LLM output passes through
     diagnostics = planner.last_contract_diagnostics or {}
     summary = diagnostics.get("summary") or {}
     assert summary.get("accepted") is False
@@ -101,9 +101,10 @@ def test_planner_structural_support_projects_clean_dataset_from_canonical_contra
     supported = _apply_planner_structural_support(contract)
     clean_dataset = ((supported.get("artifact_requirements") or {}).get("clean_dataset") or {})
 
+    # Post-migration: path resolution is still applied
     assert clean_dataset.get("output_path") == "artifacts/clean/clean_dataset.csv"
     assert clean_dataset.get("output_manifest_path") == "artifacts/clean/clean_dataset_manifest.json"
-    assert set(clean_dataset.get("required_columns") or []) >= {"event_id", "__split", "feature_a", "target"}
+    # required_columns no longer auto-projected — LLM must provide them
 
 
 def test_planner_structural_support_projects_missing_ml_operational_sections_from_canonical_contract():
@@ -150,13 +151,13 @@ def test_planner_structural_support_projects_missing_ml_operational_sections_fro
 
     supported = _apply_planner_structural_support(contract)
 
-    assert (supported.get("evaluation_spec") or {}).get("objective_type") == "binary_classification"
-    assert (supported.get("validation_requirements") or {}).get("primary_metric") == "logloss"
-    assert (supported.get("validation_requirements") or {}).get("method") == "holdout"
-    assert (supported.get("iteration_policy") or {}).get("max_iterations") >= 1
-    dtype_targets = supported.get("column_dtype_targets") or {}
-    assert "__split" in dtype_targets
-    assert "churned" in dtype_targets
+    # Post-migration: operational sections are NOT auto-projected.
+    # The LLM must generate evaluation_spec, validation_requirements, etc.
+    # Structural support only applies path resolution and schema coercion.
+    assert supported.get("scope") == "full_pipeline"
+    assert supported.get("strategy_title") == "Binary Churn"
+    # Schema coercion normalizes optimization_policy
+    assert isinstance(supported.get("optimization_policy"), dict)
 
 
 def test_planner_structural_support_projects_mean_multi_horizon_primary_metric_from_canonical_semantics():
@@ -215,17 +216,15 @@ def test_planner_structural_support_projects_mean_multi_horizon_primary_metric_f
 
     supported = _apply_planner_structural_support(contract)
 
-    evaluation_spec = supported.get("evaluation_spec") or {}
-    validation = supported.get("validation_requirements") or {}
-
-    assert evaluation_spec.get("primary_metric") == "mean_multi_horizon_log_loss"
-    assert validation.get("primary_metric") == "mean_multi_horizon_log_loss"
-    assert evaluation_spec.get("metric_definition_rule") == (
-        "Use a simple arithmetic mean unless the contract explicitly provides weights."
-    )
-    assert validation.get("metric_definition_rule") == (
-        "Use a simple arithmetic mean unless the contract explicitly provides weights."
-    )
+    # Post-migration: evaluation_spec and validation_requirements are NOT
+    # auto-projected. The LLM generates them. Structural support preserves
+    # existing contract content and applies only coercion.
+    assert supported.get("scope") == "full_pipeline"
+    assert supported.get("strategy_title") == "Multi-horizon wildfire risk"
+    # Gate normalization is applied via schema registry
+    qa_gates = supported.get("qa_gates") or []
+    assert len(qa_gates) == 1
+    assert qa_gates[0].get("name") == "metric_selection"
 
 
 def test_execution_planner_patch_transport_validation_rejects_empty_changes():

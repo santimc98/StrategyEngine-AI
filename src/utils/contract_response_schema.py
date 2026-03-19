@@ -152,6 +152,15 @@ EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS: List[str] = [
     "allowed_feature_sets",
     "task_semantics",
     "artifact_requirements",
+    "cleaning_gates",
+    "qa_gates",
+    "reviewer_gates",
+    "evaluation_spec",
+    "validation_requirements",
+    "iteration_policy",
+    "column_dtype_targets",
+    "data_engineer_runbook",
+    "ml_engineer_runbook",
 ]
 
 
@@ -279,3 +288,11 @@ EXECUTION_CONTRACT_CANONICAL_SCHEMA: Dict[str, Any] = {
 
 
 EXECUTION_CONTRACT_TRANSPORT_SCHEMA: Dict[str, Any] = copy.deepcopy(EXECUTION_CONTRACT_CANONICAL_SCHEMA)
+# Transport schema is used by the LLM tool call — keep it flexible so the
+# repair loop can fix omissions.  Only the canonical validation enforces all keys.
+_TRANSPORT_ONLY_REQUIRED = [
+    "contract_version", "scope", "strategy_title", "business_objective",
+    "output_dialect", "canonical_columns", "required_outputs", "column_roles",
+    "allowed_feature_sets", "task_semantics", "artifact_requirements",
+]
+EXECUTION_CONTRACT_TRANSPORT_SCHEMA["required"] = _TRANSPORT_ONLY_REQUIRED

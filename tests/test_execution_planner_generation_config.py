@@ -55,10 +55,11 @@ def test_execution_planner_generation_config_includes_response_schema_when_enabl
 def test_execution_planner_canonical_schema_required_surface_is_semantic_first():
     assert "task_semantics" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
     assert "artifact_requirements" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
-    assert "evaluation_spec" not in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
-    assert "validation_requirements" not in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
-    assert "iteration_policy" not in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
-    assert "column_dtype_targets" not in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
+    # Post-migration: these are now required (LLM must generate them, no auto-projection)
+    assert "evaluation_spec" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
+    assert "validation_requirements" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
+    assert "iteration_policy" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
+    assert "column_dtype_targets" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
 
 
 def test_execution_planner_generate_content_retries_without_response_schema(monkeypatch):

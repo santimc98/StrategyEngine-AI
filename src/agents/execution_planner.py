@@ -161,10 +161,50 @@ Output discipline:
 - Never return {} or placeholder-empty top-level sections.
 - Populate every required canonical section with grounded content from the inputs.
 - Keep the canonical contract semantic-first: include grounded intent and interfaces, not filler.
-- Operational sections that are mechanically derivable from canonical semantics may be omitted instead of invented.
+- You MUST populate every required section listed below. No section will be auto-filled or projected after your output. If you omit a required section, it will be missing in the final contract and downstream agents will fail.
 
 Return format:
 - Return ONLY valid JSON (no markdown, no code fences, no comments).
+
+COMPLETE CONTRACT REQUIREMENT — All of the following top-level keys MUST be present in your output:
+  contract_version, scope, strategy_title, business_objective, output_dialect,
+  canonical_columns, required_outputs, column_roles, allowed_feature_sets,
+  task_semantics, artifact_requirements, cleaning_gates, qa_gates, reviewer_gates,
+  data_engineer_runbook, ml_engineer_runbook, column_dtype_targets,
+  validation_requirements, evaluation_spec, iteration_policy, optimization_policy.
+
+Sections you MUST generate yourself (previously auto-projected, now YOUR responsibility):
+
+- evaluation_spec: object with keys:
+  - objective_type: string (e.g. "binary_classification", "multiclass", "regression", "multi_output_classification")
+  - primary_target: string (main target column name)
+  - primary_metric: string (metric name the competition/business evaluates on)
+  - metric_definition_rule: string (human-readable description of how the metric is calculated)
+  - label_columns: list[str] (all target/label columns used for training)
+  Derive these from task_semantics, column_roles.outcome, and the business objective.
+
+- validation_requirements: object with keys:
+  - method: string ("cross_validation" or "holdout")
+  - primary_metric: string (same as evaluation_spec.primary_metric)
+  - metrics_to_report: list[str] (metrics to compute and report)
+  - params: object (e.g. {"n_splits": 5, "n_repeats": 2, "stratify": true} for CV)
+  Derive from task_semantics and the nature of the problem.
+
+- iteration_policy: object with keys:
+  - max_iterations: int (total pipeline attempts; default 6 for full_pipeline, 3 for cleaning_only)
+  - metric_improvement_max: int (max metric improvement rounds; default 4 for full_pipeline)
+  - runtime_fix_max: int (max runtime error retries; default 3)
+  - compliance_bootstrap_max: int (max compliance fix attempts; default 2)
+
+- column_dtype_targets: object mapping column_name -> {"target_dtype": string, "nullable": bool, "role": string, "source": string}.
+  MUST include at least: all outcome columns, identifier columns, split columns, time columns, and decision columns.
+  For wide feature families, you may use a representative subset.
+
+- artifact_requirements.clean_dataset.required_columns: list[str] containing ALL columns the ML pipeline needs:
+  outcome columns, pre_decision features, identifiers, split columns, post_decision_audit columns.
+  CRITICAL: Do NOT include "decision" role columns here. Decision columns (e.g. predicted probabilities)
+  are MODEL OUTPUTS that do not exist in the raw data. Including them would create empty placeholder
+  columns that contaminate the feature set.
 
 Canonical contract interface (required top-level sections):
 - scope: one of ["cleaning_only", "ml_only", "full_pipeline"]
@@ -575,21 +615,85 @@ def normalize_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     return contract
 
 
+def _apply_schema_coercion(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Mechanical type/shape coercion only — no semantic invention.
+
+    Retains only:
+    - Schema registry repairs (dtype key aliases, selector type inference, gate shape)
+    - derived_columns normalization (dict/mixed -> list[str])
+    - Scope alias resolution
+    - Optimization policy defaults merge
+    - Contract version normalization
+    """
+    if not isinstance(contract, dict):
+        return {}
+
+    # Schema registry: dtype key aliases, selector type, gate shape
+    contract = apply_contract_schema_registry_repairs(contract)
+
+    # derived_columns: normalize dict/mixed -> list[str]
+    contract["derived_columns"] = _extract_derived_column_names(contract.get("derived_columns"))
+
+    # Scope alias resolution
+    if "scope" in contract:
+        contract["scope"] = normalize_contract_scope(contract.get("scope"))
+
+    # Optimization policy defaults merge
+    contract["optimization_policy"] = normalize_optimization_policy(contract.get("optimization_policy"))
+
+    # Contract version normalization
+    version = contract.get("contract_version")
+    normalized_version = normalize_contract_version(version)
+    if normalized_version != version:
+        contract["contract_version"] = normalized_version
+    elif version is None:
+        contract["contract_version"] = CONTRACT_VERSION_V41
+
+    return contract
+
+
+def _apply_minimal_path_resolution(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve clean_dataset output_path and manifest_path if missing."""
+    if not isinstance(contract, dict):
+        return contract
+
+    art_req = contract.get("artifact_requirements")
+    if not isinstance(art_req, dict):
+        art_req = {}
+        contract["artifact_requirements"] = art_req
+
+    clean_ds = art_req.get("clean_dataset")
+    if not isinstance(clean_ds, dict):
+        clean_ds = {}
+        art_req["clean_dataset"] = clean_ds
+
+    if not str(clean_ds.get("output_path") or clean_ds.get("output") or clean_ds.get("path") or "").strip():
+        output_path = get_clean_dataset_output_path(contract)
+        if output_path:
+            clean_ds["output_path"] = output_path
+
+    if not str(clean_ds.get("output_manifest_path") or clean_ds.get("manifest_path") or "").strip():
+        manifest_path = get_clean_manifest_path(contract)
+        if manifest_path:
+            clean_ds["output_manifest_path"] = manifest_path
+
+    return contract
+
+
 def _apply_planner_structural_support(contract: Dict[str, Any] | None) -> Dict[str, Any]:
     """
     Apply only non-semantic structural support to planner output.
 
-    This helper is intentionally narrow: it may project operational fields that
-    are mechanically derivable from canonical semantics and normalize contract
-    shape / artifact path plumbing, but it must not invent business intent or
-    override semantic choices that belong to the LLM.
+    Post-migration: no auto-projection of operational sections.
+    Only path resolution, artifact alignment, and schema coercion.
     """
     if not isinstance(contract, dict):
         return {}
     supported = copy.deepcopy(contract)
-    supported = _project_operational_contract_from_canonical(supported)
+    supported = _apply_minimal_path_resolution(supported)
     supported = normalize_artifact_requirements(supported)
-    supported = ensure_v41_schema(supported)
+    supported = _apply_schema_coercion(supported)
     return supported
 
 
@@ -610,123 +714,7 @@ def _append_unique_columns(bucket: List[str], values: Any) -> None:
         bucket.append(text)
 
 
-def _derive_clean_dataset_required_columns(contract: Dict[str, Any]) -> List[str]:
-    required: List[str] = []
-    _append_unique_columns(required, contract.get("canonical_columns"))
 
-    column_roles = get_column_roles(contract)
-    # "decision" columns are model OUTPUTS (e.g. predicted probabilities),
-    # not raw data columns. Including them would create empty placeholder
-    # columns in the cleaned dataset that leak into the feature set.
-    _OUTPUT_ROLES = {"decision"}
-    if isinstance(column_roles, dict):
-        for role, values in column_roles.items():
-            if str(role).strip().lower() in _OUTPUT_ROLES:
-                continue
-            _append_unique_columns(required, values)
-
-    allowed_feature_sets = contract.get("allowed_feature_sets")
-    if isinstance(allowed_feature_sets, dict):
-        for key in ("model_features", "segmentation_features", "audit_only_features"):
-            _append_unique_columns(required, allowed_feature_sets.get(key))
-
-    split_spec = contract.get("split_spec")
-    if isinstance(split_spec, dict):
-        for key in ("split_column", "fold_column"):
-            value = split_spec.get(key)
-            if isinstance(value, str):
-                _append_unique_columns(required, [value])
-        _append_unique_columns(required, split_spec.get("split_columns"))
-
-    _append_unique_columns(required, _collect_cleaning_hard_gate_columns(contract))
-    return required
-
-
-def _contract_mapping_has_meaningful_values(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    return any(_is_meaningful_contract_value(item) for item in value.values())
-
-
-def _project_evaluation_spec_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
-    existing = contract.get("evaluation_spec")
-    spec = copy.deepcopy(existing) if isinstance(existing, dict) else {}
-    task_semantics = contract.get("task_semantics")
-    if not isinstance(task_semantics, dict) or not task_semantics:
-        task_semantics = _synthesize_task_semantics(contract)
-    objective_type = str(
-        spec.get("objective_type")
-        or task_semantics.get("objective_type")
-        or task_semantics.get("problem_family")
-        or ""
-    ).strip()
-    if objective_type:
-        spec.setdefault("objective_type", objective_type)
-
-    primary_target = str(
-        spec.get("primary_target")
-        or spec.get("target_column")
-        or task_semantics.get("primary_target")
-        or contract.get("primary_target")
-        or contract.get("target_column")
-        or ""
-    ).strip()
-    target_columns = _collect_targetish_columns(
-        spec.get("target_columns")
-        or spec.get("primary_targets")
-        or task_semantics.get("target_columns")
-        or contract.get("target_columns")
-        or contract.get("outcome_columns")
-    )
-    if primary_target:
-        spec.setdefault("primary_target", primary_target)
-        spec.setdefault("target_column", primary_target)
-        spec.setdefault("label_column", primary_target)
-    if target_columns:
-        if len(target_columns) > 1:
-            spec.setdefault("target_columns", list(target_columns))
-            spec.setdefault("primary_targets", list(target_columns))
-            spec.setdefault("label_columns", list(target_columns))
-        elif target_columns[0]:
-            spec.setdefault("target_column", target_columns[0])
-            spec.setdefault("primary_target", target_columns[0])
-            spec.setdefault("label_column", target_columns[0])
-
-    partitioning = task_semantics.get("partitioning") if isinstance(task_semantics.get("partitioning"), dict) else {}
-    split_column = str(
-        spec.get("split_column")
-        or partitioning.get("split_column")
-        or ((contract.get("split_spec") or {}).get("split_column") if isinstance(contract.get("split_spec"), dict) else "")
-        or ""
-    ).strip()
-    if split_column:
-        spec.setdefault("split_column", split_column)
-
-    output_schema = task_semantics.get("output_schema") if isinstance(task_semantics.get("output_schema"), dict) else {}
-    prediction_artifact = str(
-        spec.get("prediction_artifact")
-        or output_schema.get("prediction_artifact")
-        or ""
-    ).strip()
-    if prediction_artifact:
-        spec.setdefault("prediction_artifact", prediction_artifact)
-    required_prediction_columns = [
-        str(col).strip()
-        for col in (output_schema.get("required_prediction_columns") or [])
-        if str(col).strip()
-    ]
-    if required_prediction_columns and not spec.get("required_prediction_columns"):
-        spec["required_prediction_columns"] = required_prediction_columns
-    primary_metric = _normalize_kpi_metric(spec.get("primary_metric"))
-    if not primary_metric:
-        primary_metric = _infer_primary_metric_from_canonical(contract, spec, task_semantics)
-    if primary_metric:
-        spec.setdefault("primary_metric", primary_metric)
-        metric_rule = str(spec.get("metric_definition_rule") or "").strip()
-        derived_rule = _derive_metric_definition_rule(primary_metric)
-        if not metric_rule and derived_rule:
-            spec["metric_definition_rule"] = derived_rule
-    return spec
 
 
 def _infer_primary_metric_from_canonical(
@@ -797,245 +785,8 @@ def _infer_primary_metric_from_canonical(
     return ""
 
 
-def _project_validation_requirements_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
-    existing = contract.get("validation_requirements")
-    validation = copy.deepcopy(existing) if isinstance(existing, dict) else {}
-    task_semantics = contract.get("task_semantics")
-    if not isinstance(task_semantics, dict) or not task_semantics:
-        task_semantics = _synthesize_task_semantics(contract)
-    evaluation_spec = _project_evaluation_spec_from_canonical(contract)
-
-    method = str(validation.get("method") or "").strip().lower()
-    if not method:
-        method = "holdout" if str(evaluation_spec.get("split_column") or "").strip() else "cross_validation"
-        validation["method"] = method
-
-    primary_metric = _normalize_kpi_metric(validation.get("primary_metric"))
-    if not primary_metric:
-        primary_metric = _infer_primary_metric_from_canonical(contract, evaluation_spec, task_semantics)
-    if primary_metric:
-        validation["primary_metric"] = primary_metric
-        metric_rule = str(validation.get("metric_definition_rule") or "").strip()
-        derived_rule = _derive_metric_definition_rule(primary_metric)
-        if not metric_rule and derived_rule:
-            validation["metric_definition_rule"] = derived_rule
-
-    metrics_to_report = [
-        _normalize_kpi_metric(metric)
-        for metric in (validation.get("metrics_to_report") or validation.get("metrics") or [])
-        if _normalize_kpi_metric(metric)
-    ]
-    if primary_metric and primary_metric not in metrics_to_report:
-        metrics_to_report.insert(0, primary_metric)
-    if metrics_to_report:
-        validation["metrics_to_report"] = list(dict.fromkeys(metrics_to_report))
-    elif primary_metric:
-        validation["metrics_to_report"] = [primary_metric]
-
-    params = copy.deepcopy(validation.get("params")) if isinstance(validation.get("params"), dict) else {}
-    if str(evaluation_spec.get("split_column") or "").strip():
-        params.setdefault("split_column", str(evaluation_spec.get("split_column")).strip())
-    target_columns = _collect_targetish_columns(
-        evaluation_spec.get("target_columns")
-        or evaluation_spec.get("primary_targets")
-        or task_semantics.get("target_columns")
-    )
-    primary_target = str(
-        evaluation_spec.get("primary_target")
-        or evaluation_spec.get("target_column")
-        or task_semantics.get("primary_target")
-        or ""
-    ).strip()
-    if target_columns:
-        if len(target_columns) > 1:
-            params.setdefault("target_columns", list(target_columns))
-        elif target_columns[0]:
-            params.setdefault("target_column", target_columns[0])
-    if primary_target:
-        params.setdefault("target_column", primary_target)
-    if params:
-        validation["params"] = params
-    return validation
 
 
-def _project_iteration_policy_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
-    existing = contract.get("iteration_policy")
-    if isinstance(existing, str):
-        text = existing.strip()
-        if text:
-            existing = {"summary": text}
-        else:
-            existing = {}
-    if isinstance(existing, dict) and existing:
-        return copy.deepcopy(existing)
-
-    scope = normalize_contract_scope(contract.get("scope"))
-    if scope == "cleaning_only":
-        return {
-            "max_iterations": 4,
-            "metric_improvement_max": 0,
-            "runtime_fix_max": 3,
-            "compliance_bootstrap_max": 2,
-        }
-    if scope == "ml_only":
-        return {
-            "max_iterations": 5,
-            "metric_improvement_max": 4,
-            "runtime_fix_max": 3,
-            "compliance_bootstrap_max": 2,
-        }
-    return {
-        "max_iterations": 6,
-        "metric_improvement_max": 4,
-        "runtime_fix_max": 3,
-        "compliance_bootstrap_max": 2,
-    }
-
-
-def _project_column_dtype_targets_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
-    existing = contract.get("column_dtype_targets")
-    if isinstance(existing, dict) and existing:
-        return copy.deepcopy(existing)
-
-    task_semantics = contract.get("task_semantics")
-    if not isinstance(task_semantics, dict) or not task_semantics:
-        task_semantics = _synthesize_task_semantics(contract)
-    objective_type = str(
-        task_semantics.get("objective_type")
-        or task_semantics.get("problem_family")
-        or ""
-    ).strip().lower()
-    regression_like = any(token in objective_type for token in ("regression", "forecast"))
-
-    column_roles = get_column_roles(contract)
-    dtype_targets: Dict[str, Any] = {}
-
-    def _set_dtype(columns: Any, *, target_dtype: str, nullable: bool, role: str) -> None:
-        for column in _collect_targetish_columns(columns):
-            if column in dtype_targets:
-                continue
-            dtype_targets[column] = {
-                "target_dtype": target_dtype,
-                "nullable": nullable,
-                "role": role,
-                "source": "projected_from_canonical",
-            }
-
-    if isinstance(column_roles, dict):
-        _set_dtype(column_roles.get("identifiers"), target_dtype="string", nullable=False, role="identifier")
-        _set_dtype(column_roles.get("time_columns"), target_dtype="string", nullable=True, role="time")
-        _set_dtype(column_roles.get("decision"), target_dtype="string", nullable=True, role="decision")
-        _set_dtype(
-            column_roles.get("outcome"),
-            target_dtype="float64" if regression_like else "string",
-            nullable=True,
-            role="outcome",
-        )
-
-    partitioning = task_semantics.get("partitioning") if isinstance(task_semantics.get("partitioning"), dict) else {}
-    split_column = str(partitioning.get("split_column") or "").strip()
-    if split_column and split_column not in dtype_targets:
-        dtype_targets[split_column] = {
-            "target_dtype": "string",
-            "nullable": False,
-            "role": "split",
-            "source": "projected_from_canonical",
-        }
-
-    if not dtype_targets:
-        fallback_columns = [
-            str(col).strip()
-            for col in (contract.get("canonical_columns") or [])
-            if str(col).strip()
-        ][:3]
-        for column in fallback_columns:
-            dtype_targets[column] = {
-                "target_dtype": "string",
-                "nullable": True,
-                "role": "anchor",
-                "source": "projected_from_canonical",
-            }
-    return dtype_targets
-
-
-def _project_operational_contract_from_canonical(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return {}
-
-    scope = normalize_contract_scope(contract.get("scope"))
-    if scope not in {"cleaning_only", "ml_only", "full_pipeline"}:
-        return contract
-
-    task_semantics = contract.get("task_semantics")
-    if not isinstance(task_semantics, dict) or not task_semantics:
-        synthesized = _synthesize_task_semantics(contract)
-        if synthesized:
-            contract["task_semantics"] = synthesized
-
-    if not _contract_mapping_has_meaningful_values(contract.get("column_dtype_targets")):
-        projected_dtypes = _project_column_dtype_targets_from_canonical(contract)
-        if projected_dtypes:
-            contract["column_dtype_targets"] = projected_dtypes
-
-    if not _contract_mapping_has_meaningful_values(contract.get("iteration_policy")):
-        contract["iteration_policy"] = _project_iteration_policy_from_canonical(contract)
-
-    if scope in {"ml_only", "full_pipeline"}:
-        if not _contract_mapping_has_meaningful_values(contract.get("evaluation_spec")):
-            projected_eval = _project_evaluation_spec_from_canonical(contract)
-            if projected_eval:
-                contract["evaluation_spec"] = projected_eval
-        if not _contract_mapping_has_meaningful_values(contract.get("validation_requirements")):
-            projected_validation = _project_validation_requirements_from_canonical(contract)
-            if projected_validation:
-                contract["validation_requirements"] = projected_validation
-
-    artifact_requirements = contract.get("artifact_requirements")
-    if not isinstance(artifact_requirements, dict):
-        artifact_requirements = {}
-    clean_dataset = artifact_requirements.get("clean_dataset")
-    if not isinstance(clean_dataset, dict):
-        clean_dataset = {}
-        artifact_requirements["clean_dataset"] = clean_dataset
-
-    if not str(clean_dataset.get("output_path") or clean_dataset.get("output") or clean_dataset.get("path") or "").strip():
-        output_path = get_clean_dataset_output_path(contract)
-        if output_path:
-            clean_dataset["output_path"] = output_path
-
-    if not str(clean_dataset.get("output_manifest_path") or clean_dataset.get("manifest_path") or "").strip():
-        manifest_path = get_clean_manifest_path(contract)
-        if manifest_path:
-            clean_dataset["output_manifest_path"] = manifest_path
-
-    required_columns = clean_dataset.get("required_columns")
-    if not isinstance(required_columns, list) or not any(str(col or "").strip() for col in required_columns):
-        projected_required_columns = _derive_clean_dataset_required_columns(contract)
-        if projected_required_columns:
-            clean_dataset["required_columns"] = projected_required_columns
-
-    passthrough = clean_dataset.get("optional_passthrough_columns")
-    if passthrough in (None, {}):
-        passthrough = []
-    if not isinstance(passthrough, list):
-        passthrough = []
-    if not passthrough:
-        allowed_feature_sets = contract.get("allowed_feature_sets")
-        audit_only = []
-        if isinstance(allowed_feature_sets, dict):
-            audit_only = [
-                str(col).strip()
-                for col in (allowed_feature_sets.get("audit_only_features") or [])
-                if str(col).strip()
-            ]
-        required_set = {str(col).strip().lower() for col in (clean_dataset.get("required_columns") or []) if str(col).strip()}
-        passthrough = [col for col in audit_only if col.lower() not in required_set]
-        if passthrough:
-            clean_dataset["optional_passthrough_columns"] = passthrough
-
-    artifact_requirements["clean_dataset"] = clean_dataset
-    contract["artifact_requirements"] = artifact_requirements
-    return contract
 
 
 def _unwrap_execution_contract_transport(payload: Any) -> Dict[str, Any] | None:
@@ -1234,134 +985,7 @@ def _split_validation_issues_by_phase(validation_result: Dict[str, Any] | None) 
     }
 
 
-def _normalize_strategy_feature_engineering_payload(strategy: Dict[str, Any] | None) -> Dict[str, Any]:
-    if not isinstance(strategy, dict):
-        return {"techniques": [], "notes": "", "risk_level": "low"}
 
-    raw = strategy.get("feature_engineering_strategy")
-    techniques: List[Any] = []
-    notes = ""
-    risk_level = "low"
-
-    if isinstance(raw, dict):
-        candidate = raw.get("techniques")
-        if isinstance(candidate, list):
-            techniques = list(candidate)
-        raw_notes = raw.get("notes")
-        if isinstance(raw_notes, str):
-            notes = raw_notes.strip()
-        raw_risk = str(raw.get("risk_level") or "").strip().lower()
-        if raw_risk in {"low", "med", "high"}:
-            risk_level = raw_risk
-        elif raw_risk == "medium":
-            risk_level = "med"
-    elif isinstance(raw, list):
-        techniques = list(raw)
-
-    if not techniques:
-        candidate = strategy.get("feature_engineering")
-        if isinstance(candidate, list):
-            techniques = list(candidate)
-
-    if not techniques:
-        eval_plan = strategy.get("evaluation_plan")
-        if isinstance(eval_plan, dict):
-            candidate = eval_plan.get("feature_engineering")
-            if isinstance(candidate, list):
-                techniques = list(candidate)
-
-    return {
-        "techniques": techniques if isinstance(techniques, list) else [],
-        "notes": notes,
-        "risk_level": risk_level,
-    }
-
-
-def _extract_derived_columns_from_fe_techniques(techniques: List[Any]) -> List[str]:
-    derived: List[str] = []
-    seen: set[str] = set()
-    if not isinstance(techniques, list):
-        return derived
-    for item in techniques:
-        if not isinstance(item, dict):
-            continue
-        candidate = (
-            item.get("output_column_name")
-            or item.get("output_column")
-            or item.get("derived_column")
-            or item.get("name")
-        )
-        if not isinstance(candidate, str):
-            continue
-        name = candidate.strip()
-        if not name:
-            continue
-        key = name.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        derived.append(name)
-    return derived
-
-
-def _ensure_feature_engineering_plan_from_strategy(
-    contract: Dict[str, Any],
-    strategy: Dict[str, Any] | None,
-) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return contract
-
-    normalized_fe = _normalize_strategy_feature_engineering_payload(strategy)
-    existing = contract.get("feature_engineering_plan")
-    existing_present = "feature_engineering_plan" in contract
-    if not isinstance(existing, dict):
-        existing = {}
-
-    techniques = normalized_fe.get("techniques") if isinstance(normalized_fe.get("techniques"), list) else []
-    notes_from_strategy = str(normalized_fe.get("notes") or "").strip()
-    raw_constraints = strategy.get("feature_engineering_constraints") if isinstance(strategy, dict) else None
-    constraints_from_strategy = raw_constraints if isinstance(raw_constraints, dict) and raw_constraints else {}
-    if (
-        not existing_present
-        and not techniques
-        and not notes_from_strategy
-        and not constraints_from_strategy
-    ):
-        # Legacy field is optional: keep absent unless strategy/contracts explicitly provide FE content.
-        return contract
-
-    existing_derived_raw = existing.get("derived_columns")
-    existing_entries: List[Any] = list(existing_derived_raw) if isinstance(existing_derived_raw, list) else []
-    existing_names = _extract_derived_column_names(existing_entries)
-    inferred_derived = _extract_derived_columns_from_fe_techniques(techniques)
-    seen_derived: set[str] = {str(name).strip().lower() for name in existing_names if str(name).strip()}
-    merged_derived_entries: List[Any] = list(existing_entries)
-    for name in inferred_derived:
-        candidate = str(name or "").strip()
-        if not candidate:
-            continue
-        key = candidate.lower()
-        if key in seen_derived:
-            continue
-        seen_derived.add(key)
-        merged_derived_entries.append(candidate)
-    if not merged_derived_entries:
-        merged_derived_entries = []
-
-    notes = str(existing.get("notes") or notes_from_strategy or "").strip()
-    constraints = existing.get("constraints")
-    if not isinstance(constraints, dict):
-        constraints = {}
-    if constraints_from_strategy:
-        constraints = dict(constraints_from_strategy)
-
-    contract["feature_engineering_plan"] = {
-        "techniques": techniques,
-        "derived_columns": merged_derived_entries,
-        "constraints": constraints,
-        "notes": notes,
-    }
-    return contract
 
 
 def _ensure_optimization_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -2199,72 +1823,6 @@ def _sanitize_target_mapping_conflicts(
         repaired["notes_for_engineers"] = notes
     return repaired
 
-
-def _ensure_missing_category_values(contract: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure preprocessing_requirements.nan_strategies missing_category entries
-    have a safe missing_category_value and propagate it into null_handling_gate
-    params for reviewer visibility.
-    """
-    if not isinstance(contract, dict):
-        return contract
-    prep = contract.get("preprocessing_requirements")
-    if not isinstance(prep, dict):
-        return contract
-    nan_strategies = prep.get("nan_strategies")
-    if not isinstance(nan_strategies, list):
-        return contract
-
-    missing_category_map: Dict[str, str] = {}
-    updated = False
-    for strategy in nan_strategies:
-        if not isinstance(strategy, dict):
-            continue
-        strat_name = str(strategy.get("strategy") or "").strip().lower()
-        if strat_name != "missing_category":
-            continue
-        col = strategy.get("column") or strategy.get("name")
-        if not col:
-            continue
-        col_name = str(col)
-        value = _normalize_missing_category_value(strategy.get("missing_category_value"))
-        if not value:
-            value = _DEFAULT_MISSING_CATEGORY_VALUE
-            strategy["missing_category_value"] = value
-            updated = True
-        missing_category_map[col_name] = value
-
-    if missing_category_map:
-        gates = contract.get("cleaning_gates")
-        if isinstance(gates, list):
-            for gate in gates:
-                if not isinstance(gate, dict):
-                    continue
-                gate_name = gate.get("name") or gate.get("id") or gate.get("gate")
-                if _normalize_gate_name(gate_name) != "null_handling_gate":
-                    continue
-                params = gate.get("params")
-                if not isinstance(params, dict):
-                    params = {}
-                missing_values = params.get("missing_category_values")
-                if not isinstance(missing_values, dict):
-                    missing_values = {}
-                for col, value in missing_category_map.items():
-                    if col not in missing_values:
-                        missing_values[col] = value
-                        updated = True
-                params["missing_category_values"] = missing_values
-                gate["params"] = params
-
-    if updated:
-        notes = contract.get("notes_for_engineers")
-        if not isinstance(notes, list):
-            notes = []
-        msg = "Injected missing_category_value for missing_category strategies to avoid NA sentinel collisions."
-        if msg not in notes:
-            notes.append(msg)
-        contract["notes_for_engineers"] = notes
-    return contract
 
 
 def _apply_sparse_optional_columns(
@@ -3761,48 +3319,6 @@ def _extract_derived_column_names(value: Any) -> List[str]:
     return deduped
 
 
-def _deterministic_repair_column_dtype_targets(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return contract
-    targets = contract.get("column_dtype_targets")
-    artifact_requirements = contract.get("artifact_requirements")
-    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
-    if targets in (None, {}) and isinstance(clean_dataset, dict):
-        nested_targets = clean_dataset.get("column_dtype_targets")
-        if isinstance(nested_targets, dict):
-            targets = nested_targets
-    if not isinstance(targets, dict):
-        return contract
-
-    repaired: Dict[str, Dict[str, Any]] = {}
-    for raw_col, raw_spec in targets.items():
-        col = str(raw_col or "").strip()
-        if not col:
-            continue
-        if isinstance(raw_spec, str):
-            dtype = raw_spec.strip() or "preserve"
-            repaired[col] = {"target_dtype": dtype}
-            continue
-        if not isinstance(raw_spec, dict):
-            repaired[col] = {"target_dtype": "preserve"}
-            continue
-
-        spec = dict(raw_spec)
-        if "target_dtype" not in spec or not str(spec.get("target_dtype") or "").strip():
-            for alias in ("type", "dtype", "data_type", "targetType"):
-                if alias in spec and str(spec.get(alias) or "").strip():
-                    spec["target_dtype"] = str(spec.pop(alias)).strip()
-                    break
-        if "target_dtype" not in spec or not str(spec.get("target_dtype") or "").strip():
-            spec["target_dtype"] = "preserve"
-        repaired[col] = spec
-
-    if repaired:
-        contract["column_dtype_targets"] = repaired
-        if isinstance(clean_dataset, dict):
-            clean_dataset["column_dtype_targets"] = copy.deepcopy(repaired)
-    return contract
-
 
 def _synthesize_selectors_from_allowed_feature_sets(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
@@ -3882,130 +3398,6 @@ def _synthesize_selectors_from_allowed_feature_sets(contract: Dict[str, Any]) ->
 
     return synthesized
 
-
-def _deterministic_repair_required_feature_selectors(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return contract
-    artifact_requirements = contract.get("artifact_requirements")
-    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
-    if not isinstance(clean_dataset, dict):
-        return contract
-
-    selectors_raw = clean_dataset.get("required_feature_selectors")
-
-    # ── Synthesize selectors from allowed_feature_sets when missing ──
-    # If required_feature_selectors is absent/empty but allowed_feature_sets
-    # contains selector:* references, we can resolve them using column_roles
-    # (pre_decision columns map to the selector family).
-    if not selectors_raw or (isinstance(selectors_raw, list) and len(selectors_raw) == 0):
-        synthesized = _synthesize_selectors_from_allowed_feature_sets(contract)
-        if synthesized:
-            selectors_raw = synthesized
-            clean_dataset["required_feature_selectors"] = synthesized
-        else:
-            if selectors_raw is None:
-                return contract
-
-    if selectors_raw is None:
-        return contract
-    if isinstance(selectors_raw, dict):
-        selectors_raw = [selectors_raw]
-    elif isinstance(selectors_raw, str):
-        selectors_raw = [{"selector": selectors_raw}]
-    if not isinstance(selectors_raw, list):
-        return contract
-
-    repaired: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-
-    def _push(selector_obj: Dict[str, Any]) -> None:
-        fingerprint = json.dumps(selector_obj, sort_keys=True, ensure_ascii=False)
-        if fingerprint in seen:
-            return
-        seen.add(fingerprint)
-        repaired.append(selector_obj)
-
-    for raw_selector in selectors_raw:
-        selector_obj: Dict[str, Any] | None = None
-        if isinstance(raw_selector, str):
-            token = raw_selector.strip()
-            if not token:
-                continue
-            if ":" in token:
-                selector_obj = {"selector": token}
-            elif "*" in token or "?" in token:
-                if token.endswith("*") and token.count("*") == 1 and "?" not in token:
-                    selector_obj = {"type": "prefix", "value": token[:-1]}
-                elif token.startswith("*") and token.count("*") == 1 and "?" not in token:
-                    selector_obj = {"type": "suffix", "value": token[1:]}
-                else:
-                    pattern = "^" + re.escape(token).replace("\\*", ".*").replace("\\?", ".") + "$"
-                    selector_obj = {"type": "regex", "pattern": pattern}
-            else:
-                selector_obj = {"type": "list", "columns": [token]}
-        elif isinstance(raw_selector, dict):
-            selector_obj = dict(raw_selector)
-
-        if not isinstance(selector_obj, dict):
-            continue
-
-        selector_obj = _normalize_selector_entry(selector_obj)
-        selector_type = _infer_selector_type_from_payload(selector_obj)
-        if not selector_type:
-            continue
-        selector_obj["type"] = selector_type
-
-        if selector_type == "regex":
-            pattern = selector_obj.get("pattern") or selector_obj.get("value") or selector_obj.get("regex")
-            pattern_str = str(pattern or "").strip()
-            if not pattern_str:
-                continue
-            selector_obj["pattern"] = pattern_str
-            selector_obj.pop("value", None)
-            selector_obj.pop("regex", None)
-        elif selector_type in {"prefix", "suffix", "contains"}:
-            value = selector_obj.get("value") or selector_obj.get(selector_type)
-            value_str = str(value or "").strip()
-            if not value_str:
-                continue
-            selector_obj["value"] = value_str
-        elif selector_type == "list":
-            cols = selector_obj.get("columns")
-            if isinstance(cols, str):
-                cols = [cols]
-            if not isinstance(cols, list):
-                continue
-            columns = [str(col).strip() for col in cols if str(col).strip()]
-            if not columns:
-                continue
-            selector_obj["columns"] = list(dict.fromkeys(columns))
-        elif selector_type in {"all_columns_except", "all_numeric_except"}:
-            cols = selector_obj.get("except_columns")
-            if cols is None:
-                cols = selector_obj.get("value")
-            if cols is None:
-                cols = selector_obj.get("columns")
-            if isinstance(cols, str):
-                cols = [cols]
-            if not isinstance(cols, list):
-                continue
-            excluded = [str(col).strip() for col in cols if str(col).strip()]
-            if not excluded:
-                continue
-            selector_obj["except_columns"] = list(dict.fromkeys(excluded))
-            selector_obj.pop("value", None)
-        elif selector_type == "prefix_numeric_range":
-            prefix = str(selector_obj.get("prefix") or "").strip()
-            start = selector_obj.get("start")
-            end = selector_obj.get("end")
-            if not prefix or not isinstance(start, int) or not isinstance(end, int):
-                continue
-            selector_obj["prefix"] = prefix
-
-        _push(selector_obj)
-
-    clean_dataset["required_feature_selectors"] = repaired
-    return contract
 
 
 def _collect_cleaning_inventory_candidates(contract: Dict[str, Any]) -> List[str]:
@@ -4131,263 +3523,6 @@ def _expand_inline_selector_reference(ref: str, inventory: List[str]) -> List[st
         return []
     return columns
 
-
-def _deterministic_repair_clean_dataset_consistency(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return contract
-
-    artifact_requirements = contract.get("artifact_requirements")
-    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
-    if not isinstance(clean_dataset, dict):
-        return contract
-
-    selectors = clean_dataset.get("required_feature_selectors")
-    if not isinstance(selectors, list):
-        return contract
-
-    inventory = _collect_cleaning_inventory_candidates(contract)
-    if not inventory:
-        return contract
-
-    transforms = clean_dataset.get("column_transformations")
-    if not isinstance(transforms, dict):
-        transforms = {}
-        clean_dataset["column_transformations"] = transforms
-
-    normalized_selectors: List[Dict[str, Any]] = []
-    for idx, selector in enumerate(selectors):
-        if not isinstance(selector, dict):
-            continue
-        selector_obj = dict(selector)
-        selector_obj.setdefault("name", _selector_stable_name(selector_obj, idx))
-        normalized_selectors.append(selector_obj)
-    if normalized_selectors:
-        clean_dataset["required_feature_selectors"] = normalized_selectors
-        selectors = normalized_selectors
-
-    selector_drop_reasons, _ = extract_selector_drop_reasons(transforms)
-    if selector_drop_reasons:
-        drop_policy = transforms.get("drop_policy")
-        if not isinstance(drop_policy, dict):
-            drop_policy = {}
-        drop_policy["allow_selector_drops_when"] = list(selector_drop_reasons)
-        transforms["drop_policy"] = drop_policy
-        for alias in ("allow_selector_drops_when", "allowed_reasons", "drop_reasons"):
-            if alias in transforms:
-                transforms.pop(alias, None)
-
-    scale_columns = transforms.get("scale_columns")
-    if isinstance(scale_columns, list) and scale_columns:
-        normalized_scale: List[str] = []
-        seen_scale: set[str] = set()
-        for raw_entry in scale_columns:
-            entry = str(raw_entry or "").strip()
-            if not entry:
-                continue
-            selector = _find_matching_declared_selector(entry, selectors)
-            if selector is None and entry.lower().startswith("selector:"):
-                nested = entry.split(":", 1)[1].strip()
-                selector = _find_matching_declared_selector(nested, selectors)
-                if selector is not None:
-                    entry = nested
-            if selector is not None:
-                entry = f"selector:{_selector_stable_name(selector, selectors.index(selector))}"
-                if entry not in seen_scale:
-                    seen_scale.add(entry)
-                    normalized_scale.append(entry)
-                continue
-
-            expanded_cols = _expand_inline_selector_reference(entry, inventory)
-            if expanded_cols:
-                for col in expanded_cols:
-                    if col not in seen_scale:
-                        seen_scale.add(col)
-                        normalized_scale.append(col)
-                continue
-
-            if entry not in seen_scale:
-                seen_scale.add(entry)
-                normalized_scale.append(entry)
-        if normalized_scale:
-            transforms["scale_columns"] = normalized_scale
-
-    if selector_drop_reasons:
-        anchor_columns: List[str] = []
-        for bucket in (
-            clean_dataset.get("required_columns"),
-            clean_dataset.get("optional_passthrough_columns"),
-            _collect_cleaning_hard_gate_columns(contract),
-        ):
-            if isinstance(bucket, list):
-                for col in bucket:
-                    text = str(col or "").strip()
-                    if text and text not in anchor_columns:
-                        anchor_columns.append(text)
-        anchor_norms = {_normalize_column_identifier(col) for col in anchor_columns if col}
-        required_columns = [
-            str(col).strip()
-            for col in (clean_dataset.get("required_columns") or [])
-            if str(col).strip()
-        ]
-
-        repaired_selectors: List[Dict[str, Any]] = []
-        seen_repaired: set[str] = set()
-        for idx, selector in enumerate(selectors):
-            if not isinstance(selector, dict):
-                continue
-            matched_columns, selector_issues = expand_required_feature_selectors([selector], inventory)
-            if selector_issues:
-                fingerprint = json.dumps(selector, sort_keys=True, ensure_ascii=False)
-                if fingerprint not in seen_repaired:
-                    seen_repaired.add(fingerprint)
-                    repaired_selectors.append(selector)
-                continue
-
-            overlapping = [
-                col for col in matched_columns if _normalize_column_identifier(col) in anchor_norms
-            ]
-            if not overlapping:
-                fingerprint = json.dumps(selector, sort_keys=True, ensure_ascii=False)
-                if fingerprint not in seen_repaired:
-                    seen_repaired.add(fingerprint)
-                    repaired_selectors.append(selector)
-                continue
-
-            for col in overlapping:
-                if col not in required_columns:
-                    required_columns.append(col)
-
-            remaining = [
-                col for col in matched_columns if _normalize_column_identifier(col) not in anchor_norms
-            ]
-            if not remaining:
-                continue
-
-            materialized_selector = {
-                "type": "list",
-                "columns": remaining,
-                "name": _selector_stable_name(selector, idx),
-            }
-            for key in ("id", "family", "role", "selector_hint"):
-                value = selector.get(key)
-                if value not in (None, "", []):
-                    materialized_selector[key] = copy.deepcopy(value)
-            fingerprint = json.dumps(materialized_selector, sort_keys=True, ensure_ascii=False)
-            if fingerprint not in seen_repaired:
-                seen_repaired.add(fingerprint)
-                repaired_selectors.append(materialized_selector)
-
-        clean_dataset["required_columns"] = required_columns
-        clean_dataset["required_feature_selectors"] = repaired_selectors
-
-    return contract
-
-
-def _deterministic_repair_gate_lists(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return contract
-
-    def _normalize_gate(gate: Any, gate_key: str, idx: int) -> Dict[str, Any] | None:
-        if isinstance(gate, str):
-            name = gate.strip()
-            if not name:
-                return None
-            return {"name": name, "severity": "HARD", "params": {}}
-        if not isinstance(gate, dict):
-            return None
-
-        name = ""
-        for key in ("name", "id", "gate", "metric", "check", "rule", "title", "label"):
-            value = gate.get(key)
-            if isinstance(value, str) and value.strip():
-                name = value.strip()
-                break
-        if not name:
-            name = f"{gate_key}_{idx + 1}"
-
-        severity = str(gate.get("severity") or gate.get("level") or "HARD").strip().upper()
-        if severity not in _QA_SEVERITIES:
-            severity = "HARD"
-        params = gate.get("params")
-        params_dict = dict(params) if isinstance(params, dict) else {}
-        for key in ("metric", "check", "rule", "threshold", "condition"):
-            if key in gate and key not in params_dict:
-                params_dict[key] = gate.get(key)
-
-        normalized: Dict[str, Any] = {
-            "name": name,
-            "severity": severity,
-            "params": params_dict,
-        }
-        for key in ("condition", "evidence_required", "action_if_fail"):
-            if key in gate and gate.get(key) not in (None, ""):
-                normalized[key] = gate.get(key)
-        return normalized
-
-    for gate_key in ("cleaning_gates", "qa_gates", "reviewer_gates"):
-        gates = contract.get(gate_key)
-        if not isinstance(gates, list):
-            continue
-        repaired = []
-        for idx, gate in enumerate(gates):
-            normalized = _normalize_gate(gate, gate_key, idx)
-            if normalized is not None:
-                repaired.append(normalized)
-        if repaired:
-            contract[gate_key] = repaired
-    return contract
-
-
-def _deterministic_repair_scope(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return contract
-    artifact_requirements = contract.get("artifact_requirements")
-    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
-    has_cleaning = bool(
-        isinstance(clean_dataset, dict)
-        or isinstance(contract.get("cleaning_gates"), list)
-        or contract.get("data_engineer_runbook")
-    )
-    has_ml = bool(
-        isinstance(contract.get("qa_gates"), list)
-        or isinstance(contract.get("reviewer_gates"), list)
-        or isinstance(contract.get("validation_requirements"), dict)
-        or contract.get("ml_engineer_runbook")
-    )
-
-    # Always prefer structural evidence over the raw scope string:
-    # if the contract encodes both cleaning and ML requirements, it is a full_pipeline contract,
-    # regardless of what the LLM wrote into the scope field.
-    if has_cleaning and has_ml:
-        contract["scope"] = "full_pipeline"
-        return contract
-
-    # If only one side of the pipeline is specified, infer the narrowest coherent scope.
-    if has_cleaning and not has_ml:
-        contract["scope"] = "cleaning_only"
-        return contract
-    if has_ml and not has_cleaning:
-        contract["scope"] = "ml_only"
-        return contract
-
-    # No strong structural signal – fall back to an existing, valid scope if present,
-    # otherwise default to full_pipeline to keep downstream views maximally informed.
-    scope_raw = contract.get("scope")
-    scope = normalize_contract_scope(scope_raw) if scope_raw is not None else ""
-    if scope in {"cleaning_only", "ml_only", "full_pipeline"}:
-        contract["scope"] = scope
-    else:
-        contract["scope"] = "full_pipeline"
-    return contract
-
-
-def _deterministic_repair_derived_columns(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return contract
-
-    normalized = _extract_derived_column_names(contract.get("derived_columns"))
-    contract["derived_columns"] = normalized
-    return contract
 
 
 def _merge_contract_missing_fields(
@@ -4557,118 +3692,6 @@ def _synthesize_task_semantics(contract: Dict[str, Any] | None) -> Dict[str, Any
             ],
         },
     }
-
-
-def _deterministic_repair_target_semantics(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return contract
-
-    repaired = contract
-    outcome_columns = _collect_targetish_columns(repaired.get("outcome_columns"))
-    column_roles = repaired.get("column_roles")
-    if isinstance(column_roles, dict):
-        for key in ("outcome", "target", "label"):
-            for col in _collect_targetish_columns(column_roles.get(key)):
-                if col not in outcome_columns:
-                    outcome_columns.append(col)
-
-    explicit_targets = _collect_contract_target_candidates(repaired)
-    for col in explicit_targets:
-        if col not in outcome_columns and _looks_like_target_semantic_column(col):
-            outcome_columns.append(col)
-
-    multi_target = len(outcome_columns) > 1 or _has_multi_target_signal(
-        repaired.get("business_objective"),
-        repaired.get("strategy_title"),
-        repaired.get("objective_analysis"),
-        repaired.get("evaluation_spec"),
-        repaired.get("validation_requirements"),
-    )
-    primary_target = ""
-    for source in (
-        repaired.get("target_column"),
-        repaired.get("primary_target"),
-        (column_roles or {}).get("outcome") if isinstance(column_roles, dict) else None,
-        repaired.get("outcome_columns"),
-    ):
-        values = _collect_targetish_columns(source)
-        if values:
-            primary_target = values[0]
-            break
-    if not primary_target and explicit_targets:
-        primary_target = explicit_targets[0]
-    if not primary_target and outcome_columns:
-        primary_target = outcome_columns[0]
-
-    if multi_target and outcome_columns:
-        repaired["target_columns"] = list(outcome_columns)
-        if primary_target:
-            repaired["primary_target"] = primary_target
-        for container_key in ("objective_analysis", "evaluation_spec", "validation_requirements"):
-            container = repaired.get(container_key)
-            if not isinstance(container, dict):
-                container = {}
-            else:
-                container = dict(container)
-            container["target_columns"] = list(outcome_columns)
-            container["primary_targets"] = list(outcome_columns)
-            container["label_columns"] = list(outcome_columns)
-            if primary_target:
-                container["primary_target"] = primary_target
-                container["target_column"] = primary_target
-                container["label_column"] = primary_target
-            repaired[container_key] = container
-        if isinstance(column_roles, dict):
-            role_copy = dict(column_roles)
-            role_copy["outcome"] = list(outcome_columns)
-            repaired["column_roles"] = role_copy
-        else:
-            repaired["column_roles"] = {"outcome": list(outcome_columns)}
-        repaired["outcome_columns"] = list(outcome_columns)
-        return repaired
-
-    if primary_target:
-        repaired["target_column"] = primary_target
-        repaired["primary_target"] = primary_target
-        if not outcome_columns:
-            repaired["outcome_columns"] = [primary_target]
-        for container_key in ("objective_analysis", "evaluation_spec", "validation_requirements"):
-            container = repaired.get(container_key)
-            if not isinstance(container, dict):
-                container = {}
-            else:
-                container = dict(container)
-            container.setdefault("primary_target", primary_target)
-            container.setdefault("target_column", primary_target)
-            container.setdefault("label_column", primary_target)
-            repaired[container_key] = container
-    return repaired
-
-
-def _deterministic_repair_task_semantics(contract: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return contract
-    repaired = contract
-    task_semantics = _synthesize_task_semantics(repaired)
-    if task_semantics:
-        repaired["task_semantics"] = task_semantics
-    return repaired
-
-
-def _apply_deterministic_repairs(contract: Dict[str, Any] | None) -> Dict[str, Any]:
-    if not isinstance(contract, dict):
-        return {}
-    repaired = copy.deepcopy(contract)
-    repaired = apply_contract_schema_registry_repairs(repaired)
-    repaired = _deterministic_repair_scope(repaired)
-    repaired = _deterministic_repair_target_semantics(repaired)
-    repaired = _deterministic_repair_task_semantics(repaired)
-    repaired = _deterministic_repair_gate_lists(repaired)
-    repaired = _deterministic_repair_required_feature_selectors(repaired)
-    repaired = _deterministic_repair_clean_dataset_consistency(repaired)
-    repaired = _deterministic_repair_column_dtype_targets(repaired)
-    repaired = _deterministic_repair_derived_columns(repaired)
-    return repaired
 
 
 def _validation_result_accepted(validation_result: Dict[str, Any] | None) -> bool:
@@ -4846,7 +3869,6 @@ def _validate_repair_revalidate_loop(
     attempts = max(0, int(max_iterations)) + 1
     for attempt in range(1, attempts + 1):
         working = _apply_planner_structural_support(working)
-        working = _apply_deterministic_repairs(working)
         if preserved_deliverables is not None:
             spec_obj = working.get("spec_extraction")
             if not isinstance(spec_obj, dict):
@@ -4923,7 +3945,6 @@ def build_contract_min(
                      excluded from required_columns since they provide no information.
     """
     contract = copy.deepcopy(full_contract_or_partial) if isinstance(full_contract_or_partial, dict) else {}
-    contract = _deterministic_repair_target_semantics(contract)
     strategy_dict = strategy if isinstance(strategy, dict) else {}
     inventory = [str(col) for col in (column_inventory or []) if col is not None]
     inventory_norms = {_normalize_column_identifier(col): col for col in inventory}
@@ -5414,7 +4435,7 @@ def build_contract_min(
                 }
             }
         }
-        selector_probe = _deterministic_repair_required_feature_selectors(selector_probe)
+        selector_probe = apply_contract_schema_registry_repairs(selector_probe)
         declared_feature_selectors = (
             selector_probe.get("artifact_requirements", {})
             .get("clean_dataset", {})
@@ -6686,109 +5707,10 @@ def build_contract_min(
         contract_min["secondary_scoring_subset"] = secondary_scoring_subset
     if data_partitioning_notes:
         contract_min["data_partitioning_notes"] = data_partitioning_notes
-    contract_min = _deterministic_repair_clean_dataset_consistency(contract_min)
     task_semantics = _synthesize_task_semantics(contract_min)
     if task_semantics:
         contract_min["task_semantics"] = task_semantics
     return contract_min
-
-
-def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
-    """
-    Validates and fills missing V4.1 schema keys.
-    Adds to 'unknowns' array when filling defaults.
-
-    Args:
-        contract: Contract dict from LLM
-        strict: If True, raise error on missing keys (for tests)
-
-    Returns:
-        Contract with all V4.1 keys present
-    """
-    from src.utils.contract_accessors import CONTRACT_VERSION_V41, normalize_contract_version
-
-    if not isinstance(contract, dict):
-        return contract
-
-    required_keys = [
-        "contract_version", "strategy_title", "business_objective",
-        "missing_columns_handling", "execution_constraints",
-        "objective_analysis", "data_analysis", "column_roles",
-        "preprocessing_requirements",
-        "validation_requirements", "leakage_execution_plan",
-        "optimization_specification", "segmentation_constraints",
-        "data_limited_mode", "allowed_feature_sets",
-        "artifact_requirements", "qa_gates", "cleaning_gates", "reviewer_gates",
-        "data_engineer_runbook", "ml_engineer_runbook",
-        "available_columns", "canonical_columns", "derived_columns",
-        "required_outputs", "iteration_policy", "optimization_policy", "column_dtype_targets", "unknowns",
-        "assumptions", "notes_for_engineers"
-    ]
-
-    repairs = []
-
-    for key in required_keys:
-        if key not in contract:
-            if strict:
-                raise ValueError(f"Missing required V4.1 key: {key}")
-
-            # Fill with safe default
-            if key == "contract_version":
-                contract[key] = CONTRACT_VERSION_V41
-            elif key == "optimization_policy":
-                contract[key] = get_default_optimization_policy()
-            elif key in ("optimization_specification", "segmentation_constraints"):
-                contract[key] = None
-            elif key in ("unknowns", "assumptions", "notes_for_engineers", "available_columns",
-                         "canonical_columns", "derived_columns", "required_outputs"):
-                contract[key] = []
-            elif key in ("qa_gates", "cleaning_gates", "reviewer_gates"):
-                contract[key] = []
-            elif key in ("strategy_title", "business_objective"):
-                contract[key] = ""
-            else:
-                contract[key] = {}
-
-            repairs.append(f"Added missing key: {key}")
-
-    # Ensure unknowns is a list
-    unknowns = contract.get("unknowns")
-    if not isinstance(unknowns, list):
-        unknowns = []
-        contract["unknowns"] = unknowns
-
-    # Normalize contract version to V4.1
-    version = contract.get("contract_version")
-    normalized_version = normalize_contract_version(version)
-    if version != normalized_version:
-        old_version = version
-        contract["contract_version"] = normalized_version
-        unknowns.append({
-            "item": f"Normalized contract_version from {old_version} to {normalized_version}",
-            "impact": "Schema validation enforced V4.1 version",
-            "mitigation": "Review LLM output quality",
-            "requires_verification": False
-        })
-    elif version is None:
-        contract["contract_version"] = CONTRACT_VERSION_V41
-
-    # Add repair notes to unknowns
-    for repair in repairs:
-        unknowns.append({
-            "item": repair,
-            "impact": "Schema validation filled missing field",
-            "mitigation": "Review LLM output quality",
-            "requires_verification": False
-        })
-
-    # Legacy optional field: if present, keep dict shape.
-    if "feature_engineering_plan" in contract and not isinstance(contract.get("feature_engineering_plan"), dict):
-        contract["feature_engineering_plan"] = {}
-
-    # v4.2-compatible policy defaults.
-    contract["optimization_policy"] = normalize_optimization_policy(contract.get("optimization_policy"))
-
-    return contract
 
 
 def validate_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
