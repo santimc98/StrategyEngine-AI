@@ -615,8 +615,14 @@ def _derive_clean_dataset_required_columns(contract: Dict[str, Any]) -> List[str
     _append_unique_columns(required, contract.get("canonical_columns"))
 
     column_roles = get_column_roles(contract)
+    # "decision" columns are model OUTPUTS (e.g. predicted probabilities),
+    # not raw data columns. Including them would create empty placeholder
+    # columns in the cleaned dataset that leak into the feature set.
+    _OUTPUT_ROLES = {"decision"}
     if isinstance(column_roles, dict):
-        for values in column_roles.values():
+        for role, values in column_roles.items():
+            if str(role).strip().lower() in _OUTPUT_ROLES:
+                continue
             _append_unique_columns(required, values)
 
     allowed_feature_sets = contract.get("allowed_feature_sets")
