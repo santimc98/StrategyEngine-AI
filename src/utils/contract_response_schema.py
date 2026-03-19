@@ -159,6 +159,7 @@ EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS: List[str] = [
     "validation_requirements",
     "iteration_policy",
     "column_dtype_targets",
+    "model_features",
     "data_engineer_runbook",
     "ml_engineer_runbook",
 ]

@@ -169,8 +169,8 @@ Return format:
 COMPLETE CONTRACT REQUIREMENT — All of the following top-level keys MUST be present in your output:
   contract_version, scope, strategy_title, business_objective, output_dialect,
   canonical_columns, required_outputs, column_roles, allowed_feature_sets,
-  task_semantics, artifact_requirements, cleaning_gates, qa_gates, reviewer_gates,
-  data_engineer_runbook, ml_engineer_runbook, column_dtype_targets,
+  task_semantics, artifact_requirements, model_features, cleaning_gates, qa_gates,
+  reviewer_gates, data_engineer_runbook, ml_engineer_runbook, column_dtype_targets,
   validation_requirements, evaluation_spec, iteration_policy, optimization_policy.
 
 Sections you MUST generate yourself (previously auto-projected, now YOUR responsibility):
@@ -199,6 +199,10 @@ Sections you MUST generate yourself (previously auto-projected, now YOUR respons
 - column_dtype_targets: object mapping column_name -> {"target_dtype": string, "nullable": bool, "role": string, "source": string}.
   MUST include at least: all outcome columns, identifier columns, split columns, time columns, and decision columns.
   For wide feature families, you may use a representative subset.
+
+- model_features: list[str] — the explicit list of column names the ML engineer should use as model inputs.
+  This MUST match allowed_feature_sets.model_features. Having it as a top-level key ensures downstream
+  agents can access the approved feature set without navigating nested structures.
 
 - artifact_requirements.clean_dataset.required_columns: list[str] containing ALL columns the ML pipeline needs:
   outcome columns, pre_decision features, identifiers, split columns, post_decision_audit columns.
@@ -8786,12 +8790,27 @@ domain_expert_critique:
 {critique_for_prompt or "None"}
 """
 
+        # Build a scope-aware closing checklist from the canonical schema so the
+        # LLM self-verifies completeness before returning.  The checklist is
+        # derived from the authoritative required-keys list — never hardcoded
+        # for a specific dataset or competition.
+        _required_keys_csv = ", ".join(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)
+        _closing_checklist = (
+            "\n\nBEFORE YOU RETURN — self-check your JSON against this contract completeness checklist.\n"
+            f"Every key listed here MUST be a top-level key in your output: {_required_keys_csv}.\n"
+            "If any key is missing, add it now.  Omitting a required section will fail validation.\n"
+            "For sections where you lack explicit input evidence, reason from the business objective, "
+            "task_semantics, and column_roles to derive sensible defaults — a senior planner always "
+            "produces a complete contract, never a partial one."
+        )
+
         full_prompt = (
             MINIMAL_CONTRACT_COMPILER_PROMPT
             + "\n\nSCHEMA REGISTRY EXAMPLES:\n"
             + CONTRACT_SCHEMA_EXAMPLES_TEXT
             + "\n\nINPUTS:\n"
             + user_input
+            + _closing_checklist
         )
         model_chain = [m for m in (self.model_chain or [self.model_name]) if m]
 
