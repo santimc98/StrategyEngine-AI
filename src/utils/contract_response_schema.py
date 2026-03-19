@@ -289,11 +289,7 @@ EXECUTION_CONTRACT_CANONICAL_SCHEMA: Dict[str, Any] = {
 
 
 EXECUTION_CONTRACT_TRANSPORT_SCHEMA: Dict[str, Any] = copy.deepcopy(EXECUTION_CONTRACT_CANONICAL_SCHEMA)
-# Transport schema is used by the LLM tool call — keep it flexible so the
-# repair loop can fix omissions.  Only the canonical validation enforces all keys.
-_TRANSPORT_ONLY_REQUIRED = [
-    "contract_version", "scope", "strategy_title", "business_objective",
-    "output_dialect", "canonical_columns", "required_outputs", "column_roles",
-    "allowed_feature_sets", "task_semantics", "artifact_requirements",
-]
-EXECUTION_CONTRACT_TRANSPORT_SCHEMA["required"] = _TRANSPORT_ONLY_REQUIRED
+# Transport schema must require the same keys as the canonical schema.
+# When the schema marks keys as optional, LLMs deprioritize them regardless
+# of prompt instructions — the tool schema has higher weight than text.
+EXECUTION_CONTRACT_TRANSPORT_SCHEMA["required"] = list(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)
