@@ -352,6 +352,9 @@ Scope-dependent required fields:
   - validation_requirements: REQUIRED finalized section for ML scopes
   - objective_analysis.problem_type OR evaluation_spec.objective_type OR task_semantics.objective_type must be present
   - column_dtype_targets MUST include anchor columns for ML scopes; infer conservative but explicit anchor dtypes yourself when needed.
+  - required_outputs MUST include a metrics JSON artifact (e.g. "metrics/evaluation.json" or "artifacts/ml/cv_metrics.json").
+    The downstream system reads this file to extract the primary metric value for review board evaluation.
+    Without it, the metric cannot be tracked across iterations.
 
 Gate object contract (for cleaning_gates / qa_gates / reviewer_gates):
 - preferred shape: {"name": string, "severity": "HARD"|"SOFT", "params": object}
