@@ -67,20 +67,16 @@ class ReviewBoardAgent:
         self.last_prompt = system_prompt + "\n\n" + user_prompt
 
         try:
-            if self.provider == "gemini":
-                response = self.client.generate_content(self.last_prompt)
-                content = response.text
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
-                )
-                content = response.choices[0].message.content
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            content = response.choices[0].message.content
             self.last_response = content
             parsed = json.loads(self._clean_json(content))
             normalized = self._normalize(parsed, context)

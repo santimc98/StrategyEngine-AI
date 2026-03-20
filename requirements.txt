@@ -8,9 +8,6 @@ openpyxl
 # --- Agentes & LLMs ---
 langchain
 langgraph
-langchain-google-genai
-google-genai
-google-generativeai
 openai
 zai-sdk==0.1.0
 

@@ -53,16 +53,16 @@ class ResultsAdvisorAgent:
 
     def __init__(self, api_key: Any = None):
         explicit_api_key = api_key
-        self.api_key = explicit_api_key if explicit_api_key is not None else os.getenv("MIMO_API_KEY")
+        self.api_key = explicit_api_key if explicit_api_key is not None else os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
             self.client = None
         else:
             self.client = OpenAI(
                 api_key=self.api_key,
-                base_url="https://api.xiaomimimo.com/v1",
+                base_url="https://openrouter.ai/api/v1",
                 timeout=None,
             )
-        self.model_name = "mimo-v2-flash"
+        self.model_name = os.getenv("RESULTS_ADVISOR_MODEL", "google/gemini-3-flash-preview")
         self.last_prompt = None
         self.last_response = None
         self.fe_advice_mode = self._normalize_fe_advice_mode(
@@ -80,21 +80,8 @@ class ResultsAdvisorAgent:
             os.getenv("RESULTS_ADVISOR_CRITIQUE_MODE", "llm")
         )
         self._generation_config = {
-            "temperature": float(
-                os.getenv(
-                    "RESULTS_ADVISOR_GEMINI_TEMPERATURE",
-                    os.getenv("REVIEWER_GEMINI_TEMPERATURE", "0.2"),
-                )
-            ),
-            "top_p": 0.9,
-            "top_k": 40,
-            "max_output_tokens": int(
-                os.getenv(
-                    "RESULTS_ADVISOR_GEMINI_MAX_TOKENS",
-                    os.getenv("REVIEWER_GEMINI_MAX_TOKENS", "8192"),
-                )
-            ),
-            "response_mime_type": "application/json",
+            "temperature": float(os.getenv("RESULTS_ADVISOR_TEMPERATURE", "0.2")),
+            "max_tokens": int(os.getenv("RESULTS_ADVISOR_MAX_TOKENS", "8192")),
         }
         schema_flag = str(
             os.getenv(
@@ -120,11 +107,11 @@ class ResultsAdvisorAgent:
         # Tests frequently instantiate with api_key="" to force non-network mode.
         if explicit_api_key is not None and str(explicit_api_key).strip() == "":
             return
-        critique_api_key = os.getenv("OPENROUTER_API_KEY")
-        if critique_api_key:
+        openrouter_key = self.api_key or os.getenv("OPENROUTER_API_KEY")
+        if openrouter_key:
             self.critique_provider = "openrouter"
             self.critique_client = OpenAI(
-                api_key=critique_api_key,
+                api_key=openrouter_key,
                 base_url="https://openrouter.ai/api/v1",
                 timeout=None,
             )
@@ -137,7 +124,7 @@ class ResultsAdvisorAgent:
             or self.critique_mode in {"llm", "hybrid"}
         ):
             if self.client is not None:
-                self.fe_provider = "mimo"
+                self.fe_provider = "openrouter"
                 self.fe_client = self.client
                 self.fe_model_name = str(
                     os.getenv("RESULTS_ADVISOR_LLM_MODEL", self.model_name)
@@ -184,30 +171,6 @@ class ResultsAdvisorAgent:
             "schema not supported",
         )
         return any(token in message for token in unsupported_tokens)
-
-    def _generate_gemini_json(
-        self,
-        prompt: str,
-        *,
-        generation_config: Dict[str, Any],
-    ) -> tuple[str, Dict[str, Any]]:
-        used_config = dict(generation_config or {})
-        try:
-            response = self.fe_client.generate_content(prompt, generation_config=used_config)
-        except TypeError:
-            response = self.fe_client.generate_content(prompt)
-        except Exception as err:
-            if "response_schema" in used_config and self._is_response_schema_unsupported_error(err):
-                retry_config = dict(used_config)
-                retry_config.pop("response_schema", None)
-                try:
-                    response = self.fe_client.generate_content(prompt, generation_config=retry_config)
-                except TypeError:
-                    response = self.fe_client.generate_content(prompt)
-                used_config = retry_config
-            else:
-                raise
-        return _coerce_llm_response_text(response), used_config
 
     def generate_ml_advice(self, context: Dict[str, Any]) -> str:
         if not context:
@@ -457,40 +420,31 @@ class ResultsAdvisorAgent:
         )
 
         try:
-            if self.critique_provider == "gemini":
-                generation_config = self._generation_config_for_critique()
-                generation_config["response_schema"] = copy.deepcopy(schema)
-                repaired_text, used_config = self._generate_gemini_json(
-                    repair_prompt,
-                    generation_config=generation_config,
-                )
-                trace["used_response_schema"] = "response_schema" in used_config
-            else:
-                call_kwargs = {
-                    "model": self.critique_model_name,
-                    "messages": [
-                        {"role": "system", "content": "Return only valid JSON."},
-                        {"role": "user", "content": repair_prompt},
-                    ],
-                    "temperature": 0.0,
-                }
-                if self._use_response_schema:
-                    call_kwargs["response_format"] = self._openai_response_format_for_critique()
-                try:
-                    response = self.critique_client.chat.completions.create(**call_kwargs)
-                except TypeError:
-                    retry_kwargs = dict(call_kwargs)
-                    retry_kwargs.pop("temperature", None)
-                    response = self.critique_client.chat.completions.create(**retry_kwargs)
-                except Exception as err:
-                    if self._use_response_schema and self._is_response_schema_unsupported_error(err):
-                        fallback_kwargs = dict(call_kwargs)
-                        fallback_kwargs.pop("response_format", None)
-                        response = self.critique_client.chat.completions.create(**fallback_kwargs)
-                    else:
-                        raise
-                repaired_text = response.choices[0].message.content
-                trace["used_response_schema"] = self._use_response_schema
+            call_kwargs = {
+                "model": self.critique_model_name,
+                "messages": [
+                    {"role": "system", "content": "Return only valid JSON."},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                "temperature": 0.0,
+            }
+            if self._use_response_schema:
+                call_kwargs["response_format"] = self._openai_response_format_for_critique()
+            try:
+                response = self.critique_client.chat.completions.create(**call_kwargs)
+            except TypeError:
+                retry_kwargs = dict(call_kwargs)
+                retry_kwargs.pop("temperature", None)
+                response = self.critique_client.chat.completions.create(**retry_kwargs)
+            except Exception as err:
+                if self._use_response_schema and self._is_response_schema_unsupported_error(err):
+                    fallback_kwargs = dict(call_kwargs)
+                    fallback_kwargs.pop("response_format", None)
+                    response = self.critique_client.chat.completions.create(**fallback_kwargs)
+                else:
+                    raise
+            repaired_text = response.choices[0].message.content
+            trace["used_response_schema"] = self._use_response_schema
             repaired_packet = self._parse_json_object(repaired_text)
             normalized_repaired = self._normalize_critique_packet_candidate(
                 repaired_packet,
@@ -846,42 +800,30 @@ class ResultsAdvisorAgent:
         )
 
         try:
-            if self.critique_provider == "gemini":
-                generation_config = self._generation_config_for_critique()
-                raw_text, used_config = self._generate_gemini_json(
-                    system_prompt + "\n\n" + user_prompt,
-                    generation_config=generation_config,
-                )
-                if "response_schema" in generation_config and "response_schema" not in used_config:
-                    print(
-                        "RESULTS_ADVISOR_CRITIQUE_SCHEMA_FALLBACK: "
-                        + f"provider={self.critique_provider} model={self.critique_model_name} reason=response_schema_unsupported"
-                    )
-            else:
-                call_kwargs = {
-                    "model": self.critique_model_name,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.0,
-                }
-                if self._use_response_schema:
-                    call_kwargs["response_format"] = self._openai_response_format_for_critique()
-                try:
-                    response = self.critique_client.chat.completions.create(**call_kwargs)
-                except TypeError:
-                    retry_kwargs = dict(call_kwargs)
-                    retry_kwargs.pop("temperature", None)
-                    response = self.critique_client.chat.completions.create(**retry_kwargs)
-                except Exception as err:
-                    if self._use_response_schema and self._is_response_schema_unsupported_error(err):
-                        fallback_kwargs = dict(call_kwargs)
-                        fallback_kwargs.pop("response_format", None)
-                        response = self.critique_client.chat.completions.create(**fallback_kwargs)
-                    else:
-                        raise
-                raw_text = response.choices[0].message.content
+            call_kwargs = {
+                "model": self.critique_model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.0,
+            }
+            if self._use_response_schema:
+                call_kwargs["response_format"] = self._openai_response_format_for_critique()
+            try:
+                response = self.critique_client.chat.completions.create(**call_kwargs)
+            except TypeError:
+                retry_kwargs = dict(call_kwargs)
+                retry_kwargs.pop("temperature", None)
+                response = self.critique_client.chat.completions.create(**retry_kwargs)
+            except Exception as err:
+                if self._use_response_schema and self._is_response_schema_unsupported_error(err):
+                    fallback_kwargs = dict(call_kwargs)
+                    fallback_kwargs.pop("response_format", None)
+                    response = self.critique_client.chat.completions.create(**fallback_kwargs)
+                else:
+                    raise
+            raw_text = response.choices[0].message.content
         except Exception as exc:
             self._record_critique_error(
                 stage="api_call_exception",
@@ -1274,19 +1216,15 @@ class ResultsAdvisorAgent:
         )
 
         try:
-            if self.fe_provider == "gemini":
-                response = self.fe_client.generate_content(system_prompt + "\n\n" + user_prompt)
-                content = response.text
-            else:
-                response = self.fe_client.chat.completions.create(
-                    model=self.fe_model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.1,
-                )
-                content = response.choices[0].message.content
+            response = self.fe_client.chat.completions.create(
+                model=self.fe_model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+            )
+            content = response.choices[0].message.content
         except Exception:
             return ""
 

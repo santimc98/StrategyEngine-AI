@@ -501,30 +501,6 @@ class ReviewerAgent:
         )
         return any(token in message for token in unsupported_tokens)
 
-    def _generate_gemini_json(
-        self,
-        prompt: str,
-        *,
-        generation_config: Dict[str, Any],
-    ) -> tuple[str, Dict[str, Any]]:
-        used_config = dict(generation_config or {})
-        try:
-            response = self.client.generate_content(prompt, generation_config=used_config)
-        except TypeError:
-            response = self.client.generate_content(prompt)
-        except Exception as err:
-            if "response_schema" in used_config and self._is_response_schema_unsupported_error(err):
-                retry_config = dict(used_config)
-                retry_config.pop("response_schema", None)
-                try:
-                    response = self.client.generate_content(prompt, generation_config=retry_config)
-                except TypeError:
-                    response = self.client.generate_content(prompt)
-                used_config = retry_config
-            else:
-                raise
-        return _coerce_llm_response_text(response), used_config
-
     def _attempt_llm_json_repair(
         self,
         raw_text: str,
@@ -564,26 +540,17 @@ class ReviewerAgent:
         )
 
         try:
-            if self.provider == "gemini":
-                generation_config = dict(self._generation_config)
-                generation_config["response_schema"] = copy.deepcopy(schema)
-                repaired_text, used_config = self._generate_gemini_json(
-                    repair_prompt,
-                    generation_config=generation_config,
-                )
-                trace["used_response_schema"] = "response_schema" in used_config
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": "Return only valid JSON."},
-                        {"role": "user", "content": repair_prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
-                )
-                repaired_text = response.choices[0].message.content
-                trace["used_response_schema"] = False
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": "Return only valid JSON."},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            repaired_text = response.choices[0].message.content
+            trace["used_response_schema"] = False
             parsed, parsed_trace = parse_json_object_with_repair(
                 str(repaired_text or ""),
                 actor="reviewer_json_repair",
@@ -832,21 +799,14 @@ class ReviewerAgent:
             }
 
         try:
-            if self.provider == "gemini":
-                print(f"DEBUG: Reviewer calling Gemini ({self.model_name})...")
-                content, _ = self._generate_gemini_json(
-                    system_prompt + "\n\n" + user_prompt,
-                    generation_config=self._generation_config_for_review(active_reviewer_gates),
-                )
-            else:
-                print(f"DEBUG: Reviewer calling MIMO ({self.model_name})...")
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    response_format={'type': 'json_object'},
-                    temperature=0.0
-                )
-                content = response.choices[0].message.content
+            print(f"DEBUG: Reviewer calling OpenRouter ({self.model_name})...")
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                response_format={'type': 'json_object'},
+                temperature=0.0
+            )
+            content = response.choices[0].message.content
             self.last_response = content
             result = self._parse_json_payload_with_llm_repair(
                 content,
@@ -1064,23 +1024,17 @@ class ReviewerAgent:
             )
 
         try:
-            if self.provider == "gemini":
-                print(f"DEBUG: Reviewer evaluation calling Gemini ({self.model_name})...")
-                content, _ = self._generate_gemini_json(
-                    system_prompt + "\n\nEvaluate results.",
-                    generation_config=self._generation_config_for_evaluation(eval_reviewer_gates),
-                )
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": "Evaluate results."}
-                    ],
-                    response_format={'type': 'json_object'},
-                    temperature=0.1
-                )
-                content = response.choices[0].message.content
+            print(f"DEBUG: Reviewer evaluation calling OpenRouter ({self.model_name})...")
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": "Evaluate results."}
+                ],
+                response_format={'type': 'json_object'},
+                temperature=0.1
+            )
+            content = response.choices[0].message.content
             self.last_response = content
             result = self._parse_json_payload_with_llm_repair(
                 content,

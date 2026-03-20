@@ -5,7 +5,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
-import google.generativeai as genai
+from openai import OpenAI
 
 from src.utils.senior_protocol import SENIOR_STRATEGY_PROTOCOL
 
@@ -41,19 +41,15 @@ class DomainExpertAgent:
         """
         Domain Expert with LLM + deterministic validation/scoring fallback.
         """
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
-            raise ValueError("Google API Key is required for Domain Expert.")
+            raise ValueError("OPENROUTER_API_KEY is required for Domain Expert.")
 
-        genai.configure(api_key=self.api_key)
-        self.model_name = os.getenv("DOMAIN_EXPERT_MODEL", "gemini-3-flash-preview")
-        self.model = genai.GenerativeModel(
-            model_name=self.model_name,
-            generation_config={
-                "temperature": 0.1,
-                "response_mime_type": "application/json",
-            },
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://openrouter.ai/api/v1",
         )
+        self.model_name = os.getenv("DOMAIN_EXPERT_MODEL", "google/gemini-3-flash-preview")
         self.last_prompt = None
         self.last_response = None
 
@@ -84,8 +80,13 @@ class DomainExpertAgent:
         self.last_prompt = prompt
 
         try:
-            response = self.model.generate_content(prompt)
-            content = (getattr(response, "text", "") or "").strip()
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            content = (response.choices[0].message.content or "").strip()
             self.last_response = content
             parsed = self._parse_json_response(content)
             raw_reviews = parsed.get("reviews") if isinstance(parsed, dict) else []

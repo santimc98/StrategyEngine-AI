@@ -1,4 +1,3 @@
-import google.generativeai as genai
 import pandas as pd
 import numpy as np
 import os
@@ -10,6 +9,7 @@ import json
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 from src.utils.pii_scrubber import PIIScrubber
@@ -209,18 +209,17 @@ def _count_csv_rows(file_path: str, encoding: str) -> int:
 class StewardAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Steward Agent with Gemini 3 Flash.
+        Initializes the Steward Agent via OpenRouter.
         """
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
-            raise ValueError("Google API Key is required.")
-        
-        genai.configure(api_key=self.api_key)
-        
-        self.model = genai.GenerativeModel(
-            model_name="gemini-3-flash-preview",
-            generation_config={"temperature": 0.2}
+            raise ValueError("OPENROUTER_API_KEY is required.")
+
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://openrouter.ai/api/v1",
         )
+        self.model_name = os.getenv("STEWARD_MODEL", "google/gemini-3-flash-preview")
         self.last_prompt = None
         self.last_response = None
 
@@ -372,42 +371,33 @@ class StewardAgent:
             )
             self.last_prompt = system_prompt
 
-            response = self.model.generate_content(system_prompt)
-            summary = (getattr(response, "text", "") or "").strip()
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": system_prompt}],
+                temperature=0.2,
+            )
+            summary = (response.choices[0].message.content or "").strip()
             self.last_response = summary
 
             # Diagnostic logging for empty responses (best-effort, no PII)
             try:
-                text_len = len(getattr(response, "text", "") or "")
-                candidates = getattr(response, "candidates", None)
-                cand_count = len(candidates) if candidates is not None else 0
-                first = candidates[0] if cand_count else None
-                finish_reason = getattr(first, "finish_reason", None) if first else None
-                safety_ratings = getattr(first, "safety_ratings", None) if first else None
-                citation_metadata = getattr(first, "citation_metadata", None) if first else None
-                citations = getattr(first, "citations", None) if first else None
-                prompt_feedback = getattr(response, "prompt_feedback", None)
-                print(f"STEWARD_LLM_DIAG: text_len={text_len} candidates={cand_count} finish_reason={finish_reason}")
+                text_len = len(summary)
+                finish_reason = getattr(response.choices[0], "finish_reason", None) if response.choices else None
+                print(f"STEWARD_LLM_DIAG: text_len={text_len} finish_reason={finish_reason}")
                 error_classification = None
                 if text_len == 0:
-                    pf_safety = getattr(prompt_feedback, "safety_ratings", None) if prompt_feedback else None
-                    pf_block = getattr(prompt_feedback, "block_reason", None) if prompt_feedback else None
-                    citation_info = citation_metadata or citations
                     print(
-                        f"STEWARD_LLM_EMPTY_RESPONSE: finish_reason={finish_reason} safety={safety_ratings} "
-                        f"prompt_feedback={{'block_reason': {pf_block}, 'safety': {pf_safety}}} citations={citation_info} "
+                        f"STEWARD_LLM_EMPTY_RESPONSE: finish_reason={finish_reason} "
                         f"prompt_length_chars={len(system_prompt)}"
                     )
                     error_classification = "EMPTY"
                 elif text_len < 50:
                     error_classification = "TOO_SHORT"
                 trace = {
-                    "model": self.model.model_name,
+                    "model": self.model_name,
                     "response_text_len": text_len,
                     "prompt_text_len": len(system_prompt),
-                    "candidates": cand_count,
                     "finish_reason": str(finish_reason),
-                    "safety_ratings": str(safety_ratings),
                     "timestamp": datetime.utcnow().isoformat(),
                     "error_classification": error_classification,
                 }
@@ -523,8 +513,12 @@ $raw_output
         last_text = ""
         for attempt in range(max(1, int(max_attempts))):
             self.last_prompt = current_prompt
-            response = self.model.generate_content(current_prompt)
-            text = (getattr(response, "text", "") or "").strip()
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": current_prompt}],
+                temperature=0.2,
+            )
+            text = (response.choices[0].message.content or "").strip()
             self.last_response = text
             last_text = text
             parsed = self._parse_json_response(text)

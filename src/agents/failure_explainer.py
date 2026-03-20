@@ -12,54 +12,37 @@ class FailureExplainerAgent:
     """
     Explains runtime failures using code + traceback + context.
     Returns a short, plain-text diagnosis to feed back into the next attempt.
-    Uses the Gemini Flash API (same as reviewers).
+    Uses OpenRouter as LLM provider.
     """
 
     def __init__(self, api_key: Any = None):
-        self._gemini_model = None
+        self._client = None
         self._model_name = None
 
-        google_key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if google_key:
+        openrouter_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        if openrouter_key:
             try:
-                import google.generativeai as genai
-                from google.generativeai.types import HarmCategory, HarmBlockThreshold
+                from openai import OpenAI
 
-                genai.configure(api_key=google_key)
                 self._model_name = os.getenv(
-                    "FAILURE_EXPLAINER_MODEL", "gemini-3-flash-preview"
+                    "FAILURE_EXPLAINER_MODEL", "google/gemini-3-flash-preview"
                 )
-                generation_config = {
-                    "temperature": 0.1,
-                    "top_p": 0.9,
-                    "top_k": 40,
-                    "max_output_tokens": 2048,
-                }
-                safety_settings = {
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                }
-                self._gemini_model = genai.GenerativeModel(
-                    model_name=self._model_name,
-                    generation_config=generation_config,
-                    safety_settings=safety_settings,
+                self._client = OpenAI(
+                    api_key=openrouter_key,
+                    base_url="https://openrouter.ai/api/v1",
                 )
             except Exception:
-                self._gemini_model = None
+                self._client = None
 
-    def _call_gemini(self, prompt: str) -> str:
-        """Call Gemini and return the text response."""
-        response = self._gemini_model.generate_content(prompt)
-        text = getattr(response, "text", None)
-        if not text:
-            candidates = getattr(response, "candidates", None)
-            if candidates:
-                content = getattr(candidates[0], "content", None)
-                if content and getattr(content, "parts", None):
-                    text = content.parts[0].text
-        return (text or "").strip()
+    def _call_llm(self, prompt: str) -> str:
+        """Call OpenRouter and return the text response."""
+        response = self._client.chat.completions.create(
+            model=self._model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=2048,
+        )
+        return (response.choices[0].message.content or "").strip()
 
     def explain_data_engineer_failure(
         self,
@@ -69,7 +52,7 @@ class FailureExplainerAgent:
     ) -> str:
         if not code or not error_details:
             return ""
-        if not self._gemini_model:
+        if not self._client:
             return self._fallback(error_details)
 
         ctx = context or {}
@@ -101,7 +84,7 @@ class FailureExplainerAgent:
         )
 
         try:
-            content = call_with_retries(lambda: self._call_gemini(prompt), max_retries=2)
+            content = call_with_retries(lambda: self._call_llm(prompt), max_retries=2)
         except Exception:
             return self._fallback(error_details)
 
@@ -115,7 +98,7 @@ class FailureExplainerAgent:
     ) -> str:
         if not code or not error_details:
             return ""
-        if not self._gemini_model:
+        if not self._client:
             return self._fallback(error_details)
 
         ctx = context or {}
@@ -148,7 +131,7 @@ class FailureExplainerAgent:
         )
 
         try:
-            content = call_with_retries(lambda: self._call_gemini(prompt), max_retries=2)
+            content = call_with_retries(lambda: self._call_llm(prompt), max_retries=2)
         except Exception:
             return self._fallback(error_details)
 

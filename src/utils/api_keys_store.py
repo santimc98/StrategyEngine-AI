@@ -82,25 +82,11 @@ def _decrypt(token: str) -> str:
 # Registry of supported API keys with metadata for the UI
 API_KEY_REGISTRY: List[Dict[str, str]] = [
     {
-        "env_var": "GOOGLE_API_KEY",
-        "label": "Google Gemini",
-        "description": "Auditor de Datos, Traductor, Experto de Dominio",
-        "placeholder": "AIza...",
-        "required": True,
-    },
-    {
         "env_var": "OPENROUTER_API_KEY",
         "label": "OpenRouter",
-        "description": "Estratega, Ing. Datos, Ing. ML, Analista, Planificador",
+        "description": "Todos los agentes (única API key necesaria)",
         "placeholder": "sk-or-...",
         "required": True,
-    },
-    {
-        "env_var": "MIMO_API_KEY",
-        "label": "MIMO / ZAI",
-        "description": "Asesor de Resultados, Revisor de Limpieza (opcional)",
-        "placeholder": "",
-        "required": False,
     },
 ]
 
@@ -174,19 +160,7 @@ def test_key_connectivity(env_var: str, value: str) -> tuple[bool, str]:
     if not value:
         return False, "Clave vac\u00eda"
 
-    if env_var == "GOOGLE_API_KEY":
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=value)
-            models = genai.list_models()
-            model_list = [m.name for m in models]
-            if model_list:
-                return True, f"Conectado ({len(model_list)} modelos disponibles)"
-            return True, "Conectado"
-        except Exception as e:
-            return False, f"Error: {str(e)[:80]}"
-
-    elif env_var == "OPENROUTER_API_KEY":
+    if env_var == "OPENROUTER_API_KEY":
         try:
             from openai import OpenAI
             client = OpenAI(
@@ -198,10 +172,5 @@ def test_key_connectivity(env_var: str, value: str) -> tuple[bool, str]:
             return True, "Conectado a OpenRouter"
         except Exception as e:
             return False, f"Error: {str(e)[:80]}"
-
-    elif env_var == "MIMO_API_KEY":
-        if len(value) > 10:
-            return True, "Formato v\u00e1lido"
-        return False, "Clave demasiado corta"
 
     return False, "Proveedor no reconocido"

@@ -5,7 +5,7 @@ import csv
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
-import google.generativeai as genai
+from openai import OpenAI
 
 load_dotenv()
 
@@ -1557,19 +1557,27 @@ def _extract_steward_signal_pack(
 class BusinessTranslatorAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Business Translator Agent with Gemini 3 Flash.
+        Initializes the Business Translator Agent via OpenRouter.
         """
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
-            raise ValueError("Google API Key is required.")
+            raise ValueError("OPENROUTER_API_KEY is required.")
 
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel(
-            model_name="gemini-3-flash-preview",
-            generation_config={"temperature": 0.2},  # Low temp for evidence-based executive reports
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://openrouter.ai/api/v1",
         )
+        self.model_name = os.getenv("TRANSLATOR_MODEL", "google/gemini-3-flash-preview")
         self.last_prompt = None
         self.last_response = None
+
+    def _call_llm(self, prompt: str) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return (response.choices[0].message.content or "").strip()
 
     def generate_report(
         self,
@@ -2428,8 +2436,7 @@ The final section must be "## Evidencia Usada" with entries:
                 execution_results=execution_results,
             )
             try:
-                outline_response = self.model.generate_content(outline_prompt)
-                outline_text = (getattr(outline_response, "text", "") or "").strip()
+                outline_text = self._call_llm(outline_prompt)
                 parsed_outline = _extract_first_json_object(outline_text)
                 if parsed_outline is None:
                     two_pass_notes.append("outline_parse_failed")
@@ -2492,8 +2499,7 @@ The final section must be "## Evidencia Usada" with entries:
                 pass
 
         try:
-            response = self.model.generate_content(full_prompt)
-            content = (getattr(response, "text", "") or "").strip()
+            content = self._call_llm(full_prompt)
             is_echo_response = content.strip() == full_prompt.strip()
             content = _sanitize_report_text(content)
             content = _ensure_evidence_section(content, evidence_paths)
@@ -2525,8 +2531,7 @@ The final section must be "## Evidencia Usada" with entries:
                         evidence_paths=evidence_paths,
                         target_language_code=target_language_code,
                     )
-                    repair_response = self.model.generate_content(repair_prompt)
-                    repaired = (getattr(repair_response, "text", "") or "").strip()
+                    repaired = self._call_llm(repair_prompt)
                     repaired = _sanitize_report_text(repaired)
                     repaired = _ensure_evidence_section(repaired, evidence_paths)
                     repaired = sanitize_text(repaired)
@@ -2575,8 +2580,7 @@ The final section must be "## Evidencia Usada" with entries:
                         evidence_paths=evidence_paths,
                         target_language_code=target_language_code,
                     )
-                    quality_repair_response = self.model.generate_content(quality_repair_prompt)
-                    quality_candidate = (getattr(quality_repair_response, "text", "") or "").strip()
+                    quality_candidate = self._call_llm(quality_repair_prompt)
                     quality_candidate = _sanitize_report_text(quality_candidate)
                     quality_candidate = _ensure_evidence_section(quality_candidate, evidence_paths)
                     quality_candidate = sanitize_text(quality_candidate)

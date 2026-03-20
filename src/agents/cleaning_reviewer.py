@@ -40,11 +40,11 @@ _GENERIC_ID_REGEX = r"(?i)(^id$|(?:_id$)|(?:^id_)|(?:^|[_\W])(?:id|entity|code|k
 class CleaningReviewerAgent:
     """
     LLM-driven cleaning reviewer with deterministic evidence checks.
-    Falls back to deterministic mode if MIMO_API_KEY is unavailable.
+    Falls back to deterministic mode if OPENROUTER_API_KEY is unavailable.
     """
 
     def __init__(self, api_key: Any = None):
-        self.api_key = api_key or os.getenv("MIMO_API_KEY")
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         self.provider, self.client, self.model_name, self.model_warning = init_reviewer_llm(api_key)
         if self.model_warning:
             print(f"WARNING: {self.model_warning}")
@@ -405,26 +405,18 @@ def _review_cleaning_impl(
         cleaning_code=cleaning_code,
         dataset_profile=dataset_profile,
     )
-    if provider == "gemini":
-        print(f"DEBUG: Cleaning Reviewer calling Gemini ({model_name})...")
-    else:
-        print(f"DEBUG: Cleaning Reviewer calling MIMO ({model_name})...")
+    print(f"DEBUG: Cleaning Reviewer calling OpenRouter ({model_name})...")
     try:
-        if provider == "gemini":
-            full_prompt = prompt + "\n\nINPUT_JSON:\n" + json.dumps(payload, ensure_ascii=True)
-            response = client.generate_content(full_prompt)
-            content = response.text
-        else:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-            )
-            content = response.choices[0].message.content
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+        )
+        content = response.choices[0].message.content
     except Exception as exc:
         deterministic_result["warnings"].append(f"{_LLM_CALL_WARNING}: {exc}")
         deterministic_result = _enforce_fail_closed_when_llm_unavailable(

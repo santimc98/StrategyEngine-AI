@@ -9,8 +9,7 @@ import re
 import difflib
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types as genai_types
+from openai import OpenAI
 from src.utils.contract_validation import (
     DEFAULT_DATA_ENGINEER_RUNBOOK,
     DEFAULT_ML_ENGINEER_RUNBOOK,
@@ -134,55 +133,53 @@ _EXECUTION_CONTRACT_PATCH_SCHEMA: Dict[str, Any] = {
 }
 
 
-class _GeminiGenerateContentAdapter:
-    """Small adapter to preserve the repo's generate_content-style call surface."""
+class _OpenRouterAdapter:
+    """Adapter that exposes a generate_content-style call surface using OpenRouter (OpenAI API)."""
 
     def __init__(self, api_key: str, model_name: str):
         self.api_key = str(api_key or "").strip()
         self.model_name = str(model_name or "").strip()
-        self._client = genai.Client(api_key=self.api_key)
-
-    @staticmethod
-    def _normalize_generation_config(
-        generation_config: Dict[str, Any] | genai_types.GenerateContentConfig | None,
-    ) -> genai_types.GenerateContentConfig | None:
-        if generation_config is None:
-            return None
-        if isinstance(generation_config, genai_types.GenerateContentConfig):
-            return generation_config
-        if not isinstance(generation_config, dict):
-            return None
-        payload: Dict[str, Any] = {}
-        key_map = {
-            "temperature": "temperature",
-            "top_p": "topP",
-            "top_k": "topK",
-            "candidate_count": "candidateCount",
-            "max_output_tokens": "maxOutputTokens",
-            "stop_sequences": "stopSequences",
-            "response_mime_type": "responseMimeType",
-            "response_schema": "responseSchema",
-            "response_json_schema": "responseJsonSchema",
-            "tools": "tools",
-            "tool_config": "toolConfig",
-            "automatic_function_calling": "automaticFunctionCalling",
-            "thinking_config": "thinkingConfig",
-        }
-        for src_key, dst_key in key_map.items():
-            value = generation_config.get(src_key)
-            if value is None and src_key != dst_key:
-                value = generation_config.get(dst_key)
-            if value is not None:
-                payload[dst_key] = value
-        return genai_types.GenerateContentConfig(**payload)
+        self._client = OpenAI(api_key=self.api_key, base_url="https://openrouter.ai/api/v1")
 
     def generate_content(self, prompt: str, generation_config: Dict[str, Any] | None = None):
-        config = self._normalize_generation_config(generation_config)
-        return self._client.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-            config=config,
-        )
+        """Call OpenRouter and return a response object compatible with _extract_openai_response_text."""
+        config = generation_config or {}
+        call_kwargs: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if "temperature" in config:
+            call_kwargs["temperature"] = config["temperature"]
+        if "max_output_tokens" in config:
+            call_kwargs["max_tokens"] = config["max_output_tokens"]
+        if "top_p" in config:
+            call_kwargs["top_p"] = config["top_p"]
+        # Convert Gemini-style tools to OpenAI-style tools
+        if "tools" in config and config["tools"]:
+            openai_tools = []
+            for tool in config["tools"]:
+                if isinstance(tool, dict) and "function" in tool:
+                    openai_tools.append(tool)
+                elif isinstance(tool, dict) and "functionDeclarations" in tool:
+                    for decl in tool["functionDeclarations"]:
+                        openai_tools.append({
+                            "type": "function",
+                            "function": {
+                                "name": decl.get("name", ""),
+                                "description": decl.get("description", ""),
+                                "parameters": decl.get("parametersJsonSchema", decl.get("parameters", {})),
+                            },
+                        })
+            if openai_tools:
+                call_kwargs["tools"] = openai_tools
+        if "tool_config" in config and config["tool_config"]:
+            tc = config["tool_config"]
+            if isinstance(tc, dict):
+                fcc = tc.get("functionCallingConfig", {})
+                allowed = fcc.get("allowedFunctionNames", [])
+                if allowed:
+                    call_kwargs["tool_choice"] = {"type": "function", "function": {"name": allowed[0]}}
+        return self._client.chat.completions.create(**call_kwargs)
 
 MINIMAL_CONTRACT_COMPILER_PROMPT = """
 You are an Execution Contract Compiler for a multi-agent business intelligence system.
@@ -6896,11 +6893,11 @@ class ExecutionPlannerAgent:
         # Explicit `api_key=None` means "disable external LLM client" (used by tests/fallback paths).
         # Omitting the argument keeps env-based resolution for runtime behavior.
         if api_key is _API_KEY_SENTINEL:
-            resolved_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+            resolved_api_key = os.getenv("OPENROUTER_API_KEY")
         else:
             resolved_api_key = api_key
         self.api_key = str(resolved_api_key).strip() if resolved_api_key not in (None, "") else None
-        self.provider = "google"
+        self.provider = "openrouter"
         max_output_tokens = 16384
         try:
             max_output_tokens = int(os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "16384"))
@@ -6922,15 +6919,15 @@ class ExecutionPlannerAgent:
         self.model_name = (
             os.getenv("EXECUTION_PLANNER_PRIMARY_MODEL")
             or os.getenv("EXECUTION_PLANNER_MODEL")
-            or "gemini-3.1-pro-preview"
+            or "google/gemini-3.1-pro-preview"
         ).strip()
         if not self.model_name:
-            self.model_name = "gemini-3.1-pro-preview"
+            self.model_name = "google/gemini-3.1-pro-preview"
         self.base_url = None
         if not self.api_key:
             self.client = None
         else:
-            self.client = _GeminiGenerateContentAdapter(self.api_key, self.model_name)
+            self.client = _OpenRouterAdapter(self.api_key, self.model_name)
         chain_raw = os.getenv("EXECUTION_PLANNER_MODEL_CHAIN", "")
         chain: List[str] = [self.model_name]
         if isinstance(chain_raw, str) and chain_raw.strip():
@@ -6963,25 +6960,25 @@ class ExecutionPlannerAgent:
         return config
 
     @staticmethod
-    def _build_gemini_function_tool(name: str, description: str, schema: Dict[str, Any]) -> genai_types.Tool:
-        return genai_types.Tool(
-            functionDeclarations=[
-                genai_types.FunctionDeclaration(
-                    name=name,
-                    description=description,
-                    parametersJsonSchema=copy.deepcopy(schema),
-                )
+    def _build_gemini_function_tool(name: str, description: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "functionDeclarations": [
+                {
+                    "name": name,
+                    "description": description,
+                    "parametersJsonSchema": copy.deepcopy(schema),
+                }
             ]
-        )
+        }
 
     @staticmethod
-    def _build_gemini_tool_config(name: str) -> genai_types.ToolConfig:
-        return genai_types.ToolConfig(
-            functionCallingConfig=genai_types.FunctionCallingConfig(
-                mode="ANY",
-                allowedFunctionNames=[name],
-            )
-        )
+    def _build_gemini_tool_config(name: str) -> Dict[str, Any]:
+        return {
+            "functionCallingConfig": {
+                "mode": "ANY",
+                "allowedFunctionNames": [name],
+            }
+        }
 
     @staticmethod
     def _extract_openai_response_text(response: Any) -> str:
@@ -7087,16 +7084,16 @@ class ExecutionPlannerAgent:
                 raise
             return response, used_config
 
-        raise TypeError("Execution planner model client must expose generate_content for Google function calling.")
+        raise TypeError("Execution planner model client must expose generate_content.")
 
     def _build_model_client(self, model_name: str) -> Any:
         if not self.api_key:
             return None
-        if not isinstance(self.client, _GeminiGenerateContentAdapter):
+        if not isinstance(self.client, _OpenRouterAdapter):
             return self.client
         if str(model_name or "").strip() == str(self.client.model_name or "").strip():
             return self.client
-        return _GeminiGenerateContentAdapter(self.api_key, model_name)
+        return _OpenRouterAdapter(self.api_key, model_name)
 
     def generate_contract(
         self,
