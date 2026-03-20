@@ -2226,6 +2226,40 @@ class BusinessTranslatorAgent:
             "metric_loop_context": metric_loop_context if metric_loop_context else None,
         }
 
+        # ── Pipeline scope awareness ─────────────────────────────────
+        _contract_for_scope = state.get("execution_contract")
+        _pipeline_scope = ""
+        if isinstance(_contract_for_scope, dict):
+            _pipeline_scope = str(_contract_for_scope.get("scope", "")).strip().lower()
+        if _pipeline_scope == "cleaning_only":
+            pipeline_scope_section = (
+                "PIPELINE SCOPE: CLEANING_ONLY\n"
+                "This run performed DATA CLEANING ONLY — no ML model was trained.\n"
+                "Your report must focus on:\n"
+                "  - Data quality improvements achieved (before vs after)\n"
+                "  - Cleaning operations performed and their rationale\n"
+                "  - Data validation results and gate compliance\n"
+                "  - Recommendations for data usage or further processing\n"
+                "Do NOT reference model performance, predictions, or ML metrics — they do not exist.\n"
+                "The executive decision should assess whether the cleaned data meets quality standards."
+            )
+        elif _pipeline_scope == "ml_only":
+            pipeline_scope_section = (
+                "PIPELINE SCOPE: ML_ONLY\n"
+                "This run used PRE-CLEANED data and focused on ML modeling only.\n"
+                "Your report must focus on:\n"
+                "  - Model performance and evaluation metrics\n"
+                "  - Feature importance and model interpretability\n"
+                "  - Predictions quality and business applicability\n"
+                "Minimize discussion of data cleaning — it was not performed in this run."
+            )
+        else:
+            pipeline_scope_section = (
+                "PIPELINE SCOPE: FULL_PIPELINE\n"
+                "This run performed the complete pipeline: data cleaning + ML modeling.\n"
+                "Cover both data quality and model performance in your report."
+            )
+
         # ── Run narrative (structured summary built by graph.py) ─────
         run_narrative = state.get("run_narrative")
         if isinstance(run_narrative, dict) and run_narrative:
@@ -2237,6 +2271,9 @@ class BusinessTranslatorAgent:
 $senior_translation_protocol
 
 $senior_evidence_rule
+
+=== PIPELINE SCOPE ===
+$pipeline_scope_section
 
 === MISSION ===
 Write an executive report in $target_language_name ($target_language_code)
@@ -2308,12 +2345,22 @@ $context_appendix_json
 
 === OUTPUT FORMAT ===
 Markdown. No markdown pipe tables — use provided HTML tables where available.
-The report must contain at minimum:
+
+For FULL_PIPELINE or ML_ONLY scope, the report must contain at minimum:
   1) Decision and rationale (## Decisión Ejecutiva)
   2) What happened and key findings (## Hallazgos Clave)
   3) Risks and limitations (## Riesgos)
   4) Recommended next actions (## Próximas Acciones)
   5) Evidence trail (## Evidencia Usada)
+
+For CLEANING_ONLY scope, adapt the report structure:
+  1) Data quality assessment (## Evaluación de Calidad de Datos)
+  2) Cleaning operations performed (## Operaciones de Limpieza)
+  3) Validation results and gate compliance (## Resultados de Validación)
+  4) Risks and data limitations (## Riesgos y Limitaciones)
+  5) Recommendations for data usage (## Recomendaciones)
+  6) Evidence trail (## Evidencia Usada)
+
 If the Outline Plan is non-empty, use it as a starting skeleton but adapt
 freely to improve clarity.
 """)
@@ -2359,6 +2406,7 @@ The final section must be "## Evidencia Usada" with entries:
             "artifact_headers_table_text": artifact_headers_table_text,
             "recommendations_table_text": recommendations_table_text,
             "context_appendix_json": json.dumps(context_appendix, ensure_ascii=False),
+            "pipeline_scope_section": pipeline_scope_section,
         }
 
         two_pass_enabled = str(os.getenv("TRANSLATOR_TWO_PASS_ENABLED", "1")).strip().lower() not in {

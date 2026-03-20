@@ -2,7 +2,7 @@ import os
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -2283,6 +2283,26 @@ class MLEngineerAgent:
             safe_head = max_len - safe_tail
         return text[:safe_head] + "\n...[TRUNCATED]...\n" + text[-safe_tail:]
 
+    @staticmethod
+    def _build_pipeline_scope_context(execution_contract: Optional[Dict[str, Any]] = None) -> str:
+        """Build scope-aware context string for the ML Engineer prompt."""
+        scope = ""
+        if isinstance(execution_contract, dict):
+            scope = str(execution_contract.get("scope", "")).strip().lower()
+        if scope == "ml_only":
+            return (
+                "ML_ONLY — Input data is pre-cleaned and trusted. "
+                "Skip data quality diagnostics. Focus entirely on model design, "
+                "feature engineering, training, and evaluation. "
+                "The Data Engineer performed minimal validation only."
+            )
+        # full_pipeline is the default (cleaning_only never reaches ML Engineer)
+        return (
+            "FULL_PIPELINE — Input data was cleaned by the Data Engineer. "
+            "Trust the cleaning manifest for column types and null handling. "
+            "Focus on modeling, but verify data compatibility before training."
+        )
+
     def _serialize_json_for_prompt(
         self,
         payload: Any,
@@ -4156,6 +4176,8 @@ class MLEngineerAgent:
         === SENIOR ENGINEERING PROTOCOL ===
         $senior_engineering_protocol
 
+        PIPELINE SCOPE: $pipeline_scope_context
+
         MISSION
         - Return one complete, runnable Python script for the cleaned dataset at "$data_path".
         - Follow execution contract and ML view as source of truth.
@@ -4736,6 +4758,7 @@ class MLEngineerAgent:
             dataset_scale=dataset_scale,
             artifact_schema_block=artifact_schema_block,
             data_partitioning_context=data_partitioning_context,
+            pipeline_scope_context=self._build_pipeline_scope_context(execution_contract_input),
         )
         # Safe Rendering for System Prompt
         if optimization_round_hint:

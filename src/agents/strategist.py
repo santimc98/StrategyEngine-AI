@@ -1928,6 +1928,31 @@ $payload_json
         *** USER REQUEST ***
         "$user_request"
 
+        *** SCOPE AWARENESS ***
+        Not all business objectives require a full ML pipeline. Before designing your strategy,
+        determine what the objective actually needs:
+
+        - **Data quality / ETL objectives** (e.g., "clean this dataset", "standardize columns",
+          "remove duplicates", "fix missing values"): Design a strategy focused ENTIRELY on data
+          cleaning and transformation. Do NOT propose ML models or predictions. Your strategy
+          should specify cleaning operations, quality gates, and validation criteria.
+          Set scope_recommendation: "cleaning_only" in your output.
+
+        - **ML on pre-cleaned data** (e.g., "this data is already clean, build a model",
+          "train a classifier on this prepared dataset"): Design a strategy focused on modeling.
+          Minimize cleaning steps (only validation/passthrough). Focus on model selection,
+          feature engineering, and evaluation.
+          Set scope_recommendation: "ml_only" in your output.
+
+        - **Full pipeline** (most common — e.g., "predict X", "optimize Y", "forecast Z"):
+          Design a complete strategy covering cleaning, feature engineering, modeling,
+          and evaluation. This is the default when the objective involves prediction or optimization.
+          Set scope_recommendation: "full_pipeline" in your output.
+
+        Your strategy's techniques, required_columns, and evaluation approach must align with
+        the scope you identify. A cleaning-only strategy should NOT include model training steps.
+        An ML-only strategy should NOT include heavy data cleaning operations.
+
         *** YOUR TASK ***
         Design a strategy using FIRST PRINCIPLES REASONING. Do not classify the problem into pre-defined categories.
         Instead, reason through WHAT the business is trying to achieve and HOW data science can help.

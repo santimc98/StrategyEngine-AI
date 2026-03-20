@@ -359,6 +359,40 @@ class DataEngineerAgent:
         contract = execution_contract or contract_min or {}
         from src.utils.context_pack import compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
 
+        # Build scope-aware guidance
+        _pipeline_scope = ""
+        if isinstance(contract, dict):
+            _pipeline_scope = str(contract.get("scope", "")).strip().lower()
+        if _pipeline_scope == "cleaning_only":
+            pipeline_scope_guidance = (
+                "PIPELINE SCOPE: CLEANING_ONLY — Your output is the FINAL deliverable. "
+                "There is NO downstream ML pipeline. Prioritize:\n"
+                "  - Maximum data quality and completeness\n"
+                "  - Thorough validation of all cleaning gates\n"
+                "  - Detailed manifest documenting every transformation\n"
+                "  - Production-ready output suitable for direct business use\n"
+                "  - Comprehensive null handling and type standardization"
+            )
+        elif _pipeline_scope == "ml_only":
+            pipeline_scope_guidance = (
+                "PIPELINE SCOPE: ML_ONLY — The input data is stated to be pre-cleaned. "
+                "Your role is minimal validation and passthrough:\n"
+                "  - Verify column presence and basic types\n"
+                "  - Do NOT apply aggressive cleaning or imputation\n"
+                "  - Preserve the data as-is unless contract gates explicitly require changes\n"
+                "  - Focus on compatibility: ensure output format is ML-ready\n"
+                "  - Write manifest documenting validation checks performed"
+            )
+        else:
+            pipeline_scope_guidance = (
+                "PIPELINE SCOPE: FULL_PIPELINE — Your output feeds into an ML Engineer. "
+                "Balance thoroughness with ML compatibility:\n"
+                "  - Clean data to meet contract gates\n"
+                "  - Preserve statistical properties needed for modeling\n"
+                "  - Ensure required columns are present and correctly typed\n"
+                "  - The ML Engineer will use your output for feature engineering and training"
+            )
+
         de_view = de_view or {}
         contract_context = contract if isinstance(contract, dict) else {}
         if not contract_context:
@@ -497,6 +531,11 @@ class DataEngineerAgent:
 
         OPERATING_MODE: $operating_mode
         MODE_NOTE: $repair_notes
+
+        ===================================================================
+        PIPELINE SCOPE
+        ===================================================================
+        $pipeline_scope_guidance
 
         ===================================================================
         MISSION
@@ -671,6 +710,7 @@ class DataEngineerAgent:
             outlier_report_path=outlier_report_path,
             operating_mode=operating_mode,
             repair_notes=repair_notes,
+            pipeline_scope_guidance=pipeline_scope_guidance,
         )
         self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE
         print(f"DEBUG: DE System Prompt Len: {len(system_prompt)}")
