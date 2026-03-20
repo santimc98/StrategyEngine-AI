@@ -1328,6 +1328,7 @@ if data_path is None and not st.session_state.get("analysis_complete"):
                         st.session_state["analysis_result"] = loaded
                         st.session_state["analysis_complete"] = True
                         st.session_state["viewing_run_id"] = run["run_id"]
+                        st.session_state.pop("pdf_binary", None)
                         st.rerun()
                     else:
                         st.error("No se pudieron cargar los resultados de esta ejecuci\u00f3n.")
@@ -1953,7 +1954,12 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         # ML Artifacts ZIP
         output_report = result.get("output_contract_report")
         if not isinstance(output_report, dict):
-            output_report = _load_json("data/output_contract_report.json") or {}
+            # Try run-specific path first, then CWD fallback
+            _dl_run_id = st.session_state.get("viewing_run_id") or result.get("run_id")
+            if _dl_run_id:
+                output_report = _load_json(os.path.join("runs", str(_dl_run_id), "work", "data", "output_contract_report.json"))
+            if not isinstance(output_report, dict):
+                output_report = _load_json("data/output_contract_report.json") or {}
         present_files = _resolve_ml_artifact_files(output_report, result if isinstance(result, dict) else {})
 
         with dl_col2:
