@@ -1123,7 +1123,7 @@ with st.sidebar:
 
     if _show_crm:
         crm_source = st.radio(
-            "CRM", ["Salesforce", "HubSpot"], label_visibility="collapsed",
+            "CRM", ["Salesforce", "HubSpot", "Dynamics 365"], label_visibility="collapsed",
         )
         if crm_source == "Salesforce":
             sf_auth_mode = st.selectbox("Modo de autenticaci\u00f3n", ["Token API", "OAuth (Access Token)"], key="sf_auth_mode")
@@ -1213,6 +1213,56 @@ with st.sidebar:
                             df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
                             if df_crm.empty:
                                 st.warning(f"El objeto '{selected_obj}' no contiene datos.")
+                            else:
+                                os.makedirs("data", exist_ok=True)
+                                crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")
+                                df_crm.to_csv(crm_csv, index=False, encoding="utf-8")
+                                st.session_state["crm_data_path"] = crm_csv
+                                st.session_state["crm_preview_df"] = df_crm
+                                st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extra\u00eddos</span>', unsafe_allow_html=True)
+                        except Exception as exc:
+                            st.error(f"Error al obtener los datos: {exc}")
+                if st.session_state.get("crm_data_path") and st.session_state.get("crm_preview_df") is not None:
+                    st.markdown(f'<span class="metric-pill">{len(st.session_state["crm_preview_df"]):,} registros listos</span>', unsafe_allow_html=True)
+
+        elif crm_source == "Dynamics 365":
+            dy_crm_url = st.text_input("URL de la organizaci\u00f3n", placeholder="https://miorg.crm.dynamics.com", key="dy_crm_url")
+            dy_tenant = st.text_input("Tenant ID", key="dy_tenant_id")
+            dy_client_id = st.text_input("Client ID", key="dy_client_id")
+            dy_secret = st.text_input("Client Secret", type="password", key="dy_client_secret")
+            if st.button("Conectar a Dynamics 365", key="dy_connect"):
+                if dy_crm_url and dy_tenant and dy_client_id and dy_secret:
+                    try:
+                        from src.connectors.dynamics_connector import DynamicsConnector
+                        connector = DynamicsConnector()
+                        connector.authenticate({
+                            "crm_url": dy_crm_url,
+                            "tenant_id": dy_tenant,
+                            "client_id": dy_client_id,
+                            "client_secret": dy_secret,
+                        })
+                        st.session_state["crm_connector"] = connector
+                        st.session_state["crm_authenticated"] = True
+                        st.session_state["crm_objects"] = connector.list_objects()
+                    except Exception as exc:
+                        st.error(f"Error: {exc}")
+                        st.session_state["crm_authenticated"] = False
+                else:
+                    st.warning("Completa todos los campos.")
+            if st.session_state.get("crm_authenticated") and type(st.session_state.get("crm_connector")).__name__ == "DynamicsConnector":
+                st.markdown('<span class="badge badge-success">Conectado a Dynamics 365</span>', unsafe_allow_html=True)
+                crm_objects = st.session_state.get("crm_objects", [])
+                if crm_objects:
+                    obj_labels = [f"{o['label']} ({o['name']})" for o in crm_objects]
+                    selected_idx = st.selectbox("Entidad", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="dy_obj_select")
+                    max_recs = st.number_input("M\u00e1x. registros", min_value=100, max_value=50000, value=10000, step=500, key="dy_max_recs")
+                    if st.button("Extraer Datos", key="dy_fetch"):
+                        selected_obj = crm_objects[selected_idx]["name"]
+                        try:
+                            connector = st.session_state["crm_connector"]
+                            df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
+                            if df_crm.empty:
+                                st.warning(f"La entidad '{selected_obj}' no contiene datos.")
                             else:
                                 os.makedirs("data", exist_ok=True)
                                 crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")

@@ -45,6 +45,7 @@ altair
 # --- CRM Connectors ---
 simple-salesforce>=1.12.0
 hubspot-api-client>=8.0.0
+msal>=1.28.0
 
 # --- Utils & Reporting ---
 fpdf
