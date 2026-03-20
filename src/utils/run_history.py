@@ -7,10 +7,7 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-_RUNS_DIR = os.path.join(
-    os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-    "runs",
-)
+from src.utils.paths import RUNS_DIR as _RUNS_DIR
 
 
 def _load_json_safe(path: str) -> Optional[Dict[str, Any]]:

@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Tuple
 APP_ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(APP_ROOT)
 
+from src.utils.paths import PROJECT_ROOT as _PROJECT_ROOT_PATHS
+
 from src.graph.graph import (
     app_graph,
     request_abort,

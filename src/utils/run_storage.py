@@ -6,10 +6,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from src.utils.run_bundle import write_run_manifest
-
-RUNS_DIR = "runs"
-LATEST_DIR = os.path.join(RUNS_DIR, "latest")
-ARCHIVE_DIR = os.path.join(RUNS_DIR, "archive")
+from src.utils.paths import RUNS_DIR, LATEST_DIR, ARCHIVE_DIR
 
 
 def _ensure_dir(path: str) -> None:
@@ -24,7 +21,7 @@ def _safe_load_json(path: str) -> Dict[str, Any]:
         return {}
 
 
-def init_run_dir(run_id: str, base_dir: str = "runs", started_at: Optional[str] = None) -> str:
+def init_run_dir(run_id: str, base_dir: str = RUNS_DIR, started_at: Optional[str] = None) -> str:
     run_dir = os.path.abspath(os.path.join(base_dir, run_id))  # CLAVE
     os.makedirs(run_dir, exist_ok=True)
 

@@ -17,11 +17,9 @@ import platform
 import tempfile
 from typing import Any, Dict, List, Optional
 
-_DEFAULT_STORE_PATH = os.path.join(
-    os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-    "data",
-    "api_keys.enc",
-)
+from src.utils.paths import DATA_DIR as _DATA_DIR
+
+_DEFAULT_STORE_PATH = os.path.join(_DATA_DIR, "api_keys.enc")
 
 # ---------------------------------------------------------------------------
 # Key derivation (machine-specific, deterministic)

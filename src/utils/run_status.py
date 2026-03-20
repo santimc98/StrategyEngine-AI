@@ -12,9 +12,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
-# Absolute path — immune to os.chdir() inside the graph workspace
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-RUNS_DIR = os.path.join(_PROJECT_ROOT, "runs")
+# Absolute paths — immune to os.chdir() inside the graph workspace
+from src.utils.paths import PROJECT_ROOT as _PROJECT_ROOT, RUNS_DIR
 
 
 def _status_path(run_id: str) -> str:

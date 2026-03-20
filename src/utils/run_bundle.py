@@ -13,8 +13,7 @@ from src.utils.context_pack import compress_long_lists
 from src.utils.contract_accessors import get_required_outputs
 from src.utils.review_status import normalize_status as normalize_review_status
 from src.utils.text_encoding import sanitize_text, sanitize_text_payload
-
-RUNS_DIR = "runs"
+from src.utils.paths import RUNS_DIR
 
 # ---------------------------------------------------------------------------
 # P0 FIX: Anti-bloat constants

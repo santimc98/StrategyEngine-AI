@@ -22,7 +22,9 @@ import traceback
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-os.chdir(_PROJECT_ROOT)
+
+from src.utils.paths import PROJECT_ROOT
+os.chdir(PROJECT_ROOT)
 
 from src.utils.run_status import (
     append_log,
@@ -102,7 +104,7 @@ def main(run_id: str) -> None:
     append_log(run_id, "Sistema", "Cargando modulos (puede tardar unos minutos)...", "info")
 
     # Heavy imports — graph module is ~27K lines, takes 1-3 minutes to load
-    overrides_path = os.path.join(_PROJECT_ROOT, "data", "agent_model_overrides.json")
+    overrides_path = os.path.join(PROJECT_ROOT, "data", "agent_model_overrides.json")
     if os.path.exists(overrides_path):
         try:
             with open(overrides_path, "r", encoding="utf-8") as f:
