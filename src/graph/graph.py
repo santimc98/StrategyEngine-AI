@@ -4457,6 +4457,137 @@ def _filter_missing_required_constants(
             filtered.append(col)
     return filtered, ignored
 
+def _build_translator_run_narrative(
+    state: Dict[str, Any],
+    run_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Build a compact, structured narrative of the run for the Business Translator.
+
+    Instead of forcing the translator to parse 15+ raw JSON artifacts, this
+    function pre-digests the run state into a ~2KB summary that tells the
+    story: what was asked, what happened, what worked, what the result is.
+    """
+    narrative: Dict[str, Any] = {}
+
+    # 1. Business objective
+    contract = state.get("execution_contract")
+    if not isinstance(contract, dict):
+        contract = _load_json_any("data/execution_contract.json") or {}
+    narrative["business_objective"] = (
+        state.get("business_objective")
+        or contract.get("business_objective")
+        or ""
+    )
+
+    # 2. Strategy chosen
+    strategy = state.get("selected_strategy")
+    if isinstance(strategy, dict):
+        narrative["strategy"] = {
+            "title": strategy.get("title"),
+            "hypothesis": strategy.get("hypothesis"),
+            "objective_type": strategy.get("objective_type"),
+        }
+
+    # 3. Data summary (from steward)
+    steward = _load_json_any("data/steward_summary.json") or {}
+    if isinstance(steward, dict) and steward:
+        narrative["data_summary"] = {
+            "summary": str(steward.get("summary") or "")[:600],
+            "rows": steward.get("row_count"),
+            "columns": steward.get("column_count"),
+            "encoding": steward.get("encoding"),
+        }
+
+    # 4. Cleaning summary
+    manifest = _load_json_any("data/cleaning_manifest.json")
+    if isinstance(manifest, dict) and manifest:
+        row_counts = manifest.get("row_counts", {})
+        narrative["cleaning_summary"] = {
+            "rows_before": row_counts.get("before") or row_counts.get("original"),
+            "rows_after": row_counts.get("after") or row_counts.get("final"),
+            "nulls_handled": manifest.get("nulls_filled_count")
+                or manifest.get("null_handling_count"),
+        }
+
+    # 5. ML improvement loop — the most important narrative element
+    ml_loop: Dict[str, Any] = {}
+    run_sum = run_summary if isinstance(run_summary, dict) else {}
+    metric_improvement = run_sum.get("metric_improvement")
+    if isinstance(metric_improvement, dict):
+        ml_loop["baseline_metric"] = metric_improvement.get("baseline_metric")
+        ml_loop["final_metric"] = metric_improvement.get("final_metric_reported")
+        ml_loop["kept"] = metric_improvement.get("kept")
+        ml_loop["metric_name"] = metric_improvement.get("metric_name")
+
+    budget = run_sum.get("budget_counters")
+    if isinstance(budget, dict):
+        ml_loop["total_ml_attempts"] = budget.get("ml_calls")
+        ml_loop["total_reviewer_calls"] = budget.get("reviewer_calls")
+
+    # Round history from state
+    round_history = state.get("ml_improvement_round_history")
+    if isinstance(round_history, list) and round_history:
+        ml_loop["rounds"] = [
+            {
+                "round": r.get("round_id"),
+                "hypothesis": (
+                    r.get("hypothesis", {}).get("label")
+                    if isinstance(r.get("hypothesis"), dict)
+                    else str(r.get("hypothesis") or "")[:80]
+                ),
+                "baseline": r.get("baseline_metric"),
+                "candidate": r.get("candidate_metric"),
+                "kept": r.get("kept"),
+            }
+            for r in round_history
+            if isinstance(r, dict)
+        ]
+    else:
+        # Fallback: read compact info from metric_loop_state on disk
+        mls = _load_json_any("data/metric_loop_state.json") or {}
+        if isinstance(mls, dict) and mls:
+            _round = mls.get("round") if isinstance(mls.get("round"), dict) else {}
+            _incumbent = mls.get("incumbent") if isinstance(mls.get("incumbent"), dict) else {}
+            _best = mls.get("best_observed") if isinstance(mls.get("best_observed"), dict) else {}
+            ml_loop["rounds_completed"] = _round.get("round_id")
+            ml_loop["rounds_allowed"] = _round.get("rounds_allowed")
+            ml_loop["no_improve_streak"] = _round.get("no_improve_streak")
+            ml_loop["incumbent_value"] = _incumbent.get("metric_value")
+            ml_loop["best_observed_value"] = _best.get("metric_value")
+            ml_loop["best_observed_label"] = _best.get("label")
+
+    if ml_loop:
+        narrative["ml_loop"] = ml_loop
+
+    # 6. Review verdict and feedback
+    narrative["review_verdict"] = state.get("review_verdict")
+    review_fb = state.get("review_feedback")
+    if isinstance(review_fb, dict):
+        narrative["review_feedback"] = {
+            "status": review_fb.get("status"),
+            "feedback": str(review_fb.get("feedback") or "")[:500],
+        }
+    elif isinstance(review_fb, str):
+        narrative["review_feedback"] = review_fb[:500]
+
+    # 7. Final decision
+    narrative["system_decision"] = run_sum.get("run_outcome")
+    narrative["failed_gates"] = run_sum.get("failed_gates", [])
+    narrative["warnings"] = run_sum.get("warnings", [])
+
+    # 8. Primary metric (authoritative)
+    pms = state.get("primary_metric_state")
+    if isinstance(pms, dict) and pms:
+        narrative["primary_metric"] = {
+            "name": pms.get("primary_metric_name"),
+            "value": pms.get("primary_metric_value"),
+            "source": "primary_metric_state (authoritative)",
+        }
+
+    return narrative
+
+
 def _resolve_contract_deliverables(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     V4.1 compatible deliverables resolver.
@@ -29866,6 +29997,16 @@ def run_translator(state: AgentState) -> AgentState:
                     filtered_entries.append(entry)
                 report_state["artifact_index"] = filtered_entries
                 report_state["produced_artifact_index"] = filtered_entries
+    # ── Build structured run narrative for the translator ───────────
+    # Instead of dumping 15 raw JSONs, give the translator a compact,
+    # pre-digested summary of what happened during the run.
+    try:
+        run_narrative = _build_translator_run_narrative(report_state, summary)
+        report_state["run_narrative"] = run_narrative
+    except Exception as _narrative_err:
+        print(f"WARNING: Failed to build run narrative: {_narrative_err}")
+        report_state["run_narrative"] = None
+
     report_state["has_partial_visuals"] = bool(report_plots) and error_flag
     report_has_partial = report_state["has_partial_visuals"]
     try:

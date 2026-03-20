@@ -1202,9 +1202,9 @@ def _validate_report_structure(content: str, expected_language: str) -> List[str
         issues.append("report_too_short")
     if length > 30000:
         issues.append("report_too_long")
-    decision_header = re.search(r"(?im)^\s*##\s+(Executive Decision|Decisión Ejecutiva)\s*$", content)
-    evidence_header = re.search(r"(?im)^\s*##\s+Evidencia usada\s*$", content)
-    risk_header = re.search(r"(?im)^\s*##\s+(Risks\s*&\s*Limitations|Riesgos\s*&\s*Limitaciones)\s*$", content)
+    decision_header = re.search(r"(?im)^\s*##\s+(Executive Decision|Decisi[oó]n Ejecutiva)\s*$", content)
+    evidence_header = re.search(r"(?im)^\s*##\s+Evidencia\s+[Uu]sada\s*$", content)
+    risk_header = re.search(r"(?im)^\s*##\s+(Risks|Riesgos)(\s*&?\s*(Limitations|Limitaciones))?\s*$", content)
     if not decision_header:
         issues.append("missing_decision_section")
     if not evidence_header:
@@ -1297,7 +1297,7 @@ def _build_repair_prompt(
 
         Hard constraints:
         - Keep the report evidence-based and avoid inventing metrics.
-        - Ensure sections exist: Executive Decision/Decisión Ejecutiva, Risks & Limitations/Riesgos & Limitaciones, Evidencia usada.
+        - Ensure sections exist: Decisión Ejecutiva, Riesgos, Evidencia Usada.
         - Keep "## Evidencia usada" with evidence:{claim,source} and artifact bullets.
         - Use these artifact paths when citing evidence:
         $evidence_paths
@@ -1329,7 +1329,7 @@ def _generate_deterministic_fallback_report(
     title = "# Reporte Ejecutivo (Fallback Determinístico)" if is_es else "# Executive Report (Deterministic Fallback)"
     objective_title = "## Objetivo y enfoque" if is_es else "## Objective and approach"
     decision_title = "## Decisión Ejecutiva" if is_es else "## Executive Decision"
-    risks_title = "## Riesgos & Limitaciones" if is_es else "## Risks & Limitations"
+    risks_title = "## Riesgos" if is_es else "## Risks"
     actions_title = "## Próximas acciones" if is_es else "## Next actions"
     warning_note = (
         "Este reporte se generó de forma determinística por un fallo de traducción del LLM."
@@ -1366,7 +1366,7 @@ def _generate_deterministic_fallback_report(
         "- Validate metric integrity before making a production decision.",
     ])
     lines.append("")
-    lines.append("## Evidencia usada")
+    lines.append("## Evidencia Usada")
     lines.append("")
     lines.append(_canonical_evidence_section(evidence_paths))
     return "\n".join(lines) + "\n"
@@ -2226,83 +2226,108 @@ class BusinessTranslatorAgent:
             "metric_loop_context": metric_loop_context if metric_loop_context else None,
         }
 
-        SYSTEM_PROMPT_TEMPLATE = Template("""
-You are a Senior Executive Translator and Data Storyteller.
-Create a decision-ready executive report grounded in evidence.
+        # ── Run narrative (structured summary built by graph.py) ─────
+        run_narrative = state.get("run_narrative")
+        if isinstance(run_narrative, dict) and run_narrative:
+            run_narrative_section = json.dumps(run_narrative, ensure_ascii=False, indent=2)
+        else:
+            run_narrative_section = "Not available — use FACTS and DETAILED CONTEXT below."
 
-=== SENIOR TRANSLATION PROTOCOL ===
+        SYSTEM_PROMPT_TEMPLATE = Template("""
 $senior_translation_protocol
 
-=== EVIDENCE RULE ===
 $senior_evidence_rule
 
-TARGET LANGUAGE: $target_language_name ($target_language_code)
+=== MISSION ===
+Write an executive report in $target_language_name ($target_language_code)
+for a decision-maker who has NOT seen the raw data. The report must enable
+them to understand what happened, whether the results are trustworthy, and
+what to do next.
 
-FACTS_BLOCK (do not alter values):
+=== REASONING WORKFLOW (MANDATORY) ===
+Before writing, reason through these steps internally. Your report should
+reflect this analysis, not just list data.
+
+1. ASSESS THE OUTCOME
+   - The deterministic system verdict is: $executive_decision_label
+   - What was the business objective? Did the system achieve it?
+   - If a metric improvement loop ran, what was the best metric achieved
+     vs the baseline? How many techniques were tried?
+   - If the canonical_primary_metric in FACTS_BLOCK differs from metrics
+     on disk, trust the canonical value — it reflects the selected incumbent.
+
+2. IDENTIFY WHAT MATTERS
+   - From all the metrics and artifacts below, select the 3-5 most
+     decision-relevant findings. Not everything deserves a mention.
+   - Prioritize: primary metric performance, data quality issues,
+     compliance failures, and risks that affect production readiness.
+
+3. EXPLAIN WHY
+   - Connect results to causes. If the metric improved, what technique
+     drove it? If it degraded, what went wrong?
+   - If there are contradictions between reviewers and metrics, flag them.
+
+4. RECOMMEND ACTIONS
+   - Be specific: "retry with X", "investigate Y in artifact Z",
+     "deploy with caveat W" — not generic advice.
+
+=== FACTS (do not alter values) ===
 $facts_block_json
 
-NARRATIVE_GUIDE:
-- Coherent flow: decision -> evidence -> risks -> actions.
-- Use reporting_policy as guide, avoid rigid slot-filling.
-- Never invent metrics/segments/artifact paths.
-- Avoid placeholders like "Not available", "No disponible", "N/A".
-- Include final section "## Evidencia usada".
-- If reporting_policy.demonstrative_examples_enabled applies, include:
-  "Ejemplos ilustrativos (no aptos para producción)".
+=== RUN NARRATIVE (primary context — what happened during this run) ===
+$run_narrative_section
 
-REFERENCE CONTEXT:
-- Business Objective: $business_objective
-- Strategy: $strategy_title
-- Hypothesis: $hypothesis
-- Compliance Check: $compliance
-- Executive Decision Label (deterministic): $executive_decision_label
-- Error condition: $error_condition
-- Visuals Context (JSON): $visuals_context_json
-- Decisioning Requirements (json): $decisioning_context_json
-- Decisioning Columns (text): $decisioning_columns_text
-- Evidence Paths (max 8): $evidence_paths_text
-- Outline Plan (pass-1 JSON): $outline_plan_json
-- reporting_policy: $reporting_policy_context
-- Slot Coverage: $slot_coverage_context
-- Artifact Inventory Table (HTML): $artifact_inventory_table_html
-- Artifact Compliance Table (HTML): $artifact_compliance_table_html
-- KPI Snapshot Table (HTML): $kpi_snapshot_table_html
-- Metrics Table (text): $metrics_table_text
-- Cleaned Data Sample Table (text): $cleaned_sample_table_text
-- Scored Rows Sample Table (text): $scored_sample_table_text
-- Artifact Headers Table (text): $artifact_headers_table_text
-- Recommendations Table (text): $recommendations_table_text
+=== REFERENCE CONTEXT ===
+Business Objective: $business_objective
+Strategy: $strategy_title
+Hypothesis: $hypothesis
+Compliance: $compliance
+Error condition: $error_condition
 
-CONTEXT_APPENDIX:
+=== EVIDENCE SOURCES ===
+Available artifacts: $evidence_paths_text
+Metrics: $metrics_table_text
+KPI Snapshot (HTML): $kpi_snapshot_table_html
+
+=== DETAILED CONTEXT ===
+Outline Plan (pass-1): $outline_plan_json
+Artifact Inventory (HTML): $artifact_inventory_table_html
+Artifact Compliance (HTML): $artifact_compliance_table_html
+Cleaned Data Sample: $cleaned_sample_table_text
+Scored Rows Sample: $scored_sample_table_text
+Artifact Headers: $artifact_headers_table_text
+Recommendations: $recommendations_table_text
+Visuals: $visuals_context_json
+Decisioning: $decisioning_context_json
+Decisioning Columns: $decisioning_columns_text
+Reporting Policy: $reporting_policy_context
+Slot Coverage: $slot_coverage_context
+
+=== APPENDIX (lower priority — use only if needed for depth) ===
 $context_appendix_json
 
-OUTPUT RULES:
-- Markdown output, no markdown pipe tables.
-- Prefer provided HTML tables for visual summaries.
-- If Outline Plan is non-empty, treat it as a proposed narrative skeleton. You may merge or reorder sections when that improves clarity without losing factual consistency.
-- Ensure the final report covers these topics, even if section titles differ:
-  1) Executive Decision / Decisión Ejecutiva
-  2) Objective & Approach / Objetivo y enfoque
-  3) Evidence & Metrics
-  4) Risks & Limitations / Riesgos & Limitaciones
-  5) Recommended Next Actions / Próximas acciones
-  6) Evidencia usada (final)
+=== OUTPUT FORMAT ===
+Markdown. No markdown pipe tables — use provided HTML tables where available.
+The report must contain at minimum:
+  1) Decision and rationale (## Decisión Ejecutiva)
+  2) What happened and key findings (## Hallazgos Clave)
+  3) Risks and limitations (## Riesgos)
+  4) Recommended next actions (## Próximas Acciones)
+  5) Evidence trail (## Evidencia Usada)
+If the Outline Plan is non-empty, use it as a starting skeleton but adapt
+freely to improve clarity.
 """)
 
         execution_results = state.get("execution_output", "No execution results available.")
         USER_MESSAGE_TEMPLATE = """
-Generate the Executive Report.
+Analyze the context above. Reason about what happened, what matters most,
+and what the decision-maker should do. Then write the executive report.
 
 EXECUTION FINDINGS:
 $execution_results
 
-INSTRUCTIONS:
-- Use only evidence from provided context/artifacts.
-- Keep executive tone: concise, clear, actionable.
-- Include final section "## Evidencia usada" with:
-  evidence:
-  {claim: "...", source: "..."}
-- Sources must be artifact/script paths; if unknown, use source="missing".
+The final section must be "## Evidencia Usada" with entries:
+  {claim: "...", source: "artifact_path -> key"}
 """
 
         prompt_values = {
@@ -2311,6 +2336,7 @@ INSTRUCTIONS:
             "target_language_name": target_language_name,
             "target_language_code": target_language_code,
             "facts_block_json": json.dumps(facts_block, ensure_ascii=False),
+            "run_narrative_section": run_narrative_section,
             "business_objective": business_objective,
             "strategy_title": strategy_title,
             "hypothesis": hypothesis,
