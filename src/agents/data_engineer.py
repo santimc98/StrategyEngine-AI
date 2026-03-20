@@ -931,7 +931,7 @@ class DataEngineerAgent:
 
             code = self._clean_code(content)
             deps = contract.get("required_dependencies") if isinstance(contract, dict) else None
-            dep_backend = str(runtime_dependency_context.get("backend_profile") or "e2b").lower()
+            dep_backend = str(runtime_dependency_context.get("backend_profile") or "local").lower()
             if dep_backend == "local":
                 dep_backend = "cloudrun"
             dep_check = check_dependency_precheck(

@@ -32,9 +32,9 @@ def test_dependency_precheck_blocks_extended_when_not_requested():
     assert "rapidfuzz" in result["blocked"]
 
 
-def test_dependency_precheck_blocks_torch_on_e2b():
+def test_dependency_precheck_blocks_torch_on_local():
     code = "import torch\n"
-    result = check_dependency_precheck(code, required_dependencies=[], backend_profile="e2b")
+    result = check_dependency_precheck(code, required_dependencies=[], backend_profile="local")
     assert "torch" in result["banned"]
 
 

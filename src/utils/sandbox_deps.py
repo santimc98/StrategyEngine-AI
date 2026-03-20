@@ -65,8 +65,8 @@ CLOUDRUN_OPTIONAL_ALLOWLIST = [
 ]
 # Unsupported regardless of backend (either incompatible or out-of-scope for this product runtime)
 BANNED_ALWAYS_ALLOWLIST = ["tensorflow", "keras", "pyspark", "spacy", "prophet", "cvxpy", "pulp", "fuzzywuzzy"]
-# Imports explicitly blocked on E2B due to runtime constraints (8GB RAM / lightweight profile)
-E2B_HEAVY_BLOCKLIST = ["torch", "transformers", "tokenizers", "datasets", "accelerate", "sentence_transformers"]
+# Imports blocked on lightweight sandbox profiles due to memory constraints
+LIGHTWEIGHT_SANDBOX_BLOCKLIST = ["torch", "transformers", "tokenizers", "datasets", "accelerate", "sentence_transformers"]
 
 PIP_BASE = [
     "numpy",
@@ -143,13 +143,15 @@ _DEPENDENCY_ROOT_ALIASES = {
 }
 
 _BACKEND_ALIASES = {
-    "e2b": "e2b",
-    "default": "e2b",
-    "local": "e2b",
+    "local": "local",
+    "default": "local",
+    "sandbox": "local",
     "cloudrun": "cloudrun",
     "cloud_run": "cloudrun",
     "heavy": "cloudrun",
     "heavy_runner": "cloudrun",
+    "gcp": "cloudrun",
+    "azure": "cloudrun",
 }
 
 
@@ -189,8 +191,8 @@ def extract_import_roots(code: str) -> Set[str]:
 
 
 def normalize_backend_profile(profile: str | None) -> str:
-    key = str(profile or "e2b").strip().lower()
-    return _BACKEND_ALIASES.get(key, "e2b")
+    key = str(profile or "local").strip().lower()
+    return _BACKEND_ALIASES.get(key, "local")
 
 
 def normalize_required_dependencies(required_dependencies: Iterable[str] | None = None) -> Set[str]:
@@ -206,7 +208,7 @@ def normalize_required_dependencies(required_dependencies: Iterable[str] | None 
 
 def classify_dependency_support(
     required_dependencies: Iterable[str] | None = None,
-    backend_profile: str = "e2b",
+    backend_profile: str = "local",
 ) -> Dict[str, List[str] | str]:
     required = normalize_required_dependencies(required_dependencies)
     backend = normalize_backend_profile(backend_profile)
@@ -249,14 +251,14 @@ def _allowed_import_roots(required: Set[str], backend_profile: str) -> Set[str]:
 def _banned_import_roots(backend_profile: str) -> Set[str]:
     banned = set(BANNED_ALWAYS_ALLOWLIST)
     if backend_profile != "cloudrun":
-        banned |= set(E2B_HEAVY_BLOCKLIST)
+        banned |= set(LIGHTWEIGHT_SANDBOX_BLOCKLIST)
     return banned
 
 
 def check_dependency_precheck(
     code: str,
     required_dependencies: Iterable[str] | None = None,
-    backend_profile: str = "e2b",
+    backend_profile: str = "local",
 ) -> Dict[str, List[str] | Dict[str, str] | str]:
     imports = {str(imp).strip().lower() for imp in extract_import_roots(code) if str(imp).strip()}
     required = normalize_required_dependencies(required_dependencies)
@@ -329,7 +331,7 @@ def check_dependency_precheck(
 
 def get_sandbox_install_packages(
     required_dependencies: Iterable[str] | None = None,
-    backend_profile: str = "e2b",
+    backend_profile: str = "local",
 ) -> Dict[str, List[str]]:
     required = normalize_required_dependencies(required_dependencies)
     backend = normalize_backend_profile(backend_profile)

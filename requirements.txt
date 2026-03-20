@@ -13,7 +13,6 @@ google-genai
 google-generativeai
 openai
 zai-sdk==0.1.0
-e2b-code-interpreter
 
 # --- Machine Learning (Classic & Boosting) ---
 # NOTE: catboost 1.2.8 is incompatible with sklearn >=1.8 (__sklearn_tags__ missing).

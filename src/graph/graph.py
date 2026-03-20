@@ -21,12 +21,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple
 from langgraph.graph import StateGraph, END
-from e2b_code_interpreter import Sandbox as CodeSandbox
-try:
-    from e2b import Sandbox as BaseSandbox
-except Exception:
-    BaseSandbox = None
-Sandbox = CodeSandbox
+from src.utils.sandbox_provider import get_sandbox_class
+Sandbox = get_sandbox_class()
 from dotenv import load_dotenv
 import base64
 import pandas as pd
@@ -13577,7 +13573,7 @@ class AgentState(TypedDict):
     metric_history: List[Dict[str, Any]]
     execution_output_stale: bool
     sandbox_failed: bool
-    e2b_memory_failure_detected: bool
+    sandbox_memory_failure_detected: bool
     backend_memory_estimate: Dict[str, Any]
     sandbox_retry_count: int
     max_sandbox_retries: int
@@ -14929,7 +14925,7 @@ def _resolve_dependency_backend_profile(runtime_mode: str) -> str:
     mode = str(runtime_mode or "").strip().lower()
     if mode in {"local", "cloudrun"}:
         return "cloudrun"
-    return "e2b"
+    return "local"
 
 
 def _validate_selected_strategy_executability(
@@ -15452,7 +15448,7 @@ def _estimate_dataframe_memory_gb(
     }
 
 
-def _estimate_e2b_peak_memory_gb(
+def _estimate_sandbox_peak_memory_gb(
     state: Dict[str, Any],
     data_profile: Dict[str, Any],
     ml_plan: Dict[str, Any],
@@ -15474,7 +15470,7 @@ def _estimate_e2b_peak_memory_gb(
     cv_policy = (ml_plan or {}).get("cv_policy") if isinstance(ml_plan, dict) else {}
     folds = _safe_int(cv_policy.get("n_splits"), 0) if isinstance(cv_policy, dict) else 0
 
-    # Conservative multipliers to protect E2B 8GB ceiling.
+    # Conservative multipliers to protect sandbox memory ceiling.
     prep_mult = 2.0
     if n_rows >= 1_000_000:
         prep_mult += 0.2
@@ -15520,11 +15516,11 @@ def _build_backend_memory_decision(
     data_profile: Dict[str, Any],
     ml_plan: Dict[str, Any],
 ) -> Dict[str, Any]:
-    estimate = _estimate_e2b_peak_memory_gb(state, data_profile, ml_plan)
-    e2b_limit_gb = _safe_float(os.getenv("E2B_MEMORY_LIMIT_GB"), 8.0)
-    safe_fraction = _safe_float(os.getenv("E2B_MEMORY_SAFE_FRACTION"), 0.72)
-    min_margin_gb = _safe_float(os.getenv("E2B_MEMORY_MIN_MARGIN_GB"), 1.5)
-    safe_budget_gb = min(e2b_limit_gb * safe_fraction, max(0.1, e2b_limit_gb - min_margin_gb))
+    estimate = _estimate_sandbox_peak_memory_gb(state, data_profile, ml_plan)
+    sandbox_limit_gb = _safe_float(os.getenv("SANDBOX_MEMORY_LIMIT_GB"), 8.0)
+    safe_fraction = _safe_float(os.getenv("SANDBOX_MEMORY_SAFE_FRACTION"), 0.72)
+    min_margin_gb = _safe_float(os.getenv("SANDBOX_MEMORY_MIN_MARGIN_GB"), 1.5)
+    safe_budget_gb = min(sandbox_limit_gb * safe_fraction, max(0.1, sandbox_limit_gb - min_margin_gb))
 
     hints = state.get("dataset_scale_hints") or {}
     file_mb = _safe_float(hints.get("file_mb"), 0.0)
@@ -15532,12 +15528,12 @@ def _build_backend_memory_decision(
     n_cols_hint = _safe_int(hints.get("cols") or hints.get("n_cols"), 0)
     heavy_size_signal = bool(file_mb >= 200 or est_rows >= 1_000_000 or n_cols_hint >= 1000)
 
-    if state.get("e2b_memory_failure_detected"):
+    if state.get("sandbox_memory_failure_detected"):
         return {
             "use_heavy": True,
-            "reason": "e2b_memory_failure_fallback",
+            "reason": "sandbox_memory_failure_fallback",
             "safe_budget_gb": safe_budget_gb,
-            "e2b_limit_gb": e2b_limit_gb,
+            "sandbox_limit_gb": sandbox_limit_gb,
             "estimate": estimate,
         }
 
@@ -15561,22 +15557,22 @@ def _build_backend_memory_decision(
                 "use_heavy": True,
                 "reason": "large_dataset_uncertain_memory_estimate",
                 "safe_budget_gb": safe_budget_gb,
-                "e2b_limit_gb": e2b_limit_gb,
+                "sandbox_limit_gb": sandbox_limit_gb,
                 "estimate": estimate,
             }
         if peak_gb <= safe_budget_gb:
             return {
                 "use_heavy": False,
-                "reason": "e2b_memory_safe",
+                "reason": "sandbox_memory_safe",
                 "safe_budget_gb": safe_budget_gb,
-                "e2b_limit_gb": e2b_limit_gb,
+                "sandbox_limit_gb": sandbox_limit_gb,
                 "estimate": estimate,
             }
         return {
             "use_heavy": True,
-            "reason": "est_memory_exceeds_e2b_safe",
+            "reason": "est_memory_exceeds_sandbox_safe",
             "safe_budget_gb": safe_budget_gb,
-            "e2b_limit_gb": e2b_limit_gb,
+            "sandbox_limit_gb": sandbox_limit_gb,
             "estimate": estimate,
         }
 
@@ -15585,14 +15581,14 @@ def _build_backend_memory_decision(
             "use_heavy": True,
             "reason": "memory_uncertain_guard",
             "safe_budget_gb": safe_budget_gb,
-            "e2b_limit_gb": e2b_limit_gb,
+            "sandbox_limit_gb": sandbox_limit_gb,
             "estimate": estimate,
         }
     return {
         "use_heavy": False,
-        "reason": "e2b_default",
+        "reason": "sandbox_default",
         "safe_budget_gb": safe_budget_gb,
-        "e2b_limit_gb": e2b_limit_gb,
+        "sandbox_limit_gb": sandbox_limit_gb,
         "estimate": estimate,
     }
 
@@ -15773,7 +15769,7 @@ def _build_ml_execution_profile_for_prompt(
     # Keep backend taxonomy stable for downstream prompts/tests:
     # local runner mirrors heavy/cloudrun semantics (same artifact contract),
     # so expose backend as cloudrun and carry runtime_mode separately.
-    backend = "cloudrun" if runtime_mode == "local" else ("cloudrun" if bool(backend_selection.get("use_heavy")) else "e2b")
+    backend = "cloudrun" if runtime_mode == "local" else ("cloudrun" if bool(backend_selection.get("use_heavy")) else "local")
     cpu_hint = _read_int_env_hint(
         "HEAVY_RUNNER_CPU_HINT",
         "HEAVY_RUNNER_CPU",
@@ -15869,14 +15865,14 @@ def _build_de_backend_memory_decision(
     if n_cols <= 0:
         n_cols = max(0, _safe_int(required_cols_count, 0))
 
-    e2b_limit_gb = _safe_float(os.getenv("E2B_MEMORY_LIMIT_GB"), 8.0)
-    safe_fraction = _safe_float(os.getenv("E2B_MEMORY_SAFE_FRACTION"), 0.72)
-    min_margin_gb = _safe_float(os.getenv("E2B_MEMORY_MIN_MARGIN_GB"), 1.5)
-    safe_budget_gb = min(e2b_limit_gb * safe_fraction, max(0.1, e2b_limit_gb - min_margin_gb))
+    sandbox_limit_gb = _safe_float(os.getenv("SANDBOX_MEMORY_LIMIT_GB"), 8.0)
+    safe_fraction = _safe_float(os.getenv("SANDBOX_MEMORY_SAFE_FRACTION"), 0.72)
+    min_margin_gb = _safe_float(os.getenv("SANDBOX_MEMORY_MIN_MARGIN_GB"), 1.5)
+    safe_budget_gb = min(sandbox_limit_gb * safe_fraction, max(0.1, sandbox_limit_gb - min_margin_gb))
 
     bytes_per_cell = _safe_float(os.getenv("DE_STRING_BYTES_PER_CELL"), 48.0)
-    working_mult = _safe_float(os.getenv("DE_E2B_WORKING_MULT"), 2.2)
-    base_overhead_gb = _safe_float(os.getenv("DE_E2B_BASE_OVERHEAD_GB"), 0.8)
+    working_mult = _safe_float(os.getenv("DE_SANDBOX_WORKING_MULT"), 2.2)
+    base_overhead_gb = _safe_float(os.getenv("DE_SANDBOX_BASE_OVERHEAD_GB"), 0.8)
 
     raw_df_gb = None
     estimated_peak_gb = None
@@ -15889,12 +15885,12 @@ def _build_de_backend_memory_decision(
 
     large_signal = bool(file_mb >= 200 or est_rows >= 800_000 or n_cols >= 1_000)
     medium_signal = bool(file_mb >= 50 or est_rows >= 200_000)
-    if state.get("de_e2b_memory_failure_detected"):
+    if state.get("de_sandbox_memory_failure_detected"):
         return {
             "use_heavy": True,
-            "reason": "e2b_memory_failure_fallback",
+            "reason": "sandbox_memory_failure_fallback",
             "safe_budget_gb": safe_budget_gb,
-            "e2b_limit_gb": e2b_limit_gb,
+            "sandbox_limit_gb": sandbox_limit_gb,
             "estimated_peak_gb": estimated_peak_gb,
             "raw_df_gb": raw_df_gb,
             "file_mb": file_mb,
@@ -15906,9 +15902,9 @@ def _build_de_backend_memory_decision(
         if estimated_peak_gb <= safe_budget_gb:
             return {
                 "use_heavy": False,
-                "reason": "e2b_memory_safe_de",
+                "reason": "sandbox_memory_safe_de",
                 "safe_budget_gb": safe_budget_gb,
-                "e2b_limit_gb": e2b_limit_gb,
+                "sandbox_limit_gb": sandbox_limit_gb,
                 "estimated_peak_gb": estimated_peak_gb,
                 "raw_df_gb": raw_df_gb,
                 "file_mb": file_mb,
@@ -15917,9 +15913,9 @@ def _build_de_backend_memory_decision(
             }
         return {
             "use_heavy": True,
-            "reason": "de_est_memory_exceeds_e2b_safe",
+            "reason": "de_est_memory_exceeds_sandbox_safe",
             "safe_budget_gb": safe_budget_gb,
-            "e2b_limit_gb": e2b_limit_gb,
+            "sandbox_limit_gb": sandbox_limit_gb,
             "estimated_peak_gb": estimated_peak_gb,
             "raw_df_gb": raw_df_gb,
             "file_mb": file_mb,
@@ -15932,7 +15928,7 @@ def _build_de_backend_memory_decision(
             "use_heavy": True,
             "reason": "de_memory_uncertain_guard",
             "safe_budget_gb": safe_budget_gb,
-            "e2b_limit_gb": e2b_limit_gb,
+            "sandbox_limit_gb": sandbox_limit_gb,
             "estimated_peak_gb": None,
             "raw_df_gb": raw_df_gb,
             "file_mb": file_mb,
@@ -15942,9 +15938,9 @@ def _build_de_backend_memory_decision(
     if medium_signal:
         return {
             "use_heavy": False,
-            "reason": "de_e2b_preferred_medium_scale",
+            "reason": "de_sandbox_preferred_medium_scale",
             "safe_budget_gb": safe_budget_gb,
-            "e2b_limit_gb": e2b_limit_gb,
+            "sandbox_limit_gb": sandbox_limit_gb,
             "estimated_peak_gb": None,
             "raw_df_gb": raw_df_gb,
             "file_mb": file_mb,
@@ -15953,9 +15949,9 @@ def _build_de_backend_memory_decision(
         }
     return {
         "use_heavy": False,
-        "reason": "de_e2b_default",
+        "reason": "de_sandbox_default",
         "safe_budget_gb": safe_budget_gb,
-        "e2b_limit_gb": e2b_limit_gb,
+        "sandbox_limit_gb": sandbox_limit_gb,
         "estimated_peak_gb": None,
         "raw_df_gb": raw_df_gb,
         "file_mb": file_mb,
@@ -16425,14 +16421,14 @@ def _execute_data_engineer_via_heavy_runner(
     }
 
 
-def _should_run_e2b_after_de_heavy_result(de_heavy_result: Dict[str, Any] | None) -> bool:
+def _should_run_sandbox_after_de_heavy_result(de_heavy_result: Dict[str, Any] | None) -> bool:
     """
-    Decide whether to run E2B after a DE heavy-runner attempt.
+    Decide whether to run standard sandbox after a DE heavy-runner attempt.
 
     Policy:
-    - No heavy result: run E2B.
-    - Heavy runner unavailable: run E2B fallback.
-    - Heavy runner attempted (ok or failed): do not run E2B in same cycle.
+    - No heavy result: run sandbox.
+    - Heavy runner unavailable: run sandbox fallback.
+    - Heavy runner attempted (ok or failed): do not run sandbox in same cycle.
     """
     if not isinstance(de_heavy_result, dict):
         return True
@@ -18282,7 +18278,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "budget_counters": counters,
             }
 
-    # Execute in E2B Sandbox
+    # Execute in Sandbox
     de_output_path, de_manifest_path, _ = _resolve_de_output_artifacts(state if isinstance(state, dict) else {})
     if not de_output_path or not de_manifest_path:
         msg = (
@@ -18662,13 +18658,13 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 print(
                     f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}"
                 )
-            run_e2b_after_heavy = False
-            if not run_e2b_after_heavy and isinstance(de_heavy_result, dict) and not de_heavy_result.get("ok"):
+            run_sandbox_after_heavy = False
+            if not run_sandbox_after_heavy and isinstance(de_heavy_result, dict) and not de_heavy_result.get("ok"):
                 heavy_error = str(
                     de_heavy_result.get("error_details")
                     or "HEAVY_RUNNER_ERROR: data engineer execution failed."
                 )
-                print("HEAVY_RUNNER_DE_FAILED: skipping E2B fallback for this iteration.")
+                print("HEAVY_RUNNER_DE_FAILED: skipping sandbox fallback for this iteration.")
                 return {
                     "cleaning_code": code,
                     "cleaned_data_preview": "Error: Cleaning Failed",
@@ -18676,14 +18672,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     "budget_counters": counters,
                 }
 
-            if run_e2b_after_heavy and not (isinstance(de_heavy_result, dict) and de_heavy_result.get("ok")):
-                # load_dotenv() is called at module level or main
-                api_key = os.getenv("E2B_API_KEY")
-                if not api_key:
-                    msg = "CRITICAL: E2B_API_KEY missing in .env file."
-                    return {"error_message": msg, "cleaned_data_preview": "Error: Missing E2B Key", "budget_counters": counters}
-
-                os.environ["E2B_API_KEY"] = api_key
+            if run_sandbox_after_heavy and not (isinstance(de_heavy_result, dict) and de_heavy_result.get("ok")):
+                pass  # Sandbox provider handles its own authentication
 
             step_name = "data_engineer"
             for sb_attempt in range(2):
@@ -18693,7 +18683,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 with create_sandbox_with_retry(Sandbox, max_attempts=2, run_id=run_id, step="data_engineer") as sandbox:
                     if not hasattr(sandbox, "commands"):
                         raise RuntimeError(
-                            "E2B Sandbox missing commands runner. Ensure sandbox supports commands.run."
+                            "Sandbox missing commands runner. Ensure sandbox supports commands.run."
                         )
                     run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
                     # 1. Setup Environment
@@ -18849,7 +18839,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 new_state["de_memory_backend_retry_done"] = True
                                 if run_id:
                                     new_state["de_memory_backend_retry_done_run_id"] = run_id
-                                new_state["de_e2b_memory_failure_detected"] = True
+                                new_state["de_sandbox_memory_failure_detected"] = True
                                 new_state["de_force_heavy_runner"] = True
                                 new_state["execution_error_message"] = error_details[-4000:]
                                 if run_id:
@@ -18857,7 +18847,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         run_id,
                                         "data_engineer_backend_escalation",
                                         {
-                                            "source_backend": "e2b",
+                                            "source_backend": "sandbox",
                                             "target_backend": "heavy_runner",
                                             "reason": "memory_pressure",
                                             "attempt": attempt_id,
@@ -19461,7 +19451,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     new_state["de_memory_backend_retry_done"] = True
                     if run_id:
                         new_state["de_memory_backend_retry_done_run_id"] = run_id
-                    new_state["de_e2b_memory_failure_detected"] = True
+                    new_state["de_sandbox_memory_failure_detected"] = True
                     new_state["de_force_heavy_runner"] = True
                     new_state["execution_error_message"] = err_details[-4000:]
                     if run_id:
@@ -19469,7 +19459,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             run_id,
                             "data_engineer_backend_escalation",
                             {
-                                "source_backend": "e2b",
+                                "source_backend": "sandbox",
                                 "target_backend": "heavy_runner",
                                 "reason": "memory_pressure_exception",
                                 "attempt": attempt_id,
@@ -21757,7 +21747,7 @@ def execute_code(state: AgentState) -> AgentState:
             )
         return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
 
-    # Shared prechecks for both backends (Cloud Run + E2B) to keep behavior aligned.
+    # Shared prechecks for both backends (Cloud Run + Sandbox) to keep behavior aligned.
     is_safe, violations = scan_code_safety(code)
     if not is_safe:
         failure_reason = "CRITICAL: Security Violations:\n" + "\n".join(violations)
@@ -22181,8 +22171,8 @@ def execute_code(state: AgentState) -> AgentState:
                 visuals_missing=visuals_missing,
             )
 
-    # E2B Sandbox execution path
-    print("    Backend: E2B Sandbox")
+    # Sandbox execution path
+    print("    Backend: Sandbox")
 
     # Prevent stale metrics from previous iterations
     try:
@@ -22271,15 +22261,8 @@ def execute_code(state: AgentState) -> AgentState:
         if run_id:
             log_run_event(run_id, "ml_preexec_warnings", preexec_payload)
 
-    # Secure execution using E2B
+    # Secure execution using sandbox provider
     try:
-        # load_dotenv() removed (module level)
-        api_key = os.getenv("E2B_API_KEY")
-        if not api_key:
-            msg = "CRITICAL: E2B_API_KEY missing in .env file."
-            return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
-        os.environ["E2B_API_KEY"] = api_key
-
         # Determine ML timeout based on dataset scale (P2.2)
         dataset_scale = state.get("dataset_scale") or (state.get("dataset_scale_hints") or {}).get("scale")
         if dataset_scale == "small":
@@ -22295,11 +22278,11 @@ def execute_code(state: AgentState) -> AgentState:
             with create_sandbox_with_retry(Sandbox, max_attempts=2, run_id=run_id, step="ml_engineer") as sandbox:
                 if not hasattr(sandbox, "commands"):
                     raise RuntimeError(
-                        "E2B Sandbox missing commands runner. Ensure sandbox supports commands.run."
+                        "Sandbox missing commands runner. Ensure sandbox supports commands.run."
                     )
                 run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
                 print("Installing dependencies in Sandbox...")
-                pkg_sets = get_sandbox_install_packages(required_deps, backend_profile="e2b")
+                pkg_sets = get_sandbox_install_packages(required_deps, backend_profile="local")
                 base_cmd = "pip install -q " + " ".join(pkg_sets["base"])
                 run_cmd_with_retry(sandbox, base_cmd, retries=2)
                 if pkg_sets["extra"]:
@@ -22820,7 +22803,7 @@ def execute_code(state: AgentState) -> AgentState:
         memory_pressure_detected = _is_memory_pressure_error(tail)
         if memory_pressure_detected:
             note = (
-                "E2B_MEMORY_PRESSURE_DETECTED: promoting next execution to CloudRun to avoid 8GB limit breaches."
+                "SANDBOX_MEMORY_PRESSURE_DETECTED: promoting next execution to CloudRun to avoid memory limit breaches."
             )
             history = list(state.get("feedback_history", []))
             history.append(note)
@@ -22828,7 +22811,7 @@ def execute_code(state: AgentState) -> AgentState:
             if run_id:
                 log_run_event(
                     run_id,
-                    "e2b_memory_pressure_detected",
+                    "sandbox_memory_pressure_detected",
                     {"attempt_id": attempt_id, "tail_excerpt": tail[-800:]},
                 )
         if "DETERMINISTIC_TARGET_RELATION" in tail:
@@ -22956,7 +22939,7 @@ def execute_code(state: AgentState) -> AgentState:
         "last_attempt_score": attempt_score,
         "last_attempt_valid": attempt_valid,
         "sandbox_failed": sandbox_failed,
-        "e2b_memory_failure_detected": bool(memory_pressure_detected),
+        "sandbox_memory_failure_detected": bool(memory_pressure_detected),
         "sandbox_retry_count": 0 if not sandbox_failed else state.get("sandbox_retry_count", 0),
         "ml_call_refund_pending": False,
         "execution_call_refund_pending": False,

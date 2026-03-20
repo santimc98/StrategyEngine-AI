@@ -96,13 +96,6 @@ API_KEY_REGISTRY: List[Dict[str, str]] = [
         "required": True,
     },
     {
-        "env_var": "E2B_API_KEY",
-        "label": "E2B Sandbox",
-        "description": "Ejecuci\u00f3n segura de c\u00f3digo ML en sandbox",
-        "placeholder": "e2b_...",
-        "required": True,
-    },
-    {
         "env_var": "MIMO_API_KEY",
         "label": "MIMO / ZAI",
         "description": "Asesor de Resultados, Revisor de Limpieza (opcional)",
@@ -205,12 +198,6 @@ def test_key_connectivity(env_var: str, value: str) -> tuple[bool, str]:
             return True, "Conectado a OpenRouter"
         except Exception as e:
             return False, f"Error: {str(e)[:80]}"
-
-    elif env_var == "E2B_API_KEY":
-        # E2B doesn't have a simple ping endpoint; validate format
-        if value.startswith("e2b_") or len(value) > 20:
-            return True, "Formato v\u00e1lido (no se puede verificar sin ejecutar sandbox)"
-        return False, "Formato de clave no reconocido"
 
     elif env_var == "MIMO_API_KEY":
         if len(value) > 10:

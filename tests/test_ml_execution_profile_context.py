@@ -14,7 +14,7 @@ def test_ml_execution_profile_has_runtime_budget_shape():
     profile = _build_ml_execution_profile_for_prompt(state, code="", ml_plan={})
 
     assert isinstance(profile, dict)
-    assert profile.get("backend") in {"cloudrun", "e2b"}
+    assert profile.get("backend") in {"cloudrun", "local"}
     runtime_budget = profile.get("runtime_budget")
     assert isinstance(runtime_budget, dict)
     assert isinstance(runtime_budget.get("hard_timeout_seconds"), int)

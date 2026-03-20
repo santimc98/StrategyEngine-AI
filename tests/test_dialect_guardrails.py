@@ -6,7 +6,7 @@ import pytest
 
 os.environ.setdefault("DEEPSEEK_API_KEY", "dummy")
 os.environ.setdefault("GOOGLE_API_KEY", "dummy")
-os.environ.setdefault("E2B_API_KEY", "dummy")
+os.environ.setdefault("SANDBOX_PROVIDER", "local")
 
 from src.utils.dialect_guardrails import (
     assert_not_single_column_delimiter_mismatch,

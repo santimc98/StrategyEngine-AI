@@ -193,7 +193,7 @@ def run_python_file_with_optional_timeout(
         else:
             proc = sandbox.commands.run(cmd)
     except Exception as e:
-        # E2B may raise CommandExitException for non-zero exit codes.
+        # Some sandbox providers raise CommandExitException for non-zero exit codes.
         # Normalize it to _ExecutionResult so callers can use the regular
         # runtime-error recovery path instead of jumping to outer exception flow.
         msg = _normalize_text(e)
@@ -401,7 +401,7 @@ def create_sandbox_with_retry(SandboxCls, *, max_attempts: int = 2, run_id: Opti
     Supports both context-manager style (SandboxCls.create()) and direct instantiation.
 
     Args:
-        SandboxCls: The Sandbox class (e.g., Sandbox from e2b)
+        SandboxCls: The Sandbox class (e.g., LocalSandbox from sandbox_provider)
         max_attempts: Maximum number of attempts (default: 2)
         run_id: Optional run ID for logging
         step: Optional step name for logging

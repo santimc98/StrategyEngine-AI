@@ -2,7 +2,7 @@ import os
 
 os.environ.setdefault("DEEPSEEK_API_KEY", "dummy")
 os.environ.setdefault("GOOGLE_API_KEY", "dummy")
-os.environ.setdefault("E2B_API_KEY", "dummy")
+os.environ.setdefault("SANDBOX_PROVIDER", "local")
 os.environ.setdefault("OPENROUTER_API_KEY", "dummy-openrouter")
 
 from src.graph.graph import run_engineer
