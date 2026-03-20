@@ -3100,9 +3100,12 @@ def _collect_ml_required_columns(contract: Dict[str, Any]) -> Tuple[List[str], L
 
     column_roles = contract.get("column_roles")
     if isinstance(column_roles, dict):
+        # NOTE: "decision" columns are model OUTPUTS (e.g. prob_12h, predicted_price)
+        # that do not exist in the input clean dataset.  They must NOT be required
+        # in clean_dataset coverage — only pre_decision (features) and outcome
+        # (labels) are genuine input-side ML dependencies.
         for key in (
             "pre_decision",
-            "decision",
             "outcome",
             "features",
             "feature",
@@ -3110,9 +3113,6 @@ def _collect_ml_required_columns(contract: Dict[str, Any]) -> Tuple[List[str], L
             "label",
         ):
             _extend(column_roles.get(key))
-
-    _extend(contract.get("decision_columns"))
-    _extend(contract.get("outcome_columns"))
 
     allowed_feature_sets = contract.get("allowed_feature_sets")
     if isinstance(allowed_feature_sets, dict):
