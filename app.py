@@ -758,6 +758,115 @@ section[data-testid="stSidebar"] .stButton > button:hover {
     font-weight: 600;
 }
 
+/* ---------- Chat Input Area (ChatGPT / Claude style) ---------- */
+.chat-input-container {
+    max-width: 740px;
+    margin: 0 auto;
+    padding: 0 1rem;
+}
+.chat-input-box {
+    background: var(--card-bg);
+    border: 1.5px solid var(--card-border);
+    border-radius: 16px;
+    padding: 1.25rem 1.5rem 1rem;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.chat-input-box:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 2px 20px rgba(79,139,249,0.15);
+}
+.chat-input-box .stTextArea textarea {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    font-size: 1rem !important;
+    line-height: 1.6 !important;
+    resize: none !important;
+    color: var(--text-primary) !important;
+}
+.chat-input-box .stTextArea > div > div { border: none !important; }
+.chat-input-box .stTextArea label { display: none !important; }
+.chat-attach-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 0.5rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--card-border);
+}
+.file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: linear-gradient(135deg, rgba(79,139,249,0.12) 0%, rgba(124,58,237,0.08) 100%);
+    border: 1px solid rgba(79,139,249,0.3);
+    border-radius: 20px;
+    padding: 0.3rem 0.9rem;
+    font-size: 0.82rem;
+    color: var(--accent);
+    font-weight: 600;
+}
+.file-chip-placeholder {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+}
+.chat-start-btn button {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 24px !important;
+    font-weight: 700 !important;
+    padding: 0.6rem 2rem !important;
+    font-size: 0.95rem !important;
+    transition: opacity 0.2s ease, transform 0.15s ease !important;
+}
+.chat-start-btn button:hover {
+    opacity: 0.9 !important;
+    transform: scale(1.02) !important;
+}
+
+/* ---------- Sidebar Run History ---------- */
+.sidebar-run-item {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px;
+    padding: 0.55rem 0.7rem;
+    margin-bottom: 0.4rem;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+.sidebar-run-item:hover {
+    background: rgba(79,139,249,0.1);
+}
+.sidebar-run-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #e6edf3;
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.sidebar-run-meta {
+    font-size: 0.68rem;
+    color: #8b949e;
+    margin-top: 0.2rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.sidebar-run-metric {
+    color: #a6e3a1;
+    font-weight: 600;
+}
+
 /* ---------- Footer ---------- */
 .footer {
     text-align: center;
@@ -1006,170 +1115,157 @@ with st.sidebar:
                     else:
                         st.error(f"{reg['label']}: {msg}")
 
-    st.markdown("---")
-    st.markdown("##### Origen de Datos")
+    # ---- CRM Connectors (alternative data source) ----
+    _show_crm = st.session_state.get("show_crm_panel", False)
+    if st.button("Conectar CRM", key="toggle_crm_panel", use_container_width=True):
+        st.session_state["show_crm_panel"] = not _show_crm
+        _show_crm = not _show_crm
 
-    data_source = st.radio(
-        "Selecciona el origen de datos",
-        ["Archivo Local", "Salesforce", "HubSpot"],
-        label_visibility="collapsed",
-    )
-
-    uploaded_file = None
-
-    # ---- Archivo Local ----
-    if data_source == "Archivo Local":
-        uploaded_file = st.file_uploader("Sube tu archivo CSV o Excel", type=["csv", "xlsx", "xls"])
-        if uploaded_file is not None:
-            file_size = uploaded_file.size
-            if file_size < 1024:
-                size_str = f"{file_size} B"
-            elif file_size < 1024 * 1024:
-                size_str = f"{file_size / 1024:.1f} KB"
+    if _show_crm:
+        crm_source = st.radio(
+            "CRM", ["Salesforce", "HubSpot"], label_visibility="collapsed",
+        )
+        if crm_source == "Salesforce":
+            sf_auth_mode = st.selectbox("Modo de autenticaci\u00f3n", ["Token API", "OAuth (Access Token)"], key="sf_auth_mode")
+            if sf_auth_mode == "Token API":
+                sf_username = st.text_input("Username", key="sf_username")
+                sf_password = st.text_input("Password", type="password", key="sf_password")
+                sf_token = st.text_input("Security Token", type="password", key="sf_security_token")
+                sf_connect = st.button("Conectar a Salesforce", key="sf_connect")
+                if sf_connect and sf_username and sf_password and sf_token:
+                    try:
+                        from src.connectors.salesforce_connector import SalesforceConnector
+                        connector = SalesforceConnector()
+                        connector.authenticate({"mode": "token", "username": sf_username, "password": sf_password, "security_token": sf_token})
+                        st.session_state["crm_connector"] = connector
+                        st.session_state["crm_authenticated"] = True
+                        st.session_state["crm_objects"] = connector.list_objects()
+                    except Exception as exc:
+                        st.error(f"Error: {exc}")
+                        st.session_state["crm_authenticated"] = False
             else:
-                size_str = f"{file_size / (1024*1024):.1f} MB"
-            st.markdown(f'<span class="metric-pill">{uploaded_file.name} &mdash; {size_str}</span>', unsafe_allow_html=True)
-
-    # ---- Salesforce ----
-    elif data_source == "Salesforce":
-        sf_auth_mode = st.selectbox("Modo de autenticaci\u00f3n", ["Token API", "OAuth (Access Token)"], key="sf_auth_mode")
-
-        if sf_auth_mode == "Token API":
-            sf_username = st.text_input("Username", key="sf_username")
-            sf_password = st.text_input("Password", type="password", key="sf_password")
-            sf_token = st.text_input("Security Token", type="password", key="sf_security_token")
-            sf_connect = st.button("Conectar a Salesforce", key="sf_connect")
-
-            if sf_connect and sf_username and sf_password and sf_token:
-                try:
-                    from src.connectors.salesforce_connector import SalesforceConnector
-                    connector = SalesforceConnector()
-                    connector.authenticate({
-                        "mode": "token",
-                        "username": sf_username,
-                        "password": sf_password,
-                        "security_token": sf_token,
-                    })
-                    st.session_state["crm_connector"] = connector
-                    st.session_state["crm_authenticated"] = True
-                    st.session_state["crm_objects"] = connector.list_objects()
-                except Exception as exc:
-                    st.error(f"Error: {exc}")
-                    st.session_state["crm_authenticated"] = False
-        else:
-            sf_access_token = st.text_input("Access Token", type="password", key="sf_oauth_token")
-            sf_instance_url = st.text_input("Instance URL", placeholder="https://your-instance.salesforce.com", key="sf_instance_url")
-            sf_connect_oauth = st.button("Conectar a Salesforce", key="sf_connect_oauth")
-
-            if sf_connect_oauth and sf_access_token and sf_instance_url:
-                try:
-                    from src.connectors.salesforce_connector import SalesforceConnector
-                    connector = SalesforceConnector()
-                    connector.authenticate({
-                        "mode": "oauth",
-                        "access_token": sf_access_token,
-                        "instance_url": sf_instance_url,
-                    })
-                    st.session_state["crm_connector"] = connector
-                    st.session_state["crm_authenticated"] = True
-                    st.session_state["crm_objects"] = connector.list_objects()
-                except Exception as exc:
-                    st.error(f"Error: {exc}")
-                    st.session_state["crm_authenticated"] = False
-
-        # Object selection & data fetch (shared for both SF auth modes)
-        if st.session_state.get("crm_authenticated") and type(st.session_state.get("crm_connector")).__name__ == "SalesforceConnector":
-            st.markdown('<span class="badge badge-success">Conectado a Salesforce</span>', unsafe_allow_html=True)
-            crm_objects = st.session_state.get("crm_objects", [])
-            if crm_objects:
-                obj_labels = [f"{o['label']} ({o['name']})" for o in crm_objects]
-                selected_idx = st.selectbox("Tabla CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="sf_obj_select")
-                max_recs = st.number_input("M\u00e1x. registros", min_value=100, max_value=50000, value=10000, step=500, key="sf_max_recs")
-                fetch_btn = st.button("Extraer Datos", key="sf_fetch")
-
-                if fetch_btn:
-                    selected_obj = crm_objects[selected_idx]["name"]
+                sf_access_token = st.text_input("Access Token", type="password", key="sf_oauth_token")
+                sf_instance_url = st.text_input("Instance URL", placeholder="https://your-instance.salesforce.com", key="sf_instance_url")
+                sf_connect_oauth = st.button("Conectar a Salesforce", key="sf_connect_oauth")
+                if sf_connect_oauth and sf_access_token and sf_instance_url:
                     try:
-                        connector = st.session_state["crm_connector"]
-                        df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
-                        if df_crm.empty:
-                            st.warning(f"El objeto '{selected_obj}' no contiene datos.")
-                        else:
-                            os.makedirs("data", exist_ok=True)
-                            crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")
-                            df_crm.to_csv(crm_csv, index=False, encoding="utf-8")
-                            st.session_state["crm_data_path"] = crm_csv
-                            st.session_state["crm_preview_df"] = df_crm
-                            st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extra\u00eddos</span>', unsafe_allow_html=True)
+                        from src.connectors.salesforce_connector import SalesforceConnector
+                        connector = SalesforceConnector()
+                        connector.authenticate({"mode": "oauth", "access_token": sf_access_token, "instance_url": sf_instance_url})
+                        st.session_state["crm_connector"] = connector
+                        st.session_state["crm_authenticated"] = True
+                        st.session_state["crm_objects"] = connector.list_objects()
                     except Exception as exc:
-                        st.error(f"Error al obtener los datos: {exc}")
+                        st.error(f"Error: {exc}")
+                        st.session_state["crm_authenticated"] = False
+            if st.session_state.get("crm_authenticated") and type(st.session_state.get("crm_connector")).__name__ == "SalesforceConnector":
+                st.markdown('<span class="badge badge-success">Conectado a Salesforce</span>', unsafe_allow_html=True)
+                crm_objects = st.session_state.get("crm_objects", [])
+                if crm_objects:
+                    obj_labels = [f"{o['label']} ({o['name']})" for o in crm_objects]
+                    selected_idx = st.selectbox("Tabla CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="sf_obj_select")
+                    max_recs = st.number_input("M\u00e1x. registros", min_value=100, max_value=50000, value=10000, step=500, key="sf_max_recs")
+                    if st.button("Extraer Datos", key="sf_fetch"):
+                        selected_obj = crm_objects[selected_idx]["name"]
+                        try:
+                            connector = st.session_state["crm_connector"]
+                            df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
+                            if df_crm.empty:
+                                st.warning(f"El objeto '{selected_obj}' no contiene datos.")
+                            else:
+                                os.makedirs("data", exist_ok=True)
+                                crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")
+                                df_crm.to_csv(crm_csv, index=False, encoding="utf-8")
+                                st.session_state["crm_data_path"] = crm_csv
+                                st.session_state["crm_preview_df"] = df_crm
+                                st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extra\u00eddos</span>', unsafe_allow_html=True)
+                        except Exception as exc:
+                            st.error(f"Error al obtener los datos: {exc}")
+                if st.session_state.get("crm_data_path") and st.session_state.get("crm_preview_df") is not None:
+                    st.markdown(f'<span class="metric-pill">{len(st.session_state["crm_preview_df"]):,} registros listos</span>', unsafe_allow_html=True)
 
-            if st.session_state.get("crm_data_path"):
-                preview_df = st.session_state.get("crm_preview_df")
-                if preview_df is not None:
-                    st.markdown(f'<span class="metric-pill">{len(preview_df):,} registros listos</span>', unsafe_allow_html=True)
-
-    # ---- HubSpot ----
-    elif data_source == "HubSpot":
-        hs_auth_mode = st.selectbox("Modo de autenticaci\u00f3n", ["Private App Token", "OAuth (Access Token)"], key="hs_auth_mode")
-        hs_token = st.text_input("Token", type="password", key="hs_token")
-        hs_connect = st.button("Conectar a HubSpot", key="hs_connect")
-
-        if hs_connect and hs_token:
-            try:
-                from src.connectors.hubspot_connector import HubSpotConnector
-                connector = HubSpotConnector()
-                connector.authenticate({"access_token": hs_token})
-                st.session_state["crm_connector"] = connector
-                st.session_state["crm_authenticated"] = True
-                st.session_state["crm_objects"] = connector.list_objects()
-            except Exception as exc:
-                st.error(f"Error: {exc}")
-                st.session_state["crm_authenticated"] = False
-
-        if st.session_state.get("crm_authenticated") and type(st.session_state.get("crm_connector")).__name__ == "HubSpotConnector":
-            st.markdown('<span class="badge badge-success">Conectado a HubSpot</span>', unsafe_allow_html=True)
-            crm_objects = st.session_state.get("crm_objects", [])
-            if crm_objects:
-                obj_labels = [f"{o['label']} ({o['name']})" for o in crm_objects]
-                selected_idx = st.selectbox("Tabla CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="hs_obj_select")
-                max_recs = st.number_input("M\u00e1x. registros", min_value=100, max_value=50000, value=10000, step=500, key="hs_max_recs")
-                fetch_btn = st.button("Extraer Datos", key="hs_fetch")
-
-                if fetch_btn:
-                    selected_obj = crm_objects[selected_idx]["name"]
+        elif crm_source == "HubSpot":
+            hs_auth_mode = st.selectbox("Modo de autenticaci\u00f3n", ["Private App Token", "OAuth (Access Token)"], key="hs_auth_mode")
+            hs_token = st.text_input("Token", type="password", key="hs_token")
+            if st.button("Conectar a HubSpot", key="hs_connect"):
+                if hs_token:
                     try:
-                        connector = st.session_state["crm_connector"]
-                        df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
-                        if df_crm.empty:
-                            st.warning(f"El objeto '{selected_obj}' no contiene datos.")
-                        else:
-                            os.makedirs("data", exist_ok=True)
-                            crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")
-                            df_crm.to_csv(crm_csv, index=False, encoding="utf-8")
-                            st.session_state["crm_data_path"] = crm_csv
-                            st.session_state["crm_preview_df"] = df_crm
-                            st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extra\u00eddos</span>', unsafe_allow_html=True)
+                        from src.connectors.hubspot_connector import HubSpotConnector
+                        connector = HubSpotConnector()
+                        connector.authenticate({"access_token": hs_token})
+                        st.session_state["crm_connector"] = connector
+                        st.session_state["crm_authenticated"] = True
+                        st.session_state["crm_objects"] = connector.list_objects()
                     except Exception as exc:
-                        st.error(f"Error al obtener los datos: {exc}")
+                        st.error(f"Error: {exc}")
+                        st.session_state["crm_authenticated"] = False
+            if st.session_state.get("crm_authenticated") and type(st.session_state.get("crm_connector")).__name__ == "HubSpotConnector":
+                st.markdown('<span class="badge badge-success">Conectado a HubSpot</span>', unsafe_allow_html=True)
+                crm_objects = st.session_state.get("crm_objects", [])
+                if crm_objects:
+                    obj_labels = [f"{o['label']} ({o['name']})" for o in crm_objects]
+                    selected_idx = st.selectbox("Tabla CRM", range(len(obj_labels)), format_func=lambda i: obj_labels[i], key="hs_obj_select")
+                    max_recs = st.number_input("M\u00e1x. registros", min_value=100, max_value=50000, value=10000, step=500, key="hs_max_recs")
+                    if st.button("Extraer Datos", key="hs_fetch"):
+                        selected_obj = crm_objects[selected_idx]["name"]
+                        try:
+                            connector = st.session_state["crm_connector"]
+                            df_crm = connector.fetch_object_data(selected_obj, max_records=int(max_recs))
+                            if df_crm.empty:
+                                st.warning(f"El objeto '{selected_obj}' no contiene datos.")
+                            else:
+                                os.makedirs("data", exist_ok=True)
+                                crm_csv = os.path.join("data", f"crm_{selected_obj.lower()}.csv")
+                                df_crm.to_csv(crm_csv, index=False, encoding="utf-8")
+                                st.session_state["crm_data_path"] = crm_csv
+                                st.session_state["crm_preview_df"] = df_crm
+                                st.markdown(f'<span class="metric-pill">{len(df_crm):,} registros extra\u00eddos</span>', unsafe_allow_html=True)
+                        except Exception as exc:
+                            st.error(f"Error al obtener los datos: {exc}")
+                if st.session_state.get("crm_data_path") and st.session_state.get("crm_preview_df") is not None:
+                    st.markdown(f'<span class="metric-pill">{len(st.session_state["crm_preview_df"]):,} registros listos</span>', unsafe_allow_html=True)
 
-            if st.session_state.get("crm_data_path"):
-                preview_df = st.session_state.get("crm_preview_df")
-                if preview_df is not None:
-                    st.markdown(f'<span class="metric-pill">{len(preview_df):,} registros listos</span>', unsafe_allow_html=True)
-
+    # ---- Run History in Sidebar ----
     st.markdown("---")
-    st.markdown("##### Objetivo de Negocio")
-
-    business_objective = st.text_area(
-        "Describe el objetivo que deseas lograr con tus datos",
-        placeholder="Ej: Reducir el churn de clientes en un 10% identificando los factores clave de abandono...",
-        height=130,
-        label_visibility="collapsed"
-    )
-
-    st.markdown("")  # spacer
-    start_btn = st.button("Iniciar An\u00e1lisis", use_container_width=True)
+    _sidebar_runs = _list_runs(limit=10)
+    if _sidebar_runs:
+        st.markdown(
+            '<div style="font-size:0.72rem; font-weight:700; text-transform:uppercase; '
+            'letter-spacing:0.07em; color:#8b949e; margin-bottom:0.5rem;">Historial</div>',
+            unsafe_allow_html=True,
+        )
+        _STATUS_ICONS_SIDEBAR = {
+            "complete": "\u2705", "error": "\u274c", "aborted": "\u26a0\ufe0f",
+        }
+        for _sr in _sidebar_runs:
+            _sr_icon = _STATUS_ICONS_SIDEBAR.get(_sr["status"], "\u2753")
+            _sr_strategy = _sr.get("strategy") or ""
+            _sr_title = _sr_strategy if _sr_strategy else _sr["run_id"]
+            _sr_metric = ""
+            if _sr["metric_value"]:
+                _sr_metric = f'<span class="sidebar-run-metric">{_sr["metric_name"]}: {_sr["metric_value"]}</span>'
+            st.markdown(
+                f'<div class="sidebar-run-item">'
+                f'<div class="sidebar-run-title">{_sr_icon} {_sr_title}</div>'
+                f'<div class="sidebar-run-meta">'
+                f'<span>{_sr["run_id"]}</span>'
+                f'<span>{_sr.get("started_str") or ""}</span>'
+                f'<span>{_sr.get("elapsed") or ""}</span>'
+                f'{_sr_metric}'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+            if _sr["status"] == "complete":
+                if st.button("Ver", key=f"view_run_{_sr['run_id']}", use_container_width=True):
+                    _loaded = _load_run_result(_sr["run_id"])
+                    if _loaded:
+                        st.session_state["analysis_result"] = _loaded
+                        st.session_state["analysis_complete"] = True
+                        st.session_state["viewing_run_id"] = _sr["run_id"]
+                        st.session_state.pop("pdf_binary", None)
+                        st.rerun()
+                    else:
+                        st.error("No se pudieron cargar los resultados.")
 
 # ---------------------------------------------------------------------------
 # Session State init
@@ -1207,11 +1303,105 @@ if not st.session_state.get("analysis_complete"):
                         st.session_state["analysis_complete"] = True
 
 # ---------------------------------------------------------------------------
+# Welcome Screen — ChatGPT / Claude style centered input
+# ---------------------------------------------------------------------------
+uploaded_file = None
+business_objective = ""
+start_btn = False
+
+if not st.session_state.get("analysis_complete"):
+    # Hero
+    st.markdown("""
+    <div class="hero fade-in" style="padding: 2.5rem 1rem 1rem;">
+        <h1><span class="hero-gradient">Inteligencia de Negocio Aut&oacute;noma</span></h1>
+        <p class="hero-subtitle">
+            Define tu objetivo, adjunta un dataset y deja que el equipo de agentes IA
+            audite, dise&ntilde;e estrategias, construya modelos y genere un informe ejecutivo.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ---- Centered chat-like input area ----
+    st.markdown('<div class="chat-input-container fade-in">', unsafe_allow_html=True)
+    st.markdown('<div class="chat-input-box">', unsafe_allow_html=True)
+
+    business_objective = st.text_area(
+        "Objetivo de negocio",
+        placeholder="Describe el objetivo que deseas lograr con tus datos.\nEj: Reducir el churn de clientes en un 10% identificando los factores clave de abandono...",
+        height=120,
+        label_visibility="collapsed",
+        key="main_business_objective",
+    )
+
+    st.markdown('</div>', unsafe_allow_html=True)  # close chat-input-box
+
+    # Attachment row + start button
+    _attach_col, _start_col = st.columns([3, 1])
+    with _attach_col:
+        uploaded_file = st.file_uploader(
+            "Adjuntar CSV",
+            type=["csv", "xlsx", "xls"],
+            label_visibility="collapsed",
+            key="main_file_upload",
+        )
+        if uploaded_file is not None:
+            file_size = uploaded_file.size
+            if file_size < 1024:
+                size_str = f"{file_size} B"
+            elif file_size < 1024 * 1024:
+                size_str = f"{file_size / 1024:.1f} KB"
+            else:
+                size_str = f"{file_size / (1024*1024):.1f} MB"
+            st.markdown(
+                f'<div class="file-chip">&#128206; {uploaded_file.name} &mdash; {size_str}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="file-chip-placeholder">&#128206; Adjunta un archivo CSV o Excel (obligatorio)</div>',
+                unsafe_allow_html=True,
+            )
+    with _start_col:
+        st.markdown('<div class="chat-start-btn">', unsafe_allow_html=True)
+        start_btn = st.button("Iniciar", use_container_width=True, key="main_start_btn")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)  # close chat-input-container
+
+    # Feature cards (compact)
+    st.markdown("")
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        st.markdown("""
+        <div class="feature-card fade-in">
+            <div class="feature-icon">&#128269;</div>
+            <div class="feature-title">Auditor&iacute;a de Datos</div>
+            <div class="feature-desc">An&aacute;lisis autom&aacute;tico de calidad, integridad y distribuci&oacute;n de tus datos.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_f2:
+        st.markdown("""
+        <div class="feature-card fade-in">
+            <div class="feature-icon">&#127919;</div>
+            <div class="feature-title">Estrategia IA</div>
+            <div class="feature-desc">Generaci&oacute;n y evaluaci&oacute;n de m&uacute;ltiples estrategias con deliberaci&oacute;n experta.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_f3:
+        st.markdown("""
+        <div class="feature-card fade-in">
+            <div class="feature-icon">&#9881;&#65039;</div>
+            <div class="feature-title">ML Automatizado</div>
+            <div class="feature-desc">Entrenamiento iterativo de modelos y generaci&oacute;n de informes ejecutivos.</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
 # Resolve data_path from any source
 # ---------------------------------------------------------------------------
 data_path = None
 
-if data_source == "Archivo Local" and uploaded_file is not None:
+if uploaded_file is not None:
     os.makedirs("data", exist_ok=True)
     temp_path = os.path.join("data", uploaded_file.name)
     with open(temp_path, "wb") as f:
@@ -1227,111 +1417,8 @@ if data_source == "Archivo Local" and uploaded_file is not None:
     else:
         data_path = temp_path
 
-elif data_source in ("Salesforce", "HubSpot"):
+if data_path is None:
     data_path = st.session_state.get("crm_data_path")
-
-# ---------------------------------------------------------------------------
-# Welcome Screen (no data loaded and no results)
-# ---------------------------------------------------------------------------
-if data_path is None and not st.session_state.get("analysis_complete"):
-    st.markdown("""
-    <div class="hero fade-in">
-        <h1><span class="hero-gradient">Inteligencia de Negocio Aut&oacute;noma</span></h1>
-        <p class="hero-subtitle">
-            Sube tus datos, define un objetivo y deja que nuestro equipo de agentes IA
-            audite, dise&ntilde;e estrategias, construya modelos y genere un informe ejecutivo&nbsp;&mdash; todo de forma aut&oacute;noma.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_f1, col_f2, col_f3 = st.columns(3)
-    with col_f1:
-        st.markdown("""
-        <div class="feature-card fade-in">
-            <div class="feature-icon">&#128269;</div>
-            <div class="feature-title">Auditor&iacute;a de Datos</div>
-            <div class="feature-desc">An&aacute;lisis autom&aacute;tico de calidad, integridad y distribuci&oacute;n de tus datos con recomendaciones accionables.</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col_f2:
-        st.markdown("""
-        <div class="feature-card fade-in">
-            <div class="feature-icon">&#127919;</div>
-            <div class="feature-title">Estrategia IA</div>
-            <div class="feature-desc">Generaci&oacute;n y evaluaci&oacute;n de m&uacute;ltiples estrategias anal&iacute;ticas con deliberaci&oacute;n experta para seleccionar la &oacute;ptima.</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col_f3:
-        st.markdown("""
-        <div class="feature-card fade-in">
-            <div class="feature-icon">&#9881;&#65039;</div>
-            <div class="feature-title">ML Automatizado</div>
-            <div class="feature-desc">Ingenier&iacute;a de datos, entrenamiento de modelos y evaluaci&oacute;n iterativa con generaci&oacute;n de informes ejecutivos.</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="steps-container fade-in">
-        <div class="step-item">
-            <div class="step-number">1</div>
-            <div class="step-text"><strong>Sube tus datos</strong>Carga un archivo CSV/Excel o conecta tu CRM desde el panel lateral.</div>
-        </div>
-        <div class="step-item">
-            <div class="step-number">2</div>
-            <div class="step-text"><strong>Define tu objetivo</strong>Describe qu&eacute; quieres lograr con tus datos.</div>
-        </div>
-        <div class="step-item">
-            <div class="step-number">3</div>
-            <div class="step-text"><strong>Obt&eacute;n resultados</strong>Recibe un informe ejecutivo con insights accionables.</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ---- Run History on Welcome Screen ----
-    recent_runs = _list_runs(limit=10)
-    if recent_runs:
-        st.markdown("---")
-        st.markdown("#### Historial de Ejecuciones")
-
-        _STATUS_ICONS = {
-            "complete": "\u2705",
-            "error": "\u274c",
-            "aborted": "\u26a0\ufe0f",
-        }
-        _VERDICT_LABELS_HIST = {
-            "APPROVED": "Aprobado",
-            "NEEDS_IMPROVEMENT": "Necesita Mejoras",
-        }
-
-        for run in recent_runs:
-            icon = _STATUS_ICONS.get(run["status"], "\u2753")
-            verdict_label = _VERDICT_LABELS_HIST.get(run["verdict"], run["verdict"] or "—")
-            metric_display = ""
-            if run["metric_value"]:
-                metric_display = f' | {run["metric_name"]}: **{run["metric_value"]}**'
-
-            col_info, col_action = st.columns([5, 1])
-            with col_info:
-                st.markdown(
-                    f'{icon} **{run["run_id"]}** — {run["started_str"] or "Fecha desconocida"}'
-                    f' | {run["elapsed"] or "—"}'
-                    f' | {verdict_label}'
-                    f'{metric_display}'
-                    f' | Iteraciones: {run["iterations"] or 0}'
-                )
-            with col_action:
-                if run["status"] == "complete" and st.button(
-                    "Ver", key=f"view_run_{run['run_id']}", use_container_width=True
-                ):
-                    loaded = _load_run_result(run["run_id"])
-                    if loaded:
-                        st.session_state["analysis_result"] = loaded
-                        st.session_state["analysis_complete"] = True
-                        st.session_state["viewing_run_id"] = run["run_id"]
-                        st.session_state.pop("pdf_binary", None)
-                        st.rerun()
-                    else:
-                        st.error("No se pudieron cargar los resultados de esta ejecuci\u00f3n.")
 
 # ---------------------------------------------------------------------------
 # Unified preview for any data source
@@ -1664,9 +1751,9 @@ if st.session_state.get("active_run_id") and not st.session_state.get("analysis_
 
 elif start_btn:
     if data_path is None:
-        st.sidebar.error("Sube un archivo de datos o conecta un CRM para comenzar.")
+        st.error("Adjunta un archivo CSV o conecta un CRM antes de iniciar.")
     elif not business_objective:
-        st.sidebar.error("Define un objetivo de negocio antes de iniciar el an\u00e1lisis.")
+        st.error("Define un objetivo de negocio antes de iniciar el an\u00e1lisis.")
     else:
         st.session_state["analysis_complete"] = False
         st.session_state["analysis_result"] = None
