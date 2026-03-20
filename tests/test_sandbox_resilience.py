@@ -343,3 +343,19 @@ def test_create_sandbox_with_retry_cleanup_on_success():
         pass
 
     mock_sandbox.close.assert_called_once()
+
+
+def test_create_sandbox_with_retry_filters_unknown_kwargs_for_local_style_classes():
+    class DummySandbox:
+        def __init__(self, endpoint=None):
+            self.endpoint = endpoint
+
+        def close(self):
+            return None
+
+    with create_sandbox_with_retry(
+        DummySandbox,
+        max_attempts=1,
+        sandbox_kwargs={"endpoint": "https://sandbox.example.com", "api_key": "secret"},
+    ) as sandbox:
+        assert sandbox.endpoint == "https://sandbox.example.com"

@@ -32,6 +32,11 @@ from src.utils.run_status import (
     write_final_state,
     write_status,
 )
+from src.utils.sandbox_config import normalize_sandbox_config
+from src.utils.sandbox_provider import (
+    get_sandbox_class,
+    get_sandbox_provider_spec,
+)
 
 # Progress weight per step (cumulative %)
 _STEP_PROGRESS = {
@@ -84,6 +89,8 @@ def main(run_id: str) -> None:
 
     csv_path = params["csv_path"]
     business_objective = params["business_objective"]
+    sandbox_config = normalize_sandbox_config(params.get("sandbox_config"))
+    sandbox_provider = str(sandbox_config.get("provider") or "local").strip().lower() or "local"
 
     # Write initial status IMMEDIATELY — before any heavy imports.
     # This lets the Streamlit polling UI show progress right away.
@@ -102,6 +109,27 @@ def main(run_id: str) -> None:
     )
     append_log(run_id, "Sistema", "Iniciando pipeline de analisis...", "info")
     append_log(run_id, "Sistema", "Cargando modulos (puede tardar unos minutos)...", "info")
+    append_log(run_id, "Sistema", f"Sandbox seleccionado: {sandbox_provider}", "info")
+
+    try:
+        get_sandbox_class(sandbox_provider)
+    except Exception as exc:
+        spec = get_sandbox_provider_spec(sandbox_provider)
+        append_log(run_id, "Sistema", f"Sandbox no disponible: {spec.label}", "error")
+        _update_status(
+            run_id,
+            stage=active_step,
+            progress=current_progress,
+            completed_steps=completed_steps,
+            iteration=ml_iteration,
+            max_iterations=ml_max_iterations,
+            metric_name=best_metric_name,
+            metric_value=current_metric_value,
+            status="error",
+            error=str(exc),
+            started_at=started_at,
+        )
+        return
 
     # Heavy imports — graph module is ~27K lines, takes 1-3 minutes to load
     overrides_path = os.path.join(PROJECT_ROOT, "data", "agent_model_overrides.json")
@@ -125,6 +153,8 @@ def main(run_id: str) -> None:
         "csv_path": csv_path,
         "business_objective": business_objective,
         "run_id": run_id,
+        "sandbox_config": sandbox_config,
+        "sandbox_provider": sandbox_provider,
     }
 
     final_state = initial_state.copy()

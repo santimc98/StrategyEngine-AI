@@ -22,13 +22,34 @@ from datetime import datetime, timezone
 from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple
 from langgraph.graph import StateGraph, END
 from src.utils.sandbox_provider import get_sandbox_class
-Sandbox = get_sandbox_class()
 from dotenv import load_dotenv
 import base64
 import pandas as pd
 
 # Add src to path to allow imports if running from root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+
+def _resolve_state_sandbox_config(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    from src.utils.sandbox_config import normalize_sandbox_config
+
+    if not isinstance(state, dict):
+        return normalize_sandbox_config({})
+    return normalize_sandbox_config(state.get("sandbox_config"))
+
+
+def _resolve_state_sandbox_class(state: Optional[Dict[str, Any]]):
+    sandbox_config = _resolve_state_sandbox_config(state)
+    provider = str(sandbox_config.get("provider") or "local").strip().lower() or "local"
+    return get_sandbox_class(provider)
+
+
+def _resolve_state_sandbox_kwargs(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    sandbox_config = _resolve_state_sandbox_config(state)
+    settings = sandbox_config.get("settings")
+    if not isinstance(settings, dict):
+        return {}
+    return dict(settings)
 
 from src.agents.steward import StewardAgent
 from src.agents.strategist import StrategistAgent
@@ -13545,6 +13566,8 @@ def _persist_iteration_artifacts(iter_id: int, state: Dict[str, Any] | None = No
 class AgentState(TypedDict):
     csv_path: str
     business_objective: str
+    sandbox_config: Dict[str, Any]
+    sandbox_provider: str
     data_summary: str
     strategies: Dict[str, Any]
     selected_strategy: Dict[str, Any]
@@ -18680,7 +18703,13 @@ def run_data_engineer(state: AgentState) -> AgentState:
               if isinstance(de_heavy_result, dict) and de_heavy_result.get("ok"):
                 break
               try:
-                with create_sandbox_with_retry(Sandbox, max_attempts=2, run_id=run_id, step="data_engineer") as sandbox:
+                with create_sandbox_with_retry(
+                    _resolve_state_sandbox_class(state),
+                    max_attempts=2,
+                    run_id=run_id,
+                    step="data_engineer",
+                    sandbox_kwargs=_resolve_state_sandbox_kwargs(state),
+                ) as sandbox:
                     if not hasattr(sandbox, "commands"):
                         raise RuntimeError(
                             "Sandbox missing commands runner. Ensure sandbox supports commands.run."
@@ -22275,7 +22304,13 @@ def execute_code(state: AgentState) -> AgentState:
         step_name = "ml_engineer"
         for sb_attempt in range(2):
           try:
-            with create_sandbox_with_retry(Sandbox, max_attempts=2, run_id=run_id, step="ml_engineer") as sandbox:
+            with create_sandbox_with_retry(
+                _resolve_state_sandbox_class(state),
+                max_attempts=2,
+                run_id=run_id,
+                step="ml_engineer",
+                sandbox_kwargs=_resolve_state_sandbox_kwargs(state),
+            ) as sandbox:
                 if not hasattr(sandbox, "commands"):
                     raise RuntimeError(
                         "Sandbox missing commands runner. Ensure sandbox supports commands.run."

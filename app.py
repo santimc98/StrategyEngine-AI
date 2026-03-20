@@ -46,6 +46,13 @@ from src.utils.api_keys_store import (
     save_keys as _save_api_keys,
     test_key_connectivity as _test_api_key,
 )
+from src.utils.sandbox_config import (
+    load_sandbox_config as _load_sandbox_config,
+    mask_sandbox_secret as _mask_sandbox_secret,
+    normalize_sandbox_config as _normalize_sandbox_config,
+    save_sandbox_config as _save_sandbox_config,
+)
+import src.utils.sandbox_provider as _sandbox_provider
 from src.utils.run_history import list_runs as _list_runs, load_run_result as _load_run_result
 
 # Auto-heal cwd when prior run crashed inside runs/<run_id>/work.
@@ -59,6 +66,40 @@ except Exception as cwd_err:
 apply_keys_to_env()
 
 _SIGNAL_HANDLER_INSTALLED = False
+
+_get_sandbox_provider_spec = getattr(
+    _sandbox_provider,
+    "get_sandbox_provider_spec",
+    lambda provider=None: type(
+        "SandboxProviderSpecFallback",
+        (),
+        {
+            "name": str(provider or "local").strip().lower() or "local",
+            "label": str(provider or "local").strip().title() or "Local",
+            "description": "Metadata de sandbox no disponible en este despliegue.",
+            "implemented": False,
+            "config_fields": (),
+        },
+    )(),
+)
+_is_sandbox_provider_available = getattr(
+    _sandbox_provider,
+    "is_sandbox_provider_available",
+    lambda provider=None: str(provider or "local").strip().lower() in {"", "local", "default"},
+)
+_list_sandbox_providers = getattr(
+    _sandbox_provider,
+    "list_sandbox_providers",
+    lambda: [_get_sandbox_provider_spec("local")],
+)
+_test_sandbox_provider_connectivity = getattr(
+    _sandbox_provider,
+    "test_sandbox_provider_connectivity",
+    lambda provider=None, settings=None: (
+        _is_sandbox_provider_available(provider),
+        "Sandbox local disponible" if _is_sandbox_provider_available(provider) else "Provider no disponible",
+    ),
+)
 
 AGENT_MODEL_LABELS: Dict[str, str] = {
     "strategist": "Estratega",
@@ -249,6 +290,17 @@ def _init_runtime_model_settings() -> None:
         st.session_state.get("base_agent_models", {}),
         applied_models,
     )
+
+
+def _sandbox_status_summary(config: Dict[str, Any]) -> tuple[str, str, str]:
+    spec = _get_sandbox_provider_spec(config.get("provider"))
+    if _is_sandbox_provider_available(spec.name):
+        color = "#a6e3a1"
+        detail = "Disponible"
+    else:
+        color = "#f9e2af"
+        detail = "Pendiente de backend"
+    return spec.label, detail, color
 
 
 def _handle_shutdown(signum, frame):
@@ -1117,6 +1169,126 @@ with st.sidebar:
                     else:
                         st.error(f"{reg['label']}: {msg}")
 
+    st.markdown("---")
+
+    if "show_sandbox_settings" not in st.session_state:
+        st.session_state["show_sandbox_settings"] = False
+
+    if st.button("Sandbox de ejecucion", key="toggle_sandbox_settings", use_container_width=True):
+        st.session_state["show_sandbox_settings"] = not bool(st.session_state.get("show_sandbox_settings"))
+
+    stored_sandbox_config = _load_sandbox_config()
+    sandbox_provider_specs = _list_sandbox_providers()
+    sandbox_label, sandbox_status_text, sandbox_status_color = _sandbox_status_summary(stored_sandbox_config)
+    st.markdown(
+        f"""
+        <div class="sidebar-settings-panel">
+            <div class="ssp-title">Sandbox</div>
+            <div class="ssp-desc">
+                <div><strong>Provider:</strong> {sandbox_label}</div>
+                <div style="color:{sandbox_status_color};">{sandbox_status_text}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state.get("show_sandbox_settings"):
+        st.markdown(
+            """
+            <div class="sidebar-settings-panel">
+                <div class="ssp-title">Configuraci&oacute;n de Sandbox</div>
+                <div class="ssp-desc">Elige si las runs se ejecutan en local o en un backend remoto registrado por tu empresa.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        sandbox_options = [spec.name for spec in sandbox_provider_specs]
+        current_provider = stored_sandbox_config.get("provider", "local")
+        if current_provider not in sandbox_options:
+            sandbox_options.append(current_provider)
+        selected_provider = st.selectbox(
+            "Proveedor de sandbox",
+            sandbox_options,
+            index=sandbox_options.index(current_provider),
+            format_func=lambda name: (
+                f"{_get_sandbox_provider_spec(name).label} "
+                f"({'disponible' if _is_sandbox_provider_available(name) else 'pendiente de backend'})"
+            ),
+            key="sandbox_provider_select",
+        )
+        selected_spec = _get_sandbox_provider_spec(selected_provider)
+        stored_settings = (
+            stored_sandbox_config.get("settings", {})
+            if selected_provider == current_provider and isinstance(stored_sandbox_config.get("settings"), dict)
+            else {}
+        )
+        pending_sandbox_settings: Dict[str, Any] = {}
+
+        st.markdown(
+            f'<span style="color:#6c7086; font-size:0.72rem;">{selected_spec.description}</span>',
+            unsafe_allow_html=True,
+        )
+        if not _is_sandbox_provider_available(selected_provider):
+            st.warning(
+                "Este provider todavia no tiene backend registrado en este despliegue. "
+                "Puedes guardar la configuracion, pero la app bloqueara la run hasta que exista una implementacion real."
+            )
+
+        for field in selected_spec.config_fields:
+            existing_value = str(stored_settings.get(field.key) or "")
+            st.markdown(
+                f'<span style="color:#e6edf3; font-size:0.82rem; font-weight:600;">{field.label}'
+                f'{" *" if field.required else ""}</span>'
+                f'<br><span style="color:#6c7086; font-size:0.72rem;">{field.description}</span>',
+                unsafe_allow_html=True,
+            )
+            widget_value = st.text_input(
+                field.label,
+                value=existing_value,
+                type="password" if field.secret else "default",
+                placeholder=field.placeholder,
+                key=f"sandbox_field_{selected_provider}_{field.key}",
+                label_visibility="collapsed",
+            )
+            pending_sandbox_settings[field.key] = widget_value
+            if field.secret and existing_value:
+                st.markdown(
+                    f'<span style="color:#a6e3a1; font-size:0.7rem;">\u2713 {_mask_sandbox_secret(existing_value)}</span>',
+                    unsafe_allow_html=True,
+                )
+
+        sandbox_save_col, sandbox_test_col = st.columns(2)
+        candidate_sandbox_config = _normalize_sandbox_config(
+            {"provider": selected_provider, "settings": pending_sandbox_settings}
+        )
+
+        with sandbox_save_col:
+            if st.button("Guardar sandbox", key="save_sandbox_settings", use_container_width=True):
+                missing_fields = [
+                    field.label
+                    for field in selected_spec.config_fields
+                    if field.required and not str(candidate_sandbox_config.get("settings", {}).get(field.key) or "").strip()
+                ]
+                if missing_fields:
+                    st.error(f"Faltan campos obligatorios: {', '.join(missing_fields)}")
+                else:
+                    _save_sandbox_config(candidate_sandbox_config)
+                    st.success("Configuracion de sandbox guardada.")
+                    st.rerun()
+
+        with sandbox_test_col:
+            if st.button("Verificar sandbox", key="test_sandbox_settings", use_container_width=True):
+                ok, msg = _test_sandbox_provider_connectivity(
+                    selected_provider,
+                    candidate_sandbox_config.get("settings", {}),
+                )
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
     # ---- CRM Connectors (alternative data source) ----
     _show_crm = st.session_state.get("show_crm_panel", False)
     if st.button("Conectar CRM", key="toggle_crm_panel", use_container_width=True):
@@ -1807,6 +1979,16 @@ elif start_btn:
     elif not business_objective:
         st.error("Define un objetivo de negocio antes de iniciar el an\u00e1lisis.")
     else:
+        sandbox_config = _load_sandbox_config()
+        sandbox_provider = str(sandbox_config.get("provider") or "local").strip().lower() or "local"
+        sandbox_spec = _get_sandbox_provider_spec(sandbox_provider)
+        if not _is_sandbox_provider_available(sandbox_provider):
+            st.error(
+                f"El sandbox seleccionado ({sandbox_spec.label}) no tiene backend registrado en este despliegue. "
+                "Selecciona Local o instala el provider remoto antes de lanzar la run."
+            )
+            st.stop()
+
         st.session_state["analysis_complete"] = False
         st.session_state["analysis_result"] = None
         st.session_state.pop("dismissed_latest_run", None)
@@ -1826,7 +2008,7 @@ elif start_btn:
 
         # Generate run_id and write worker input
         run_id = _uuid_mod.uuid4().hex[:8]
-        _write_worker_input(run_id, data_path, business_objective)
+        _write_worker_input(run_id, data_path, business_objective, sandbox_config=sandbox_config)
 
         # Launch background worker as independent subprocess
         worker_log_dir = os.path.join("runs", run_id)

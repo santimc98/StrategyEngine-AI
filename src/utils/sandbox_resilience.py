@@ -393,7 +393,36 @@ def safe_download_file(sandbox: Any, remote_path: str, max_attempts: int = 2) ->
         return None
 
 
-def create_sandbox_with_retry(SandboxCls, *, max_attempts: int = 2, run_id: Optional[str] = None, step: Optional[str] = None):
+def _filter_callable_kwargs(target: Any, sandbox_kwargs: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Pass through only kwargs that the target can accept."""
+
+    payload = dict(sandbox_kwargs or {})
+    if not payload:
+        return {}
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return payload
+
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()):
+        return payload
+
+    allowed = {
+        name
+        for name, param in sig.parameters.items()
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    return {key: value for key, value in payload.items() if key in allowed}
+
+
+def create_sandbox_with_retry(
+    SandboxCls,
+    *,
+    max_attempts: int = 2,
+    run_id: Optional[str] = None,
+    step: Optional[str] = None,
+    sandbox_kwargs: Optional[dict[str, Any]] = None,
+):
     """
     Wrapper for creating sandbox with retry logic.
 
@@ -422,6 +451,10 @@ def create_sandbox_with_retry(SandboxCls, *, max_attempts: int = 2, run_id: Opti
         last_error = None
         uses_context_manager = hasattr(SandboxCls, "create") and callable(getattr(SandboxCls, "create"))
         context = None
+        create_kwargs = _filter_callable_kwargs(
+            getattr(SandboxCls, "create") if uses_context_manager else SandboxCls,
+            sandbox_kwargs,
+        )
 
         # Retry loop for CREATION only
         for attempt in range(1, max_attempts + 1):
@@ -431,11 +464,11 @@ def create_sandbox_with_retry(SandboxCls, *, max_attempts: int = 2, run_id: Opti
 
                 if uses_context_manager:
                     # Use SandboxCls.create() as context manager
-                    context = SandboxCls.create()
+                    context = SandboxCls.create(**create_kwargs)
                     sandbox = context.__enter__()
                 else:
                     # Direct instantiation
-                    sandbox = SandboxCls()
+                    sandbox = SandboxCls(**create_kwargs)
 
                 # Creation succeeded, break out of retry loop
                 break

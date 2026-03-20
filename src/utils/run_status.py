@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 # Absolute paths — immune to os.chdir() inside the graph workspace
 from src.utils.paths import PROJECT_ROOT as _PROJECT_ROOT, RUNS_DIR
+from src.utils.sandbox_config import normalize_sandbox_config
 
 
 def _status_path(run_id: str) -> str:
@@ -121,7 +122,12 @@ def write_final_state(run_id: str, state: Dict[str, Any]) -> None:
     _atomic_write_json(_final_state_path(run_id), serializable)
 
 
-def write_worker_input(run_id: str, csv_path: str, business_objective: str) -> str:
+def write_worker_input(
+    run_id: str,
+    csv_path: str,
+    business_objective: str,
+    sandbox_config: Optional[Dict[str, Any]] = None,
+) -> str:
     """Write the input parameters for the worker to read."""
     run_dir = os.path.join(RUNS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=True)
@@ -129,6 +135,7 @@ def write_worker_input(run_id: str, csv_path: str, business_objective: str) -> s
     _atomic_write_json(input_path, {
         "csv_path": os.path.abspath(csv_path),
         "business_objective": business_objective,
+        "sandbox_config": normalize_sandbox_config(sandbox_config),
     })
     return input_path
 
