@@ -20554,7 +20554,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     if isinstance(review_result, dict):
                         status = review_result.get("status")
                         if status == "REJECTED":
-                            if not state.get("cleaning_reviewer_retry_done"):
+                            reviewer_retries = int(state.get("cleaning_reviewer_retry_count", 0))
+                            if reviewer_retries < 2:
                                 base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                                 fixes = review_result.get("required_fixes", [])
                                 fixes_text = ""
@@ -20583,7 +20584,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 except Exception:
                                     pass
                                 new_state = dict(state)
-                                new_state["cleaning_reviewer_retry_done"] = True
+                                new_state["cleaning_reviewer_retry_count"] = reviewer_retries + 1
                                 failed_checks = [str(item) for item in (review_result.get("failed_checks") or []) if item]
                                 hard_failures = [str(item) for item in (review_result.get("hard_failures") or []) if item]
                                 required_fix_items = [str(item) for item in (fixes or []) if item]
@@ -22244,6 +22245,42 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         qa_context["review_subject"] = review_subject
         code = _resolve_qa_subject_code(state if isinstance(state, dict) else {}, qa_context, review_subject)
         execution_profile = {}
+        if review_subject == "data_engineer":
+            # Inject DE-specific context: cleaning manifest and quality summary
+            cleaning_manifest = _load_json_safe("artifacts/clean/cleaning_manifest.json")
+            if not cleaning_manifest:
+                cleaning_manifest = _load_json_safe("data/cleaning_manifest.json")
+            if cleaning_manifest:
+                qa_context["cleaning_manifest"] = cleaning_manifest
+            # Build cleaning quality summary for null inflation detection
+            try:
+                _csv_enc = (state.get("csv_encoding") or "utf-8")
+                _csv_sep = (state.get("csv_sep") or ",")
+                _raw_path = state.get("csv_path") or "data/raw.csv"
+                _cleaned_path = (
+                    state.get("cleaned_csv_path")
+                    or "artifacts/clean/dataset_cleaned.csv"
+                )
+                if os.path.exists(_cleaned_path) and os.path.exists(_raw_path):
+                    import pandas as _pd_qa
+                    _raw_df = _pd_qa.read_csv(_raw_path, dtype=str, sep=_csv_sep, encoding=_csv_enc, nrows=2000)
+                    _cleaned_df = _pd_qa.read_csv(_cleaned_path, dtype=str, nrows=2000)
+                    _qa_quality = {"cleaned_rows": len(_cleaned_df), "raw_rows": len(_raw_df), "notable_columns": {}}
+                    for _col in _cleaned_df.columns:
+                        _c_null = _cleaned_df[_col].isna() | (_cleaned_df[_col].str.strip() == "")
+                        _c_pct = round(float(_c_null.sum()) / max(len(_cleaned_df), 1) * 100, 1)
+                        if _col in _raw_df.columns:
+                            _r_null = _raw_df[_col].isna() | (_raw_df[_col].str.strip() == "")
+                            _r_pct = round(float(_r_null.sum()) / max(len(_raw_df), 1) * 100, 1)
+                            _infl = round(_c_pct - _r_pct, 1)
+                            if _infl > 5 or _c_pct > 30:
+                                _qa_quality["notable_columns"][_col] = {
+                                    "raw_null_pct": _r_pct, "cleaned_null_pct": _c_pct, "null_inflation_pp": _infl,
+                                }
+                    if _qa_quality["notable_columns"]:
+                        qa_context["cleaning_quality_summary"] = _qa_quality
+            except Exception:
+                pass
         if review_subject == "ml_engineer":
             execution_profile = state.get("ml_execution_profile")
             if not isinstance(execution_profile, dict) or not execution_profile:

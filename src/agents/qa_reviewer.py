@@ -594,7 +594,11 @@ class QAReviewerAgent:
                 "- Audit cleaning/preparation code and declared subject outputs, not downstream model-training behavior.\n"
                 "- Treat qa_gates as technical verification of the data engineer deliverables: cleaned/enriched datasets, "
                 "traceability artifacts, manifests, exclusions, normalization, and row/accounting evidence.\n"
-                "- Do not invent ML-only failures when the contract is cleaning-first and model_training is false."
+                "- Do not invent ML-only failures when the contract is cleaning-first and model_training is false.\n"
+                "- If 'cleaning_quality_summary' is present in QA context, inspect 'notable_columns' for null inflation.\n"
+                "  A column with null_inflation_pp > 35 likely indicates a broken parser (e.g., datetime parsing "
+                "destroying valid dates). This is a HARD quality failure requiring a multi-stage parsing fix.\n"
+                "- If 'cleaning_manifest' is present, cross-check declared transformations against the actual code."
             )
         else:
             subject_specific_guidance = (
@@ -624,8 +628,15 @@ class QAReviewerAgent:
         1. Identify the review subject and the outputs it is responsible for.
         2. Read the ACTIVE_QA_GATES and decide what evidence each active gate actually requires.
         3. Inspect only the code regions and artifacts that matter for those active gates.
-        4. Reject only when an active HARD gate is truly violated with concrete evidence.
-        5. If evidence is incomplete or ambiguous, downgrade to APPROVE_WITH_WARNINGS instead of inventing certainty.
+        4. For each gate, reason about what constitutes a real violation vs an acceptable outcome:
+           - A "verify_*" gate asks you to check whether a condition holds in the OUTPUT, not whether
+             explicit validation code exists. If the output data satisfies the condition, the gate passes
+             regardless of how the code achieved it. Absence of a check is not the same as a violation.
+           - A gate that checks row counts or data shape must account for legitimate upstream operations
+             (e.g., filtering debug rows, deduplication) that are requested by OTHER gates in the contract.
+             Cross-reference before concluding that a reduction is anomalous.
+        5. Reject only when an active HARD gate is truly violated with concrete evidence from the output.
+        6. If evidence is incomplete or ambiguous, downgrade to APPROVE_WITH_WARNINGS instead of inventing certainty.
 
         === EVIDENCE RULE ===
         $senior_evidence_rule
@@ -693,6 +704,10 @@ class QAReviewerAgent:
         - Only fail gates listed in QA Gates; otherwise mention as warnings.
         - When listing failed_gates, use the gate "name" values from QA Gates.
         - failed_gates/hard_failures MUST be an exact subset of ACTIVE_QA_GATES.
+        - SELF-CHECK BEFORE FAILING ANY GATE: verify the gate name appears verbatim in ACTIVE_QA_GATES.
+          If it does not, you MUST NOT include it in failed_gates or hard_failures — report it as a
+          warning in feedback text only. The gate families above (1-8) are reasoning aids for active gates,
+          not an independent list of gates to evaluate.
         - Never invent gates. Non-active findings go only to feedback/warnings (no gate failure).
         - IMPORTANT EXCEPTION: if Metric Improvement Round Active=true AND Augmentation Requested=true,
           do NOT fail no_synthetic_data for controlled augmentation/resampling changes in this round.
