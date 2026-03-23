@@ -5,10 +5,12 @@ from src.utils.contract_views import (
     build_de_view,
     build_cleaning_view,
     build_contract_views_projection,
+    build_contract_view_projection_reports,
     build_ml_view,
     build_qa_view,
     build_reviewer_view,
     build_translator_view,
+    list_view_projection_report_errors,
     persist_views,
     trim_to_budget,
 )
@@ -35,14 +37,167 @@ def test_de_view_excludes_prohibited_fields():
     assert "data_engineer_runbook" in de_view
 
 
+def test_de_view_preserves_declared_optional_passthrough_columns_from_clean_dataset():
+    contract = {
+        "canonical_columns": ["lead_id", "feature_a", "target"],
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["lead_id", "feature_a", "target"],
+                "optional_passthrough_columns": ["raw_event_ts", "status_text"],
+            }
+        },
+        "allowed_feature_sets": {
+            "audit_only_features": ["audit_col"],
+        },
+        "cleaning_gates": [{"name": "parse_event_ts", "severity": "HARD"}],
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/cleaning_manifest.json", "owner": "data_engineer"},
+        ],
+    }
+    de_view = build_de_view(contract, contract, artifact_index=[])
+    assert de_view.get("optional_passthrough_columns") == ["raw_event_ts", "status_text"]
+
+
+def test_de_view_respects_explicit_empty_optional_passthrough_columns_without_falling_back():
+    contract = {
+        "canonical_columns": ["lead_id", "feature_a", "target"],
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["lead_id", "feature_a", "target"],
+                "optional_passthrough_columns": [],
+            }
+        },
+        "allowed_feature_sets": {
+            "audit_only_features": ["audit_col"],
+        },
+        "cleaning_gates": [{"name": "gate_a", "severity": "HARD"}],
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/cleaning_manifest.json", "owner": "data_engineer"},
+        ],
+    }
+    de_view = build_de_view(contract, contract, artifact_index=[])
+    assert de_view.get("optional_passthrough_columns") == []
+
+
+def test_de_view_preserves_raw_allowed_feature_sets_from_contract():
+    contract = {
+        "canonical_columns": ["lead_id", "feature_a", "feature_b", "target"],
+        "model_features": ["feature_a", "feature_b"],
+        "allowed_feature_sets": ["commercial_activity", "future_modeling_subset"],
+        "column_roles": {
+            "pre_decision": ["lead_id", "feature_a", "feature_b"],
+            "identifiers": ["lead_id"],
+            "outcome": ["target"],
+        },
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["lead_id", "feature_a", "feature_b", "target"],
+                "optional_passthrough_columns": [],
+            }
+        },
+        "cleaning_gates": [{"name": "gate_a", "severity": "HARD"}],
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/dataset_enriched.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/cleaning_manifest.json", "owner": "data_engineer"},
+        ],
+    }
+
+    de_view = build_de_view(contract, contract, artifact_index=[])
+
+    assert de_view.get("model_features") == ["feature_a", "feature_b"]
+    assert de_view.get("column_roles", {}).get("identifiers") == ["lead_id"]
+    assert de_view.get("allowed_feature_sets") == ["commercial_activity", "future_modeling_subset"]
+
+
+def test_projection_reports_flag_missing_contract_critical_bindings_for_de_view():
+    contract = {
+        "canonical_columns": ["lead_id", "feature_a", "target"],
+        "model_features": ["feature_a"],
+        "allowed_feature_sets": ["future_modeling_subset"],
+        "column_roles": {
+            "pre_decision": ["lead_id", "feature_a"],
+            "identifiers": ["lead_id"],
+            "outcome": ["target"],
+        },
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["lead_id", "feature_a", "target"],
+                "optional_passthrough_columns": [],
+            }
+        },
+        "cleaning_gates": [{"name": "gate_a", "severity": "HARD"}],
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/dataset_enriched.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/cleaning_manifest.json", "owner": "data_engineer"},
+        ],
+    }
+    de_view = build_de_view(contract, contract, artifact_index=[])
+    de_view.pop("model_features", None)
+
+    reports = build_contract_view_projection_reports(contract, {"de_view": de_view}, contract_min=contract)
+
+    assert "model_features" in (reports.get("de_view", {}).get("missing_bindings") or [])
+    assert "de_view_binding_model_features_missing" in list_view_projection_report_errors(reports)
+
+
+def test_projection_reports_require_exact_allowed_feature_sets_payload():
+    contract = {
+        "canonical_columns": ["feature_a", "feature_b", "target"],
+        "model_features": ["feature_a"],
+        "allowed_feature_sets": [
+            {"family": "commercial_activity", "intent": "allowed"},
+            {"family": "administrative", "intent": "exclude"},
+        ],
+        "column_roles": {"pre_decision": ["feature_a", "feature_b"], "outcome": ["target"]},
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/dataset_enriched.csv", "owner": "data_engineer"},
+        ],
+    }
+
+    de_view = build_de_view(contract, contract, artifact_index=[])
+    mutated_view = dict(de_view)
+    mutated_view["allowed_feature_sets"] = [{"family": "commercial_activity", "intent": "allowed"}]
+
+    reports = build_contract_view_projection_reports(contract, {"de_view": mutated_view}, contract_min=contract)
+
+    assert "allowed_feature_sets" in (reports.get("de_view", {}).get("missing_bindings") or [])
+
+
+def test_projection_reports_accept_explicit_empty_optional_passthrough_columns():
+    contract = {
+        "canonical_columns": ["lead_id", "feature_a", "target"],
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["lead_id", "feature_a", "target"],
+                "optional_passthrough_columns": [],
+            }
+        },
+        "cleaning_gates": [{"name": "gate_a", "severity": "HARD"}],
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/cleaning_manifest.json", "owner": "data_engineer"},
+        ],
+    }
+
+    de_view = build_de_view(contract, contract, artifact_index=[])
+    reports = build_contract_view_projection_reports(contract, {"de_view": de_view}, contract_min=contract)
+
+    assert "optional_passthrough_columns" not in (reports.get("de_view", {}).get("missing_bindings") or [])
+
+
 def test_ml_view_includes_required_fields():
     contract_full = _load_fixture("contract_full_small.json")
     contract_min = _load_fixture("contract_min_small.json")
     artifact_index = _load_fixture("artifact_index_small.json")
     ml_view = build_ml_view(contract_full, contract_min, artifact_index)
     assert ml_view.get("required_outputs")
-    assert "forbidden_features" in ml_view
-    assert isinstance(ml_view.get("forbidden_features"), list)
+    assert isinstance(ml_view.get("column_roles"), dict)
+    assert "allowed_feature_sets" in ml_view
     assert ml_view.get("objective_type")
     decisioning = ml_view.get("decisioning_requirements", {})
     assert isinstance(decisioning, dict)
@@ -149,6 +304,15 @@ def test_projection_uses_task_semantics_objective_when_objective_analysis_is_unk
 def test_projection_de_view_includes_gates_and_runbook():
     contract = {
         "scope": "cleaning_only",
+        "active_workstreams": {
+            "cleaning": True,
+            "feature_engineering": True,
+            "model_training": False,
+        },
+        "future_ml_handoff": {
+            "enabled": True,
+            "primary_target": "target_future",
+        },
         "cleaning_gates": [{"name": "required_columns_present", "severity": "HARD", "params": {}}],
         "data_engineer_runbook": {"steps": ["load", "clean", "persist"]},
         "artifact_requirements": {
@@ -166,6 +330,150 @@ def test_projection_de_view_includes_gates_and_runbook():
     assert de_view.get("cleaning_gates")
     assert isinstance(de_view.get("data_engineer_runbook"), dict)
     assert de_view.get("data_engineer_runbook")
+    assert (de_view.get("active_workstreams") or {}).get("model_training") is False
+    assert (de_view.get("future_ml_handoff") or {}).get("primary_target") == "target_future"
+
+
+def test_projection_prefers_explicit_agent_interfaces_over_legacy_inference():
+    contract = {
+        "scope": "cleaning_only",
+        "strategy_title": "CRM prep",
+        "business_objective": "Prepare a clean CRM dataset for future modeling.",
+        "canonical_columns": ["lead_id", "feature_a", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "decision": [],
+            "outcome": ["target"],
+            "post_decision_audit_only": [],
+            "unknown": [],
+            "identifiers": ["lead_id"],
+            "time_columns": [],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature_a"],
+            "segmentation_features": ["feature_a"],
+            "forbidden_features": [],
+            "audit_only_features": [],
+        },
+        "required_outputs": ["artifacts/clean/default_clean.csv"],
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["lead_id", "feature_a", "target"],
+                "output_path": "artifacts/clean/default_clean.csv",
+                "output_manifest_path": "artifacts/clean/default_manifest.json",
+            }
+        },
+        "cleaning_gates": [{"name": "legacy_gate", "severity": "HARD", "params": {}}],
+        "agent_interfaces": {
+            "data_engineer": {
+                "required_columns": ["lead_id", "feature_a"],
+                "output_path": "artifacts/clean/interface_clean.csv",
+                "output_manifest_path": "artifacts/clean/interface_manifest.json",
+                "cleaning_gates": [{"name": "interface_gate", "severity": "SOFT", "params": {}}],
+            },
+            "translator": {
+                "key_decisions": ["interface:key_decision"],
+                "constraints": {"cite_sources": True, "no_markdown_tables": True, "tone": "executive"},
+            },
+        },
+    }
+
+    projected = build_contract_views_projection(contract, artifact_index=[])
+    de_view = projected.get("de_view") or {}
+    translator_view = projected.get("translator_view") or {}
+
+    assert de_view.get("output_path") == "artifacts/clean/default_clean.csv"
+    assert de_view.get("output_manifest_path") == "artifacts/clean/default_manifest.json"
+    assert de_view.get("required_columns") == ["lead_id", "feature_a", "target"]
+    cleaning_gate_names = {gate.get("name") for gate in (de_view.get("cleaning_gates") or []) if isinstance(gate, dict)}
+    assert "legacy_gate" in cleaning_gate_names
+    assert "interface:key_decision" in (translator_view.get("key_decisions") or [])
+    assert (translator_view.get("constraints") or {}).get("tone") == "executive"
+
+
+def test_build_ml_view_prefers_explicit_ml_engineer_interface():
+    contract_full = {
+        "scope": "full_pipeline",
+        "canonical_columns": ["feature_a", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "decision": [],
+            "outcome": ["target"],
+            "post_decision_audit_only": [],
+            "unknown": [],
+            "identifiers": [],
+            "time_columns": [],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature_a"],
+            "segmentation_features": ["feature_a"],
+            "forbidden_features": [],
+            "audit_only_features": [],
+        },
+        "required_outputs": ["artifacts/ml/default_metrics.json"],
+        "validation_requirements": {"primary_metric": "log_loss"},
+        "agent_interfaces": {
+            "ml_engineer": {
+                "required_outputs": ["artifacts/ml/interface_metrics.json"],
+                "primary_metric": "mean_multi_horizon_log_loss",
+                "metric_definition_rule": "Use the explicit interface metric.",
+            }
+        },
+    }
+
+    ml_view = build_ml_view(contract_full, {}, [])
+
+    assert ml_view.get("required_outputs") == ["artifacts/ml/default_metrics.json"]
+    assert ml_view.get("primary_metric") == "log_loss"
+    assert ml_view.get("metric_definition_rule") == "Use the explicit interface metric."
+
+
+def test_projection_preserves_top_level_de_outputs_when_interface_is_partial():
+    contract = {
+        "scope": "cleaning_only",
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "intent": "cleaned_dataset", "owner": "data_engineer"},
+            {"path": "artifacts/clean/cleaning_manifest.json", "intent": "cleaning_manifest", "owner": "data_engineer"},
+            {"path": "artifacts/clean/dataset_enriched.csv", "intent": "enriched_dataset", "owner": "data_engineer"},
+        ],
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["lead_id", "feature_a", "target"],
+                "output_path": "artifacts/clean/dataset_cleaned.csv",
+                "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+            }
+        },
+        "cleaning_gates": [
+            {"name": "required_columns_present", "severity": "HARD", "params": {}},
+            {"name": "standardize_dates", "severity": "HARD", "params": {}},
+        ],
+        "data_engineer_runbook": {"steps": ["load", "clean", "persist"]},
+        "agent_interfaces": {
+            "data_engineer": {
+                "required_outputs": ["artifacts/clean/dataset_cleaned.csv"],
+                "cleaning_gates": [{"name": "required_columns_present", "severity": "HARD", "params": {}}],
+            }
+        },
+    }
+
+    projected = build_contract_views_projection(contract, artifact_index=[])
+    de_view = projected.get("de_view") or {}
+    cleaning_view = projected.get("cleaning_view") or {}
+
+    assert set(de_view.get("required_outputs") or []) == {
+        "artifacts/clean/dataset_cleaned.csv",
+        "artifacts/clean/cleaning_manifest.json",
+        "artifacts/clean/dataset_enriched.csv",
+    }
+    assert set(cleaning_view.get("required_outputs") or []) == {
+        "artifacts/clean/dataset_cleaned.csv",
+        "artifacts/clean/cleaning_manifest.json",
+        "artifacts/clean/dataset_enriched.csv",
+    }
+    assert {gate.get("name") for gate in (de_view.get("cleaning_gates") or []) if isinstance(gate, dict)} == {
+        "required_columns_present",
+        "standardize_dates",
+    }
 
 
 def test_projection_ml_view_preserves_runbook_list_shape():
@@ -248,6 +556,75 @@ def test_projection_propagates_outlier_policy_to_relevant_views():
     assert isinstance(cleaning_view.get("outlier_policy"), dict)
     assert cleaning_view.get("outlier_report_path") == "data/outlier_treatment_report.json"
     assert isinstance(ml_view.get("outlier_policy"), dict)
+
+
+def test_projection_builds_column_resolution_context_from_profile_evidence():
+    contract = {
+        "scope": "cleaning_only",
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["created_at", "annual_revenue"],
+                "output_path": "data/cleaned_data.csv",
+                "output_manifest_path": "data/cleaning_manifest.json",
+            }
+        },
+        "cleaning_gates": [
+            {
+                "name": "robust_date_parsing_with_invalid_flagging",
+                "severity": "HARD",
+                "action_type": "parse",
+                "params": {"target_columns": ["created_at"]},
+            },
+            {
+                "name": "normalize_numeric_ranges_and_amounts",
+                "severity": "HARD",
+                "action_type": "standardize",
+                "params": {"target_columns": ["annual_revenue"]},
+            },
+        ],
+        "column_dtype_targets": {
+            "created_at": {"target_dtype": "datetime"},
+            "annual_revenue": {"target_dtype": "float64"},
+        },
+    }
+    data_profile = {
+        "basic_stats": {"columns": ["created_at", "annual_revenue"]},
+        "dtypes": {"created_at": "object", "annual_revenue": "object"},
+        "missingness": {"created_at": 0.12, "annual_revenue": 0.21},
+        "cardinality": {
+            "created_at": {
+                "top_values": [
+                    {"value": "2025-07-08", "count": 5},
+                    {"value": "27/06/2025", "count": 3},
+                    {"value": "not_a_date", "count": 1},
+                ]
+            },
+            "annual_revenue": {
+                "top_values": [
+                    {"value": "$350k", "count": 2},
+                    {"value": "0.1M", "count": 1},
+                    {"value": "unknown", "count": 1},
+                ]
+            },
+        },
+    }
+
+    projected = build_contract_views_projection(contract, artifact_index=[], data_profile=data_profile)
+    de_view = projected.get("de_view") or {}
+    cleaning_view = projected.get("cleaning_view") or {}
+    context = de_view.get("column_resolution_context") or {}
+
+    assert de_view.get("column_resolution_context_path") == "data/column_resolution_context.json"
+    assert cleaning_view.get("column_resolution_context_path") == "data/column_resolution_context.json"
+    assert set(context) >= {"created_at", "annual_revenue"}
+    assert context["created_at"]["semantic_kind"] == "datetime_like"
+    assert "iso_date" in (context["created_at"].get("observed_format_families") or [])
+    assert "slash_date" in (context["created_at"].get("observed_format_families") or [])
+    assert context["annual_revenue"]["semantic_kind"] == "amount_like"
+    assert "currency_symbol" in (context["annual_revenue"].get("observed_format_families") or [])
+    assert "magnitude_suffix" in (context["annual_revenue"].get("observed_format_families") or [])
+    assert context["annual_revenue"]["preservation_expectation"] == "retain_in_output"
+    assert (cleaning_view.get("column_resolution_context") or {}) == context
 
 
 def test_ml_view_includes_scored_rows_schema():
@@ -388,8 +765,7 @@ def test_ml_view_prefers_visual_requirements_plot_spec_over_reporting_policy():
     plots = plot_spec.get("plots") or []
     assert plots
     assert plots[0].get("plot_id") == "canonical_plot"
-    warnings = ml_view.get("view_warnings") or {}
-    assert warnings.get("plot_spec_source") == "artifact_requirements.visual_requirements.plot_spec"
+    assert "view_warnings" not in ml_view
 
 
 def test_ml_view_required_outputs_merge_contract_min_and_full():
@@ -540,7 +916,7 @@ def test_ml_view_exposes_declared_cleaning_manifest_path():
     assert ml_view.get("cleaning_manifest_path") == "artifacts/manifests/custom_clean_manifest.json"
 
 
-def test_ml_view_inherits_roles_when_min_lax():
+def test_ml_view_preserves_explicit_allowed_feature_sets_without_role_heuristics():
     contract_min = {
         "canonical_columns": ["feature_a", "target", "audit_col", "entity_id"],
         "column_roles": {
@@ -561,14 +937,11 @@ def test_ml_view_inherits_roles_when_min_lax():
         },
     }
     ml_view = build_ml_view(contract_full, contract_min, [])
-    forbidden = set(ml_view.get("forbidden_features") or [])
-    assert "audit_col" in forbidden
-    assert "target" in forbidden
-    assert "audit_col" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
-    assert "target" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
+    assert ml_view.get("column_roles") == contract_min["column_roles"]
+    assert ml_view.get("allowed_feature_sets") == contract_min["allowed_feature_sets"]
 
 
-def test_ml_view_excludes_identifier_columns():
+def test_ml_view_does_not_inject_identifier_metadata():
     contract_min = {
         "canonical_columns": ["EntityId", "feature_a"],
         "column_roles": {
@@ -581,13 +954,12 @@ def test_ml_view_excludes_identifier_columns():
         },
     }
     ml_view = build_ml_view({}, contract_min, [])
-    assert "EntityId" in (ml_view.get("identifier_columns") or [])
-    identifier_overrides = ml_view.get("identifier_overrides", {})
-    assert "EntityId" in (identifier_overrides.get("candidate_allowed_by_contract") or [])
-    assert "EntityId" in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
+    assert "identifier_columns" not in ml_view
+    assert "identifier_overrides" not in ml_view
+    assert ml_view.get("allowed_feature_sets") == contract_min["allowed_feature_sets"]
 
 
-def test_ml_view_preserves_forbidden_features_from_min():
+def test_ml_view_does_not_rewrite_forbidden_features_from_min():
     contract_min = {
         "canonical_columns": ["feature_a", "audit_col", "EntityId"],
         "column_roles": {
@@ -601,15 +973,11 @@ def test_ml_view_preserves_forbidden_features_from_min():
         },
     }
     ml_view = build_ml_view({}, contract_min, [])
-    forbidden = set(ml_view.get("forbidden_features") or [])
-    assert forbidden == {"audit_col"}
-    assert "feature_a" in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
-    assert "audit_col" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
-    identifier_overrides = ml_view.get("identifier_overrides", {})
-    assert "EntityId" in (identifier_overrides.get("candidate_allowed_by_contract") or [])
+    assert "forbidden_features" not in ml_view
+    assert ml_view.get("allowed_feature_sets") == contract_min["allowed_feature_sets"]
 
 
-def test_ml_view_prefers_full_allowed_feature_sets():
+def test_ml_view_preserves_declared_allowed_feature_sets_without_expansion():
     contract_full = {
         "canonical_columns": ["feature_a", "feature_b", "audit_col", "EntityId"],
         "allowed_feature_sets": {
@@ -628,13 +996,9 @@ def test_ml_view_prefers_full_allowed_feature_sets():
         },
     }
     ml_view = build_ml_view(contract_full, contract_min, [])
-    allowed = ml_view.get("allowed_feature_sets") or {}
-    assert allowed.get("model_features") == ["feature_a", "EntityId"]
-    assert allowed.get("segmentation_features") == ["feature_b", "EntityId"]
-    assert ml_view.get("audit_only_columns") == ["audit_col"]
-    assert "EntityId" in (ml_view.get("identifier_columns") or [])
-    identifier_overrides = ml_view.get("identifier_overrides", {})
-    assert "EntityId" in (identifier_overrides.get("candidate_allowed_by_contract") or [])
+    assert ml_view.get("allowed_feature_sets") == contract_min["allowed_feature_sets"]
+    assert "audit_only_columns" not in ml_view
+    assert "identifier_columns" not in ml_view
 
 
 def test_reviewer_view_contains_gates_and_outputs():
@@ -653,8 +1017,55 @@ def test_qa_view_contains_gates_and_requirements():
     qa_view = build_qa_view(contract_full, contract_min, artifact_index)
     assert qa_view.get("qa_gates")
     assert qa_view.get("artifact_requirements", {}).get("required_outputs")
+    assert qa_view.get("review_subject") in {"data_engineer", "ml_engineer"}
+    assert qa_view.get("subject_required_outputs")
+    assert qa_view.get("qa_required_outputs") is not None
     assert qa_view.get("column_roles")
     assert qa_view.get("allowed_feature_sets")
+
+
+def test_qa_view_targets_data_engineer_for_cleaning_only_contract():
+    contract_full = {
+        "scope": "cleaning_only",
+        "active_workstreams": {"data_cleaning": True, "feature_engineering": True, "model_training": False},
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/dataset_enriched.csv", "owner": "data_engineer"},
+            {"path": "artifacts/qa/data_validation_results.json", "owner": "qa_engineer"},
+        ],
+        "qa_gates": [{"name": "verify_exclusions", "severity": "HARD"}],
+        "column_roles": {"features": ["feature_a"]},
+        "canonical_columns": ["feature_a"],
+    }
+    qa_view = build_qa_view(contract_full, contract_full, artifact_index=[])
+    assert qa_view.get("review_subject") == "data_engineer"
+    assert qa_view.get("subject_required_outputs") == [
+        "artifacts/clean/dataset_cleaned.csv",
+        "artifacts/clean/dataset_enriched.csv",
+    ]
+    assert qa_view.get("qa_required_outputs") == ["artifacts/qa/data_validation_results.json"]
+
+
+def test_qa_view_targets_ml_engineer_for_training_contract():
+    contract_full = {
+        "scope": "ml_only",
+        "active_workstreams": {"data_cleaning": False, "feature_engineering": False, "model_training": True},
+        "required_outputs": [
+            {"path": "artifacts/ml/model_metrics.json", "owner": "ml_engineer"},
+            {"path": "artifacts/ml/scored_rows.csv", "owner": "ml_engineer"},
+            {"path": "artifacts/qa/model_validation_results.json", "owner": "qa_engineer"},
+        ],
+        "qa_gates": [{"name": "target_mapping_check", "severity": "HARD"}],
+        "column_roles": {"features": ["feature_a"], "outcome": ["target"]},
+        "canonical_columns": ["feature_a", "target"],
+    }
+    qa_view = build_qa_view(contract_full, contract_full, artifact_index=[])
+    assert qa_view.get("review_subject") == "ml_engineer"
+    assert qa_view.get("subject_required_outputs") == [
+        "artifacts/ml/model_metrics.json",
+        "artifacts/ml/scored_rows.csv",
+    ]
+    assert qa_view.get("qa_required_outputs") == ["artifacts/qa/model_validation_results.json"]
 
 
 def test_qa_view_carries_row_count_hints_when_available():
@@ -744,6 +1155,26 @@ def test_trim_to_budget_preserves_required_fields():
     assert trimmed.get("required_outputs") == ["data/metrics.json"]
     assert trimmed.get("forbidden_features") == ["x"]
     assert trimmed.get("gates") == ["gate_a"]
+
+
+def test_trim_to_budget_preserves_nested_contractual_subtrees_without_placeholder_truncation():
+    payload = {
+        "column_roles": {
+            "future_modeling_features": [f"feature_{idx}" for idx in range(40)],
+            "administrative_exclude": ["internal_debug_flag", "legacy_import_batch"],
+        },
+        "allowed_feature_sets": {
+            "model_features": [f"feature_{idx}" for idx in range(40)],
+            "named_sets": [f"family_{idx}" for idx in range(20)],
+        },
+        "non_contractual_notes": [f"note_{idx}" for idx in range(200)],
+    }
+
+    trimmed = trim_to_budget(payload, max_chars=600)
+
+    assert trimmed.get("column_roles", {}).get("future_modeling_features") == [f"feature_{idx}" for idx in range(40)]
+    assert trimmed.get("allowed_feature_sets", {}).get("named_sets") == [f"family_{idx}" for idx in range(20)]
+    assert "...(40 total)" not in json.dumps(trimmed, ensure_ascii=True)
 
 
 def test_trim_to_budget_accepts_optional_limits():
