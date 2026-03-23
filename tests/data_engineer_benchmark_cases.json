@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "purpose": "Reference replay cases for isolated Data Engineer model benchmarking.",
+  "cases": [
+    {
+      "run_id": "8ec99856",
+      "status": "benchmark_ready",
+      "focus": [
+        "deduplication_runtime_robustness",
+        "output_contract_closure",
+        "cleaned_vs_enriched_separation"
+      ],
+      "required_files": [
+        "runs/8ec99856/worker_input.json",
+        "runs/8ec99856/work/data/execution_contract_raw.json",
+        "runs/8ec99856/work/data/contracts/views/de_view.json",
+        "runs/8ec99856/work/artifacts/data_engineer_context.json",
+        "runs/8ec99856/work/artifacts/data_engineer_last.py"
+      ],
+      "quality_checks": []
+    },
+    {
+      "run_id": "ae947942",
+      "status": "benchmark_ready",
+      "focus": [
+        "datetime_parsing_signal_preservation",
+        "avoid_universal_hard_failure_on_nullable_dates"
+      ],
+      "required_files": [
+        "runs/ae947942/worker_input.json",
+        "runs/ae947942/work/data/execution_contract_raw.json",
+        "runs/ae947942/work/data/contracts/views/de_view.json",
+        "runs/ae947942/work/artifacts/data_engineer_context.json",
+        "runs/ae947942/work/artifacts/data_engineer_last.py",
+        "runs/ae947942/work/artifacts/data_engineer_sandbox_last_error.json"
+      ],
+      "quality_checks": [
+        {
+          "type": "max_null_inflation",
+          "report_path": "artifacts/reports/quality_audit_report.json",
+          "columns": [
+            "created_at",
+            "last_activity_at"
+          ],
+          "max_increase": 0.35
+        }
+      ]
+    },
+    {
+      "run_id": "c946b64d",
+      "status": "benchmark_ready",
+      "focus": [
+        "deduplication_identity_resolution",
+        "placeholder_tokens_are_not_identity_evidence"
+      ],
+      "required_files": [
+        "runs/c946b64d/worker_input.json",
+        "runs/c946b64d/work/data/execution_contract_raw.json",
+        "runs/c946b64d/work/data/contracts/views/de_view.json",
+        "runs/c946b64d/work/artifacts/data_engineer_context.json",
+        "runs/c946b64d/work/artifacts/data_engineer_last.py",
+        "runs/c946b64d/sandbox/local_runner/data_engineer/attempt_4/output/artifacts/clean/deduplication_decisions.csv"
+      ],
+      "quality_checks": [
+        {
+          "type": "no_all_placeholder_dedup_drops",
+          "csv_path": "artifacts/clean/deduplication_decisions.csv",
+          "decision_column": "decision",
+          "keys_column": "dedup_keys",
+          "drop_token": "DROPPED",
+          "placeholder_tokens": [
+            "",
+            "nan",
+            "none",
+            "null",
+            "unknown",
+            "-",
+            "?",
+            "telefono pendiente",
+            "teléfono pendiente",
+            "<na>"
+          ]
+        }
+      ]
+    }
+  ]
+}

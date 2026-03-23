@@ -1,0 +1,239 @@
+{
+  "version": 1,
+  "purpose": "Inventory of historical runs used to harden system support for agent reasoning.",
+  "tracks": [
+    {
+      "name": "planner_architecture",
+      "runs": [
+        {
+          "run_id": "d41881a0",
+          "severity": "S1",
+          "layer": "validator_semantic_guard",
+          "failure_class": "scope_compatibility_and_scaling_false_positive",
+          "status": "component_test_covered",
+          "required_files": [
+            "runs/d41881a0/agents/execution_planner/planner_diag.json",
+            "runs/d41881a0/agents/execution_planner/semantic_core.json"
+          ]
+        },
+        {
+          "run_id": "3727266f",
+          "severity": "S1",
+          "layer": "schema_coercion_gate_normalization",
+          "failure_class": "gate_semantics_lost_during_normalization",
+          "status": "component_test_covered",
+          "required_files": [
+            "runs/3727266f/agents/execution_planner/response_attempt_1.txt",
+            "runs/3727266f/agents/execution_planner/contract_diagnostics.json"
+          ]
+        },
+        {
+          "run_id": "daa319ab",
+          "severity": "S1",
+          "layer": "semantic_guard_required_outputs",
+          "failure_class": "artifact_misread_as_path",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/daa319ab/agents/execution_planner/semantic_core.json",
+            "runs/daa319ab/agents/execution_planner/contract_raw.json"
+          ]
+        },
+        {
+          "run_id": "deb6da59",
+          "severity": "S1",
+          "layer": "semantic_guard_required_outputs",
+          "failure_class": "filename_like_semantic_output_misread_as_physical_path",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/deb6da59/agents/execution_planner/semantic_core.json",
+            "runs/deb6da59/agents/execution_planner/contract_raw.json"
+          ]
+        },
+        {
+          "run_id": "2a1e9a11",
+          "severity": "S1",
+          "layer": "transport_json_recovery",
+          "failure_class": "truncated_terminal_json_tail",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/2a1e9a11/agents/execution_planner/semantic_core.json",
+            "runs/2a1e9a11/agents/execution_planner/response_attempt_1.txt"
+          ]
+        },
+        {
+          "run_id": "e60616ac",
+          "severity": "S1",
+          "layer": "contract_compile_prompt_transport_budget",
+          "failure_class": "oversized_shadow_contract_triggered_length_cutoff",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/e60616ac/agents/execution_planner/planner_diag.json",
+            "runs/e60616ac/agents/execution_planner/response_attempt_1.txt"
+          ]
+        },
+        {
+          "run_id": "6b664652",
+          "severity": "S1",
+          "layer": "validator_cleaning_gate_semantics",
+          "failure_class": "processing_only_passthrough_drop_conflict_false_positive",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/6b664652/agents/execution_planner/contract_raw.json",
+            "runs/6b664652/agents/execution_planner/contract_diagnostics.json"
+          ]
+        },
+        {
+          "run_id": "97929fa9",
+          "severity": "S1",
+          "layer": "validator_optimization_policy_semantics",
+          "failure_class": "disabled_cleaning_only_policy_zero_rounds_rejected",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/97929fa9/agents/execution_planner/contract_raw.json",
+            "runs/97929fa9/agents/execution_planner/contract_diagnostics.json"
+          ]
+        },
+        {
+          "run_id": "57dff3ce",
+          "severity": "S1",
+          "layer": "planner_transport_extraction",
+          "failure_class": "nonzero_completion_tokens_but_empty_extracted_response",
+          "status": "component_test_covered",
+          "required_files": [
+            "runs/57dff3ce/agents/execution_planner/planner_diag.json",
+            "runs/57dff3ce/agents/execution_planner/response_attempt_1.txt"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "projection_and_runtime_architecture",
+      "runs": [
+        {
+          "run_id": "6f2993d7",
+          "severity": "S1",
+          "layer": "contract_views",
+          "failure_class": "agent_view_lost_top_level_outputs_and_cleaning_gates",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/6f2993d7/agents/execution_planner/contract_raw.json"
+          ]
+        },
+        {
+          "run_id": "c946b64d",
+          "severity": "S1",
+          "layer": "artifact_publication_and_manifests",
+          "failure_class": "sandbox_outputs_not_promoted_and_manifest_duplicated_rich_deliverables",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/c946b64d/work/data/output_contract_report.json",
+            "runs/c946b64d/work/data/report_artifact_manifest.json"
+          ]
+        },
+        {
+          "run_id": "ccc6cbf5",
+          "severity": "S1",
+          "layer": "qa_contract_routing",
+          "failure_class": "qa_view_built_but_runtime_skipped_contract_required_qa_execution",
+          "status": "component_test_covered",
+          "required_files": [
+            "runs/ccc6cbf5/work/data/output_contract_report.json",
+            "runs/ccc6cbf5/work/data/contracts/views/qa_view.json"
+          ]
+        },
+        {
+          "run_id": "ccc6cbf5",
+          "severity": "S1",
+          "layer": "contract_views_de_passthrough_projection",
+          "failure_class": "explicit_optional_passthrough_columns_lost_between_contract_and_de_view",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/ccc6cbf5/agents/execution_planner/contract_raw.json",
+            "runs/ccc6cbf5/work/data/contracts/views/de_view.json"
+          ]
+        },
+        {
+          "run_id": "5342757b",
+          "severity": "S1",
+          "layer": "artifact_index_persistence",
+          "failure_class": "partial_failure_uploaded_outputs_not_merged_into_produced_artifact_index",
+          "status": "component_test_covered",
+          "required_files": [
+            "runs/5342757b/work/artifacts/data_engineer_sandbox_last_error.json",
+            "runs/5342757b/work/data/produced_artifact_index.json"
+          ]
+        },
+        {
+          "run_id": "ae947942",
+          "severity": "S1",
+          "layer": "translator_fallback_evidence_selection",
+          "failure_class": "declared_missing_outputs_presented_as_available_artifacts",
+          "status": "component_test_covered",
+          "required_files": [
+            "runs/ae947942/work/data/executive_summary.md",
+            "runs/ae947942/work/data/report_artifact_manifest.json"
+          ]
+        },
+        {
+          "run_id": "57dff3ce",
+          "severity": "S1",
+          "layer": "output_contract_reporting",
+          "failure_class": "invalid_empty_execution_contract_reported_as_ok",
+          "status": "component_test_covered",
+          "required_files": [
+            "runs/57dff3ce/work/data/execution_contract.json",
+            "runs/57dff3ce/work/data/output_contract_report.json"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "agentic_reference_runs",
+      "runs": [
+        {
+          "run_id": "56c18886",
+          "severity": "A1",
+          "layer": "semantic_core_closure",
+          "failure_class": "model_features_left_empty_despite_future_handoff",
+          "status": "fixed_by_prompt_refactor",
+          "required_files": [
+            "runs/56c18886/agents/execution_planner/semantic_response_attempt_1.txt"
+          ]
+        },
+        {
+          "run_id": "76b191ed",
+          "severity": "A2",
+          "layer": "data_engineer_runtime_delivery",
+          "failure_class": "owned_outputs_not_closed_against_contract",
+          "status": "prompt_hardened_follow_up",
+          "required_files": [
+            "runs/76b191ed/work/data/output_contract_report.json",
+            "runs/76b191ed/work/data/contracts/views/de_view.json"
+          ]
+        },
+        {
+          "run_id": "5342757b",
+          "severity": "A2",
+          "layer": "data_engineer_output_closure",
+          "failure_class": "required_empty_artifact_omitted_when_zero_events_observed",
+          "status": "prompt_hardened_follow_up",
+          "required_files": [
+            "runs/5342757b/work/artifacts/data_engineer_last.py",
+            "runs/5342757b/work/artifacts/audit/data_quality_report.json"
+          ]
+        },
+        {
+          "run_id": "ae947942",
+          "severity": "A2",
+          "layer": "data_engineer_temporal_gate_reasoning",
+          "failure_class": "datetime_parse_null_inflation_promoted_to_universal_hard_failure",
+          "status": "prompt_hardened_follow_up",
+          "required_files": [
+            "runs/ae947942/work/artifacts/data_engineer_last.py",
+            "runs/ae947942/work/artifacts/data_engineer_sandbox_last_error.json"
+          ]
+        }
+      ]
+    }
+  ]
+}
