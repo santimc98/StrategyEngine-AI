@@ -605,13 +605,23 @@ def normalize_artifact_requirements(
     ):
         artifact_requirements["scored_rows_schema"] = scored_schema_payload
 
-    # Preserve schema_binding and clean_dataset if present (do not drop optional passthrough info)
+    # Preserve declared dataset bindings without reinterpreting them.
     schema_binding = artifact_req.get("schema_binding")
     if isinstance(schema_binding, dict):
         artifact_requirements["schema_binding"] = schema_binding
-    clean_dataset = artifact_req.get("clean_dataset")
-    if isinstance(clean_dataset, dict):
-        artifact_requirements["clean_dataset"] = clean_dataset
+    cleaned_dataset = artifact_req.get("cleaned_dataset")
+    if isinstance(cleaned_dataset, dict):
+        artifact_requirements["cleaned_dataset"] = cleaned_dataset
+        if "clean_dataset" not in artifact_requirements:
+            artifact_requirements["clean_dataset"] = cleaned_dataset
+    legacy_clean_dataset = artifact_req.get("clean_dataset")
+    if isinstance(legacy_clean_dataset, dict):
+        artifact_requirements["clean_dataset"] = legacy_clean_dataset
+        if "cleaned_dataset" not in artifact_requirements:
+            artifact_requirements["cleaned_dataset"] = legacy_clean_dataset
+    enriched_dataset = artifact_req.get("enriched_dataset")
+    if isinstance(enriched_dataset, dict):
+        artifact_requirements["enriched_dataset"] = enriched_dataset
 
     def _extract_path(item: Any) -> str:
         if not item:
@@ -2570,7 +2580,13 @@ def resolve_contract_active_workstreams(contract: Any) -> Dict[str, Any]:
     )
     scope = normalize_contract_scope(payload.get("scope"))
     artifact_requirements = payload.get("artifact_requirements") if isinstance(payload.get("artifact_requirements"), dict) else {}
-    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else {}
+    clean_dataset = {}
+    if isinstance(artifact_requirements, dict):
+        candidate = artifact_requirements.get("cleaned_dataset")
+        if not isinstance(candidate, dict):
+            candidate = artifact_requirements.get("clean_dataset")
+        if isinstance(candidate, dict):
+            clean_dataset = candidate
     required_outputs = payload.get("required_outputs") if isinstance(payload.get("required_outputs"), list) else []
     required_outputs_text = " ".join(str(item or "") for item in required_outputs)
     has_explicit_eval = isinstance(payload.get("evaluation_spec"), dict) and bool(payload.get("evaluation_spec"))
@@ -3833,7 +3849,9 @@ def validate_contract_minimal_readonly(
             selector_sources: List[Any] = []
             artifact_requirements = contract.get("artifact_requirements")
             if isinstance(artifact_requirements, dict):
-                clean_dataset = artifact_requirements.get("clean_dataset")
+                clean_dataset = artifact_requirements.get("cleaned_dataset")
+                if not isinstance(clean_dataset, dict):
+                    clean_dataset = artifact_requirements.get("clean_dataset")
                 if isinstance(clean_dataset, dict):
                     selector_sources.append(clean_dataset.get("required_feature_selectors"))
             selector_sources.append(contract.get("required_feature_selectors"))
@@ -3923,7 +3941,9 @@ def validate_contract_minimal_readonly(
     artifact_requirements = contract.get("artifact_requirements")
     clean_dataset_cfg = {}
     if isinstance(artifact_requirements, dict):
-        candidate = artifact_requirements.get("clean_dataset")
+        candidate = artifact_requirements.get("cleaned_dataset")
+        if not isinstance(candidate, dict):
+            candidate = artifact_requirements.get("clean_dataset")
         if isinstance(candidate, dict):
             clean_dataset_cfg = candidate
     raw_dtype_targets = contract.get("column_dtype_targets")
@@ -3971,7 +3991,9 @@ def validate_contract_minimal_readonly(
 
         clean_dataset = {}
         if isinstance(artifact_requirements, dict):
-            candidate = artifact_requirements.get("clean_dataset")
+            candidate = artifact_requirements.get("cleaned_dataset")
+            if not isinstance(candidate, dict):
+                candidate = artifact_requirements.get("clean_dataset")
             if isinstance(candidate, dict):
                 clean_dataset = candidate
         required_cols, invalid_required_cols = _normalize_nonempty_str_list(

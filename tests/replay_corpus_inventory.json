@@ -184,6 +184,18 @@
             "runs/57dff3ce/work/data/execution_contract.json",
             "runs/57dff3ce/work/data/output_contract_report.json"
           ]
+        },
+        {
+          "run_id": "6c9b6bd5",
+          "severity": "S1",
+          "layer": "contract_views_ml_projection",
+          "failure_class": "declared_model_features_omitted_from_ml_view",
+          "status": "replay_covered",
+          "required_files": [
+            "runs/6c9b6bd5/work/data/execution_contract_raw.json",
+            "runs/6c9b6bd5/work/data/contracts/views/ml_view.json",
+            "runs/6c9b6bd5/work/data/contracts/view_projection_reports/ml_view_coverage.json"
+          ]
         }
       ]
     },

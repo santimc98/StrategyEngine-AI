@@ -17,6 +17,9 @@ from src.utils.contract_validation import (
 from src.utils.contract_accessors import (
     get_canonical_columns,
     get_clean_dataset_output_path,
+    get_dataset_artifact_binding,
+    get_declared_artifact_path_by_intent,
+    get_enriched_dataset_output_path,
     get_clean_manifest_path,
     get_cleaning_gates,
     get_column_roles,
@@ -96,8 +99,10 @@ COMPILER_OPERATIONAL_SCHEMA_EXAMPLES_TEXT = """
 - column_dtype_targets: {"created_at": {"target_dtype": "datetime", "nullable": true, "role": "time_columns", "source": "support_context_profile"}}
 - gate_list_example: [{"name": "drop_debug_columns", "severity": "HARD", "action_type": "drop", "final_state": "removed", "params": {"target_columns": ["debug_col"]}}, {"name": "no_null_target", "severity": "HARD", "action_type": "check", "params": {"column": "target"}}]
 - required_outputs_example: [{"intent": "cleaned_dataset", "path": "artifacts/clean/dataset_cleaned.csv", "required": true, "owner": "data_engineer", "kind": "dataset"}]
-- artifact_requirements.clean_dataset:
+- artifact_requirements.cleaned_dataset:
   {"output_path": "artifacts/clean/dataset_cleaned.csv", "output_manifest_path": "artifacts/clean/cleaning_manifest.json", "required_columns": ["id", "feature_a", "target"], "optional_passthrough_columns": ["raw_event_ts"], "required_feature_selectors": [], "column_transformations": {"drop_columns": ["debug_col"], "scale_columns": ["feature_a"]}}
+- artifact_requirements.enriched_dataset:
+  {"output_path": "artifacts/clean/dataset_enriched.csv", "required_columns": ["feature_a", "target"], "description": "Model-ready handoff dataset for future ML."}
 - future_ml_handoff: {"enabled": true, "primary_target": "target", "target_columns": ["target"], "readiness_goal": "dataset ready for later ML", "notes": "training deferred to a later run"}
 - agent_interfaces.data_engineer (optional thin delta example):
   {"focus": ["traceability_artifacts", "deduplication_survivorship"]}
@@ -399,7 +404,8 @@ Compilation responsibilities for Task B:
   - when semantic_core contains conceptual deliverable labels, materialize them as required_outputs objects with path + intent
 
 - Your main job is to materialize the minimal operational layer required for execution:
-  - artifact_requirements.clean_dataset
+  - artifact_requirements.cleaned_dataset
+  - artifact_requirements.enriched_dataset when a separate future-ML/model-ready artifact exists
   - column_dtype_targets
   - iteration_policy
   - executable gate objects for cleaning_gates / qa_gates / reviewer_gates
@@ -407,8 +413,9 @@ Compilation responsibilities for Task B:
   - evaluation_spec and validation_requirements only when active_workstreams.model_training = true
 
 - Treat these as context-derived sections, not template sections:
-  - artifact_requirements.clean_dataset.required_columns
-  - artifact_requirements.clean_dataset.column_transformations
+  - artifact_requirements.cleaned_dataset.required_columns
+  - artifact_requirements.cleaned_dataset.column_transformations
+  - artifact_requirements.enriched_dataset.required_columns when enriched_dataset is declared
   - column_dtype_targets
   - gate params and gate names
   - required_outputs materializations needed for execution
@@ -471,18 +478,24 @@ Compilation responsibilities for Task B:
   This MUST match allowed_feature_sets.model_features. Having it as a top-level key ensures downstream
   agents can access the approved feature set without navigating nested structures.
 
-- artifact_requirements.clean_dataset.required_columns: list[str] containing ALL columns the ML pipeline needs:
+- artifact_requirements.cleaned_dataset.required_columns: list[str] containing the persisted cleaned dataset schema for THIS run:
   outcome columns, pre_decision features, identifiers, split columns, post_decision_audit columns.
   CRITICAL: Do NOT include "decision" role columns here. Decision columns (e.g. predicted probabilities)
   are MODEL OUTPUTS that do not exist in the raw data. Including them would create empty placeholder
-  columns that contaminate the feature set.
-  If you declare model_features / allowed_feature_sets / column_roles, you must close clean_dataset coverage
+  columns that contaminate the cleaned dataset.
+  If you declare model_features / allowed_feature_sets / column_roles, you must close cleaned_dataset coverage
   from those declarations instead of leaving coverage implicit.
-- artifact_requirements.clean_dataset.optional_passthrough_columns: list[str] for processing-only dependencies.
+- artifact_requirements.cleaned_dataset.optional_passthrough_columns: list[str] for processing-only dependencies.
   Use this when a column is required to execute HARD parse/coerce/standardize/derive gates, temporal logic,
   deduplication, or intermediate derivation, but is not guaranteed to survive in every persisted clean artifact.
   Do not force every transform-only dependency into required_columns if it is operationally needed but not part of the
   final clean dataset schema.
+- artifact_requirements.enriched_dataset.required_columns: list[str] for the future-ML/model-ready handoff dataset when that artifact exists.
+  This binding is distinct from cleaned_dataset.
+  It should contain ONLY the explicitly approved handoff schema for that artifact
+  (typically model_features + target_columns + explicitly approved safe derived columns).
+  Do NOT inherit cleaned_dataset optional_passthrough_columns into enriched_dataset unless the contract explicitly
+  declares passthrough for enriched_dataset itself.
 
 Canonical contract interface (required top-level sections):
 - scope: one of ["cleaning_only", "ml_only", "full_pipeline"]
@@ -538,17 +551,19 @@ Scope-dependent required fields:
 - If scope includes cleaning ("cleaning_only" or "full_pipeline"):
   - cleaning_gates: list of gate objects
   - data_engineer_runbook: object/list/string with actionable steps
-  - artifact_requirements.clean_dataset.required_columns: list[str]
-  - artifact_requirements.clean_dataset.optional_passthrough_columns (optional but strongly preferred when transform-only
+  - artifact_requirements.cleaned_dataset.required_columns: list[str]
+  - artifact_requirements.cleaned_dataset.optional_passthrough_columns (optional but strongly preferred when transform-only
     execution dependencies exist): list[str]
-  - artifact_requirements.clean_dataset.required_feature_selectors (optional): list[object]
+  - artifact_requirements.cleaned_dataset.required_feature_selectors (optional): list[object]
     to represent wide feature families compactly (regex/prefix/range/list/all_columns_except)
-  - artifact_requirements.clean_dataset.output_path: file path for cleaned CSV
-  - artifact_requirements.clean_dataset.output_manifest_path (or manifest_path): file path for cleaning manifest JSON
+  - artifact_requirements.cleaned_dataset.output_path: file path for cleaned CSV
+  - artifact_requirements.cleaned_dataset.output_manifest_path (or manifest_path): file path for cleaning manifest JSON
+  - If required_outputs include a separate model-ready / enriched dataset owned by data_engineer, also declare
+    artifact_requirements.enriched_dataset with its own output_path and required_columns.
   - column_dtype_targets must include explicit dtype targets for anchor columns
     (target/split/identifier/time/decision) and selector-level dtype targets for wide families when applicable.
 - If any column drop/scaling is requested, declare it explicitly in
-  artifact_requirements.clean_dataset.column_transformations with:
+  artifact_requirements.cleaned_dataset.column_transformations with:
     - drop_columns: list[str]
     - scale_columns: list[str]
     - drop_policy (optional but required for selector-based criteria drops): {
@@ -622,9 +637,9 @@ Hard rules:
   - If active_workstreams.model_training = true, the optimization metric declared or implied anywhere in strategy, business objective, or gates must be reflected in both
     evaluation_spec.primary_metric and validation_requirements.primary_metric.
   - If active_workstreams.model_training = true, validation protocol declared or implied anywhere in strategy, gates, or runbooks must be reflected in validation_requirements.method and params.
-  - If active_workstreams.feature_engineering = true or future_ml_handoff.enabled = true, model features and role buckets must close artifact_requirements.clean_dataset.required_columns for all non-decision columns needed by future ML.
+  - If active_workstreams.feature_engineering = true or future_ml_handoff.enabled = true, model features and role buckets must close artifact_requirements.enriched_dataset.required_columns for all non-decision columns needed by future ML handoff artifacts.
   - If cleaning_gates or column_transformations reference columns needed only during parsing/coercion/standardization/derivation,
-    close that dependency through artifact_requirements.clean_dataset.optional_passthrough_columns instead of silently dropping it.
+    close that dependency through artifact_requirements.cleaned_dataset.optional_passthrough_columns instead of silently dropping it.
   - Anchor columns (outcome, identifiers, split, time, decision) must have explicit entries in column_dtype_targets.
 - You may add extra fields if useful, but do not omit required minimum fields.
 
@@ -817,12 +832,13 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
         "must_be_executable_from_contract": True,
         "required_contract_inputs": [
             "scope",
-            "artifact_requirements.clean_dataset.output_path",
-            "artifact_requirements.clean_dataset.output_manifest_path|manifest_path",
-            "artifact_requirements.clean_dataset.required_columns",
-            "artifact_requirements.clean_dataset.required_feature_selectors (optional)",
-            "artifact_requirements.clean_dataset.column_transformations (optional)",
-            "artifact_requirements.clean_dataset.column_transformations.drop_policy (optional)",
+            "artifact_requirements.cleaned_dataset.output_path",
+            "artifact_requirements.cleaned_dataset.output_manifest_path|manifest_path",
+            "artifact_requirements.cleaned_dataset.required_columns",
+            "artifact_requirements.cleaned_dataset.required_feature_selectors (optional)",
+            "artifact_requirements.cleaned_dataset.column_transformations (optional)",
+            "artifact_requirements.cleaned_dataset.column_transformations.drop_policy (optional)",
+            "artifact_requirements.enriched_dataset.required_columns when future_ml_handoff or enriched output is declared",
             "column_dtype_targets",
             "cleaning_gates",
             "data_engineer_runbook",
@@ -834,12 +850,13 @@ DOWNSTREAM_CONSUMER_INTERFACE_V1 = {
         "required_contract_inputs": [
             "scope",
             "cleaning_gates",
-            "artifact_requirements.clean_dataset.output_path",
-            "artifact_requirements.clean_dataset.output_manifest_path|manifest_path",
-            "artifact_requirements.clean_dataset.required_columns",
-            "artifact_requirements.clean_dataset.required_feature_selectors (optional)",
-            "artifact_requirements.clean_dataset.column_transformations (optional)",
-            "artifact_requirements.clean_dataset.column_transformations.drop_policy (optional)",
+            "artifact_requirements.cleaned_dataset.output_path",
+            "artifact_requirements.cleaned_dataset.output_manifest_path|manifest_path",
+            "artifact_requirements.cleaned_dataset.required_columns",
+            "artifact_requirements.cleaned_dataset.required_feature_selectors (optional)",
+            "artifact_requirements.cleaned_dataset.column_transformations (optional)",
+            "artifact_requirements.cleaned_dataset.column_transformations.drop_policy (optional)",
+            "artifact_requirements.enriched_dataset when a separate enriched handoff artifact is declared",
             "outlier_policy (optional)",
         ],
     },
@@ -1204,7 +1221,7 @@ def _apply_schema_coercion(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _apply_minimal_path_resolution(contract: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolve clean_dataset output_path and manifest_path if missing."""
+    """Resolve dataset artifact bindings from explicit contract content if missing."""
     if not isinstance(contract, dict):
         return contract
 
@@ -1213,9 +1230,12 @@ def _apply_minimal_path_resolution(contract: Dict[str, Any]) -> Dict[str, Any]:
         art_req = {}
         contract["artifact_requirements"] = art_req
 
-    clean_ds = art_req.get("clean_dataset")
+    clean_ds = art_req.get("cleaned_dataset")
     if not isinstance(clean_ds, dict):
-        clean_ds = {}
+        legacy_clean = art_req.get("clean_dataset")
+        clean_ds = legacy_clean if isinstance(legacy_clean, dict) else {}
+        art_req["cleaned_dataset"] = clean_ds
+    if "clean_dataset" not in art_req and isinstance(clean_ds, dict):
         art_req["clean_dataset"] = clean_ds
 
     if not str(clean_ds.get("output_path") or clean_ds.get("output") or clean_ds.get("path") or "").strip():
@@ -1227,6 +1247,52 @@ def _apply_minimal_path_resolution(contract: Dict[str, Any]) -> Dict[str, Any]:
         manifest_path = get_clean_manifest_path(contract)
         if manifest_path:
             clean_ds["output_manifest_path"] = manifest_path
+
+    enriched_ds = art_req.get("enriched_dataset")
+    enriched_declared = isinstance(enriched_ds, dict)
+    if not enriched_declared:
+        enriched_ds = {}
+
+    enriched_output_path = str(
+        enriched_ds.get("output_path") or enriched_ds.get("output") or enriched_ds.get("path") or ""
+    ).strip()
+    if not enriched_output_path:
+        enriched_output_path = get_enriched_dataset_output_path(contract)
+        if enriched_output_path:
+            enriched_ds["output_path"] = enriched_output_path
+
+    if not isinstance(enriched_ds.get("required_columns"), list):
+        allowed_sets = contract.get("allowed_feature_sets")
+        if not isinstance(allowed_sets, dict):
+            allowed_sets = {}
+
+        model_features = []
+        model_features_raw = allowed_sets.get("model_features")
+        if isinstance(model_features_raw, list):
+            model_features = [str(col).strip() for col in model_features_raw if str(col).strip()]
+
+        target_columns: List[str] = []
+        future_ml_handoff = contract.get("future_ml_handoff")
+        if isinstance(future_ml_handoff, dict):
+            target_columns_raw = future_ml_handoff.get("target_columns")
+            if isinstance(target_columns_raw, list):
+                target_columns = [str(col).strip() for col in target_columns_raw if str(col).strip()]
+        if not target_columns:
+            target_columns_raw = contract.get("target_columns")
+            if isinstance(target_columns_raw, list):
+                target_columns = [str(col).strip() for col in target_columns_raw if str(col).strip()]
+        if not target_columns:
+            roles = get_column_roles(contract)
+            outcome_cols = roles.get("outcome")
+            if isinstance(outcome_cols, list):
+                target_columns = [str(col).strip() for col in outcome_cols if str(col).strip()]
+
+        inferred_enriched_required = list(dict.fromkeys(model_features + target_columns))
+        if inferred_enriched_required:
+            enriched_ds["required_columns"] = inferred_enriched_required
+
+    if enriched_declared or enriched_output_path or enriched_ds.get("required_columns"):
+        art_req["enriched_dataset"] = enriched_ds
 
     return contract
 
@@ -4671,7 +4737,11 @@ def _collect_cleaning_hard_gate_columns(contract: Dict[str, Any]) -> List[str]:
 
     _consume_gate_container(contract.get("cleaning_gates"))
     artifact_requirements = contract.get("artifact_requirements")
-    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
+    clean_dataset = None
+    if isinstance(artifact_requirements, dict):
+        clean_dataset = artifact_requirements.get("cleaned_dataset")
+        if not isinstance(clean_dataset, dict):
+            clean_dataset = artifact_requirements.get("clean_dataset")
     if isinstance(clean_dataset, dict):
         _consume_gate_container(clean_dataset.get("cleaning_gates"))
     return gate_columns
@@ -5615,6 +5685,32 @@ def build_contract_min(
         full_required_files = _extract_required_paths(full_artifact_requirements)
         required_outputs = list(dict.fromkeys(full_required_files or []))
 
+    contract_for_artifact_resolution = (
+        full_contract_or_partial
+        if isinstance(full_contract_or_partial, dict)
+        else contract
+    )
+
+    def _infer_owned_dataset_output_path(intent: str, basename_tokens: List[str]) -> str:
+        if isinstance(contract_for_artifact_resolution, dict):
+            declared = get_declared_artifact_path_by_intent(
+                contract_for_artifact_resolution,
+                intent,
+                owner="data_engineer",
+                required_only=True,
+            )
+            if declared:
+                return declared
+        lowered_tokens = [str(token).strip().lower() for token in basename_tokens if str(token).strip()]
+        for raw_path in required_outputs:
+            normalized = _normalize_artifact_path(raw_path)
+            lower = normalized.lower()
+            if not lower.endswith(".csv"):
+                continue
+            if any(token in lower for token in lowered_tokens):
+                return normalized
+        return ""
+
     # P1.5: Infer feature selectors for wide datasets
     feature_selectors = []
     if len(canonical_columns) > 200:
@@ -5625,23 +5721,28 @@ def build_contract_min(
             print(f"FEATURE_SELECTORS: Inferred {len(feature_selectors)} selectors for {len(canonical_columns)} columns")
 
     declared_feature_selectors: List[Dict[str, Any]] = []
-    full_clean_dataset = (
-        full_artifact_requirements.get("clean_dataset")
-        if isinstance(full_artifact_requirements, dict)
-        else None
+    full_cleaned_dataset = (
+        get_dataset_artifact_binding(contract_for_artifact_resolution, "cleaned_dataset")
+        if isinstance(contract_for_artifact_resolution, dict)
+        else {}
     )
-    if isinstance(full_clean_dataset, dict) and full_clean_dataset.get("required_feature_selectors") is not None:
+    full_enriched_dataset = (
+        get_dataset_artifact_binding(contract_for_artifact_resolution, "enriched_dataset")
+        if isinstance(contract_for_artifact_resolution, dict)
+        else {}
+    )
+    if isinstance(full_cleaned_dataset, dict) and full_cleaned_dataset.get("required_feature_selectors") is not None:
         selector_probe = {
             "artifact_requirements": {
-                "clean_dataset": {
-                    "required_feature_selectors": copy.deepcopy(full_clean_dataset.get("required_feature_selectors"))
+                "cleaned_dataset": {
+                    "required_feature_selectors": copy.deepcopy(full_cleaned_dataset.get("required_feature_selectors"))
                 }
             }
         }
         selector_probe = apply_contract_schema_registry_repairs(selector_probe)
         declared_feature_selectors = (
             selector_probe.get("artifact_requirements", {})
-            .get("clean_dataset", {})
+            .get("cleaned_dataset", {})
             .get("required_feature_selectors", [])
         )
         if not isinstance(declared_feature_selectors, list):
@@ -6227,44 +6328,69 @@ def build_contract_min(
     inherited_required_columns: List[str] = []
     inherited_column_transformations: Dict[str, Any] = {}
     inherited_clean_output_path = (
-        get_clean_dataset_output_path(full_contract_or_partial)
-        if isinstance(full_contract_or_partial, dict)
+        get_clean_dataset_output_path(contract_for_artifact_resolution)
+        if isinstance(contract_for_artifact_resolution, dict)
         else ""
     )
+    if not inherited_clean_output_path:
+        inherited_clean_output_path = _infer_owned_dataset_output_path(
+            "cleaned_dataset",
+            ["cleaned", "clean_dataset", "dataset_cleaned", "dataset_limpio"],
+        )
     inherited_clean_manifest_path = (
         get_declared_artifact_path(
-            full_contract_or_partial,
+            contract_for_artifact_resolution,
             "cleaning_manifest.json",
             owner="data_engineer",
             kind="manifest",
         )
-        if isinstance(full_contract_or_partial, dict)
+        if isinstance(contract_for_artifact_resolution, dict)
         else ""
     )
-    if isinstance(full_clean_dataset, dict):
-        required_raw = full_clean_dataset.get("required_columns")
+    inherited_enriched_output_path = (
+        get_enriched_dataset_output_path(contract_for_artifact_resolution)
+        if isinstance(contract_for_artifact_resolution, dict)
+        else ""
+    )
+    if not inherited_enriched_output_path:
+        inherited_enriched_output_path = _infer_owned_dataset_output_path(
+            "enriched_dataset",
+            ["enriched", "dataset_enriched", "dataset_enriquecido", "model_ready", "handoff"],
+        )
+    inherited_enriched_required_columns: List[str] = []
+    if isinstance(full_cleaned_dataset, dict):
+        required_raw = full_cleaned_dataset.get("required_columns")
         if isinstance(required_raw, list):
             inherited_required_columns = [
                 str(col).strip() for col in required_raw if str(col).strip()
             ]
-        optional_raw = full_clean_dataset.get("optional_passthrough_columns")
+        optional_raw = full_cleaned_dataset.get("optional_passthrough_columns")
         if isinstance(optional_raw, list):
             inherited_optional_passthrough = [
                 str(col).strip() for col in optional_raw if str(col).strip()
             ]
-        transforms_raw = full_clean_dataset.get("column_transformations")
+        transforms_raw = full_cleaned_dataset.get("column_transformations")
         if isinstance(transforms_raw, dict):
             inherited_column_transformations = copy.deepcopy(transforms_raw)
-        output_path = str(full_clean_dataset.get("output_path") or "").strip()
+        output_path = str(full_cleaned_dataset.get("output_path") or "").strip()
         if output_path:
             inherited_clean_output_path = output_path
         manifest_path = str(
-            full_clean_dataset.get("output_manifest_path")
-            or full_clean_dataset.get("manifest_path")
+            full_cleaned_dataset.get("output_manifest_path")
+            or full_cleaned_dataset.get("manifest_path")
             or ""
         ).strip()
         if manifest_path:
             inherited_clean_manifest_path = manifest_path
+    if isinstance(full_enriched_dataset, dict):
+        enriched_required_raw = full_enriched_dataset.get("required_columns")
+        if isinstance(enriched_required_raw, list):
+            inherited_enriched_required_columns = [
+                str(col).strip() for col in enriched_required_raw if str(col).strip()
+            ]
+        output_path = str(full_enriched_dataset.get("output_path") or "").strip()
+        if output_path:
+            inherited_enriched_output_path = output_path
 
     # Compute clean_dataset.required_columns excluding constant columns.
     # Prefer explicit anchors declared upstream; only fall back to full canonical
@@ -6306,8 +6432,31 @@ def build_contract_min(
         column_inventory=inventory,
     )
 
+    enriched_required_columns: List[str] = []
+    if inherited_enriched_required_columns:
+        for col in inherited_enriched_required_columns:
+            resolved = canonical_norms.get(_normalize_column_identifier(col)) or col
+            if _normalize_column_identifier(resolved) in dropped_constant_norms and resolved not in outcome_cols:
+                continue
+            if resolved not in enriched_required_columns:
+                enriched_required_columns.append(resolved)
+    else:
+        future_target_columns = []
+        if isinstance(future_ml_handoff, dict):
+            target_cols = future_ml_handoff.get("target_columns")
+            if isinstance(target_cols, list):
+                future_target_columns = [str(col).strip() for col in target_cols if str(col).strip()]
+        if not future_target_columns:
+            future_target_columns = [str(col).strip() for col in outcome_cols if str(col).strip()]
+        for col in model_features + future_target_columns:
+            resolved = canonical_norms.get(_normalize_column_identifier(col)) or col
+            if not resolved:
+                continue
+            if resolved not in enriched_required_columns:
+                enriched_required_columns.append(resolved)
+
     artifact_requirements = {
-        "clean_dataset": {
+        "cleaned_dataset": {
             "required_columns": clean_dataset_required_columns,
             "output_path": inherited_clean_output_path,
             "output_manifest_path": inherited_clean_manifest_path,
@@ -6329,24 +6478,40 @@ def build_contract_min(
             "optional_passthrough_columns": inherited_optional_passthrough,
         },
     }
+    if inherited_enriched_output_path or enriched_required_columns:
+        artifact_requirements["enriched_dataset"] = {
+            "required_columns": enriched_required_columns,
+            "output_path": inherited_enriched_output_path,
+        }
     if inherited_column_transformations:
-        artifact_requirements["clean_dataset"]["column_transformations"] = inherited_column_transformations
+        artifact_requirements["cleaned_dataset"]["column_transformations"] = inherited_column_transformations
+    if isinstance(full_artifact_requirements.get("clean_dataset"), dict):
+        artifact_requirements["clean_dataset"] = copy.deepcopy(full_artifact_requirements.get("clean_dataset"))
+    elif "cleaned_dataset" in artifact_requirements:
+        artifact_requirements["clean_dataset"] = copy.deepcopy(artifact_requirements["cleaned_dataset"])
 
-    data_engineer_runbook = "\n".join(
-        [
-            f"Produce {inherited_clean_output_path} containing ONLY the columns listed in required_columns.",
-            "Your output CSV must match EXACTLY the required_columns list - no more, no less.",
-            "If a column exists in raw data but is NOT in required_columns, DISCARD it (do not include in output).",
-            "Constant columns (single unique value) have been pre-excluded from required_columns.",
-            "Preserve column names; do not invent or rename columns.",
-            f"Load using output_dialect from {inherited_clean_manifest_path} when available.",
-            "Parse numeric/date fields conservatively; document conversions.",
-            "If a required column is missing from input, report and stop (no fabrication).",
-            "Do not derive targets or train models.",
-            "Avoid advanced validation metrics (MAE/correlation); report only dtype and null counts.",
-            f"Write {inherited_clean_manifest_path} with input/output dialect details.",
-        ]
-    )
+    data_engineer_runbook_lines = [
+        f"Produce {inherited_clean_output_path} containing ONLY artifact_requirements.cleaned_dataset.required_columns.",
+        "Your cleaned_dataset CSV must match EXACTLY the cleaned_dataset.required_columns list - no more, no less.",
+        "If a column exists in raw data but is NOT in cleaned_dataset.required_columns, DISCARD it from cleaned_dataset unless it is explicitly declared as optional_passthrough_columns for that artifact.",
+        "Constant columns (single unique value) have been pre-excluded from cleaned_dataset.required_columns.",
+        "Preserve column names; do not invent or rename columns.",
+        f"Load using output_dialect from {inherited_clean_manifest_path} when available.",
+        "Parse numeric/date fields conservatively; document conversions.",
+        "If a required column is missing from input, report and stop (no fabrication).",
+        "Do not derive targets or train models.",
+        "Avoid advanced validation metrics (MAE/correlation); report only dtype and null counts.",
+        f"Write {inherited_clean_manifest_path} with input/output dialect details.",
+    ]
+    if inherited_enriched_output_path:
+        data_engineer_runbook_lines.extend(
+            [
+                f"Produce {inherited_enriched_output_path} as a DISTINCT enriched/model-ready artifact when declared.",
+                "The enriched_dataset schema must match artifact_requirements.enriched_dataset.required_columns exactly.",
+                "Do not carry cleaned_dataset optional_passthrough_columns into enriched_dataset unless artifact_requirements.enriched_dataset explicitly declares them.",
+            ]
+        )
+    data_engineer_runbook = "\n".join(data_engineer_runbook_lines)
     ml_engineer_runbook = "\n".join(
         [
             "Use allowed_feature_sets for modeling/segmentation.",
@@ -6953,7 +7118,9 @@ def validate_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
         schema_binding = {}
         artifact_requirements["schema_binding"] = schema_binding
 
-    clean_dataset = artifact_requirements.get("clean_dataset")
+    clean_dataset = artifact_requirements.get("cleaned_dataset")
+    if not isinstance(clean_dataset, dict):
+        clean_dataset = artifact_requirements.get("clean_dataset")
     if not isinstance(clean_dataset, dict):
         clean_dataset = None
 
@@ -9470,11 +9637,12 @@ class ExecutionPlannerAgent:
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
                 "column_roles MUST use canonical role buckets only: "
                 "pre_decision, decision, outcome, post_decision_audit_only, identifiers, time_columns, unknown.\n"
-                "For cleaning scopes, define artifact_requirements.clean_dataset.output_path and output_manifest_path.\n"
+                "For cleaning scopes, define artifact_requirements.cleaned_dataset.output_path and output_manifest_path.\n"
+                "If a separate model-ready/enriched dataset is required, declare artifact_requirements.enriched_dataset separately.\n"
                 "required_feature_selectors entries must be list[object] and each object must have key type.\n"
                 "Example: [{\"type\": \"prefix\", \"value\": \"feature_\"}, {\"type\": \"regex\", \"pattern\": \"^pixel_\\\\d+$\"}].\n"
                 "If cleaning requires dropping/scaling columns, declare them in "
-                "artifact_requirements.clean_dataset.column_transformations.{drop_columns,scale_columns,drop_policy}; "
+                "artifact_requirements.cleaned_dataset.column_transformations.{drop_columns,scale_columns,drop_policy}; "
                 "do not leave these decisions only in runbook prose.\n"
                 "If required_feature_selectors are used and any drop-by-criteria is requested, define "
                 "column_transformations.drop_policy.allow_selector_drops_when with explicit reasons.\n"
@@ -9484,7 +9652,7 @@ class ExecutionPlannerAgent:
                 "and therefore must not overlap required_feature_selectors.\n"
                 "If selector-drop policy is active, HARD cleaning gates must not rely on selector-covered columns.\n"
                 "For wide feature families, you may declare compact selectors in "
-                "artifact_requirements.clean_dataset.required_feature_selectors (regex/prefix/range/list).\n"
+                "artifact_requirements.cleaned_dataset.required_feature_selectors (regex/prefix/range/list).\n"
                 "Avoid enumerating massive feature families as explicit lists; keep explicit anchors only.\n"
                 "Never place wildcard selector tokens (e.g., pixel*) inside required_columns.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
@@ -9493,7 +9661,7 @@ class ExecutionPlannerAgent:
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
                 "When active_workstreams.model_training=true, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
                 "aligned with strategy/evidence so views can request the right visuals.\n"
-                "When active_workstreams.model_training=false but future_ml_handoff is in scope, do not invent training/CV sections; instead make future_ml_handoff and clean_dataset coverage explicit.\n"
+                "When active_workstreams.model_training=false but future_ml_handoff is in scope, do not invent training/CV sections; instead make future_ml_handoff and enriched_dataset coverage explicit.\n"
                 "Gate lists must be executable by downstream views: use gate objects with "
                 "{name, severity, params} (severity in HARD|SOFT). If using metric/check/rule language, "
                 "map it to name and keep semantic details in params.\n"
@@ -9603,7 +9771,7 @@ class ExecutionPlannerAgent:
             if transform_block is None:
                 transform_block = {}
             if not isinstance(transform_block, dict):
-                return [], [], [], [], ["artifact_requirements.clean_dataset.column_transformations must be an object"]
+                return [], [], [], [], ["artifact_requirements.cleaned_dataset.column_transformations must be an object"]
 
             def _collect(alias_keys: Tuple[str, ...]) -> Tuple[List[str], bool]:
                 values: List[str] = []
@@ -9625,15 +9793,15 @@ class ExecutionPlannerAgent:
             )
             errors: List[str] = []
             if invalid_drop:
-                errors.append("artifact_requirements.clean_dataset.column_transformations.drop_columns must be list[str]")
+                errors.append("artifact_requirements.cleaned_dataset.column_transformations.drop_columns must be list[str]")
             if invalid_scale:
-                errors.append("artifact_requirements.clean_dataset.column_transformations.scale_columns must be list[str]")
+                errors.append("artifact_requirements.cleaned_dataset.column_transformations.scale_columns must be list[str]")
             transform_payload = dict(transform_block)
             if "drop_policy" not in transform_payload and "drop_policy" in clean_dataset:
                 transform_payload["drop_policy"] = clean_dataset.get("drop_policy")
             selector_drop_reasons, selector_drop_errors = extract_selector_drop_reasons(transform_payload)
             for issue in selector_drop_errors:
-                errors.append(f"artifact_requirements.clean_dataset.column_transformations.drop_policy: {issue}")
+                errors.append(f"artifact_requirements.cleaned_dataset.column_transformations.drop_policy: {issue}")
 
             criteria_drop_directives: List[str] = []
             feature_engineering = transform_block.get("feature_engineering")
@@ -9654,13 +9822,13 @@ class ExecutionPlannerAgent:
             if raw_selectors is None:
                 return [], []
             if not isinstance(raw_selectors, list):
-                return [], ["artifact_requirements.clean_dataset.required_feature_selectors must be list[object]"]
+                return [], ["artifact_requirements.cleaned_dataset.required_feature_selectors must be list[object]"]
             selectors: List[Dict[str, Any]] = []
             errors: List[str] = []
             for idx, item in enumerate(raw_selectors):
                 if not isinstance(item, dict):
                     errors.append(
-                        f"artifact_requirements.clean_dataset.required_feature_selectors[{idx}] must be an object"
+                        f"artifact_requirements.cleaned_dataset.required_feature_selectors[{idx}] must be an object"
                     )
                     continue
                 # Auto-normalise LLM format variants (nested dict, string shorthand, etc.)
@@ -9672,7 +9840,7 @@ class ExecutionPlannerAgent:
                         item["type"] = selector_type
                 if not selector_type:
                     errors.append(
-                        f"artifact_requirements.clean_dataset.required_feature_selectors[{idx}] is missing type"
+                        f"artifact_requirements.cleaned_dataset.required_feature_selectors[{idx}] is missing type"
                     )
                     continue
                 selector = dict(item)
@@ -9684,7 +9852,7 @@ class ExecutionPlannerAgent:
             optional_cols, invalid_optional = _to_clean_str_list(clean_dataset.get("optional_passthrough_columns"))
             errors: List[str] = []
             if invalid_optional:
-                errors.append("artifact_requirements.clean_dataset.optional_passthrough_columns must be list[str]")
+                errors.append("artifact_requirements.cleaned_dataset.optional_passthrough_columns must be list[str]")
             return optional_cols, errors
 
         def _gate_list_valid(value: Any, gate_key: str) -> bool:
@@ -10109,7 +10277,8 @@ class ExecutionPlannerAgent:
             },
             "compiler_operational_targets": {
                 "must_materialize": [
-                    "artifact_requirements.clean_dataset",
+                    "artifact_requirements.cleaned_dataset",
+                    "artifact_requirements.enriched_dataset_when_required",
                     "column_dtype_targets",
                     "iteration_policy",
                     "gate_object_shapes",
@@ -10312,7 +10481,7 @@ domain_expert_critique:
             "- If targets are declared, evaluation_spec must name the primary target and label columns.\n"
             "- If a metric appears anywhere in strategy/objective/gates/runbooks, it must appear in both evaluation_spec.primary_metric and validation_requirements.primary_metric.\n"
             "- If a validation protocol is implied anywhere, validation_requirements must close it explicitly.\n"
-            "- If model_features / allowed_feature_sets / column_roles imply ML input columns, artifact_requirements.clean_dataset.required_columns must cover them.\n"
+            "- If model_features / allowed_feature_sets / column_roles imply ML input columns, artifact_requirements.enriched_dataset.required_columns must cover them for any future-ML handoff dataset.\n"
             "- If anchor columns exist (outcome, identifiers, split, time, decision), column_dtype_targets must include explicit entries for those anchors.\n"
             "- Prefer a compact contract: do not duplicate top-level sections inside agent_interfaces.\n"
             "- Only emit agent_interfaces blocks when additive consumer-specific hints are genuinely useful.\n"

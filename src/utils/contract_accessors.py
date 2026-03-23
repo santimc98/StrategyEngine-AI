@@ -1239,6 +1239,7 @@ def get_deliverables(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
             path = item.get("path") or ""
             result.append({
                 "path": path,
+                "intent": item.get("intent") or "",
                 "required": bool(item.get("required", True)),
                 "kind": item.get("kind") or _infer_kind_from_path(path),
                 "owner": item.get("owner") or _infer_owner_from_path(path),
@@ -1253,6 +1254,25 @@ def get_deliverables(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "description": "",
             })
     return result
+
+
+_DATASET_ARTIFACT_BINDING_ALIASES: Dict[str, List[str]] = {
+    "cleaned_dataset": ["cleaned_dataset", "clean_dataset"],
+    "enriched_dataset": ["enriched_dataset"],
+}
+
+
+def get_dataset_artifact_binding(contract: Dict[str, Any], binding_name: str) -> Dict[str, Any]:
+    """Return a dataset artifact binding, supporting legacy aliases for cleaned data."""
+    artifact_reqs = get_artifact_requirements(contract)
+    if not isinstance(artifact_reqs, dict):
+        return {}
+    aliases = _DATASET_ARTIFACT_BINDING_ALIASES.get(str(binding_name or "").strip(), [str(binding_name or "").strip()])
+    for alias in aliases:
+        candidate = artifact_reqs.get(alias)
+        if isinstance(candidate, dict):
+            return candidate
+    return {}
 
 
 def get_declared_artifacts(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1277,6 +1297,7 @@ def get_declared_artifacts(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
             key,
             {
                 "path": normalized_path,
+                "intent": "",
                 "required": False,
                 "kind": "",
                 "owner": "",
@@ -1286,6 +1307,9 @@ def get_declared_artifacts(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
         existing["path"] = existing.get("path") or normalized_path
         existing["required"] = bool(existing.get("required")) or bool(payload.get("required"))
+        intent = str(payload.get("intent") or "").strip()
+        if intent and not existing.get("intent"):
+            existing["intent"] = intent
         kind = str(payload.get("kind") or "").strip()
         if not kind:
             kind = _infer_kind_from_path(normalized_path)
@@ -1314,13 +1338,14 @@ def get_declared_artifacts(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         _merge(
             deliverable.get("path"),
-            {
-                "required": bool(deliverable.get("required")),
-                "kind": deliverable.get("kind"),
-                "owner": deliverable.get("owner"),
-                "description": deliverable.get("description"),
-                "source": "deliverables",
-            },
+                {
+                    "required": bool(deliverable.get("required")),
+                    "intent": deliverable.get("intent"),
+                    "kind": deliverable.get("kind"),
+                    "owner": deliverable.get("owner"),
+                    "description": deliverable.get("description"),
+                    "source": "deliverables",
+                },
         )
 
     required_outputs = contract.get("required_outputs")
@@ -1331,6 +1356,7 @@ def get_declared_artifacts(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
                     item.get("path") or item.get("output") or item.get("artifact"),
                     {
                         "required": bool(item.get("required", True)),
+                        "intent": item.get("intent"),
                         "kind": item.get("kind"),
                         "owner": item.get("owner"),
                         "description": item.get("description"),
@@ -1376,30 +1402,36 @@ def get_declared_artifacts(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
                 },
             )
 
-    clean_cfg = artifact_reqs.get("clean_dataset")
-    if isinstance(clean_cfg, dict):
-        clean_output = clean_cfg.get("output_path") or clean_cfg.get("output") or clean_cfg.get("path")
-        if clean_output:
+    for binding_name, default_description, source_prefix in (
+        ("cleaned_dataset", "Cleaned dataset output.", "artifact_requirements.cleaned_dataset"),
+        ("enriched_dataset", "Enriched dataset output.", "artifact_requirements.enriched_dataset"),
+    ):
+        dataset_cfg = get_dataset_artifact_binding(contract, binding_name)
+        if not isinstance(dataset_cfg, dict):
+            continue
+        dataset_output = dataset_cfg.get("output_path") or dataset_cfg.get("output") or dataset_cfg.get("path")
+        if dataset_output:
             _merge(
-                clean_output,
+                dataset_output,
                 {
                     "required": True,
+                    "intent": binding_name,
                     "kind": "dataset",
                     "owner": "data_engineer",
-                    "description": "Cleaned dataset output.",
-                    "source": "artifact_requirements.clean_dataset.output_path",
+                    "description": default_description,
+                    "source": f"{source_prefix}.output_path",
                 },
             )
-        clean_manifest = clean_cfg.get("output_manifest_path") or clean_cfg.get("manifest_path")
-        if clean_manifest:
+        dataset_manifest = dataset_cfg.get("output_manifest_path") or dataset_cfg.get("manifest_path")
+        if dataset_manifest:
             _merge(
-                clean_manifest,
+                dataset_manifest,
                 {
                     "required": True,
                     "kind": "manifest",
                     "owner": "data_engineer",
                     "description": "Cleaning manifest output.",
-                    "source": "artifact_requirements.clean_dataset.manifest_path",
+                    "source": f"{source_prefix}.manifest_path",
                 },
             )
 
@@ -1476,6 +1508,36 @@ def get_declared_artifact_path(
     return ""
 
 
+def get_declared_artifact_path_by_intent(
+    contract: Dict[str, Any],
+    intent: str,
+    *,
+    owner: str | None = None,
+    required_only: bool = False,
+) -> str:
+    """Resolve an artifact path by deliverable intent."""
+    if not isinstance(contract, dict):
+        return ""
+    intent_norm = str(intent or "").strip().lower()
+    if not intent_norm:
+        return ""
+    owner_norm = str(owner or "").strip().lower()
+    for artifact in get_declared_artifacts(contract):
+        if not isinstance(artifact, dict):
+            continue
+        if required_only and not artifact.get("required"):
+            continue
+        artifact_intent = str(artifact.get("intent") or "").strip().lower()
+        if artifact_intent != intent_norm:
+            continue
+        if owner_norm and str(artifact.get("owner") or "").strip().lower() != owner_norm:
+            continue
+        resolved_path = normalize_artifact_path(artifact.get("path"))
+        if resolved_path:
+            return resolved_path
+    return ""
+
+
 def get_declared_file_schema(
     contract: Dict[str, Any],
     target: str | None = None,
@@ -1508,23 +1570,52 @@ def get_declared_file_schema(
     return {}
 
 
-def get_clean_dataset_output_path(contract: Dict[str, Any]) -> str:
+def get_cleaned_dataset_output_path(contract: Dict[str, Any]) -> str:
     """Resolve the cleaned dataset output path declared by the contract."""
-    artifact_reqs = get_artifact_requirements(contract)
-    clean_cfg = artifact_reqs.get("clean_dataset")
+    clean_cfg = get_dataset_artifact_binding(contract, "cleaned_dataset")
     if isinstance(clean_cfg, dict):
         for key in ("output_path", "output", "path"):
             value = clean_cfg.get(key)
             normalized = normalize_artifact_path(value)
             if normalized:
                 return normalized
+    declared = get_declared_artifact_path_by_intent(contract, "cleaned_dataset", owner="data_engineer", required_only=True)
+    if declared:
+        return declared
+    for alias in ("dataset_cleaned.csv", "cleaned_dataset.csv", "clean_dataset.csv"):
+        declared = get_declared_artifact_path(contract, alias, owner="data_engineer", kind="dataset")
+        if declared:
+            return declared
     return get_declared_artifact_path(contract, kind="dataset", owner="data_engineer")
+
+
+def get_clean_dataset_output_path(contract: Dict[str, Any]) -> str:
+    """Backward-compatible alias for the cleaned dataset output path."""
+    return get_cleaned_dataset_output_path(contract)
+
+
+def get_enriched_dataset_output_path(contract: Dict[str, Any]) -> str:
+    """Resolve the enriched/model-ready dataset output path declared by the contract."""
+    enriched_cfg = get_dataset_artifact_binding(contract, "enriched_dataset")
+    if isinstance(enriched_cfg, dict):
+        for key in ("output_path", "output", "path"):
+            value = enriched_cfg.get(key)
+            normalized = normalize_artifact_path(value)
+            if normalized:
+                return normalized
+    declared = get_declared_artifact_path_by_intent(contract, "enriched_dataset", owner="data_engineer", required_only=True)
+    if declared:
+        return declared
+    for alias in ("dataset_enriched.csv", "enriched_dataset.csv", "dataset_enriquecido.csv"):
+        declared = get_declared_artifact_path(contract, alias, owner="data_engineer", kind="dataset")
+        if declared:
+            return declared
+    return ""
 
 
 def get_clean_manifest_path(contract: Dict[str, Any]) -> str:
     """Resolve the cleaning manifest path declared by the contract."""
-    artifact_reqs = get_artifact_requirements(contract)
-    clean_cfg = artifact_reqs.get("clean_dataset")
+    clean_cfg = get_dataset_artifact_binding(contract, "cleaned_dataset")
     if isinstance(clean_cfg, dict):
         for key in ("output_manifest_path", "manifest_path"):
             value = clean_cfg.get(key)

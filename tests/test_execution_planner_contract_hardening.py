@@ -112,6 +112,38 @@ def test_planner_structural_support_projects_clean_dataset_from_canonical_contra
     # required_columns no longer auto-projected — LLM must provide them
 
 
+def test_planner_structural_support_separates_cleaned_and_enriched_dataset_bindings():
+    contract = {
+        "scope": "cleaning_only",
+        "canonical_columns": ["lead_id", "feature_a", "feature_b", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a", "feature_b"],
+            "outcome": ["target"],
+            "identifiers": ["lead_id"],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature_a", "feature_b"],
+            "segmentation_features": [],
+            "forbidden_features": [],
+            "audit_only_features": ["lead_id"],
+        },
+        "future_ml_handoff": {"enabled": True, "target_columns": ["target"]},
+        "required_outputs": [
+            {"intent": "cleaned_dataset", "path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer"},
+            {"intent": "enriched_dataset", "path": "artifacts/clean/dataset_enriched.csv", "owner": "data_engineer"},
+            {"path": "artifacts/clean/cleaning_manifest.json", "owner": "data_engineer"},
+        ],
+        "artifact_requirements": {},
+    }
+
+    supported = _apply_planner_structural_support(contract)
+    artifact_requirements = supported.get("artifact_requirements") or {}
+
+    assert (artifact_requirements.get("cleaned_dataset") or {}).get("output_path") == "artifacts/clean/dataset_cleaned.csv"
+    assert (artifact_requirements.get("enriched_dataset") or {}).get("output_path") == "artifacts/clean/dataset_enriched.csv"
+    assert (artifact_requirements.get("enriched_dataset") or {}).get("required_columns") == ["feature_a", "feature_b", "target"]
+
+
 def test_planner_structural_support_projects_missing_ml_operational_sections_from_canonical_contract():
     contract = {
         "scope": "full_pipeline",

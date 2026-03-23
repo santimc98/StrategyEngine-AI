@@ -1,5 +1,7 @@
 from src.utils.contract_accessors import (
     get_clean_dataset_output_path,
+    get_dataset_artifact_binding,
+    get_enriched_dataset_output_path,
     get_clean_manifest_path,
     get_declared_artifact_path,
     get_declared_file_schema,
@@ -121,3 +123,28 @@ def test_clean_artifact_resolution_handles_clean_dataset_aliases_from_required_o
 
     assert get_clean_dataset_output_path(contract) == "artifacts/clean/clean_dataset.csv"
     assert get_clean_manifest_path(contract) == "artifacts/clean/clean_dataset_manifest.json"
+
+
+def test_dataset_artifact_binding_prefers_explicit_cleaned_and_enriched_contract_bindings():
+    contract = {
+        "required_outputs": [
+            {"intent": "cleaned_dataset", "path": "artifacts/clean/cleaned_dataset.csv", "owner": "data_engineer"},
+            {"intent": "enriched_dataset", "path": "artifacts/clean/enriched_dataset.csv", "owner": "data_engineer"},
+        ],
+        "artifact_requirements": {
+            "cleaned_dataset": {
+                "required_columns": ["id", "feature_a", "target"],
+                "output_path": "artifacts/clean/cleaned_dataset.csv",
+                "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+            },
+            "enriched_dataset": {
+                "required_columns": ["feature_a", "target"],
+                "output_path": "artifacts/clean/enriched_dataset.csv",
+            },
+        },
+    }
+
+    assert get_dataset_artifact_binding(contract, "cleaned_dataset").get("output_path") == "artifacts/clean/cleaned_dataset.csv"
+    assert get_clean_dataset_output_path(contract) == "artifacts/clean/cleaned_dataset.csv"
+    assert get_clean_manifest_path(contract) == "artifacts/clean/cleaning_manifest.json"
+    assert get_enriched_dataset_output_path(contract) == "artifacts/clean/enriched_dataset.csv"

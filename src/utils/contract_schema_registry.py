@@ -139,10 +139,16 @@ def _repair_required_feature_selectors(contract: Dict[str, Any]) -> Dict[str, An
     if not isinstance(contract, dict):
         return contract
     artifact_requirements = contract.get("artifact_requirements")
-    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else None
-    if not isinstance(clean_dataset, dict):
+    cleaned_dataset = None
+    if isinstance(artifact_requirements, dict):
+        candidate = artifact_requirements.get("cleaned_dataset")
+        if not isinstance(candidate, dict):
+            candidate = artifact_requirements.get("clean_dataset")
+        if isinstance(candidate, dict):
+            cleaned_dataset = candidate
+    if not isinstance(cleaned_dataset, dict):
         return contract
-    selectors = clean_dataset.get("required_feature_selectors")
+    selectors = cleaned_dataset.get("required_feature_selectors")
     if selectors is None:
         return contract
     if isinstance(selectors, dict):
@@ -189,7 +195,7 @@ def _repair_required_feature_selectors(contract: Dict[str, Any]) -> Dict[str, An
             else:
                 continue
         normalized.append(selector)
-    clean_dataset["required_feature_selectors"] = normalized
+    cleaned_dataset["required_feature_selectors"] = normalized
     return contract
 
 

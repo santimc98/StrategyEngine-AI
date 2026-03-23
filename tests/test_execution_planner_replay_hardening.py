@@ -142,3 +142,14 @@ def test_replay_ccc6cbf5_de_view_preserves_declared_optional_passthrough_columns
     expected_optional = artifact_reqs.get("optional_passthrough_columns") or []
 
     assert de_view.get("optional_passthrough_columns") == expected_optional
+
+
+def test_replay_6c9b6bd5_ml_view_preserves_declared_model_features():
+    contract_raw = json.loads(
+        (_REPO_ROOT / "runs" / "6c9b6bd5" / "work" / "data" / "execution_contract_raw.json").read_text(encoding="utf-8")
+    )
+
+    projected = build_contract_views_projection(contract_raw, artifact_index=[])
+    ml_view = projected.get("ml_view") or {}
+
+    assert ml_view.get("model_features") == contract_raw.get("model_features")

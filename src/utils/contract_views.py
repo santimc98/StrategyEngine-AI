@@ -12,9 +12,11 @@ from src.utils.contract_accessors import (
     get_clean_manifest_path,
     get_column_roles,
     get_cleaning_gates,
+    get_dataset_artifact_binding,
     get_declared_artifacts,
     get_deliverables_by_owner,
     get_derived_column_names,
+    get_enriched_dataset_output_path,
     get_outlier_policy,
     get_outcome_columns,
     get_qa_gates,
@@ -65,6 +67,7 @@ class DEView(TypedDict, total=False):
     column_transformations: Dict[str, Any]
     output_path: str
     output_manifest_path: str
+    artifact_requirements: Dict[str, Any]
     required_columns_path: str
     column_sets_path: str
     output_dialect: Dict[str, Any]
@@ -87,6 +90,7 @@ class MLView(TypedDict, total=False):
     canonical_columns: List[str]
     column_roles: Dict[str, List[str]]
     allowed_feature_sets: Any
+    model_features: List[str]
     column_dtype_targets: Dict[str, Dict[str, Any]]
     required_outputs: List[str]
     validation_requirements: Dict[str, Any]
@@ -158,6 +162,7 @@ class CleaningView(TypedDict, total=False):
     column_resolution_context_path: str
     column_sets_path: str
     column_transformations: Dict[str, Any]
+    artifact_requirements: Dict[str, Any]
     dialect: Dict[str, Any]
     cleaning_gates: List[Dict[str, Any]]
     column_roles: Dict[str, List[str]]
@@ -218,6 +223,7 @@ _CANONICAL_VIEW_KEYS: Dict[str, set[str]] = {
         "column_transformations",
         "output_path",
         "output_manifest_path",
+        "artifact_requirements",
         "cleaning_gates",
         "data_engineer_runbook",
         "outlier_policy",
@@ -236,6 +242,7 @@ _CANONICAL_VIEW_KEYS: Dict[str, set[str]] = {
         "audit_only_columns",
         "identifier_columns",
         "allowed_feature_sets",
+        "model_features",
         "forbidden_features",
         "column_dtype_targets",
         "required_outputs",
@@ -360,6 +367,7 @@ _VIEW_PROJECTION_SPECS: Dict[str, Dict[str, Any]] = {
             "column_resolution_context",
             "column_resolution_context_path",
             "column_transformations",
+            "artifact_requirements",
             "output_path",
             "output_manifest_path",
             "output_dialect",
@@ -375,6 +383,7 @@ _VIEW_PROJECTION_SPECS: Dict[str, Dict[str, Any]] = {
         "role": "ml_engineer",
         "budget": 16000,
         "always_fields": [
+            "model_features",
             "forbidden_features",
             "validation_requirements",
             "visual_requirements",
@@ -395,6 +404,7 @@ _VIEW_PROJECTION_SPECS: Dict[str, Dict[str, Any]] = {
             "audit_only_columns",
             "identifier_columns",
             "allowed_feature_sets",
+            "model_features",
             "forbidden_features",
             "column_dtype_targets",
             "required_outputs",
@@ -499,8 +509,9 @@ _VIEW_PROJECTION_SPECS: Dict[str, Dict[str, Any]] = {
             "required_feature_selectors",
             "column_resolution_context",
             "column_resolution_context_path",
-            "column_transformations",
-            "dialect",
+        "column_transformations",
+        "artifact_requirements",
+        "dialect",
             "cleaning_gates",
             "column_roles",
             "allowed_feature_sets",
@@ -794,6 +805,56 @@ def _coerce_dict(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _resolve_artifact_requirements_payload(
+    contract_min: Dict[str, Any],
+    contract_full: Dict[str, Any],
+) -> Dict[str, Any]:
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    return artifact_reqs
+
+
+def _resolve_dataset_artifact_binding(
+    contract_min: Dict[str, Any],
+    contract_full: Dict[str, Any],
+    binding_name: str,
+) -> Dict[str, Any]:
+    combined = contract_full if isinstance(contract_full, dict) else {}
+    if isinstance(contract_min, dict) and contract_min:
+        combined = {**combined, **contract_min}
+    binding = get_dataset_artifact_binding(combined, binding_name)
+    if isinstance(binding, dict):
+        return binding
+    artifact_reqs = _resolve_artifact_requirements_payload(contract_min, contract_full)
+    aliases = [str(binding_name or "").strip()]
+    if binding_name == "cleaned_dataset":
+        aliases.append("clean_dataset")
+    for alias in aliases:
+        candidate = _coerce_dict(artifact_reqs.get(alias))
+        if candidate:
+            return candidate
+    return {}
+
+
+def _project_de_artifact_requirements(
+    contract_min: Dict[str, Any],
+    contract_full: Dict[str, Any],
+) -> Dict[str, Any]:
+    artifact_reqs = _resolve_artifact_requirements_payload(contract_min, contract_full)
+    payload: Dict[str, Any] = {}
+    if isinstance(artifact_reqs.get("cleaned_dataset"), dict):
+        payload["cleaned_dataset"] = copy.deepcopy(artifact_reqs.get("cleaned_dataset"))
+    elif isinstance(artifact_reqs.get("clean_dataset"), dict):
+        payload["clean_dataset"] = copy.deepcopy(artifact_reqs.get("clean_dataset"))
+    if isinstance(artifact_reqs.get("enriched_dataset"), dict):
+        payload["enriched_dataset"] = copy.deepcopy(artifact_reqs.get("enriched_dataset"))
+    schema_binding = _coerce_dict(artifact_reqs.get("schema_binding"))
+    if schema_binding:
+        payload["schema_binding"] = copy.deepcopy(schema_binding)
+    return payload
 
 
 def _first_value(*values: Any) -> Any:
@@ -1143,11 +1204,13 @@ def _default_subject_code_path(review_subject: str) -> str:
 
 
 def _resolve_required_columns(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[str]:
-    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
-        contract_full.get("artifact_requirements")
-    )
-    clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
+    clean_cfg = _resolve_dataset_artifact_binding(contract_min, contract_full, "cleaned_dataset")
     required = clean_cfg.get("required_columns")
+    if isinstance(required, list) and required:
+        return [str(c) for c in required if c]
+    artifact_reqs = _resolve_artifact_requirements_payload(contract_min, contract_full)
+    schema_binding = _coerce_dict(artifact_reqs.get("schema_binding"))
+    required = schema_binding.get("required_columns")
     if isinstance(required, list) and required:
         return [str(c) for c in required if c]
     canonical = contract_min.get("canonical_columns")
@@ -1160,10 +1223,7 @@ def _resolve_required_columns(contract_min: Dict[str, Any], contract_full: Dict[
 
 
 def _resolve_required_feature_selectors(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[Dict[str, Any]]:
-    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
-        contract_full.get("artifact_requirements")
-    )
-    clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
+    clean_cfg = _resolve_dataset_artifact_binding(contract_min, contract_full, "cleaned_dataset")
     selectors = clean_cfg.get("required_feature_selectors")
     if not isinstance(selectors, list):
         return []
@@ -1183,9 +1243,7 @@ def _resolve_passthrough_columns(
     contract_min: Dict[str, Any], contract_full: Dict[str, Any], required_columns: List[str]
 ) -> List[str]:
     required_set = {str(c) for c in required_columns if c}
-    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
-        contract_full.get("artifact_requirements")
-    )
+    artifact_reqs = _resolve_artifact_requirements_payload(contract_min, contract_full)
 
     def _normalize(raw: Any) -> List[str]:
         if not isinstance(raw, list):
@@ -1193,7 +1251,7 @@ def _resolve_passthrough_columns(
         return [str(c) for c in raw if isinstance(c, str) and str(c).strip()]
 
     def _declared_optional_passthrough() -> tuple[bool, List[str]]:
-        clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
+        clean_cfg = _resolve_dataset_artifact_binding(contract_min, contract_full, "cleaned_dataset")
         if "optional_passthrough_columns" in clean_cfg and isinstance(clean_cfg.get("optional_passthrough_columns"), list):
             return True, _normalize(clean_cfg.get("optional_passthrough_columns"))
         schema_binding = _coerce_dict(artifact_reqs.get("schema_binding"))
@@ -1259,10 +1317,7 @@ def _resolve_output_dialect(contract_min: Dict[str, Any], contract_full: Dict[st
 
 
 def _resolve_column_transformations(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> Dict[str, Any]:
-    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
-        contract_full.get("artifact_requirements")
-    )
-    clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
+    clean_cfg = _resolve_dataset_artifact_binding(contract_min, contract_full, "cleaned_dataset")
     transforms = clean_cfg.get("column_transformations")
     if not isinstance(transforms, dict):
         transforms = {}
@@ -1329,10 +1384,7 @@ def _resolve_column_dtype_targets(contract_min: Dict[str, Any], contract_full: D
             if normalized:
                 return normalized
 
-    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
-        contract_full.get("artifact_requirements")
-    )
-    clean_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
+    clean_cfg = _resolve_dataset_artifact_binding(contract_min, contract_full, "cleaned_dataset")
     targets = clean_cfg.get("column_dtype_targets")
     if isinstance(targets, dict) and targets:
         normalized: Dict[str, Dict[str, Any]] = {}
@@ -2327,6 +2379,7 @@ def build_de_view(
         report_path = _resolve_de_outlier_report_path_from_policy(outlier_policy)
     output_dialect = _resolve_output_dialect(contract_min, contract_full)
     column_sets_summary = contract_min.get("column_sets_summary") or contract_full.get("column_sets_summary")
+    dataset_artifact_requirements = _project_de_artifact_requirements(contract_min, contract_full)
     projection_context: Dict[str, Any] = {
         "scope": scope,
         "active_workstreams": active_workstreams,
@@ -2346,6 +2399,7 @@ def build_de_view(
         "column_transformations": column_transformations,
         "output_path": output_path or "",
         "output_manifest_path": manifest_path or "",
+        "artifact_requirements": dataset_artifact_requirements,
         "output_dialect": output_dialect,
         "cleaning_gates": cleaning_gates,
         "data_engineer_runbook": data_engineer_runbook,
@@ -2455,7 +2509,7 @@ def build_ml_view(
         if isinstance(runbook, str) and runbook.strip():
             ml_engineer_runbook = runbook.strip()
             break
-    clean_dataset_cfg = _coerce_dict(artifact_reqs.get("clean_dataset"))
+    clean_dataset_cfg = _resolve_dataset_artifact_binding(contract_min, contract_full, "cleaned_dataset")
     cleaned_data_path = str(
         clean_dataset_cfg.get("output_path")
         or clean_dataset_cfg.get("path")
@@ -2500,7 +2554,7 @@ def build_ml_view(
         "reviewer_gates": reviewer_gates,
         "ml_engineer_runbook": ml_engineer_runbook,
     }
-    if model_features:
+    if _contract_declares_any_path(contract_min, contract_full, ["model_features", "allowed_feature_sets.model_features"]):
         projection_context["model_features"] = model_features
     if _contract_declares_any_path(contract_min, contract_full, ["allowed_feature_sets"]):
         projection_context["allowed_feature_sets"] = allowed_feature_sets
@@ -2618,6 +2672,8 @@ def build_qa_view(
         "qa_required_outputs": list(qa_required_outputs),
         "optional_outputs": optional_outputs,
     }
+    if review_subject == "data_engineer":
+        artifact_payload.update(_project_de_artifact_requirements(contract_min, contract_full))
     file_schemas = artifact_reqs.get("file_schemas")
     if isinstance(file_schemas, dict) and file_schemas:
         artifact_payload["file_schemas"] = file_schemas
@@ -2776,6 +2832,7 @@ def build_cleaning_view(
     all_required_outputs = _resolve_required_outputs(contract_min, contract_full)
     output_path = _resolve_output_path(contract_min, contract_full, all_required_outputs)
     manifest_path = _resolve_manifest_path(contract_min, contract_full, all_required_outputs)
+    dataset_artifact_requirements = _project_de_artifact_requirements(contract_min, contract_full)
     cleaning_required_outputs = _resolve_required_outputs_for_owner(
         contract_min,
         contract_full,
@@ -2802,6 +2859,7 @@ def build_cleaning_view(
         "column_resolution_context": column_resolution_context,
         "column_resolution_context_path": _DEFAULT_COLUMN_RESOLUTION_CONTEXT_PATH,
         "column_transformations": column_transformations,
+        "artifact_requirements": dataset_artifact_requirements,
         "dialect": dialect,
         "cleaning_gates": cleaning_gates,
         "column_roles": column_roles,
@@ -3090,6 +3148,7 @@ def _resolve_binding_required_columns(contract_min: Dict[str, Any], contract_ful
         value,
         declared=bool(value),
         source_paths=[
+            "artifact_requirements.cleaned_dataset.required_columns",
             "artifact_requirements.clean_dataset.required_columns",
             "artifact_requirements.schema_binding.required_columns",
             "required_columns",
@@ -3103,6 +3162,7 @@ def _resolve_binding_optional_passthrough(contract_min: Dict[str, Any], contract
         contract_min,
         contract_full,
         [
+            "artifact_requirements.cleaned_dataset.optional_passthrough_columns",
             "artifact_requirements.clean_dataset.optional_passthrough_columns",
             "artifact_requirements.schema_binding.optional_passthrough_columns",
         ],
@@ -3111,8 +3171,36 @@ def _resolve_binding_optional_passthrough(contract_min: Dict[str, Any], contract
         value,
         declared=declared,
         source_paths=[
+            "artifact_requirements.cleaned_dataset.optional_passthrough_columns",
             "artifact_requirements.clean_dataset.optional_passthrough_columns",
             "artifact_requirements.schema_binding.optional_passthrough_columns",
+        ],
+    )
+
+
+def _resolve_binding_dataset_artifact_requirements(
+    contract_min: Dict[str, Any],
+    contract_full: Dict[str, Any],
+) -> Dict[str, Any]:
+    value = _project_de_artifact_requirements(contract_min, contract_full)
+    declared = _contract_declares_any_path(
+        contract_min,
+        contract_full,
+        [
+            "artifact_requirements.cleaned_dataset",
+            "artifact_requirements.enriched_dataset",
+            "artifact_requirements.clean_dataset",
+            "artifact_requirements.schema_binding",
+        ],
+    )
+    return _binding_payload(
+        value,
+        declared=declared,
+        source_paths=[
+            "artifact_requirements.cleaned_dataset",
+            "artifact_requirements.enriched_dataset",
+            "artifact_requirements.clean_dataset",
+            "artifact_requirements.schema_binding",
         ],
     )
 
@@ -3237,6 +3325,7 @@ _VIEW_PROJECTION_BINDINGS: Dict[str, List[Dict[str, Any]]] = {
         {"name": "column_roles", "mode": "role_map_subset", "resolver": _resolve_binding_column_roles},
         {"name": "allowed_feature_sets", "mode": "feature_sets_subset", "resolver": _resolve_binding_allowed_feature_sets},
         {"name": "model_features", "mode": "list_subset", "resolver": _resolve_binding_model_features},
+        {"name": "artifact_requirements", "mode": "dict_contract_equal", "resolver": _resolve_binding_dataset_artifact_requirements},
         {"name": "required_outputs", "mode": "paths_subset", "resolver": lambda cmin, cfull: _resolve_binding_required_outputs_for_owner(cmin, cfull, "data_engineer")},
         {"name": "required_columns", "mode": "list_subset", "resolver": _resolve_binding_required_columns},
         {"name": "optional_passthrough_columns", "mode": "list_subset", "resolver": _resolve_binding_optional_passthrough},
@@ -3247,6 +3336,7 @@ _VIEW_PROJECTION_BINDINGS: Dict[str, List[Dict[str, Any]]] = {
         {"name": "column_roles", "mode": "role_map_subset", "resolver": _resolve_binding_column_roles},
         {"name": "allowed_feature_sets", "mode": "feature_sets_subset", "resolver": _resolve_binding_allowed_feature_sets},
         {"name": "model_features", "mode": "list_subset", "resolver": _resolve_binding_model_features},
+        {"name": "artifact_requirements", "mode": "dict_contract_equal", "resolver": _resolve_binding_dataset_artifact_requirements},
         {"name": "required_outputs", "mode": "paths_subset", "resolver": lambda cmin, cfull: _resolve_binding_required_outputs_for_owner(cmin, cfull, "data_engineer")},
         {"name": "required_columns", "mode": "list_subset", "resolver": _resolve_binding_required_columns},
         {"name": "cleaning_gates", "mode": "gates_subset", "resolver": _resolve_binding_cleaning_gates},
@@ -3311,6 +3401,10 @@ def _binding_matches(expected_payload: Dict[str, Any], actual_value: Any, field_
                 return False
         return True
     if mode == "feature_sets_subset":
+        expected = _normalize_contract_payload(expected_value)
+        actual = _normalize_contract_payload(actual_value)
+        return expected == actual
+    if mode == "dict_contract_equal":
         expected = _normalize_contract_payload(expected_value)
         actual = _normalize_contract_payload(actual_value)
         return expected == actual
