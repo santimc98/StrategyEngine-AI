@@ -69,13 +69,12 @@ def test_optimization_mode_prompt_includes_action_family_and_invariants(monkeypa
     )
 
     prompt = str(agent.last_prompt or "")
-    assert "MODE: OPTIMIZATION_MODE" in prompt
-    assert "ACTIVE ACTION FAMILY:" in prompt
-    assert "ensemble_or_stacking" in prompt
-    assert "INVARIANTS_LOCK (mandatory, immutable):" in prompt
-    assert "data/metrics.json" in prompt
-    assert "RECENT_TRACKER (mandatory evidence for this round):" in prompt
-    assert "HYPOTHESIS_PACKET_JSON" in prompt
+    assert (
+        "MODE: METRIC_IMPROVEMENT" in prompt
+        or "metric-improvement round" in prompt
+    )
+    assert "incumbent script" in prompt
+    assert "cheapest valid change" in prompt
 
 
 def test_run_engineer_optimization_mode_skips_baseline_plan(monkeypatch):
@@ -140,4 +139,3 @@ def test_run_engineer_optimization_mode_skips_baseline_plan(monkeypatch):
     assert calls.get("editor_mode") is True
     assert calls.get("previous_code") == "print('baseline')"
     assert result.get("generated_code") == "print('optimized-edit')"
-

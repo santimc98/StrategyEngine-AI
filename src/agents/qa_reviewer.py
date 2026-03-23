@@ -341,6 +341,26 @@ class QAReviewerAgent:
         )
         return any(token in message for token in unsupported_tokens)
 
+    def _generate_gemini_json(
+        self,
+        prompt: str,
+        *,
+        generation_config: Dict[str, Any] | None = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        if not self.client:
+            raise RuntimeError("Gemini client not configured")
+        config = dict(generation_config or self._generation_config)
+        try:
+            response = self.client.generate_content(prompt, generation_config=config)
+            return str(getattr(response, "text", "") or ""), config
+        except Exception as err:
+            if not self._is_response_schema_unsupported_error(err):
+                raise
+            fallback_config = dict(config)
+            fallback_config.pop("response_schema", None)
+            response = self.client.generate_content(prompt, generation_config=fallback_config)
+            return str(getattr(response, "text", "") or ""), fallback_config
+
     def _attempt_llm_json_repair(
         self,
         raw_text: str,
@@ -557,18 +577,62 @@ class QAReviewerAgent:
         qa_gate_names = _gate_names(qa_gate_specs)
         qa_gates_json = json.dumps(qa_gate_specs, indent=2, ensure_ascii=True)
         active_qa_gates_json = json.dumps(qa_gate_names, indent=2, ensure_ascii=True)
+        review_subject = str((evaluation_spec or {}).get("review_subject") or "ml_engineer").strip().lower() or "ml_engineer"
+        subject_required_outputs = (
+            (evaluation_spec or {}).get("subject_required_outputs")
+            or (evaluation_spec or {}).get("artifacts_to_verify")
+            or []
+        )
+        if not isinstance(subject_required_outputs, list):
+            subject_required_outputs = []
+        qa_required_outputs = (evaluation_spec or {}).get("qa_required_outputs") or []
+        if not isinstance(qa_required_outputs, list):
+            qa_required_outputs = []
+        subject_code_path_hint = str((evaluation_spec or {}).get("subject_code_path_hint") or "").strip()
+        if review_subject == "data_engineer":
+            subject_specific_guidance = (
+                "- Audit cleaning/preparation code and declared subject outputs, not downstream model-training behavior.\n"
+                "- Treat qa_gates as technical verification of the data engineer deliverables: cleaned/enriched datasets, "
+                "traceability artifacts, manifests, exclusions, normalization, and row/accounting evidence.\n"
+                "- Do not invent ML-only failures when the contract is cleaning-first and model_training is false."
+            )
+        else:
+            subject_specific_guidance = (
+                "- Audit modeling/evaluation code and declared ML outputs against the active qa_gates.\n"
+                "- Use evaluation, metric, split, and artifact evidence when those are present in context."
+            )
         metric_round_context = _extract_metric_round_context(evaluation_spec)
         metric_round_active = bool(metric_round_context.get("metric_round_active"))
         augmentation_requested = bool(metric_round_context.get("augmentation_requested"))
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are the Lead QA Engineer.
-        Your role is to audit Python code against the ACTIVE_QA_GATES using concrete evidence.
-        Reject only when an active HARD gate is truly violated with concrete evidence.
+
+        MISSION:
+        Audit the declared review subject against the contract-driven ACTIVE_QA_GATES using concrete evidence from code,
+        produced artifacts, and the provided QA context. Your job is to verify technical correctness and contractual
+        executability, not to invent a different plan.
+
+        SOURCE OF TRUTH AND PRECEDENCE:
+        1. ACTIVE_QA_GATES and contract-driven QA context.
+        2. Declared review subject outputs and subject code path hints.
+        3. Concrete evidence from code/artifacts/static checks.
+        4. Business objective and strategy as explanatory context only.
+        If sources disagree, preserve the contract-driven QA context unless concrete evidence proves a hard violation.
+
+        QA DECISION WORKFLOW (MANDATORY):
+        1. Identify the review subject and the outputs it is responsible for.
+        2. Read the ACTIVE_QA_GATES and decide what evidence each active gate actually requires.
+        3. Inspect only the code regions and artifacts that matter for those active gates.
+        4. Reject only when an active HARD gate is truly violated with concrete evidence.
+        5. If evidence is incomplete or ambiguous, downgrade to APPROVE_WITH_WARNINGS instead of inventing certainty.
 
         === EVIDENCE RULE ===
         $senior_evidence_rule
         
+        REVIEW SUBJECT GUIDANCE:
+        $subject_specific_guidance
+
         QUALITY GATES (SPEC-DRIVEN):
         Use the gate families below as reasoning aids, not as a generic checklist. Only evaluate what is active.
         
@@ -606,8 +670,13 @@ class QAReviewerAgent:
         INPUT CONTEXT:
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title
-        - Evaluation Spec (JSON): $evaluation_spec_json
+        - Review Subject: $review_subject
+        - QA Context (JSON): $evaluation_spec_json
+        - Subject Required Outputs: $subject_required_outputs_json
+        - QA Output Paths: $qa_required_outputs_json
+        - Subject Code Path Hint: $subject_code_path_hint
         - ML Dataset Path: $ml_data_path
+        - Contract Source Used: $contract_source_used
         - QA Gates (contract-driven, with severity/params): $qa_gates
         - ACTIVE_QA_GATES (names only): $active_qa_gates
         - Execution Diagnostics (JSON): $execution_diagnostics_json
@@ -649,14 +718,20 @@ class QAReviewerAgent:
             SYSTEM_PROMPT_TEMPLATE,
             business_objective=business_objective,
             strategy_title=strategy.get('title', 'Unknown'),
+            review_subject=review_subject,
             evaluation_spec_json=eval_spec_json,
+            subject_required_outputs_json=json.dumps(subject_required_outputs, indent=2, ensure_ascii=True),
+            qa_required_outputs_json=json.dumps(qa_required_outputs, indent=2, ensure_ascii=True),
+            subject_code_path_hint=subject_code_path_hint or "missing",
             ml_data_path=ml_data_path,
+            contract_source_used=contract_source_used,
             qa_gates=qa_gates_json,
             active_qa_gates=active_qa_gates_json,
             execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2, ensure_ascii=True),
             metric_round_active=str(metric_round_active).lower(),
             augmentation_requested=str(augmentation_requested).lower(),
             output_format_instructions=output_format_instructions,
+            subject_specific_guidance=subject_specific_guidance,
             senior_evidence_rule=SENIOR_EVIDENCE_RULE,
         )
 

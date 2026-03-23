@@ -15,6 +15,7 @@ import pytest
 
 from src.agents.cleaning_reviewer import (
     CleaningReviewerAgent,
+    _build_llm_prompt,
     _enforce_contract_strict_rejection,
     _merge_cleaning_gates,
     _CONTRACT_MISSING_CLEANING_GATES,
@@ -23,6 +24,35 @@ from src.agents.cleaning_reviewer import (
 
 class TestContractStrictMode:
     """Test suite for contract-strict mode behavior."""
+
+    def test_llm_prompt_uses_senior_precedence_and_review_workflow(self):
+        prompt, payload = _build_llm_prompt(
+            gates=[{"name": "required_columns_present", "severity": "HARD", "params": {}}],
+            required_columns=["col_a"],
+            dialect={"sep": ",", "decimal": ".", "encoding": "utf-8"},
+            column_roles={"identifiers": ["col_a"]},
+            facts={"row_count": 3},
+            deterministic_gate_results=[{"name": "required_columns_present", "passed": True}],
+            contract_source_used="cleaning_view",
+            context_pack="sample context",
+            cleaning_code="df = df.copy()",
+            dataset_profile={"basic_stats": {"n_rows": 3}},
+            column_resolution_context={
+                "col_a": {
+                    "semantic_kind": "datetime_like",
+                    "observed_format_families": ["iso_date", "slash_date"],
+                }
+            },
+        )
+
+        assert "MISSION" in prompt
+        assert "SOURCE OF TRUTH AND PRECEDENCE" in prompt
+        assert "REVIEW DECISION WORKFLOW (MANDATORY)" in prompt
+        assert "deterministic_gate_results are supporting evidence only" in prompt
+        assert "GUIDANCE, NOT A SUBSTITUTE FOR REASONING" in prompt
+        assert "column_resolution_context" in prompt
+        assert payload["contract_source_used"] == "cleaning_view"
+        assert "column_resolution_context" in payload
 
     def test_merge_cleaning_gates_returns_fallback_source_when_empty(self):
         """When cleaning_gates is missing/empty, source should be 'fallback'."""

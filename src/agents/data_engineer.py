@@ -9,7 +9,16 @@ from dotenv import load_dotenv
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.code_extract import extract_code_block
 from src.utils.senior_protocol import SENIOR_ENGINEERING_PROTOCOL
-from src.utils.contract_accessors import get_cleaning_gates
+from src.utils.contract_accessors import (
+    get_cleaning_gates,
+    get_declared_artifacts,
+    get_required_outputs_by_owner,
+    normalize_artifact_path,
+)
+from src.utils.contract_validator import (
+    normalize_contract_scope,
+    derive_contract_scope_from_workstreams,
+)
 from src.utils.cleaning_contract_semantics import expand_required_feature_selectors
 from src.utils.sandbox_deps import (
     BASE_ALLOWLIST,
@@ -182,7 +191,15 @@ class DataEngineerAgent:
         de_view = de_view if isinstance(de_view, dict) else {}
         focus: Dict[str, Any] = {}
 
-        for key in ("scope", "required_outputs", "column_roles", "outlier_policy", "column_dtype_targets"):
+        for key in (
+            "scope",
+            "required_outputs",
+            "column_roles",
+            "outlier_policy",
+            "column_dtype_targets",
+            "active_workstreams",
+            "future_ml_handoff",
+        ):
             value = contract.get(key)
             if value not in (None, "", [], {}):
                 focus[key] = value
@@ -212,6 +229,145 @@ class DataEngineerAgent:
                 focus["de_view_projection"] = view_focus
 
         return focus
+
+    def _build_data_engineer_required_outputs_context(
+        self,
+        contract: Dict[str, Any],
+        de_view: Dict[str, Any],
+        *,
+        primary_output_path: str = "",
+        manifest_path: str = "",
+        outlier_report_path: str = "",
+    ) -> List[Dict[str, Any]]:
+        contract = contract if isinstance(contract, dict) else {}
+        de_view = de_view if isinstance(de_view, dict) else {}
+
+        entries: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _infer_kind(path: str) -> str:
+            lower = str(path or "").strip().lower()
+            if not lower:
+                return ""
+            if lower.endswith(".csv"):
+                return "dataset"
+            if lower.endswith(".json"):
+                if "manifest" in lower:
+                    return "manifest"
+                return "metadata"
+            if lower.endswith(".md"):
+                return "report"
+            return ""
+
+        def _merge(path: Any, payload: Optional[Dict[str, Any]] = None) -> None:
+            normalized = normalize_artifact_path(path)
+            if not normalized:
+                return
+            key = normalized.lower()
+            payload = payload if isinstance(payload, dict) else {}
+            if key in seen:
+                for existing in entries:
+                    if str(existing.get("path") or "").strip().lower() != key:
+                        continue
+                    if payload.get("required"):
+                        existing["required"] = True
+                    for field in ("kind", "description", "owner", "source"):
+                        if payload.get(field) and not existing.get(field):
+                            existing[field] = payload[field]
+                    return
+                return
+            seen.add(key)
+            entries.append(
+                {
+                    "path": normalized,
+                    "required": bool(payload.get("required", True)),
+                    "kind": str(payload.get("kind") or _infer_kind(normalized)).strip(),
+                    "owner": str(payload.get("owner") or "data_engineer").strip(),
+                    "description": str(payload.get("description") or "").strip(),
+                    "source": str(payload.get("source") or "").strip(),
+                    "materialization_policy": (
+                        "required_even_if_empty"
+                        if bool(payload.get("required", True))
+                        else "optional_when_applicable"
+                    ),
+                }
+            )
+
+        for artifact in get_declared_artifacts(contract):
+            if not isinstance(artifact, dict):
+                continue
+            owner = str(artifact.get("owner") or "").strip().lower()
+            if owner and owner != "data_engineer":
+                continue
+            _merge(
+                artifact.get("path"),
+                {
+                    "required": artifact.get("required", True),
+                    "kind": artifact.get("kind"),
+                    "owner": artifact.get("owner") or "data_engineer",
+                    "description": artifact.get("description"),
+                    "source": "execution_contract.required_outputs",
+                },
+            )
+
+        for path in get_required_outputs_by_owner(contract, "data_engineer"):
+            _merge(path, {"required": True, "owner": "data_engineer", "source": "execution_contract.required_outputs"})
+
+        raw_view_outputs = de_view.get("required_outputs")
+        if isinstance(raw_view_outputs, list):
+            for item in raw_view_outputs:
+                if isinstance(item, dict):
+                    _merge(
+                        item.get("path"),
+                        {
+                            "required": item.get("required", True),
+                            "kind": item.get("kind"),
+                            "owner": item.get("owner") or "data_engineer",
+                            "description": item.get("description"),
+                            "source": "de_view.required_outputs",
+                        },
+                    )
+                else:
+                    _merge(item, {"required": True, "owner": "data_engineer", "source": "de_view.required_outputs"})
+
+        _merge(primary_output_path, {"required": True, "kind": "dataset", "owner": "data_engineer", "source": "de_view.output_path"})
+        _merge(manifest_path, {"required": True, "kind": "manifest", "owner": "data_engineer", "source": "de_view.output_manifest_path"})
+        if outlier_report_path:
+            _merge(
+                outlier_report_path,
+                {
+                    "required": False,
+                    "kind": "report",
+                    "owner": "data_engineer",
+                    "description": "Optional outlier treatment report when outlier policy is enabled.",
+                    "source": "outlier_policy.report_path",
+                },
+            )
+
+        return entries
+
+    def _resolve_pipeline_scope(
+        self,
+        contract: Dict[str, Any],
+        de_view: Dict[str, Any],
+    ) -> str:
+        contract = contract if isinstance(contract, dict) else {}
+        de_view = de_view if isinstance(de_view, dict) else {}
+
+        explicit_scope = str(de_view.get("scope") or contract.get("scope") or "").strip()
+        if explicit_scope:
+            return normalize_contract_scope(explicit_scope)
+
+        merged_context: Dict[str, Any] = {}
+        if contract:
+            merged_context.update(contract)
+        if isinstance(de_view.get("active_workstreams"), dict):
+            merged_context["active_workstreams"] = dict(de_view.get("active_workstreams") or {})
+        for key in ("future_ml_handoff", "task_semantics", "business_objective", "strategy_title"):
+            if key not in merged_context and key in de_view:
+                merged_context[key] = de_view.get(key)
+
+        return derive_contract_scope_from_workstreams(merged_context)
 
     def _detect_repair_mode(self, data_audit: str, requested: bool) -> bool:
         """
@@ -359,19 +515,19 @@ class DataEngineerAgent:
         contract = execution_contract or contract_min or {}
         from src.utils.context_pack import compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
 
-        # Build scope-aware guidance
-        _pipeline_scope = ""
-        if isinstance(contract, dict):
-            _pipeline_scope = str(contract.get("scope", "")).strip().lower()
+        # Build scope-aware guidance from the DE-visible contract/view context.
+        _pipeline_scope = self._resolve_pipeline_scope(contract, de_view or {})
         if _pipeline_scope == "cleaning_only":
             pipeline_scope_guidance = (
-                "PIPELINE SCOPE: CLEANING_ONLY — Your output is the FINAL deliverable. "
-                "There is NO downstream ML pipeline. Prioritize:\n"
-                "  - Maximum data quality and completeness\n"
-                "  - Thorough validation of all cleaning gates\n"
-                "  - Detailed manifest documenting every transformation\n"
-                "  - Production-ready output suitable for direct business use\n"
-                "  - Comprehensive null handling and type standardization"
+                "PIPELINE SCOPE: CLEANING_ONLY — No model training occurs in THIS run. "
+                "Your responsibility is to close the complete set of data-engineer deliverables "
+                "declared by the contract for this run, which may include a final cleaned dataset, "
+                "future-ML handoff datasets, and metadata artifacts.\n"
+                "  - Prioritize maximum data quality, traceability, and artifact completeness\n"
+                "  - Treat DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT as the owned deliverable list\n"
+                "  - If the run prepares future ML handoff artifacts, materialize them explicitly\n"
+                "  - Validate all cleaning gates thoroughly before writing outputs\n"
+                "  - Keep null handling and type standardization production-grade"
             )
         elif _pipeline_scope == "ml_only":
             pipeline_scope_guidance = (
@@ -385,12 +541,13 @@ class DataEngineerAgent:
             )
         else:
             pipeline_scope_guidance = (
-                "PIPELINE SCOPE: FULL_PIPELINE — Your output feeds into an ML Engineer. "
-                "Balance thoroughness with ML compatibility:\n"
-                "  - Clean data to meet contract gates\n"
-                "  - Preserve statistical properties needed for modeling\n"
+                "PIPELINE SCOPE: FULL_PIPELINE — This run includes downstream ML consumption. "
+                "Balance thoroughness with compatibility while still closing every data-engineer "
+                "deliverable assigned by the contract:\n"
+                "  - Clean data to meet contract gates and preserve modeling integrity\n"
+                "  - Preserve statistical properties needed for downstream modeling\n"
                 "  - Ensure required columns are present and correctly typed\n"
-                "  - The ML Engineer will use your output for feature engineering and training"
+                "  - Materialize every owned output, not just the primary cleaned dataset"
             )
 
         de_view = de_view or {}
@@ -467,6 +624,14 @@ class DataEngineerAgent:
             outlier_stage = str(outlier_policy.get("apply_stage") or "data_engineer").strip().lower()
             if bool(outlier_enabled) and outlier_stage in {"data_engineer", "both"}:
                 outlier_report_path = "data/outlier_treatment_report.json"
+        de_required_outputs = self._build_data_engineer_required_outputs_context(
+            contract,
+            de_view,
+            primary_output_path=de_output_path,
+            manifest_path=de_manifest_path,
+            outlier_report_path=outlier_report_path,
+        )
+        de_required_outputs_json = json.dumps(compress_long_lists(de_required_outputs)[0], indent=2)
         artifact_requirements = contract.get("artifact_requirements")
         clean_dataset_cfg = {}
         if isinstance(artifact_requirements, dict):
@@ -489,6 +654,13 @@ class DataEngineerAgent:
             column_dtype_targets = {}
         column_dtype_targets_json = json.dumps(
             compress_long_lists(column_dtype_targets)[0],
+            indent=2,
+        )
+        column_resolution_context = de_view.get("column_resolution_context")
+        if not isinstance(column_resolution_context, dict) or not column_resolution_context:
+            column_resolution_context = {}
+        column_resolution_context_json = json.dumps(
+            compress_long_lists(column_resolution_context)[0],
             indent=2,
         )
         runtime_dependency_context = self._build_runtime_dependency_context()
@@ -541,16 +713,26 @@ class DataEngineerAgent:
         MISSION
         ===================================================================
         - Return one complete, runnable Python script that cleans the input CSV
-          and writes the cleaned output + manifest.
-        - Follow the execution contract and cleaning gates as source of truth.
+          and materializes every required data-engineer deliverable declared in
+          DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT.
+        - Follow the execution contract, owned deliverables, and cleaning gates
+          as source of truth.
         - Be universal and adaptive to any CSV and business objective.
 
         ===================================================================
         SOURCE OF TRUTH AND PRECEDENCE
         ===================================================================
-        1) CLEANING_GATES_CONTEXT + required_columns + required_feature_selectors (authoritative)
-        2) COLUMN_DTYPE_TARGETS_CONTEXT + COLUMN_TRANSFORMATIONS_CONTEXT (authoritative)
-        3) ROLE RUNBOOK (advisory — informs reasoning, does not override gates)
+        1) DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT + DE_VIEW_CONTEXT (authoritative for
+           what you own, what you must write, and the DE-visible scope)
+        2) CLEANING_GATES_CONTEXT + required_columns + required_feature_selectors
+           (authoritative for what must be cleaned, retained, or validated)
+        3) COLUMN_RESOLUTION_CONTEXT + DATA_SAMPLE_CONTEXT
+           (authoritative support evidence for what raw formats, placeholders,
+           locale ambiguities, and recoverable signal exist in THIS dataset)
+        4) COLUMN_DTYPE_TARGETS_CONTEXT + COLUMN_TRANSFORMATIONS_CONTEXT
+           (authoritative for target typing and transformation mechanics)
+        5) EXECUTION_CONTRACT_CONTEXT (authoritative tie-breaker when the DE view is silent)
+        6) ROLE RUNBOOK (advisory — informs reasoning, does not override contract/gates)
 
         ===================================================================
         ENGINEERING REASONING WORKFLOW (MANDATORY)
@@ -560,6 +742,18 @@ class DataEngineerAgent:
         script. This is not optional — it is how you prevent sequencing bugs.
 
         # EXECUTION PLAN (reason about these in order):
+        #
+        # 0. DELIVERABLE CLOSURE:
+        #    Enumerate every output you own from DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT.
+        #    Map each one to a concrete write action.
+        #    - Distinguish primary datasets vs metadata/report artifacts.
+        #    - Do not collapse a multi-artifact contract into one CSV + manifest pair.
+        #    - If one dataframe supports multiple declared outputs, still write each
+        #      declared artifact explicitly with the correct contract path.
+        #    - Required deliverables are contractual obligations, not conditional events.
+        #      If a required artifact has zero rows, zero findings, zero decisions, or
+        #      zero exceptions in THIS run, still materialize a schema-valid empty artifact
+        #      and explain in the manifest why it is empty.
         #
         # 1. LOAD & VALIDATE: Read CSV with dtype=str. Verify required columns exist.
         #
@@ -572,17 +766,62 @@ class DataEngineerAgent:
         #    string columns to their final types.
         #    - List each column that needs null handling and the strategy.
         #
-        # 3. TYPE CONVERSION (AFTER null handling):
-        #    Apply COLUMN_DTYPE_TARGETS. Use pd.to_numeric(errors='coerce') for
-        #    numeric columns. For string columns, convert only after nulls are resolved.
-        #    Use pandas nullable Int64/Float64 for nullable integer/float columns.
+        # 3. FORMAT RESOLUTION (BEFORE final casting):
+        #    For date/time, rate, count, and amount columns, reason about the observed
+        #    format families in THIS dataset before choosing parsing logic.
+        #    - Use COLUMN_RESOLUTION_CONTEXT first, then DE_VIEW_CONTEXT, DATA SUMMARY,
+        #      and the sample rows to infer whether a column mixes locale/date orders,
+        #      timestamps, decimals, currencies, percentages, magnitude suffixes,
+        #      placeholders, or noisy symbols.
+        #    - Do not assume one parser or one locale is enough if the context suggests
+        #      heterogeneous formats.
+        #    - Prefer a staged parsing strategy that salvages defensible values before
+        #      coercing unresolved strings to null.
+        #    - If parsing would destroy a large fraction of plausible signal, adapt the
+        #      strategy or flag unresolved formats explicitly instead of silently
+        #      accepting massive information loss.
+        #    - Do not infer a hard "no nulls after parsing" requirement for temporal
+        #      columns from target dtype alone. A datetime target does not by itself
+        #      mean complete parse coverage is mandatory.
+        #    - When raw context shows invalid or mixed temporal formats, preserve
+        #      unresolved values as null plus traceability flags/log entries unless
+        #      the contract or a gate explicitly requires complete recoverability.
         #
-        # 4. CONSTRAINT VALIDATION:
+        # 4. TYPE CONVERSION (AFTER format resolution):
+        #    Apply COLUMN_DTYPE_TARGETS once the parsing strategy is settled.
+        #    Use pandas nullable Int64/Float64 for nullable integer/float columns.
+        #    Final dtypes should reflect the resolved semantics, not raw string noise.
+        #
+        # 5. IDENTITY RESOLUTION (WHEN DEDUPLICATION IS IN SCOPE):
+        #    If a cleaning gate, runbook step, or contract context implies deduplication,
+        #    reason explicitly about duplicate evidence BEFORE writing the algorithm.
+        #    - Decide which signals are strong, medium, or weak identity evidence for
+        #      THIS dataset and business context.
+        #    - Treat nulls, placeholders, and missing contact fields as absence of
+        #      evidence, not as positive evidence that two rows are the same entity.
+        #    - Do not collapse rows just because a composite key can be mechanically
+        #      constructed; preserve records when identity evidence is ambiguous.
+        #    - Make survivorship logic explicit: explain why one record is retained
+        #      over another when duplicates are defensible.
+        #    - If the context only supports soft duplicate suspicion, prefer flags/logs
+        #      over irreversible dropping or merging.
+        #
+        # 6. CONSTRAINT VALIDATION:
         #    - HARD gates: check and raise ValueError("CLEANING_GATE_FAILED: ...") if violated.
         #    - SOFT gates: check and warn if thresholds exceeded, but do not block.
-        #    - Non-nullable columns: verify no unexpected nulls after conversion.
+        #    - Non-nullable columns: verify no unexpected nulls after conversion only
+        #      when the contract or a gate makes non-nullability explicit.
+        #    - Do not convert "required for downstream use" into "must be fully non-null"
+        #      unless the run context actually supports that stronger claim.
+        #    - For temporal/numeric cleaning, check whether the final null inflation is
+        #      consistent with the observed raw quality or whether your parser was too blunt.
+        #    - For temporal fields in cleaning-first runs, prefer "recover what is
+        #      defensible, flag what is invalid, and report residual nulls" over
+        #      brittle hard-failure semantics unless completeness is explicitly contractual.
         #
-        # 5. OUTPUT: Write cleaned CSV and manifest with actual operations performed.
+        # 7. OUTPUT CLOSURE:
+        #    Write every owned required output and make sure metadata artifacts reflect
+        #    actual operations performed, not only planned ones.
 
         Your Decision Log, Assumptions, and Risks blocks should reflect the specific
         reasoning you did for THIS dataset — not generic boilerplate.
@@ -593,10 +832,15 @@ class DataEngineerAgent:
         - Output valid Python code only. No markdown, no code fences, no prose.
         - Scope: cleaning only (no modeling, scoring, optimization, or analytics).
         - Read input with pd.read_csv(..., dtype=str, low_memory=False, sep, decimal, encoding from inputs).
-        - Write cleaned CSV to $de_output_path.
-        - Write manifest to $de_manifest_path.
+        - Write every required output you own in DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT.
+        - Treat $de_output_path and $de_manifest_path as primary anchors, not as the
+          exhaustive deliverable set unless the contract says so.
+        - If a required artifact is logically empty in THIS run, write the empty artifact
+          with a valid schema and explain the emptiness in the manifest instead of omitting it.
         - If outlier policy is enabled, write report to $outlier_report_path.
         - Do not fabricate columns. Do not overwrite the input file.
+        - Do not silently omit auxiliary metadata/report artifacts that the contract
+          assigns to the data engineer.
         - Missing required columns → fail fast with ValueError.
         - Use only dependencies from RUNTIME_DEPENDENCY_CONTEXT.
 
@@ -620,7 +864,16 @@ class DataEngineerAgent:
         - Preserve split/partition columns exactly as-is.
         - For wide datasets, resolve feature selectors against actual header; prefer
           vectorized transforms over per-column procedural loops.
+        - For temporal, amount, and rate columns, preserve signal before declaring data
+          invalid. Senior cleaning distinguishes heterogeneous but recoverable formats
+          from truly unparseable values.
+        - A parsed datetime column is not automatically a hard completeness gate.
+          Treat complete non-null coverage as a contractual requirement only when the
+          contract, gate semantics, or business-critical role explicitly demands it.
         - Create parent directories before writing. Preserve deterministic column order.
+        - For identity resolution, missing contact/company values are lack of evidence.
+          A senior implementation only drops or merges rows when the available signals
+          defensibly support duplicate identity for THIS dataset.
         - The manifest must reflect ACTUAL operations performed, not planned ones.
           If an imputation ran, log it. If it was skipped (no nulls found), say so.
 
@@ -646,12 +899,14 @@ class DataEngineerAgent:
         Encoding: '$csv_encoding' | Sep: '$csv_sep' | Decimal: '$csv_decimal'
         DE Cleaning Objective: "$business_objective"
 
+        DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT: $de_required_outputs_context
         Required Columns (DE View): $required_columns
         Optional Passthrough Columns: $optional_passthrough_columns
 
         DE_VIEW_CONTEXT: $de_view_context
         EXECUTION_CONTRACT_CONTEXT: $execution_contract_context
         CLEANING_GATES_CONTEXT: $cleaning_gates_context
+        COLUMN_RESOLUTION_CONTEXT: $column_resolution_context
         COLUMN_DTYPE_TARGETS_CONTEXT: $column_dtype_targets_context
         COLUMN_TRANSFORMATIONS_CONTEXT: $column_transformations_context
         OUTLIER_POLICY_CONTEXT: $outlier_policy_context
@@ -667,10 +922,13 @@ class DataEngineerAgent:
         """
 
         USER_TEMPLATE = (
-            "Analyze the cleaning gates, column dtype targets, and data sample. "
-            "Reason about the correct operation order for THIS specific dataset — "
-            "which columns need null handling before type conversion, which gates "
-            "impose constraints, what the runbook advises. "
+            "Analyze the owned deliverables, cleaning gates, column dtype targets, "
+            "column resolution context, and data sample. Reason first about the deliverable closure for THIS "
+            "run — which artifacts you must write, how each one is materialized, "
+            "and how the cleaning plan supports them. Then reason about the correct "
+            "operation order for THIS specific dataset — which columns need null "
+            "handling before type conversion, which gates impose constraints, what "
+            "the runbook advises. "
             "Then generate the complete cleaning script."
         )
 
@@ -691,12 +949,14 @@ class DataEngineerAgent:
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
             business_objective=business_objective,
+            de_required_outputs_context=de_required_outputs_json,
             required_columns=json.dumps(required_columns_payload),
             optional_passthrough_columns=json.dumps(optional_passthrough_payload),
             data_audit=data_audit,
             execution_contract_context=contract_json,
             de_view_context=de_view_json,
             outlier_policy_context=outlier_policy_json,
+            column_resolution_context=column_resolution_context_json,
             column_transformations_context=column_transformations_json,
             column_dtype_targets_context=column_dtype_targets_json,
             data_engineer_runbook=de_runbook_json,
@@ -778,7 +1038,7 @@ class DataEngineerAgent:
                 "    pd = None",
                 "",
                 "os.makedirs('data', exist_ok=True)",
-                f"_REQUIRED_OUTPUT_PATHS = {json.dumps([p for p in [de_output_path, de_manifest_path, outlier_report_path] if p], ensure_ascii=False)}",
+                f"_REQUIRED_OUTPUT_PATHS = {json.dumps([str(item.get('path') or '') for item in de_required_outputs if str(item.get('path') or '').strip()], ensure_ascii=False)}",
                 "",
                 "def _ensure_parent_dir(path):",
                 "    if not isinstance(path, str) or not path.strip():",

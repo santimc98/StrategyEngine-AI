@@ -1892,6 +1892,18 @@ $payload_json
         === SENIOR STRATEGY PROTOCOL ===
         $senior_strategy_protocol
 
+        *** MISSION ***
+        - Reason from the business objective and dataset evidence first.
+        - Produce the smallest strategy that is genuinely fit for THIS run.
+        - Optimize for downstream executability, not for generic ML completeness.
+
+        *** SOURCE OF TRUTH AND PRECEDENCE ***
+        1) USER REQUEST + business objective language (authoritative for real intent)
+        2) DATASET SUMMARY + STEWARD_FACTS + COLUMN METADATA (authoritative for feasibility)
+        3) AUTHORIZED COLUMN INVENTORY / COLUMN SETS / COLUMN MANIFEST (authoritative for column names and families)
+        4) COMPUTE CONSTRAINTS (authoritative for practicality)
+        5) Generic data science patterns are advisory only and must never override the current run context
+
         *** DATASET SUMMARY ***
         $data_summary
 
@@ -1928,6 +1940,18 @@ $payload_json
         *** USER REQUEST ***
         "$user_request"
 
+        *** STRATEGY REASONING WORKFLOW (MANDATORY) ***
+        Before writing the strategy, reason in this order:
+        1. Determine the real business intent of THIS run.
+        2. Decide the operational scope recommendation from context:
+           - cleaning_only
+           - ml_only
+           - full_pipeline
+        3. Choose objective_type only AFTER understanding the run intent.
+           objective_type is a compact label for your conclusion, not the starting point.
+        4. Calibrate validation, techniques, and artifacts to the chosen scope.
+        5. Keep the plan minimal and credible for the current dataset, not generically impressive.
+
         *** SCOPE AWARENESS ***
         Not all business objectives require a full ML pipeline. Before designing your strategy,
         determine what the objective actually needs:
@@ -1954,8 +1978,11 @@ $payload_json
         An ML-only strategy should NOT include heavy data cleaning operations.
 
         *** YOUR TASK ***
-        Design a strategy using FIRST PRINCIPLES REASONING. Do not classify the problem into pre-defined categories.
-        Instead, reason through WHAT the business is trying to achieve and HOW data science can help.
+        Design a strategy using FIRST PRINCIPLES REASONING.
+        Do not start from canned problem categories.
+        Instead, reason through WHAT the business is trying to achieve, WHAT decision follows,
+        WHAT this run should and should not do, and only then assign compact labels such as
+        objective_type or scope_recommendation.
 
         CRITICAL: Your reasoning must be universal and adaptable to ANY objective, not hardcoded to specific problem types.
 
@@ -1986,6 +2013,8 @@ $payload_json
         - **objective_type**: One of [descriptive, predictive, prescriptive, causal, comparative]
         - **objective_reasoning**: WHY you chose this type (2-3 sentences connecting business goal to objective type)
         - **success_metric**: What metric best captures business success (not generic ML metrics)
+        - **scope_recommendation**: One of [cleaning_only, ml_only, full_pipeline]
+        - **scope_reasoning**: WHY this run needs that scope and what is explicitly out of scope
 
         Examples of objective_reasoning (DO NOT COPY, USE AS REFERENCE):
         - "The business wants to find the optimal price point to maximize expected revenue (Price × Success Probability).
@@ -2000,7 +2029,7 @@ $payload_json
            This is a DESCRIPTIVE objective because the goal is pattern discovery, not prediction.
            Success metric: Segment interpretability and separation quality (silhouette score)."
 
-        *** STRATEGY ROADMAP THINKING (for iterative ML work) ***
+        *** STRATEGY ROADMAP THINKING (for iterative ML work only when scope requires it) ***
         If this looks like predictive or optimization work that may evolve across multiple
         rounds, reason about WHICH levers matter most for THIS dataset and THIS business goal.
         Use these levers as a toolbox, not as a mandatory sequence:
@@ -2083,12 +2112,15 @@ $payload_json
 
         Use numeric thresholds only when the current dataset context makes them defensible.
 
-        *** STEP 5: EVALUATE APPROPRIATE METRICS ***
-        Based on your objective_type, reason through what metrics best measure success.
-        DO NOT use pre-defined metric lists. Instead, think:
+        *** STEP 5: EVALUATE APPROPRIATE METRICS AND ARTIFACTS ***
+        Based on your scope_recommendation and objective_type, reason through what metrics
+        and artifacts best measure success.
+        DO NOT use pre-defined universal lists. Instead, think:
         - What does the business care about? (revenue, accuracy, interpretability, coverage)
         - What are the risks? (false positives costly? false negatives worse?)
         - What validates the approach? (cross-validation, time split, holdout)
+        - Which outputs are genuinely needed for THIS run? cleaned datasets, enriched datasets,
+          reports, metrics, predictions, explanations, diagnostics, or none of some of them?
 
         Examples (DO NOT COPY LITERALLY):
         - Prescriptive (optimization): Expected Value, Revenue Lift, Opportunity Cost
@@ -2107,6 +2139,8 @@ $payload_json
             "objective_type": "One of: descriptive, predictive, prescriptive, causal, comparative",
             "objective_reasoning": "2-3 sentences explaining WHY this objective_type fits the business goal",
             "success_metric": "Primary business metric (not generic ML metric)",
+            "scope_recommendation": "One of: cleaning_only, ml_only, full_pipeline",
+            "scope_reasoning": "2-3 sentences explaining what this run must include and exclude",
             "recommended_evaluation_metrics": ["list", "of", "metrics", "to", "track"],
             "validation_strategy": "Strategy name with data-driven rationale (e.g., 'time_split: data has temporal ordering')",
             "validation_rationale": "2-3 sentences explaining WHY this validation fits the data structure",
@@ -2120,6 +2154,7 @@ $payload_json
               "signal_quality": "Assessment of data quality for proposed method",
               "compute_value_tradeoff": "Is complexity justified by expected lift?"
             },
+            "recommended_artifacts": [{"artifact_type": "string", "required": true, "rationale": "why"}],
             "fallback_chain": ["Primary approach", "Credible fallback", "Simpler safe option"],
             "expected_lift": "Estimated magnitude/direction of value relative to a simpler baseline",
             "estimated_difficulty": "Low | Medium | High (with data-driven justification)",
@@ -2133,7 +2168,9 @@ $payload_json
         - NEVER invent, rename, abbreviate, or infer columns not present in AUTHORIZED COLUMN INVENTORY.
         - If uncertain about a column, omit it (do not hallucinate).
         - "objective_reasoning" is MANDATORY and must connect business goal → objective_type.
+        - "scope_recommendation" and "scope_reasoning" are MANDATORY and must reflect THIS run, not generic defaults.
         - "feasibility_analysis" is MANDATORY - no technique without data-driven justification.
+        - "recommended_artifacts" must be scoped to THIS run. Cleaning-only runs should not require predictions.
         - "fallback_chain" must be concise and credible - every strategy needs a Plan B.
         - "reasoning" must include: why this fits the objective, what could fail, and recovery plan.
         """
@@ -2637,6 +2674,131 @@ $payload_json
         best_validation["repair_applied"] = repaired
         return best_payload, best_validation
 
+    def _infer_scope_recommendation(self, primary: Dict[str, Any], user_request: str) -> str:
+        if not isinstance(primary, dict):
+            primary = {}
+        scope_raw = str(primary.get("scope_recommendation") or "").strip().lower()
+        if scope_raw in {"cleaning_only", "ml_only", "full_pipeline"}:
+            return scope_raw
+
+        combined_parts = [
+            str(user_request or ""),
+            str(primary.get("objective_reasoning") or ""),
+            str(primary.get("scope_reasoning") or ""),
+            str(primary.get("reasoning") or ""),
+            str(primary.get("analysis_type") or ""),
+        ]
+        techniques = primary.get("techniques")
+        if isinstance(techniques, list):
+            combined_parts.extend(str(item or "") for item in techniques)
+        combined = " ".join(combined_parts).lower()
+
+        has_cleaning_signal = any(
+            tok in combined
+            for tok in (
+                "clean",
+                "quality",
+                "deduplic",
+                "standardiz",
+                "normaliz",
+                "leakage",
+                "audit",
+                "etl",
+                "missing values",
+            )
+        )
+        has_training_signal = any(
+            tok in combined
+            for tok in (
+                "train",
+                "classifier",
+                "regression",
+                "forecast",
+                "predictive model",
+                "cross-validation",
+                "roc_auc",
+                "f1",
+                "precision",
+                "recall",
+            )
+        )
+        if has_cleaning_signal and not has_training_signal:
+            return "cleaning_only"
+        if has_training_signal and not has_cleaning_signal:
+            return "ml_only"
+        if has_training_signal and has_cleaning_signal:
+            return "full_pipeline"
+        return "full_pipeline"
+
+    def _default_metrics_for_scope(self, scope: str, objective_type: str) -> List[str]:
+        scope_norm = str(scope or "").strip().lower()
+        objective_norm = str(objective_type or "").strip().lower()
+        if scope_norm == "cleaning_only":
+            return [
+                "data_quality_pass_rate",
+                "retained_rows_after_cleaning",
+                "transformation_traceability_completeness",
+            ]
+        if scope_norm == "ml_only":
+            if objective_norm == "prescriptive":
+                return ["expected_value", "decision_gain"]
+            if objective_norm == "causal":
+                return ["effect_size", "confidence_interval_width"]
+            if objective_norm == "comparative":
+                return ["lift_at_k", "ranking_quality"]
+            if objective_norm == "descriptive":
+                return ["summary_statistics", "pattern_stability"]
+            return ["accuracy", "roc_auc"]
+        return ["data_quality_pass_rate", "primary_model_metric", "decision_readiness"]
+
+    def _default_validation_for_scope(self, scope: str, objective_type: str) -> Tuple[str, str]:
+        scope_norm = str(scope or "").strip().lower()
+        objective_norm = str(objective_type or "").strip().lower()
+        if scope_norm == "cleaning_only":
+            return (
+                "data_quality_validation_with_rule_based_checks",
+                "This run is focused on cleaning and preparation, so validation should emphasize data quality, leakage prevention, and traceability rather than model performance.",
+            )
+        if scope_norm == "ml_only":
+            if objective_norm == "predictive":
+                return (
+                    "holdout_or_cross_validation_based_on_data_structure",
+                    "This run assumes modeling on prepared data, so validation should test generalization using the lightest credible split strategy supported by the dataset structure.",
+                )
+            return (
+                "objective_specific_validation",
+                "Validation should be chosen from the current modeling objective and data structure, not from generic defaults.",
+            )
+        return (
+            "staged_validation_with_cleaning_checks_and_model_evaluation",
+            "A full pipeline run must validate both data preparation integrity and downstream model credibility without mixing those judgments.",
+        )
+
+    def _default_artifacts_for_scope(self, scope: str) -> List[Dict[str, Any]]:
+        scope_norm = str(scope or "").strip().lower()
+        if scope_norm == "cleaning_only":
+            return [
+                {"artifact_type": "clean_dataset", "required": True, "rationale": "Primary cleaned dataset for direct use or future modeling."},
+                {"artifact_type": "enriched_dataset", "required": True, "rationale": "Feature-enriched dataset when this run prepares future modeling handoff."},
+                {"artifact_type": "data_dictionary", "required": True, "rationale": "Traceability for column semantics, types, and transformations."},
+                {"artifact_type": "decision_log", "required": True, "rationale": "Audit trail for exclusions, imputation, and deduplication decisions."},
+                {"artifact_type": "diagnostics", "required": False, "rationale": "Optional quality diagnostics or issue summaries."},
+            ]
+        if scope_norm == "ml_only":
+            return [
+                {"artifact_type": "metrics", "required": True, "rationale": "Evaluation results for the trained or validated model."},
+                {"artifact_type": "predictions_or_scores", "required": True, "rationale": "Primary modeling output for ranking, scoring, or prediction."},
+                {"artifact_type": "diagnostics", "required": False, "rationale": "Optional model diagnostics or error analysis."},
+                {"artifact_type": "explainability", "required": False, "rationale": "Optional explanations when interpretability matters."},
+            ]
+        return [
+            {"artifact_type": "clean_dataset", "required": True, "rationale": "Prepared dataset required before downstream modeling."},
+            {"artifact_type": "metrics", "required": True, "rationale": "Evaluation evidence for the modeling stage."},
+            {"artifact_type": "predictions_or_scores", "required": True, "rationale": "Primary output when the run includes predictive or scoring work."},
+            {"artifact_type": "diagnostics", "required": False, "rationale": "Optional diagnostics spanning preparation and modeling."},
+            {"artifact_type": "explainability", "required": False, "rationale": "Optional explanations when needed by the business or reviewers."},
+        ]
+
     def _build_strategy_spec_from_llm(self, strategy_payload: Dict[str, Any], data_summary: str, user_request: str) -> Dict[str, Any]:
         """
         Build strategy_spec using LLM-generated reasoning instead of hardcoded inference.
@@ -2652,12 +2814,14 @@ $payload_json
         if isinstance(strategy_payload, dict):
             strategies = strategy_payload.get("strategies", []) or []
         primary = strategies[0] if strategies else {}
+        if not isinstance(primary, dict):
+            primary = {}
 
-        # Use LLM-generated objective_type (with fallback to heuristic if missing)
-        objective_type = primary.get("objective_type", "descriptive")
+        scope_recommendation = self._infer_scope_recommendation(primary, user_request)
 
-        # If LLM didn't provide objective_type (backward compatibility), use simple heuristic
-        if not objective_type or objective_type == "descriptive":
+        # Use LLM-generated objective_type (with fallback only when missing/blank)
+        objective_type = str(primary.get("objective_type") or "").strip().lower()
+        if not objective_type:
             combined = " ".join([str(user_request or "").lower()])
             if any(tok in combined for tok in ["optimiz", "maximize", "minimize", "optimal", "best price"]):
                 objective_type = "prescriptive"
@@ -2668,19 +2832,22 @@ $payload_json
             else:
                 objective_type = "descriptive"
 
-        # Use LLM-generated metrics (with sensible defaults if missing)
+        # Use LLM-generated metrics (with scope-aware defaults only if missing)
         metrics = primary.get("recommended_evaluation_metrics", [])
         if not metrics:
-            # Sensible defaults based on objective_type
-            if objective_type == "prescriptive":
-                metrics = ["expected_value", "revenue_lift"]
-            elif objective_type == "predictive":
-                metrics = ["accuracy", "roc_auc"]
-            else:
-                metrics = ["summary_statistics"]
+            metrics = self._default_metrics_for_scope(scope_recommendation, objective_type)
 
-        validation_strategy = primary.get("validation_strategy", "cross_validation")
-        validation_rationale = primary.get("validation_rationale", "Default cross-validation for general applicability.")
+        validation_strategy = str(primary.get("validation_strategy") or "").strip()
+        validation_rationale = str(primary.get("validation_rationale") or "").strip()
+        if not validation_strategy or not validation_rationale:
+            default_validation_strategy, default_validation_rationale = self._default_validation_for_scope(
+                scope_recommendation,
+                objective_type,
+            )
+            if not validation_strategy:
+                validation_strategy = default_validation_strategy
+            if not validation_rationale:
+                validation_rationale = default_validation_rationale
 
         target_columns: List[str] = []
 
@@ -2740,13 +2907,24 @@ $payload_json
 
         fallback_chain = primary.get("fallback_chain", [])
         if not fallback_chain:
-            # Provide default fallback chain based on objective_type
-            if objective_type == "predictive":
-                fallback_chain = ["Proposed model", "Logistic/Linear Regression baseline", "Majority class/mean predictor"]
-            elif objective_type == "prescriptive":
-                fallback_chain = ["Optimization model", "Rule-based heuristic", "Current business practice"]
+            if scope_recommendation == "cleaning_only":
+                fallback_chain = [
+                    "Primary cleaning and traceability pipeline",
+                    "Reduced cleaning pipeline with explicit unresolved issues",
+                    "Descriptive audit only with blocked handoff",
+                ]
+            elif scope_recommendation == "ml_only":
+                fallback_chain = [
+                    "Primary modeling approach",
+                    "Simpler baseline model",
+                    "Minimal safe benchmark",
+                ]
             else:
-                fallback_chain = ["Primary analysis", "Simplified analysis", "Descriptive statistics only"]
+                fallback_chain = [
+                    "Primary full pipeline",
+                    "Reduced-risk baseline pipeline",
+                    "Cleaning-first handoff with deferred modeling",
+                ]
 
         expected_lift = primary.get("expected_lift", "Not quantified - baseline comparison recommended")
 
@@ -2788,18 +2966,13 @@ $payload_json
         if "target" in combined:
             leakage_risks.append("Exclude target or target-derived fields from features.")
 
-        # Universal recommended artifacts (not hardcoded to objective_type)
-        recommended_artifacts = [
-            {"artifact_type": "clean_dataset", "required": True, "rationale": "Base dataset for modeling."},
-            {"artifact_type": "metrics", "required": True, "rationale": "Objective evaluation results."},
-            {"artifact_type": "predictions_or_scores", "required": True, "rationale": "Primary output (predictions, scores, or recommendations)."},
-            {"artifact_type": "explainability", "required": False, "rationale": "Feature importances or model explanations."},
-            {"artifact_type": "diagnostics", "required": False, "rationale": "Error analysis or quality diagnostics."},
-            {"artifact_type": "visualizations", "required": False, "rationale": "Plots for interpretability."},
-        ]
+        recommended_artifacts = primary.get("recommended_artifacts", [])
+        if not isinstance(recommended_artifacts, list) or not recommended_artifacts:
+            recommended_artifacts = self._default_artifacts_for_scope(scope_recommendation)
 
         return {
             "objective_type": objective_type,
+            "scope_recommendation": scope_recommendation,
             "target_columns": target_columns,
             "feature_engineering": feature_engineering_strategy,
             "evaluation_plan": evaluation_plan,

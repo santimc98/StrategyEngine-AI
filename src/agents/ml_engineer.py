@@ -1835,24 +1835,9 @@ class MLEngineerAgent:
         execution_contract = execution_contract if isinstance(execution_contract, dict) else {}
         ml_view = ml_view if isinstance(ml_view, dict) else {}
 
-        allowed_sets = (
-            execution_contract.get("allowed_feature_sets")
-            if isinstance(execution_contract.get("allowed_feature_sets"), dict)
-            else (
-                ml_view.get("allowed_feature_sets")
-                if isinstance(ml_view.get("allowed_feature_sets"), dict)
-                else {}
-            )
-        )
-        column_roles = (
-            execution_contract.get("column_roles")
-            if isinstance(execution_contract.get("column_roles"), dict)
-            else (
-                ml_view.get("column_roles")
-                if isinstance(ml_view.get("column_roles"), dict)
-                else {}
-            )
-        )
+        allowed_sets = execution_contract.get("allowed_feature_sets")
+        if allowed_sets in (None, ""):
+            allowed_sets = ml_view.get("allowed_feature_sets")
         evaluation_spec = (
             execution_contract.get("evaluation_spec")
             if isinstance(execution_contract.get("evaluation_spec"), dict)
@@ -1890,15 +1875,27 @@ class MLEngineerAgent:
             )
         )
 
-        model_features = allowed_sets.get("model_features")
-        if not isinstance(model_features, list) or not model_features:
-            model_features = column_roles.get("pre_decision")
+        model_features = (
+            execution_contract.get("model_features")
+            if isinstance(execution_contract.get("model_features"), list)
+            else (
+                ml_view.get("model_features")
+                if isinstance(ml_view.get("model_features"), list)
+                else None
+            )
+        )
+        if (not isinstance(model_features, list) or not model_features) and isinstance(allowed_sets, dict):
+            model_features = allowed_sets.get("model_features")
         if not isinstance(model_features, list):
             model_features = []
 
-        forbidden_features = allowed_sets.get("forbidden_features")
-        if not isinstance(forbidden_features, list):
-            forbidden_features = []
+        forbidden_features = []
+        if isinstance(allowed_sets, dict):
+            forbidden_features = allowed_sets.get("forbidden_features")
+            if not isinstance(forbidden_features, list) or not forbidden_features:
+                forbidden_features = allowed_sets.get("forbidden_for_modeling")
+            if not isinstance(forbidden_features, list):
+                forbidden_features = []
 
         target_columns = evaluation_spec.get("target_columns")
         if not isinstance(target_columns, list) or not target_columns:
@@ -1960,8 +1957,8 @@ class MLEngineerAgent:
         authoritative_state = {
             "input_dataset": data_path,
             "source_of_truth": {
-                "features": "allowed_feature_sets.model_features (fallback: column_roles.pre_decision)",
-                "forbidden_features": "allowed_feature_sets.forbidden_features",
+                "features": "model_features (fallback: allowed_feature_sets.model_features when explicitly declared)",
+                "forbidden_features": "allowed_feature_sets.forbidden_features / forbidden_for_modeling when explicitly declared",
                 "targets": "evaluation_spec.target_columns (fallback: validation_requirements.label_columns)",
                 "split_rules": "split_spec",
                 "output_schema": "required_outputs + artifact_requirements",
@@ -2287,8 +2284,18 @@ class MLEngineerAgent:
     def _build_pipeline_scope_context(execution_contract: Optional[Dict[str, Any]] = None) -> str:
         """Build scope-aware context string for the ML Engineer prompt."""
         scope = ""
+        active_workstreams = {}
         if isinstance(execution_contract, dict):
             scope = str(execution_contract.get("scope", "")).strip().lower()
+            active_raw = execution_contract.get("active_workstreams")
+            if isinstance(active_raw, dict):
+                active_workstreams = active_raw
+        if active_workstreams.get("model_training") is False and active_workstreams.get("feature_engineering"):
+            return (
+                "FEATURE_PREP_ONLY — Current run prepares predictive features and ML-ready data for a future modeling run. "
+                "Do not train or benchmark a final model. "
+                "Focus on defensible feature derivation, leakage avoidance, and producing enriched artifacts for later ML."
+            )
         if scope == "ml_only":
             return (
                 "ML_ONLY — Input data is pre-cleaned and trusted. "
@@ -2446,15 +2453,22 @@ class MLEngineerAgent:
         view = ml_view or {}
         plan = ml_plan or {}
 
-        outcome_columns = contract.get("outcome_columns")
-        if not isinstance(outcome_columns, list) or not outcome_columns:
-            outcome_columns = view.get("outcome_columns")
-        if not isinstance(outcome_columns, list):
-            outcome_columns = []
-
         target_column = None
-        if outcome_columns:
-            target_column = str(outcome_columns[0])
+        task_semantics = contract.get("task_semantics")
+        if not isinstance(task_semantics, dict) or not task_semantics:
+            task_semantics = view.get("task_semantics") if isinstance(view.get("task_semantics"), dict) else {}
+        target_columns = task_semantics.get("target_columns") if isinstance(task_semantics, dict) else None
+        if isinstance(target_columns, list) and target_columns:
+            target_column = str(target_columns[0])
+        elif isinstance(task_semantics, dict) and str(task_semantics.get("primary_target") or "").strip():
+            target_column = str(task_semantics.get("primary_target")).strip()
+        else:
+            evaluation_spec = contract.get("evaluation_spec")
+            if not isinstance(evaluation_spec, dict) or not evaluation_spec:
+                evaluation_spec = view.get("evaluation_spec") if isinstance(view.get("evaluation_spec"), dict) else {}
+            eval_targets = evaluation_spec.get("target_columns") if isinstance(evaluation_spec, dict) else None
+            if isinstance(eval_targets, list) and eval_targets:
+                target_column = str(eval_targets[0])
 
         split_spec = contract.get("split_spec")
         if not isinstance(split_spec, dict):
@@ -3932,9 +3946,18 @@ class MLEngineerAgent:
     ) -> str | None:
         contract = execution_contract or {}
         profile = data_profile or {}
-        outcome_columns = contract.get("outcome_columns")
-        if isinstance(outcome_columns, list) and outcome_columns:
-            return str(outcome_columns[0])
+        task_semantics = contract.get("task_semantics")
+        if isinstance(task_semantics, dict):
+            target_columns = task_semantics.get("target_columns")
+            if isinstance(target_columns, list) and target_columns:
+                return str(target_columns[0])
+            if str(task_semantics.get("primary_target") or "").strip():
+                return str(task_semantics.get("primary_target")).strip()
+        evaluation_spec = contract.get("evaluation_spec")
+        if isinstance(evaluation_spec, dict):
+            target_columns = evaluation_spec.get("target_columns")
+            if isinstance(target_columns, list) and target_columns:
+                return str(target_columns[0])
         outcome_analysis = profile.get("outcome_analysis", {})
         if isinstance(outcome_analysis, dict) and outcome_analysis:
             for key in outcome_analysis.keys():
@@ -4446,15 +4469,25 @@ class MLEngineerAgent:
                     else {}
                 )
             )
-            allowed_sets_lock = (
-                ml_view_payload.get("allowed_feature_sets")
-                if isinstance(ml_view_payload.get("allowed_feature_sets"), dict)
+            allowed_sets_lock = ml_view_payload.get("allowed_feature_sets")
+            if allowed_sets_lock in (None, ""):
+                allowed_sets_lock = execution_contract_input.get("allowed_feature_sets")
+            locked_model_features = (
+                ml_view_payload.get("model_features")
+                if isinstance(ml_view_payload.get("model_features"), list)
                 else (
-                    execution_contract_input.get("allowed_feature_sets")
-                    if isinstance(execution_contract_input.get("allowed_feature_sets"), dict)
-                    else {}
+                    execution_contract_input.get("model_features")
+                    if isinstance(execution_contract_input.get("model_features"), list)
+                    else []
                 )
             )
+            locked_forbidden_features = []
+            if isinstance(allowed_sets_lock, dict):
+                locked_forbidden_features = allowed_sets_lock.get("forbidden_features")
+                if not isinstance(locked_forbidden_features, list) or not locked_forbidden_features:
+                    locked_forbidden_features = allowed_sets_lock.get("forbidden_for_modeling")
+                if not isinstance(locked_forbidden_features, list):
+                    locked_forbidden_features = []
             column_roles_lock = (
                 ml_view_payload.get("column_roles")
                 if isinstance(ml_view_payload.get("column_roles"), dict)
@@ -4530,18 +4563,19 @@ class MLEngineerAgent:
                         else []
                     ),
                 },
-                "allowed_feature_sets": {
-                    "model_features": [
-                        str(item)
-                        for item in (allowed_sets_lock.get("model_features") or [])[:60]
-                        if str(item).strip()
-                    ],
-                    "forbidden_features": [
-                        str(item)
-                        for item in (allowed_sets_lock.get("forbidden_features") or [])[:24]
-                        if str(item).strip()
-                    ],
-                },
+                "model_features": [
+                    str(item)
+                    for item in locked_model_features[:60]
+                    if str(item).strip()
+                ],
+                "allowed_feature_sets": copy.deepcopy(allowed_sets_lock)
+                if isinstance(allowed_sets_lock, (dict, list))
+                else {},
+                "forbidden_features": [
+                    str(item)
+                    for item in locked_forbidden_features[:24]
+                    if str(item).strip()
+                ],
                 "column_roles": {
                     "identifiers": column_roles_lock.get("identifiers"),
                     "outcome": column_roles_lock.get("outcome"),

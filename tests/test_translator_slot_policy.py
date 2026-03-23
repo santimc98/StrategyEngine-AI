@@ -55,7 +55,8 @@ def test_translator_required_slot_missing_mentions_no_disponible(tmp_path, monke
     report = agent.generate_report(
         {"execution_output": "OK", "business_objective": "Objetivo de prueba"}
     )
-    assert "No disponible" in report
+    assert "Slot Coverage" in report
+    assert "missing_required_slots" in report
 
 
 def test_translator_without_segment_pricing_slot_does_not_require_segments(tmp_path, monkeypatch):

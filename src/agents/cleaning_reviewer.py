@@ -337,6 +337,9 @@ def _review_cleaning_impl(
 
     # Extract cleaning code from view for LLM intent verification
     cleaning_code = view.get("cleaning_code")
+    column_resolution_context = view.get("column_resolution_context")
+    if not isinstance(column_resolution_context, dict):
+        column_resolution_context = {}
     outlier_policy = view.get("outlier_policy") if isinstance(view.get("outlier_policy"), dict) else {}
     outlier_report_path = str(
         view.get("outlier_report_path")
@@ -368,6 +371,7 @@ def _review_cleaning_impl(
         manifest=manifest,
         raw_sample=raw_sample,
         column_roles=column_roles,
+        model_features=_list_str(view.get("model_features")),
         allowed_feature_sets=view.get("allowed_feature_sets") or {},
         dataset_profile=dataset_profile,
         cleaning_code=cleaning_code,
@@ -404,6 +408,7 @@ def _review_cleaning_impl(
         context_pack=context_pack,
         cleaning_code=cleaning_code,
         dataset_profile=dataset_profile,
+        column_resolution_context=column_resolution_context,
     )
     print(f"DEBUG: Cleaning Reviewer calling OpenRouter ({model_name})...")
     try:
@@ -1279,7 +1284,8 @@ def _evaluate_gates_deterministic(
     manifest: Dict[str, Any],
     raw_sample: Optional[pd.DataFrame],
     column_roles: Dict[str, List[str]],
-    allowed_feature_sets: Dict[str, Any],
+    model_features: List[str],
+    allowed_feature_sets: Any,
     dataset_profile: Optional[Dict[str, Any]] = None,
     cleaning_code: Optional[str] = None,
     outlier_policy: Optional[Dict[str, Any]] = None,
@@ -1294,7 +1300,9 @@ def _evaluate_gates_deterministic(
     failure_summaries: List[str] = []
     warning_summaries: List[str] = []
     gate_results: List[Dict[str, Any]] = []
-    model_features = _list_str(allowed_feature_sets.get("model_features")) if isinstance(allowed_feature_sets, dict) else []
+    model_features = _list_str(model_features)
+    if not model_features and isinstance(allowed_feature_sets, dict):
+        model_features = _list_str(allowed_feature_sets.get("model_features"))
     outlier_policy = outlier_policy if isinstance(outlier_policy, dict) else {}
     outlier_report = outlier_report if isinstance(outlier_report, dict) else {}
 
@@ -1358,6 +1366,7 @@ def _evaluate_gates_deterministic(
                 cleaned_header=cleaned_header,
                 required_columns=required_columns,
                 column_roles=column_roles,
+                model_features=model_features,
                 allowed_feature_sets=allowed_feature_sets,
                 dataset_profile=dataset_profile,
                 params=params,
@@ -1525,46 +1534,42 @@ def _build_llm_prompt(
     context_pack: Optional[str] = None,
     cleaning_code: Optional[str] = None,
     dataset_profile: Optional[Dict[str, Any]] = None,
+    column_resolution_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     system_prompt = (
-        "You are a Senior Data Scientist reviewing data cleaning output.\n"
-        "Your role is to evaluate cleaning quality using CONTEXTUAL REASONING, not rigid rules.\n\n"
-        "EVALUATION WORKFLOW:\n"
-        "1. Review the CONTEXT TRIPLET provided:\n"
-        "   - Contract/View: What gates and constraints were requested?\n"
-        "   - Data Profile: What were the original data characteristics?\n"
-        "   - Cleaning Code: What transformations did the Data Engineer actually execute?\n"
-        "2. For each gate, reason about the gate's intent before deciding pass/fail.\n"
-        "3. Prefer direct evidence from cleaning_code and data_profile over pattern matching or generic heuristics.\n"
-        "4. If evidence is ambiguous, prefer PASS/WARNING over unsupported failure.\n\n"
-        "COMMON HIGH-RISK GATE PATTERNS:\n\n"
-        "*** no_semantic_rescale ***\n"
-        "When this gate is present, check whether numeric columns were inappropriately rescaled (e.g., /255, /100, MinMaxScaler).\n"
-        "DO NOT use arbitrary thresholds like 'if max < 1.5, it was rescaled'.\n"
-        "INSTEAD, follow this reasoning process:\n"
-        "  1. Check the DATA PROFILE: What were the original min/max ranges for numeric columns?\n"
-        "  2. Check the CLEANING CODE: Are there explicit rescaling operations like:\n"
-        "     - Division: df['col'] = df['col'] / 255, df['col'] / 100\n"
-        "     - Scalers: MinMaxScaler, StandardScaler\n"
-        "     - Multiplication: df['col'] * 0.01, df['col'] * 0.00392\n"
-        "  3. ONLY flag rescaling if you find EXPLICIT EVIDENCE of transformation in the code.\n"
-        "  4. If data has low values (0-1 range) but NO rescaling code exists, the data was ALREADY normalized in the source. This is NOT a violation.\n"
-        "  5. Columns with 'percent', 'pct', '%', 'ratio', 'probability' in the name are ALLOWED to be rescaled.\n\n"
-        "*** no_synthetic_data ***\n"
-        "When this gate is present, check if the cleaning code generates fake/synthetic data (Faker, make_classification, np.random for data generation).\n"
-        "Using np.random for imputation or noise is different from generating entire synthetic datasets.\n\n"
-        "GENERAL RULES:\n"
-        "- If a HARD gate fails, status must be REJECTED.\n"
+        "You are a Senior Data Scientist reviewing data cleaning output.\n\n"
+        "MISSION\n"
+        "- Evaluate whether the delivered cleaning work satisfies the requested cleaning contract for THIS run.\n"
+        "- Use contextual reasoning grounded in contract, data evidence, and executed code.\n"
+        "- Do not apply rigid heuristics when the context does not justify them.\n\n"
+        "SOURCE OF TRUTH AND PRECEDENCE\n"
+        "1. cleaning_gates + required_columns + column_roles + dialect + contract_source_used in the payload are authoritative review scope.\n"
+        "2. column_resolution_context + cleaning_code + facts + data_profile are primary evidence of what the Data Engineer actually did and what the data looked like.\n"
+        "3. deterministic_gate_results are supporting evidence only. They may help focus attention, but they do NOT override the contract or your evidence-based judgment.\n"
+        "4. If sources conflict, preserve contract intent and prefer direct evidence from column_resolution_context/cleaning_code/data_profile over shallow pattern matching.\n\n"
+        "REVIEW DECISION WORKFLOW (MANDATORY)\n"
+        "1. Understand the contract first: what gates were requested, what columns matter, and what would count as a real violation.\n"
+        "2. Read the available evidence pack: facts, column_resolution_context, data_profile, cleaning_code, and deterministic_gate_results.\n"
+        "3. For each gate, reason about the gate's intent before deciding pass/fail.\n"
+        "4. Reject only when you have contract-relevant evidence of a real violation.\n"
+        "5. If evidence is ambiguous or incomplete, prefer PASSED or PASSED_WITH_WARNING reasoning over unsupported failure.\n"
+        "6. Keep feedback tied to this dataset and this code path, not generic cleaning advice.\n\n"
+        "HIGH-RISK EXAMPLES (GUIDANCE, NOT A SUBSTITUTE FOR REASONING)\n"
+        "- no_semantic_rescale: do not infer rescaling from low numeric ranges alone. Look for explicit code evidence such as division by constants, scaler objects, or explicit multiplicative rescaling. If data is already in a low range but no such code exists, that is not a violation.\n"
+        "- no_synthetic_data: distinguish between generating synthetic rows/datasets and limited stochastic operations such as noise or imputation support. Reject only when the code clearly fabricates data beyond the contract.\n\n"
+        "DECISION RULES\n"
+        "- If any HARD gate fails, status must be REJECTED.\n"
         "- If only SOFT gates fail, status must be APPROVE_WITH_WARNINGS.\n"
         "- If no gates fail, status must be APPROVED.\n"
         "- When evidence is insufficient, mark the gate as PASSED and add a warning.\n"
-        "- DO NOT reject based on data ranges alone; you MUST find code evidence of violations.\n\n"
-        "EVIDENCE REQUIREMENT:\n"
-        "- Any REJECT must cite SPECIFIC evidence from cleaning_code or data_profile.\n"
+        "- Do not reject based on data ranges alone; you must find contract-relevant evidence.\n\n"
+        "EVIDENCE REQUIREMENT\n"
+        "- Any REJECT must cite specific evidence from cleaning_code, facts, or data_profile.\n"
         "- Format: EVIDENCE: <source>#<detail> -> <snippet>\n"
         "- Example: EVIDENCE: cleaning_code#line42 -> df['pixel'] = df['pixel'] / 255\n"
-        "- If you cannot find code evidence, do NOT reject; mark as PASSED with a note.\n\n"
-        "Return JSON only with the specified schema.\n\n"
+        "- If you cannot find concrete evidence, do not reject; explain the uncertainty as a warning.\n\n"
+        "OUTPUT\n"
+        "- Return JSON only with the specified schema.\n\n"
         "Required JSON schema:\n"
         "{\n"
         '  "status": "APPROVED" | "APPROVE_WITH_WARNINGS" | "REJECTED",\n'
@@ -1598,6 +1603,8 @@ def _build_llm_prompt(
     }
     if context_pack:
         payload["context_pack"] = context_pack
+    if column_resolution_context and isinstance(column_resolution_context, dict):
+        payload["column_resolution_context"] = column_resolution_context
 
     # CONTEXT TRIPLET for LLM reasoning
     # 1. Cleaning Code - what did the engineer actually execute?
@@ -2126,7 +2133,8 @@ def _check_feature_coverage_sanity(
     cleaned_header: List[str],
     required_columns: List[str],
     column_roles: Dict[str, List[str]],
-    allowed_feature_sets: Dict[str, Any],
+    model_features: List[str],
+    allowed_feature_sets: Any,
     dataset_profile: Optional[Dict[str, Any]],
     params: Dict[str, Any],
 ) -> Tuple[List[str], Dict[str, Any]]:
@@ -2176,8 +2184,8 @@ def _check_feature_coverage_sanity(
         if str(col).strip() and str(col).strip().lower() not in structural_norm
     ]
 
-    model_features = []
-    if isinstance(allowed_feature_sets, dict):
+    model_features = _list_str(model_features)
+    if not model_features and isinstance(allowed_feature_sets, dict):
         model_features = _list_str(allowed_feature_sets.get("model_features"))
     expected_model_features = [
         col for col in model_features

@@ -213,6 +213,37 @@ def _normalize_path(path: Any) -> str:
     return text
 
 
+def _extract_declared_artifact_path(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("path", "output_path", "output", "file", "filename", "expected_filename"):
+            candidate = value.get(key)
+            if _looks_like_path(candidate):
+                return _normalize_path(candidate)
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return ""
+    if _looks_like_path(value):
+        normalized = _normalize_path(value)
+        if normalized.startswith(("{", "[")):
+            return ""
+        return normalized
+    return ""
+
+
+def _collect_declared_artifact_paths(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    seen: set[str] = set()
+    paths: List[str] = []
+    for item in values:
+        normalized = _extract_declared_artifact_path(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        paths.append(normalized)
+    return paths
+
+
 def _human_size(num_bytes: Optional[int]) -> str:
     if not isinstance(num_bytes, int) or num_bytes < 0:
         return "-"
@@ -334,7 +365,7 @@ def _status_badge(status: str) -> str:
 
 def _build_report_artifact_manifest(
     artifact_index: List[Dict[str, Any]],
-    required_outputs: List[str],
+    required_outputs: List[Any],
     output_contract_report: Dict[str, Any],
     review_verdict: Optional[str],
     gate_context: Dict[str, Any],
@@ -345,9 +376,8 @@ def _build_report_artifact_manifest(
     output_contract_report = output_contract_report if isinstance(output_contract_report, dict) else {}
 
     required_set: set[str] = set()
-    for path in required_outputs or []:
-        if _looks_like_path(path):
-            required_set.add(_normalize_path(path))
+    for path in _collect_declared_artifact_paths(required_outputs):
+        required_set.add(path)
 
     for path in output_contract_report.get("missing", []) or []:
         if _looks_like_path(path):
@@ -914,10 +944,45 @@ def _build_evidence_items(evidence_paths: List[str], min_items: int = 3, max_ite
         if len(items) >= max_items:
             break
         clean_path = _sanitize_evidence_value(path)
-        items.append({"claim": f"Artifact available: {clean_path}", "source": clean_path})
+        items.append({"claim": f"Confirmed artifact present: {clean_path}", "source": clean_path})
     while len(items) < min_items:
         items.append({"claim": "No verificable con artifacts actuales", "source": "missing"})
     return items
+
+
+def _select_confirmed_evidence_paths(
+    manifest: Dict[str, Any],
+    raw_evidence_paths: List[str],
+    *,
+    artifact_available_fn=None,
+    max_items: int = 8,
+) -> List[str]:
+    confirmed: List[str] = []
+    manifest_items = manifest.get("items", []) if isinstance(manifest, dict) else []
+    if isinstance(manifest_items, list):
+        for item in manifest_items:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            if item.get("present") and _looks_like_path(path):
+                confirmed.append(str(path))
+
+    if not confirmed and callable(artifact_available_fn):
+        for path in raw_evidence_paths or []:
+            if not _looks_like_path(path):
+                continue
+            if artifact_available_fn(path):
+                confirmed.append(str(path))
+
+    deduped: List[str] = []
+    for path in confirmed:
+        normalized = _normalize_path(path)
+        if not normalized or normalized in deduped:
+            continue
+        deduped.append(normalized)
+        if len(deduped) >= max_items:
+            break
+    return deduped
 
 def _is_valid_evidence_source(source: str) -> bool:
     if not source:
@@ -927,7 +992,7 @@ def _is_valid_evidence_source(source: str) -> bool:
         return False
     lower = normalized.lower()
     if lower == "missing":
-        return True
+        return False
     if lower.startswith("script:"):
         return True
     if "/" in normalized or "\\" in normalized:
@@ -936,6 +1001,11 @@ def _is_valid_evidence_source(source: str) -> bool:
         if ext in lower:
             return True
     return False
+
+
+def _is_placeholder_evidence_claim(claim: str) -> bool:
+    normalized = str(claim or "").strip().lower()
+    return normalized.startswith("no verificable con artifacts actuales")
 
 def _normalize_evidence_sources(report: str) -> str:
     if not report:
@@ -1224,6 +1294,7 @@ def _validate_report(
     metrics_payload: Dict[str, Any],
     plots: List[str],
     expected_language: str,
+    decision_discrepancy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     structure_issues = _validate_report_structure(content, expected_language=expected_language)
     decision_in_report = _extract_report_decision(content)
@@ -1240,6 +1311,18 @@ def _validate_report(
         if not _value_matches_references(value, refs):
             unverified_metrics.append(f"{metric_name}:{excerpt}")
 
+    evidence_items = _parse_evidence_items_from_report(content)
+    unsupported_evidence_claims: List[str] = []
+    for item in evidence_items:
+        if not isinstance(item, dict):
+            continue
+        claim = str(item.get("claim") or "").strip()
+        source = str(item.get("source") or "").strip().lower()
+        if not claim:
+            continue
+        if source == "missing" and not _is_placeholder_evidence_claim(claim):
+            unsupported_evidence_claims.append(claim)
+
     allowed_plots = {str(path).replace("\\", "/") for path in (plots or [])}
     invalid_plots: List[str] = []
     for path in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", content):
@@ -1254,14 +1337,23 @@ def _validate_report(
     critical_issues.extend(decision_issue)
     if len(unverified_metrics) > 2:
         critical_issues.append("unverified_metrics_gt2")
+    if unsupported_evidence_claims:
+        critical_issues.append("unsupported_evidence_claims")
     if invalid_plots:
         critical_issues.append("invalid_plot_reference")
+
+    context_warnings: List[str] = []
+    if isinstance(decision_discrepancy, dict) and decision_discrepancy:
+        context_warnings.append("decision_discrepancy_authoritative_vs_derived")
 
     return {
         "structure_issues": structure_issues,
         "decision_issue": decision_issue,
         "unverified_metrics": unverified_metrics,
+        "unsupported_evidence_claims": unsupported_evidence_claims,
         "invalid_plots": invalid_plots,
+        "context_warnings": context_warnings,
+        "decision_discrepancy": decision_discrepancy if isinstance(decision_discrepancy, dict) else None,
         "critical_issues": critical_issues,
         "has_critical": bool(critical_issues),
     }
@@ -1272,7 +1364,9 @@ def _score_report_quality(validation: Dict[str, Any]) -> int:
     score -= 8 * len(validation.get("structure_issues", []))
     score -= 12 * len(validation.get("decision_issue", []))
     score -= 5 * min(4, len(validation.get("unverified_metrics", [])))
+    score -= 10 * min(3, len(validation.get("unsupported_evidence_claims", [])))
     score -= 6 * len(validation.get("invalid_plots", []))
+    score -= 15 * min(1, len(validation.get("context_warnings", [])))
     return max(0, min(100, score))
 
 
@@ -1297,6 +1391,9 @@ def _build_repair_prompt(
 
         Hard constraints:
         - Keep the report evidence-based and avoid inventing metrics.
+        - The executive decision must exactly match the required decision label.
+        - Do not present a substantive claim with source "missing".
+        - Only use source "missing" for explicit uncertainty placeholders such as "No verificable con artifacts actuales".
         - Ensure sections exist: Decisión Ejecutiva, Riesgos, Evidencia Usada.
         - Keep "## Evidencia usada" with evidence:{claim,source} and artifact bullets.
         - Use these artifact paths when citing evidence:
@@ -1572,6 +1669,14 @@ class BusinessTranslatorAgent:
         self.last_response = None
 
     def _call_llm(self, prompt: str) -> str:
+        model = getattr(self, "model", None)
+        if model is not None:
+            if hasattr(model, "generate_content"):
+                response = model.generate_content(prompt)
+                text = getattr(response, "text", response)
+                return str(text or "").strip()
+            if callable(model):
+                return str(model(prompt) or "").strip()
         response = self.client.chat.completions.create(
             model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
@@ -1609,9 +1714,23 @@ class BusinessTranslatorAgent:
             view_inventory = artifact_index
 
         def _artifact_available(path: str) -> bool:
+            normalized = _normalize_path(path)
             if artifact_index:
-                return any(item.get("path") == path for item in artifact_index if isinstance(item, dict))
-            return os.path.exists(path)
+                for item in artifact_index:
+                    if not isinstance(item, dict):
+                        continue
+                    item_path = _normalize_path(item.get("path"))
+                    if item_path != normalized:
+                        continue
+                    if "present" in item:
+                        return bool(item.get("present"))
+                    status = str(item.get("status") or "").strip().lower()
+                    if status in {"ok", "present_optional"}:
+                        return True
+                    if os.path.exists(normalized):
+                        return True
+                return False
+            return os.path.exists(normalized)
         
         # Safe extraction of strategy info
         strategy = state.get('selected_strategy', {})
@@ -1754,26 +1873,21 @@ class BusinessTranslatorAgent:
             cleaned_path = "data/cleaned_dataset.csv" if _artifact_available("data/cleaned_dataset.csv") else "data/cleaned_data.csv"
         cleaned_rows = _safe_load_csv(cleaned_path, max_rows=100) if _artifact_available(cleaned_path) else None
         business_objective = state.get("business_objective") or contract.get("business_objective") or ""
-        executive_decision_label = _derive_exec_decision(
+        derived_decision_label = _derive_exec_decision(
             review_verdict or compliance,
             data_adequacy_report,
             metrics_payload,
         )
+        run_outcome_token = _normalize_decision_token((run_summary or {}).get("run_outcome"))
+        executive_decision_label = run_outcome_token or derived_decision_label
 
         required_outputs: List[str] = []
-        if isinstance(contract.get("required_outputs"), list):
-            required_outputs.extend([_normalize_path(path) for path in contract.get("required_outputs") if _looks_like_path(path)])
+        required_outputs.extend(_collect_declared_artifact_paths(contract.get("required_outputs")))
         artifact_requirements = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
         if isinstance(artifact_requirements, dict):
             required_files = artifact_requirements.get("required_files")
             if isinstance(required_files, list):
-                for item in required_files:
-                    if isinstance(item, dict):
-                        path = item.get("path") or item.get("output") or item.get("artifact")
-                    else:
-                        path = item
-                    if _looks_like_path(path):
-                        required_outputs.append(_normalize_path(path))
+                required_outputs.extend(_collect_declared_artifact_paths(required_files))
         # Keep insertion order
         required_outputs = [p for idx, p in enumerate(required_outputs) if p and p not in required_outputs[:idx]]
 
@@ -2092,20 +2206,12 @@ class BusinessTranslatorAgent:
             run_summary=run_summary if isinstance(run_summary, dict) else {},
             run_id=str(run_id) if run_id else None,
         )
-        evidence_paths: List[str] = []
-        manifest_items = manifest.get("items", []) if isinstance(manifest, dict) else []
-        if isinstance(manifest_items, list):
-            for item in manifest_items:
-                if not isinstance(item, dict):
-                    continue
-                path = item.get("path")
-                if item.get("present") and _looks_like_path(path):
-                    evidence_paths.append(str(path))
-        if not evidence_paths:
-            evidence_paths = [path for path in raw_evidence_paths if _artifact_available(path)]
-        if not evidence_paths:
-            evidence_paths = list(raw_evidence_paths)
-        evidence_paths = [p for idx, p in enumerate(evidence_paths) if p and p not in evidence_paths[:idx]][:8]
+        evidence_paths = _select_confirmed_evidence_paths(
+            manifest,
+            raw_evidence_paths,
+            artifact_available_fn=_artifact_available,
+            max_items=8,
+        )
         artifact_inventory_table_html = _build_artifact_inventory_table_html(manifest)
         artifact_compliance_table_html = _build_artifact_compliance_table_html(
             manifest,
@@ -2182,17 +2288,19 @@ class BusinessTranslatorAgent:
         target_language_code = _detect_primary_language(business_objective, preferred_language=preferred_language)
         target_language_name = "Spanish" if target_language_code == "es" else "English"
 
-        run_outcome_token = _normalize_decision_token((run_summary or {}).get("run_outcome"))
         decision_discrepancy = None
-        if run_outcome_token and run_outcome_token != executive_decision_label:
+        if run_outcome_token and derived_decision_label and run_outcome_token != derived_decision_label:
             decision_discrepancy = {
-                "derived_decision": executive_decision_label,
+                "authoritative_decision": executive_decision_label,
+                "derived_decision": derived_decision_label,
                 "run_outcome": run_outcome_token,
-                "note": "run_summary outcome differs from deterministic derivation",
+                "note": "derived reviewer/adequacy decision differs from authoritative run outcome",
             }
 
         facts_block = {
             "executive_decision_label": executive_decision_label,
+            "authoritative_run_outcome": run_outcome_token,
+            "derived_decision_label": derived_decision_label,
             "decision_discrepancy": decision_discrepancy,
             "business_objective": business_objective,
             "strategy_title": strategy_title,
@@ -2289,13 +2397,24 @@ for a decision-maker who has NOT seen the raw data. The report must enable
 them to understand what happened, whether the results are trustworthy, and
 what to do next.
 
-=== REASONING WORKFLOW (MANDATORY) ===
+=== SOURCE OF TRUTH AND PRECEDENCE ===
+1. FACTS_BLOCK is authoritative for the executive decision label used in this report.
+2. If FACTS_BLOCK includes an authoritative run outcome, it overrides softer
+   signals from reviewer verdicts, data adequacy, heuristics, or narrative text.
+3. RUN NARRATIVE and DETAILED CONTEXT explain what happened and why; they do not
+   override the authoritative executive outcome.
+4. Evidence must come from listed artifacts or explicit deterministic facts.
+   If support is missing, state uncertainty explicitly instead of presenting the claim as established.
+
+=== TRANSLATION DECISION WORKFLOW (MANDATORY) ===
 Before writing, reason through these steps internally. Your report should
 reflect this analysis, not just list data.
 
 1. ASSESS THE OUTCOME
-   - The deterministic system verdict is: $executive_decision_label
+   - The authoritative executive outcome for this report is: $executive_decision_label
    - What was the business objective? Did the system achieve it?
+   - If reviewer or adequacy signals differ from the authoritative outcome,
+     explain the discrepancy but do NOT override the authoritative outcome.
    - If a metric improvement loop ran, what was the best metric achieved
      vs the baseline? How many techniques were tried?
    - If the canonical_primary_metric in FACTS_BLOCK differs from metrics
@@ -2310,7 +2429,7 @@ reflect this analysis, not just list data.
 3. EXPLAIN WHY
    - Connect results to causes. If the metric improved, what technique
      drove it? If it degraded, what went wrong?
-   - If there are contradictions between reviewers and metrics, flag them.
+   - If there are contradictions between reviewers, governance outputs, and metrics, flag them.
 
 4. RECOMMEND ACTIONS
    - Be specific: "retry with X", "investigate Y in artifact Z",
@@ -2522,6 +2641,7 @@ The final section must be "## Evidencia Usada" with entries:
                     metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
                     plots=plots,
                     expected_language=target_language_code,
+                    decision_discrepancy=decision_discrepancy,
                 )
                 if validation.get("has_critical"):
                     repair_prompt = _build_repair_prompt(
@@ -2542,6 +2662,7 @@ The final section must be "## Evidencia Usada" with entries:
                         metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
                         plots=plots,
                         expected_language=target_language_code,
+                        decision_discrepancy=decision_discrepancy,
                     )
                     if repair_validation.get("has_critical"):
                         content = _generate_deterministic_fallback_report(
@@ -2591,6 +2712,7 @@ The final section must be "## Evidencia Usada" with entries:
                         metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
                         plots=plots,
                         expected_language=target_language_code,
+                        decision_discrepancy=decision_discrepancy,
                     )
                     quality_candidate_score = _score_report_quality(quality_candidate_validation)
                     if quality_candidate_score >= quality_score:

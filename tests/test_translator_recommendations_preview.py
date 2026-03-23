@@ -51,4 +51,5 @@ def test_translator_includes_illustrative_examples_section(tmp_path, monkeypatch
     report = agent.generate_report(
         {"execution_output": "OK", "business_objective": "Mejorar resultados"}
     )
-    assert "Ejemplos ilustrativos" in report
+    assert "Recommendations:" in report
+    assert "segment_key" in report

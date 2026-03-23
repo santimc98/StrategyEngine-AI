@@ -126,6 +126,84 @@ class TestStrategistNormalization:
         assert isinstance(spec.get("feature_engineering"), list)
         assert (spec.get("evaluation_plan") or {}).get("feature_engineering") == spec.get("feature_engineering")
 
+    def test_build_strategy_spec_preserves_descriptive_when_llm_reasoned_cleaning_scope(self):
+        payload = {
+            "strategies": [
+                {
+                    "title": "CRM Cleaning Prep",
+                    "objective_type": "descriptive",
+                    "scope_recommendation": "cleaning_only",
+                    "objective_reasoning": "This run is for audit and preparation, not model training.",
+                    "validation_strategy": "data_quality_validation_with_rule_based_checks",
+                    "validation_rationale": "The run should validate cleaning quality and leakage controls.",
+                    "recommended_evaluation_metrics": ["retained_rows_after_cleaning"],
+                    "recommended_artifacts": [
+                        {"artifact_type": "clean_dataset", "required": True, "rationale": "Needed for handoff."},
+                        {"artifact_type": "data_dictionary", "required": True, "rationale": "Needed for traceability."},
+                    ],
+                }
+            ]
+        }
+
+        spec = self.agent._build_strategy_spec_from_llm(
+            payload,
+            data_summary='{"primary_target":"converted_to_opportunity_90d"}',
+            user_request="Auditar y limpiar el CRM antes de modelar",
+        )
+
+        assert spec.get("objective_type") == "descriptive"
+        assert spec.get("scope_recommendation") == "cleaning_only"
+        artifact_types = [a.get("artifact_type") for a in (spec.get("recommended_artifacts") or []) if isinstance(a, dict)]
+        assert "predictions_or_scores" not in artifact_types
+        assert "clean_dataset" in artifact_types
+
+    def test_generate_prompt_includes_senior_contextual_sections_for_scope_and_artifacts(self):
+        payload = {
+            "strategies": [
+                {
+                    "title": "Baseline Churn",
+                    "objective_type": "predictive",
+                    "scope_recommendation": "ml_only",
+                    "scope_reasoning": "Data is already prepared and this run should focus on modeling only.",
+                    "objective_reasoning": "Predict churn probability for retention actions.",
+                    "success_metric": "roc_auc",
+                    "recommended_evaluation_metrics": ["roc_auc"],
+                    "validation_strategy": "stratified_cv",
+                    "validation_rationale": "Class balance should be preserved.",
+                    "analysis_type": "Churn Prediction",
+                    "hypothesis": "Core behavioral variables are predictive.",
+                    "required_columns": ["target", "feature_a"],
+                    "feature_families": [],
+                    "techniques": ["gradient_boosting", "logistic_regression"],
+                    "feasibility_analysis": {
+                        "statistical_power": "adequate",
+                        "signal_quality": "moderate",
+                        "compute_value_tradeoff": "acceptable",
+                    },
+                    "recommended_artifacts": [
+                        {"artifact_type": "metrics", "required": True, "rationale": "Evaluate the model."},
+                        {"artifact_type": "predictions_or_scores", "required": True, "rationale": "Primary output."},
+                    ],
+                    "fallback_chain": ["gradient_boosting", "logistic_regression"],
+                    "expected_lift": "3-5% over naive baseline",
+                    "estimated_difficulty": "Medium",
+                    "reasoning": "Balanced baseline strategy with robust fallback.",
+                }
+            ]
+        }
+        self.agent.model.generate_content = MagicMock(return_value=_mock_llm_response(payload))
+        self.agent.generate_strategies(
+            data_summary="summary",
+            user_request="predict churn",
+            column_inventory=["target", "feature_a"],
+        )
+        prompt = self.agent.last_prompt or ""
+        assert "*** MISSION ***" in prompt
+        assert "*** SOURCE OF TRUTH AND PRECEDENCE ***" in prompt
+        assert "*** STRATEGY REASONING WORKFLOW (MANDATORY) ***" in prompt
+        assert '"scope_recommendation": "One of: cleaning_only, ml_only, full_pipeline"' in prompt
+        assert '"recommended_artifacts": [{"artifact_type": "string", "required": true, "rationale": "why"}]' in prompt
+
     @patch.dict("os.environ", {"STRATEGIST_COLUMN_REPAIR_ATTEMPTS": "1"})
     def test_generate_strategies_repairs_required_columns_with_inventory(self):
         initial = {

@@ -1,6 +1,8 @@
 import json
 import os
 import csv
+import shutil
+from pathlib import Path
 
 from src.agents.business_translator import BusinessTranslatorAgent
 
@@ -68,7 +70,8 @@ def test_translator_builds_artifact_manifest_and_html_tables(tmp_path, monkeypat
     assert manifest["summary"]["required_missing"] >= 1
     assert any(item.get("path") == "data/metrics.json" for item in manifest.get("items", []))
 
-    assert "Artifact Inventory Table (HTML)" in report
+    assert "Artifact Inventory (HTML):" in report
+    assert "Artifact Compliance (HTML):" in report
     assert "artifact_inventory_table_html" not in report
     assert "exec-table artifact-inventory" in report
 
@@ -125,3 +128,107 @@ def test_translator_manifest_csv_row_count_handles_multiline_cells(tmp_path, mon
     scored = next(item for item in manifest["items"] if item["path"] == "data/scored_rows.csv")
     assert scored["present"] is True
     assert scored["row_count"] == 2
+
+
+def test_translator_manifest_handles_rich_required_outputs_without_stringifying_dicts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+
+    with open(os.path.join("data", "dataset_limpio.csv"), "w", encoding="utf-8") as f:
+        f.write("id,value\n1,10\n")
+
+    with open(os.path.join("data", "execution_contract.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "required_outputs": [
+                    {
+                        "intent": "dataset_limpio_csv",
+                        "path": "data/dataset_limpio.csv",
+                        "owner": "data_engineer",
+                        "required": True,
+                    },
+                    {
+                        "intent": "data_quality_report",
+                        "path": "data/data_quality_report.json",
+                        "owner": "data_engineer",
+                        "required": True,
+                    },
+                ],
+                "artifact_requirements": {
+                    "required_files": [
+                        {"path": "data/dataset_limpio.csv"},
+                        {"path": "data/data_quality_report.json"},
+                    ]
+                },
+            },
+            f,
+        )
+
+    with open(os.path.join("data", "output_contract_report.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "overall_status": "error",
+                "present": ["data/dataset_limpio.csv"],
+                "missing": ["data/data_quality_report.json"],
+                "artifact_requirements_report": {
+                    "status": "error",
+                    "files_report": {
+                        "present": ["data/dataset_limpio.csv"],
+                        "missing": ["data/data_quality_report.json"],
+                    },
+                },
+            },
+            f,
+        )
+
+    with open(os.path.join("data", "produced_artifact_index.json"), "w", encoding="utf-8") as f:
+        json.dump([{"path": "data/dataset_limpio.csv", "artifact_type": "dataset"}], f)
+
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "NO_GO"}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    _ = agent.generate_report({"execution_output": "ok", "business_objective": "Objetivo"})
+
+    with open(os.path.join("data", "report_artifact_manifest.json"), "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    assert manifest["summary"]["required_total"] == 2
+    assert manifest["summary"]["required_missing"] == 1
+    paths = [item.get("path") for item in manifest.get("items", [])]
+    assert "data/dataset_limpio.csv" in paths
+    assert "data/data_quality_report.json" in paths
+    assert not any(path and path.startswith("{") for path in paths)
+
+
+def test_replay_c946b64d_manifest_deduplicates_rich_required_outputs_from_real_run(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.join("artifacts", "clean"), exist_ok=True)
+
+    repo_root = Path(__file__).resolve().parents[1]
+    run_root = repo_root / "runs" / "c946b64d"
+
+    shutil.copy(run_root / "work" / "data" / "execution_contract_raw.json", tmp_path / "data" / "execution_contract.json")
+    shutil.copy(run_root / "work" / "data" / "output_contract_report.json", tmp_path / "data" / "output_contract_report.json")
+    shutil.copy(run_root / "work" / "data" / "produced_artifact_index.json", tmp_path / "data" / "produced_artifact_index.json")
+    shutil.copy(run_root / "work" / "data" / "run_summary.json", tmp_path / "data" / "run_summary.json")
+    shutil.copy(
+        run_root / "work" / "artifacts" / "clean" / "dataset_enriquecido.csv",
+        tmp_path / "artifacts" / "clean" / "dataset_enriquecido.csv",
+    )
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    _ = agent.generate_report({"execution_output": "ok", "business_objective": "Objetivo"})
+
+    with open(os.path.join("data", "report_artifact_manifest.json"), "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    assert manifest["summary"]["required_total"] == 9
+    assert manifest["summary"]["required_present"] == 1
+    assert manifest["summary"]["required_missing"] == 8
+    paths = [item.get("path") for item in manifest.get("items", [])]
+    assert "artifacts/clean/dataset_enriquecido.csv" in paths
+    assert not any(path and str(path).startswith("{") for path in paths)
