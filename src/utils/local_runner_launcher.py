@@ -29,6 +29,12 @@ def _normalize_scope_segment(value: Any) -> str:
 
 
 def _copy_file(src: str, dst: str) -> None:
+    if os.path.isdir(src):
+        # Directory artifact (e.g., "artifacts/ml/models/"): copy entire tree
+        if os.path.exists(dst):
+            shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+        return
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
     shutil.copy2(src, dst)
 
