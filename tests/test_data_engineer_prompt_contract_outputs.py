@@ -412,3 +412,190 @@ def test_data_engineer_prompt_includes_column_resolution_context_as_support_evid
     assert "Use COLUMN_RESOLUTION_CONTEXT first" in prompt
     assert "\"annual_revenue\"" in prompt
     assert "\"currency_symbol\"" in prompt
+
+
+def test_data_engineer_prompt_includes_artifact_obligations_as_contract_extraction_context():
+    agent = DataEngineerAgent(api_key="fake")
+    execution_contract = {
+        "scope": "cleaning_only",
+        "artifact_requirements": {
+            "cleaned_dataset": {
+                "output_path": "artifacts/clean/dataset_cleaned.csv",
+                "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+                "required_columns": ["lead_id", "created_at"],
+                "optional_passthrough_columns": ["raw_event_ts"],
+                "column_transformations": {"drop_columns": ["internal_debug_flag"]},
+            },
+            "enriched_dataset": {
+                "output_path": "artifacts/clean/dataset_enriched.csv",
+                "required_columns": ["created_at", "score_target"],
+            },
+        },
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer", "required": True},
+            {"path": "artifacts/clean/dataset_enriched.csv", "owner": "data_engineer", "required": True},
+        ],
+    }
+    de_view = {
+        "required_columns": ["lead_id", "created_at"],
+        "output_path": "artifacts/clean/dataset_cleaned.csv",
+        "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+        "required_outputs": [
+            "artifacts/clean/dataset_cleaned.csv",
+            "artifacts/clean/dataset_enriched.csv",
+        ],
+        "cleaning_gates": [],
+    }
+
+    with patch(
+        "src.agents.data_engineer.call_chat_with_fallback",
+        return_value=(_mock_response("print('ok')"), "mock/model"),
+    ):
+        agent.generate_cleaning_script(
+            data_audit="audit",
+            strategy={"required_columns": ["lead_id", "created_at"]},
+            input_path="data/raw.csv",
+            execution_contract=execution_contract,
+            de_view=de_view,
+        )
+
+    prompt = agent.last_prompt or ""
+    assert "ARTIFACT_OBLIGATIONS_CONTEXT" in prompt
+    assert "lossless extraction of artifact bindings already declared in the contract" in prompt
+    assert "\"binding_name\": \"cleaned_dataset\"" in prompt
+    assert "artifact_requirements.cleaned_dataset.output_path" in prompt
+
+
+def test_data_engineer_repair_mode_uses_previous_script_patch_context():
+    agent = DataEngineerAgent(api_key="fake")
+    execution_contract = {
+        "scope": "cleaning_only",
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer", "required": True},
+        ],
+    }
+    de_view = {
+        "scope": "cleaning_only",
+        "required_columns": ["lead_id", "created_at"],
+        "output_path": "artifacts/clean/dataset_cleaned.csv",
+        "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+        "required_outputs": ["artifacts/clean/dataset_cleaned.csv"],
+        "cleaning_gates": [],
+        "data_engineer_runbook": {"steps": ["clean", "persist"]},
+    }
+    previous_code = (
+        "import pandas as pd\n"
+        "df = pd.read_csv('data/raw.csv')\n"
+        "raise ValueError('boom')\n"
+    )
+    feedback_record = {
+        "agent": "data_engineer",
+        "source": "runtime_retry",
+        "status": "REJECTED",
+        "iteration": 2,
+        "feedback": "Runtime retry required after sandbox failure.",
+        "failed_gates": ["runtime_failure"],
+        "required_fixes": ["Fix the failing pandas operation without rewriting the whole script."],
+        "hard_failures": ["runtime_failure"],
+        "runtime_error_tail": "ValueError: boom",
+    }
+
+    with patch(
+        "src.agents.data_engineer.call_chat_with_fallback",
+        return_value=(_mock_response("print('patched')"), "mock/model"),
+    ):
+        code = agent.generate_cleaning_script(
+            data_audit="RUNTIME_ERROR_CONTEXT:\nValueError: boom",
+            strategy={"required_columns": ["lead_id", "created_at"]},
+            input_path="data/raw.csv",
+            execution_contract=execution_contract,
+            de_view=de_view,
+            repair_mode=True,
+            previous_code=previous_code,
+            feedback_record=feedback_record,
+        )
+
+    prompt = agent.last_prompt or ""
+    assert "MODE: REPAIR_EDITOR" in prompt
+    assert "PREVIOUS_SCRIPT_BODY_TO_PATCH" in prompt
+    assert "Do not regenerate from zero" in prompt
+    assert "Fix the failing pandas operation without rewriting the whole script." in prompt
+    assert "json.dumps = _safe_dumps_json" not in prompt
+    assert "print('patched')" in code
+
+
+def test_data_engineer_repair_mode_promotes_failure_explainer_fix_and_compacts_error_context():
+    agent = DataEngineerAgent(api_key="fake")
+    execution_contract = {
+        "scope": "cleaning_only",
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer", "required": True},
+        ],
+    }
+    de_view = {
+        "scope": "cleaning_only",
+        "required_columns": ["lead_id", "created_at"],
+        "output_path": "artifacts/clean/dataset_cleaned.csv",
+        "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+        "required_outputs": ["artifacts/clean/dataset_cleaned.csv"],
+        "cleaning_gates": [],
+        "data_engineer_runbook": {"steps": ["clean", "persist"]},
+    }
+    previous_code = "import pandas as pd\ndf = pd.read_csv('data/raw.csv')\nraise KeyError('boom')\n"
+    feedback_record = {
+        "agent": "data_engineer",
+        "source": "runtime_retry",
+        "status": "REJECTED",
+        "iteration": 2,
+        "feedback": "Runtime retry required after sandbox failure.",
+        "failed_gates": ["runtime_failure"],
+        "required_fixes": [],
+        "hard_failures": ["runtime_failure"],
+        "runtime_error_tail": "KeyError: boom",
+    }
+    data_audit = "\n".join(
+        [
+            "RUNTIME_ERROR_CONTEXT:",
+            "KeyError: boom",
+            "",
+            "TRACEBACK_TAIL_20:",
+            "Traceback line 1",
+            "Traceback line 2",
+            "",
+            "LLM_FAILURE_EXPLANATION:",
+            "WHERE: Inside the deduplication stage.",
+            "WHY: The retained frame lost the grouping column before the selection step.",
+            "FIX: Preserve _dedup_group_key on the retained rows before selecting decision columns.",
+            "DIAGNOSTIC: Print kept.columns before the failing selection.",
+            "",
+            "LATEST_ITERATION_FEEDBACK_RECORD_JSON:",
+            '{"agent":"data_engineer","required_fixes":[]}',
+            "",
+            "ITERATION_FEEDBACK_CONTEXT:",
+            "Very long stale narrative that should not appear inside REPAIR_ERROR_CONTEXT.",
+        ]
+    )
+
+    with patch(
+        "src.agents.data_engineer.call_chat_with_fallback",
+        return_value=(_mock_response("print('patched')"), "mock/model"),
+    ):
+        code = agent.generate_cleaning_script(
+            data_audit=data_audit,
+            strategy={"required_columns": ["lead_id", "created_at"]},
+            input_path="data/raw.csv",
+            execution_contract=execution_contract,
+            de_view=de_view,
+            repair_mode=True,
+            previous_code=previous_code,
+            feedback_record=feedback_record,
+        )
+
+    prompt = agent.last_prompt or ""
+    assert "Preserve _dedup_group_key on the retained rows before selecting decision columns." in prompt
+    repair_context = prompt.split("REPAIR_ERROR_CONTEXT:", 1)[1].split("PREVIOUS_SCRIPT_BODY_TO_PATCH:", 1)[0]
+    assert "LLM_FAILURE_EXPLANATION:" in repair_context
+    assert "LATEST_ITERATION_FEEDBACK_RECORD_JSON:" not in repair_context
+    assert "ITERATION_FEEDBACK_CONTEXT:" not in repair_context
+    assert "Runtime retry required after sandbox failure." in repair_context
+    assert "print('patched')" in code

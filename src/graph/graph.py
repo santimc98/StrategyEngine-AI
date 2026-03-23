@@ -144,6 +144,7 @@ from src.utils.contract_views import (
     persist_views,
     persist_view_projection_reports,
 )
+from src.utils.artifact_obligations import build_data_engineer_artifact_obligations
 from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
 from src.utils.cleaning_executor import execute_cleaning_plan
 from src.utils.actor_critic_schemas import normalize_target_columns
@@ -5824,6 +5825,32 @@ def _persist_column_resolution_context(
     return path
 
 
+def _persist_artifact_obligations_context(
+    context: Dict[str, Any],
+    *,
+    base_dir: str = "data",
+    run_bundle_dir: str | None = None,
+) -> str:
+    context = context if isinstance(context, dict) else {}
+    if not context:
+        return ""
+    path = os.path.join(base_dir, "contracts", "support", "data_engineer_artifact_obligations.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(context, f, indent=2, ensure_ascii=False)
+    if run_bundle_dir:
+        bundle_path = os.path.join(
+            run_bundle_dir,
+            "contracts",
+            "support",
+            "data_engineer_artifact_obligations.json",
+        )
+        os.makedirs(os.path.dirname(bundle_path), exist_ok=True)
+        with open(bundle_path, "w", encoding="utf-8") as f:
+            json.dump(context, f, indent=2, ensure_ascii=False)
+    return path
+
+
 def _build_contract_views(
     state: Dict[str, Any],
     contract: Dict[str, Any],
@@ -5858,8 +5885,14 @@ def _build_contract_views(
     for error in projection_report_errors:
         if error not in view_errors:
             view_errors.append(error)
+    artifact_obligations_context = build_data_engineer_artifact_obligations(contract)
     column_resolution_context_path = _persist_column_resolution_context(
         views,
+        base_dir="data",
+        run_bundle_dir=state.get("run_bundle_dir"),
+    )
+    artifact_obligations_context_path = _persist_artifact_obligations_context(
+        artifact_obligations_context,
         base_dir="data",
         run_bundle_dir=state.get("run_bundle_dir"),
     )
@@ -5888,6 +5921,8 @@ def _build_contract_views(
         "results_advisor_view": results_advisor_view,
         "contract_views_projection_ok": not view_errors,
         "contract_views_projection_errors": view_errors,
+        "artifact_obligations_context": artifact_obligations_context,
+        "artifact_obligations_context_path": artifact_obligations_context_path,
         "column_resolution_context_path": column_resolution_context_path,
     }
 
@@ -10550,6 +10585,63 @@ def _build_latest_feedback_record_block(record: Dict[str, Any] | None) -> str:
     return "LATEST_ITERATION_FEEDBACK_RECORD_JSON:\n" + json.dumps(normalized, ensure_ascii=True, indent=2)
 
 
+def _parse_failure_explainer_sections(text: str) -> Dict[str, List[str] | str]:
+    parsed: Dict[str, Any] = {
+        "where": "",
+        "why": "",
+        "fixes": [],
+        "diagnostics": [],
+    }
+    raw = str(text or "")
+    if not raw.strip():
+        return parsed
+
+    for raw_line in raw.splitlines():
+        line = str(raw_line or "").strip()
+        if not line or ":" not in line:
+            continue
+        label, value = line.split(":", 1)
+        label_norm = str(label or "").strip().upper()
+        value_text = str(value or "").strip(" -\t")
+        if not value_text:
+            continue
+        if label_norm == "WHERE" and not parsed["where"]:
+            parsed["where"] = value_text
+        elif label_norm == "WHY" and not parsed["why"]:
+            parsed["why"] = value_text
+        elif label_norm == "FIX":
+            parsed["fixes"].append(value_text)
+        elif label_norm == "DIAGNOSTIC":
+            parsed["diagnostics"].append(value_text)
+
+    parsed["fixes"] = list(dict.fromkeys([str(x) for x in parsed["fixes"] if str(x).strip()]))[:6]
+    parsed["diagnostics"] = list(dict.fromkeys([str(x) for x in parsed["diagnostics"] if str(x).strip()]))[:4]
+    return parsed
+
+
+def _extract_de_failure_explainer_fix_hints(text: str) -> List[str]:
+    parsed = _parse_failure_explainer_sections(text)
+    hints: List[str] = []
+    for item in parsed.get("fixes") or []:
+        hints.append(str(item))
+    diagnostics = parsed.get("diagnostics") or []
+    if diagnostics:
+        hints.append(f"Use this minimal diagnostic if needed: {diagnostics[0]}")
+    return list(dict.fromkeys([str(x) for x in hints if str(x).strip()]))[:8]
+
+
+def _append_de_failure_explainer_context(payload: str, explainer_text: str) -> tuple[str, List[str]]:
+    payload_text = str(payload or "")
+    explainer = str(explainer_text or "").strip()
+    if not explainer:
+        return payload_text, []
+    payload_text += "\nLLM_FAILURE_EXPLANATION:\n" + explainer
+    repair_hints = _extract_de_failure_explainer_fix_hints(explainer)
+    if repair_hints:
+        payload_text += "\nREPAIR_HINTS:\n- " + "\n- ".join(repair_hints)
+    return payload_text, repair_hints
+
+
 def _set_latest_feedback_record(
     state: Dict[str, Any],
     *,
@@ -14004,6 +14096,8 @@ class AgentState(TypedDict):
     execution_contract_source: str
     contract_views: Dict[str, Any]
     contract_view_paths: Dict[str, str]
+    artifact_obligations_context: Dict[str, Any]
+    artifact_obligations_context_path: str
     de_view: Dict[str, Any]
     ml_view: Dict[str, Any]
     reviewer_view: Dict[str, Any]
@@ -18127,6 +18221,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
     except Exception:
         pass
     required_all_columns = _resolve_contract_columns_for_cleaning(state.get("execution_contract", {}))
+    artifact_obligations_context = state.get("artifact_obligations_context")
+    if not isinstance(artifact_obligations_context, dict) or not artifact_obligations_context:
+        artifact_obligations_context = build_data_engineer_artifact_obligations(
+            execution_contract if isinstance(execution_contract, dict) else {}
+        )
     if minimal_context_mode:
         context_payload = {
             "csv_path": csv_path,
@@ -18134,6 +18233,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "csv_sep": csv_sep,
             "csv_decimal": csv_decimal,
             "de_view": de_view,
+            "artifact_obligations_context": artifact_obligations_context,
+            "artifact_obligations_context_path": state.get("artifact_obligations_context_path"),
             "feedback_context": data_engineer_audit_override,
             "last_gate_context": state.get("last_gate_context"),
         }
@@ -18153,6 +18254,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "dataset_training_mask": state.get("dataset_training_mask"),
             "de_view": de_view,
             "execution_contract": execution_contract,
+            "artifact_obligations_context": artifact_obligations_context,
+            "artifact_obligations_context_path": state.get("artifact_obligations_context_path"),
             "context_pack": context_pack,
         }
     try:
@@ -18174,13 +18277,47 @@ def run_data_engineer(state: AgentState) -> AgentState:
         "csv_sep": csv_sep,
         "csv_decimal": csv_decimal,
     }
+    previous_de_code = None
+    if int(attempt_id or 0) > 1:
+        previous_candidates: List[str] = []
+        for candidate in [
+            state.get("cleaning_code"),
+            state.get("data_engineer_last_code"),
+            os.path.join("artifacts", "data_engineer_last.py"),
+        ]:
+            if isinstance(candidate, str) and candidate.strip():
+                previous_candidates.append(candidate)
+        for candidate in previous_candidates:
+            code_text = ""
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate, "r", encoding="utf-8") as f_prev:
+                        code_text = f_prev.read()
+                except Exception:
+                    code_text = ""
+            else:
+                code_text = str(candidate or "")
+            if code_text.strip() and not code_text.lstrip().startswith("# Error"):
+                previous_de_code = code_text
+                break
+    latest_de_feedback_record = (
+        state.get("data_engineer_feedback_record")
+        if isinstance(state.get("data_engineer_feedback_record"), dict)
+        else None
+    )
     sig = inspect.signature(data_engineer.generate_cleaning_script)
     if "execution_contract" in sig.parameters and not minimal_context_mode:
         kwargs["execution_contract"] = execution_contract
     if "de_view" in sig.parameters:
         kwargs["de_view"] = de_view
+    if "artifact_obligations" in sig.parameters and artifact_obligations_context:
+        kwargs["artifact_obligations"] = artifact_obligations_context
     if "repair_mode" in sig.parameters:
         kwargs["repair_mode"] = bool(attempt_id > 1)
+    if "previous_code" in sig.parameters and previous_de_code:
+        kwargs["previous_code"] = previous_de_code
+    if "feedback_record" in sig.parameters and latest_de_feedback_record:
+        kwargs["feedback_record"] = latest_de_feedback_record
     code = data_engineer.generate_cleaning_script(**kwargs)
     try:
         os.makedirs("artifacts", exist_ok=True)
@@ -18429,6 +18566,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 new_state = dict(state)
                 new_state["de_preflight_retry_done"] = True
                 payload = "PREFLIGHT_ERROR_CONTEXT:\n" + msg
+                explainer_fix_hints: List[str] = []
                 try:
                     explainer_text = ""
                     try:
@@ -18456,7 +18594,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         print(f"Warning: failure explainer failed: {explainer_err}")
                         explainer_text = ""
                     if explainer_text:
-                        payload += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                        payload, explainer_fix_hints = _append_de_failure_explainer_context(
+                            payload,
+                            explainer_text,
+                        )
                         try:
                             os.makedirs("artifacts", exist_ok=True)
                             with open(
@@ -18478,7 +18619,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     iteration=int(attempt_id),
                     feedback=str(msg),
                     failed_gates=["data_engineer_preflight"],
-                    required_fixes=[str(item) for item in preflight_issues if str(item).strip()],
+                    required_fixes=[
+                        str(item)
+                        for item in list(preflight_issues) + list(explainer_fix_hints)
+                        if str(item).strip()
+                    ],
                     runtime_error_tail=str(msg),
                     evidence=[{"claim": "Data engineer preflight checks failed.", "source": "data_engineer_preflight"}],
                 )
@@ -18983,6 +19128,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     gate_hints = _build_de_gate_implementation_hints(de_view_for_hints.get("cleaning_gates"))
                     if gate_hints:
                         payload += "\nGATE_IMPLEMENTATION_HINTS:\n- " + "\n- ".join(gate_hints)
+                    explainer_fix_hints: List[str] = []
                     try:
                         runtime_record = {
                             "agent": "data_engineer",
@@ -19022,7 +19168,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             context=explainer_ctx,
                         )
                         if explainer_text:
-                            payload += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                            payload, explainer_fix_hints = _append_de_failure_explainer_context(
+                                payload,
+                                explainer_text,
+                            )
                             try:
                                 os.makedirs("artifacts", exist_ok=True)
                                 with open(
@@ -19046,7 +19195,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         iteration=int(attempt_id),
                         feedback="Data Engineer runtime failure detected in heavy runner execution.",
                         failed_gates=["runtime_failure"],
-                        required_fixes=[str(item) for item in (gate_hints or []) if str(item).strip()],
+                        required_fixes=[
+                            str(item)
+                            for item in list(gate_hints or []) + list(explainer_fix_hints)
+                            if str(item).strip()
+                        ],
                         hard_failures=["runtime_failure"],
                         runtime_error_tail=str(runtime_error_text or "")[-1400:],
                         evidence=[
@@ -19403,6 +19556,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             {"attempt": attempt_id, "has_snippet": bool(error_snippet)},
                                         )
                                     cleaning_view = state.get("cleaning_view") or (state.get("contract_views") or {}).get("cleaning_view")
+                                    artifact_obligations = state.get("artifact_obligations_context")
+                                    if not isinstance(artifact_obligations, dict) or not artifact_obligations:
+                                        artifact_obligations = build_data_engineer_artifact_obligations(
+                                            state.get("execution_contract", {}) or {}
+                                        )
                                     # Load cleaning code for intent verification by reviewer
                                     cleaning_code_for_reviewer = None
                                     try:
@@ -19419,14 +19577,17 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         if cleaning_code_for_reviewer:
                                             cleaning_view_copy["cleaning_code"] = cleaning_code_for_reviewer
                                         cleaning_view_copy = compress_long_lists(cleaning_view_copy)[0]
+                                        review_context_payload = dict(cleaning_view_copy)
+                                        if artifact_obligations:
+                                            review_context_payload["artifact_obligations"] = artifact_obligations
                                         reviewer_result = cleaning_reviewer.review_cleaning(
                                             cleaning_view_copy,
                                             cleaned_csv_path=local_cleaned_path,
                                             cleaning_manifest_path=local_manifest_path,
                                             raw_csv_path=csv_path,
                                             failure_context=failure_context,
+                                            artifact_obligations=artifact_obligations,
                                         )
-                                        review_context_payload = cleaning_view_copy
                                     else:
                                         contract = state.get("execution_contract", {}) or {}
                                         review_context = {
@@ -19439,6 +19600,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         }
                                         if cleaning_code_for_reviewer:
                                             review_context["cleaning_code"] = cleaning_code_for_reviewer
+                                        if artifact_obligations:
+                                            review_context["artifact_obligations"] = artifact_obligations
                                         review_context = compress_long_lists(review_context)[0]
                                         reviewer_result = cleaning_reviewer.review_cleaning(
                                             review_context,
@@ -19519,6 +19682,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     gate_hints = _build_de_gate_implementation_hints(de_view_for_hints.get("cleaning_gates"))
                                     if gate_hints:
                                         payload += "\nGATE_IMPLEMENTATION_HINTS:\n- " + "\n- ".join(gate_hints)
+                                    explainer_fix_hints: List[str] = []
                                     try:
                                         runtime_record = {
                                             "agent": "data_engineer",
@@ -19561,7 +19725,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         print(f"Warning: failure explainer failed: {explainer_err}")
                                         explainer_text = ""
                                     if explainer_text:
-                                        payload += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                                        payload, explainer_fix_hints = _append_de_failure_explainer_context(
+                                            payload,
+                                            explainer_text,
+                                        )
                                         try:
                                             os.makedirs("artifacts", exist_ok=True)
                                             with open(
@@ -19583,7 +19750,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     iteration=int(attempt_id),
                                     feedback="Data Engineer runtime failure detected in sandbox execution.",
                                     failed_gates=["runtime_failure"],
-                                    required_fixes=[str(item) for item in (gate_hints or []) if str(item).strip()],
+                                    required_fixes=[
+                                        str(item)
+                                        for item in list(gate_hints or []) + list(explainer_fix_hints)
+                                        if str(item).strip()
+                                    ],
                                     hard_failures=["runtime_failure"],
                                     runtime_error_tail=str(error_details or "")[-1400:],
                                     evidence=[
@@ -19792,8 +19963,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         except Exception as explainer_err:
                             print(f"Warning: failure explainer failed: {explainer_err}")
                             explainer_text = ""
+                        explainer_fix_hints: List[str] = []
                         if explainer_text:
-                            payload = payload + "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                            payload, explainer_fix_hints = _append_de_failure_explainer_context(
+                                payload,
+                                explainer_text,
+                            )
                             try:
                                 os.makedirs("artifacts", exist_ok=True)
                                 with open(
@@ -19816,6 +19991,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             required_fixes=[
                                 "Avoid destructive conversions that remove too many rows.",
                                 "Use contract-aligned null/typing handling and preserve row integrity.",
+                                *explainer_fix_hints,
                             ],
                             runtime_error_tail=json.dumps(row_drop_summary, ensure_ascii=True)[:1400],
                             evidence=[{"claim": "Row drop summary exceeded guard threshold.", "source": "cleaning_manifest.json#row_counts"}],
@@ -20300,6 +20476,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     cleaning_view = state.get("cleaning_view") or (state.get("contract_views") or {}).get("cleaning_view")
                     # Load cleaning code for intent verification by reviewer
                     cleaning_code_for_normal_review = None
+                    artifact_obligations = state.get("artifact_obligations_context")
+                    if not isinstance(artifact_obligations, dict) or not artifact_obligations:
+                        artifact_obligations = build_data_engineer_artifact_obligations(
+                            state.get("execution_contract", {}) or {}
+                        )
                     try:
                         de_code_path = os.path.join("artifacts", "data_engineer_last.py")
                         if os.path.exists(de_code_path):
@@ -20318,13 +20499,16 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         if os.path.exists("data/required_columns.json"):
                             cleaning_view_copy["required_columns_path"] = "data/required_columns.json"
                         cleaning_view_copy = compress_long_lists(cleaning_view_copy)[0]
+                        review_context_payload = dict(cleaning_view_copy)
+                        if artifact_obligations:
+                            review_context_payload["artifact_obligations"] = artifact_obligations
                         review_result = cleaning_reviewer.review_cleaning(
                             cleaning_view_copy,
                             cleaned_csv_path=local_cleaned_path,
                             cleaning_manifest_path=local_manifest_path,
                             raw_csv_path=csv_path,
+                            artifact_obligations=artifact_obligations,
                         )
-                        review_context_payload = cleaning_view_copy
                     else:
                         contract = state.get("execution_contract", {}) or {}
                         review_context = {
@@ -20346,6 +20530,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             review_context["input_dialect"] = input_dialect
                         if cleaning_code_for_normal_review:
                             review_context["cleaning_code"] = cleaning_code_for_normal_review
+                        if artifact_obligations:
+                            review_context["artifact_obligations"] = artifact_obligations
                         review_context = compress_long_lists(review_context)[0]
                         review_result = cleaning_reviewer.review_cleaning(review_context)
                         review_context_payload = review_context

@@ -2,7 +2,11 @@ import json
 from pathlib import Path
 import os
 
-from src.graph.graph import _resolve_de_output_artifacts, _persist_runner_artifact_index
+from src.graph.graph import (
+    _resolve_de_output_artifacts,
+    _persist_artifact_obligations_context,
+    _persist_runner_artifact_index,
+)
 
 
 def test_resolve_de_output_artifacts_covers_all_owned_contract_outputs():
@@ -112,3 +116,34 @@ def test_persist_runner_artifact_index_keeps_downloaded_outputs_on_partial_failu
     persisted = json.loads(Path("data/produced_artifact_index.json").read_text(encoding="utf-8"))
     persisted_paths = {item["path"] for item in persisted}
     assert paths == persisted_paths
+
+
+def test_persist_artifact_obligations_context_writes_support_artifact_and_bundle_copy(tmp_path):
+    context = {
+        "role": "data_engineer",
+        "artifact_bindings": [
+            {
+                "binding_name": "cleaned_dataset",
+                "source_contract_path": "artifact_requirements.cleaned_dataset",
+                "declared_binding": {"output_path": "artifacts/clean/dataset_cleaned.csv"},
+            }
+        ],
+    }
+
+    base_dir = tmp_path / "data"
+    run_bundle_dir = tmp_path / "run_bundle"
+    path = _persist_artifact_obligations_context(
+        context,
+        base_dir=str(base_dir),
+        run_bundle_dir=str(run_bundle_dir),
+    )
+
+    assert path.endswith("data_engineer_artifact_obligations.json")
+    persisted = json.loads(Path(path).read_text(encoding="utf-8"))
+    bundled = json.loads(
+        (run_bundle_dir / "contracts" / "support" / "data_engineer_artifact_obligations.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted == context
+    assert bundled == context

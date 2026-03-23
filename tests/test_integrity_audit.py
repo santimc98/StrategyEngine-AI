@@ -109,3 +109,60 @@ def test_missing_required_is_critical():
     issues, _ = run_integrity_audit(df, contract)
     critical = [i for i in issues if i.get("severity") == "critical"]
     assert any(i.get("type") == "MISSING_COLUMN" for i in critical)
+
+
+def test_cleaned_dataset_binding_takes_precedence_over_canonical_columns_and_respects_drop_columns():
+    df = pd.DataFrame(
+        {
+            "lead_id": ["L1", "L2"],
+            "country": ["ES", "FR"],
+            "converted_to_opportunity_90d": [0, 1],
+        }
+    )
+    contract = {
+        "canonical_columns": [
+            "lead_id",
+            "opportunity_id",
+            "crm_record_hash",
+            "internal_debug_flag",
+            "country",
+            "converted_to_opportunity_90d",
+        ],
+        "artifact_requirements": {
+            "cleaned_dataset": {
+                "required_columns": [
+                    "lead_id",
+                    "opportunity_id",
+                    "crm_record_hash",
+                    "country",
+                    "converted_to_opportunity_90d",
+                ],
+                "optional_passthrough_columns": ["internal_debug_flag"],
+                "column_transformations": {
+                    "drop_columns": [
+                        "opportunity_id",
+                        "crm_record_hash",
+                        "internal_debug_flag",
+                    ]
+                },
+            }
+        },
+    }
+
+    issues, _ = run_integrity_audit(df, contract)
+
+    critical_missing = {
+        issue.get("column")
+        for issue in issues
+        if issue.get("type") == "MISSING_COLUMN" and issue.get("severity") == "critical"
+    }
+    optional_missing = {
+        issue.get("column")
+        for issue in issues
+        if issue.get("type") == "OPTIONAL_COLUMN_MISSING"
+    }
+
+    assert "opportunity_id" not in critical_missing
+    assert "crm_record_hash" not in critical_missing
+    assert "internal_debug_flag" not in critical_missing
+    assert "internal_debug_flag" in optional_missing

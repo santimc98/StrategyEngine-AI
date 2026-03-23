@@ -43,6 +43,16 @@ class TestContractStrictMode:
                     "observed_format_families": ["iso_date", "slash_date"],
                 }
             },
+            artifact_obligations={
+                "role": "data_engineer",
+                "artifact_bindings": [
+                    {
+                        "binding_name": "cleaned_dataset",
+                        "source_contract_path": "artifact_requirements.cleaned_dataset",
+                        "declared_binding": {"required_columns": ["col_a"]},
+                    }
+                ],
+            },
         )
 
         assert "MISSION" in prompt
@@ -51,8 +61,10 @@ class TestContractStrictMode:
         assert "deterministic_gate_results are supporting evidence only" in prompt
         assert "GUIDANCE, NOT A SUBSTITUTE FOR REASONING" in prompt
         assert "column_resolution_context" in prompt
+        assert "artifact_obligations" in prompt
         assert payload["contract_source_used"] == "cleaning_view"
         assert "column_resolution_context" in payload
+        assert "artifact_obligations" in payload
 
     def test_merge_cleaning_gates_returns_fallback_source_when_empty(self):
         """When cleaning_gates is missing/empty, source should be 'fallback'."""

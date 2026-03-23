@@ -16,6 +16,7 @@ from src.utils.contract_accessors import (
     get_validation_requirements,
     get_preprocessing_requirements,
     get_artifact_requirements,
+    get_dataset_artifact_binding,
 )
 
 
@@ -94,10 +95,23 @@ def _build_requirements_from_v41(contract: Dict[str, Any]) -> List[Dict[str, Any
             return [value]
         return []
 
+    def _resolve_cleaned_dataset_binding(contract_obj: Dict[str, Any]) -> Dict[str, Any]:
+        binding = get_dataset_artifact_binding(contract_obj, "cleaned_dataset")
+        return binding if isinstance(binding, dict) else {}
+
+    def _resolve_cleaned_dataset_drop_columns(contract_obj: Dict[str, Any]) -> set[str]:
+        binding = _resolve_cleaned_dataset_binding(contract_obj)
+        transforms = binding.get("column_transformations")
+        if not isinstance(transforms, dict):
+            return set()
+        return {str(col) for col in _coerce_list(transforms.get("drop_columns"))}
+
     def _resolve_required_columns(contract_obj: Dict[str, Any]) -> List[str]:
-        artifacts = get_artifact_requirements(contract_obj)
-        clean_dataset = artifacts.get("clean_dataset") if isinstance(artifacts, dict) else None
+        clean_dataset = _resolve_cleaned_dataset_binding(contract_obj)
         required_cols = _coerce_list(clean_dataset.get("required_columns")) if isinstance(clean_dataset, dict) else []
+        drop_columns = _resolve_cleaned_dataset_drop_columns(contract_obj)
+        if required_cols and drop_columns:
+            required_cols = [col for col in required_cols if col not in drop_columns]
         if required_cols:
             return required_cols
         canonical_cols = get_canonical_columns(contract_obj)
@@ -183,9 +197,13 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
     # V4.1: No legacy validations - use validation_requirements instead
     artifacts = get_artifact_requirements(contract)
     schema_binding = artifacts.get("schema_binding") if isinstance(artifacts, dict) else {}
-    optional_cols = schema_binding.get("optional_passthrough_columns", []) if isinstance(schema_binding, dict) else []
-    if not isinstance(optional_cols, list):
-        optional_cols = []
+    cleaned_dataset = get_dataset_artifact_binding(contract, "cleaned_dataset")
+    optional_cols: List[str] = []
+    if isinstance(cleaned_dataset, dict):
+        optional_cols.extend(str(col) for col in cleaned_dataset.get("optional_passthrough_columns", []) or [] if col)
+    if isinstance(schema_binding, dict):
+        optional_cols.extend(str(col) for col in schema_binding.get("optional_passthrough_columns", []) or [] if col)
+    optional_cols = list(dict.fromkeys(optional_cols))
 
     stats: Dict[str, Dict[str, Any]] = {}
     issues: List[Dict[str, Any]] = []

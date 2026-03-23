@@ -68,6 +68,7 @@ class CleaningReviewerAgent:
                     cleaned_csv_path=request["cleaned_csv_path"],
                     cleaning_manifest_path=request["cleaning_manifest_path"],
                     raw_csv_path=request.get("raw_csv_path"),
+                    artifact_obligations=request.get("artifact_obligations"),
                     client=self.client,
                     model_name=self.model_name,
                     provider=self.provider,
@@ -119,12 +120,14 @@ def _parse_review_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[
         maybe_failure = cleaning_view.get("failure_context")
         if isinstance(maybe_failure, dict):
             failure_context = maybe_failure
+    artifact_obligations = kwargs.get("artifact_obligations")
     return {
         "cleaning_view": cleaning_view,
         "cleaned_csv_path": str(cleaned_csv_path),
         "cleaning_manifest_path": str(cleaning_manifest_path),
         "raw_csv_path": str(raw_csv_path) if raw_csv_path else None,
         "failure_context": failure_context if isinstance(failure_context, dict) else None,
+        "artifact_obligations": artifact_obligations if isinstance(artifact_obligations, dict) else None,
     }
 
 
@@ -177,12 +180,14 @@ def _parse_legacy_context(context: Dict[str, Any]) -> Dict[str, Any]:
     )
     raw_csv_path = context.get("raw_csv_path") or context.get("raw_path")
     failure_context = context.get("failure_context") if isinstance(context, dict) else None
+    artifact_obligations = context.get("artifact_obligations") if isinstance(context.get("artifact_obligations"), dict) else None
     return {
         "cleaning_view": cleaning_view,
         "cleaned_csv_path": str(cleaned_csv_path),
         "cleaning_manifest_path": str(cleaning_manifest_path),
         "raw_csv_path": str(raw_csv_path) if raw_csv_path else None,
         "failure_context": failure_context if isinstance(failure_context, dict) else None,
+        "artifact_obligations": artifact_obligations,
     }
 
 
@@ -285,6 +290,7 @@ def _review_cleaning_impl(
     cleaned_csv_path: str,
     cleaning_manifest_path: str,
     raw_csv_path: Optional[str],
+    artifact_obligations: Optional[Dict[str, Any]],
     client: Any,
     model_name: str,
     provider: str,
@@ -340,6 +346,8 @@ def _review_cleaning_impl(
     column_resolution_context = view.get("column_resolution_context")
     if not isinstance(column_resolution_context, dict):
         column_resolution_context = {}
+    if not isinstance(artifact_obligations, dict):
+        artifact_obligations = {}
     outlier_policy = view.get("outlier_policy") if isinstance(view.get("outlier_policy"), dict) else {}
     outlier_report_path = str(
         view.get("outlier_report_path")
@@ -409,6 +417,7 @@ def _review_cleaning_impl(
         cleaning_code=cleaning_code,
         dataset_profile=dataset_profile,
         column_resolution_context=column_resolution_context,
+        artifact_obligations=artifact_obligations,
     )
     print(f"DEBUG: Cleaning Reviewer calling OpenRouter ({model_name})...")
     try:
@@ -1535,6 +1544,7 @@ def _build_llm_prompt(
     cleaning_code: Optional[str] = None,
     dataset_profile: Optional[Dict[str, Any]] = None,
     column_resolution_context: Optional[Dict[str, Any]] = None,
+    artifact_obligations: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     system_prompt = (
         "You are a Senior Data Scientist reviewing data cleaning output.\n\n"
@@ -1544,12 +1554,13 @@ def _build_llm_prompt(
         "- Do not apply rigid heuristics when the context does not justify them.\n\n"
         "SOURCE OF TRUTH AND PRECEDENCE\n"
         "1. cleaning_gates + required_columns + column_roles + dialect + contract_source_used in the payload are authoritative review scope.\n"
-        "2. column_resolution_context + cleaning_code + facts + data_profile are primary evidence of what the Data Engineer actually did and what the data looked like.\n"
+        "2. artifact_obligations + column_resolution_context + cleaning_code + facts + data_profile are primary evidence of what the Data Engineer actually did and what the data looked like.\n"
         "3. deterministic_gate_results are supporting evidence only. They may help focus attention, but they do NOT override the contract or your evidence-based judgment.\n"
-        "4. If sources conflict, preserve contract intent and prefer direct evidence from column_resolution_context/cleaning_code/data_profile over shallow pattern matching.\n\n"
+        "4. artifact_obligations is a lossless extraction of artifact bindings already declared in the contract. It introduces no new semantics.\n"
+        "5. If sources conflict, preserve contract intent and prefer direct evidence from artifact_obligations/column_resolution_context/cleaning_code/data_profile over shallow pattern matching.\n\n"
         "REVIEW DECISION WORKFLOW (MANDATORY)\n"
         "1. Understand the contract first: what gates were requested, what columns matter, and what would count as a real violation.\n"
-        "2. Read the available evidence pack: facts, column_resolution_context, data_profile, cleaning_code, and deterministic_gate_results.\n"
+        "2. Read the available evidence pack: artifact_obligations, facts, column_resolution_context, data_profile, cleaning_code, and deterministic_gate_results.\n"
         "3. For each gate, reason about the gate's intent before deciding pass/fail.\n"
         "4. Reject only when you have contract-relevant evidence of a real violation.\n"
         "5. If evidence is ambiguous or incomplete, prefer PASSED or PASSED_WITH_WARNING reasoning over unsupported failure.\n"
@@ -1605,6 +1616,8 @@ def _build_llm_prompt(
         payload["context_pack"] = context_pack
     if column_resolution_context and isinstance(column_resolution_context, dict):
         payload["column_resolution_context"] = column_resolution_context
+    if artifact_obligations and isinstance(artifact_obligations, dict):
+        payload["artifact_obligations"] = artifact_obligations
 
     # CONTEXT TRIPLET for LLM reasoning
     # 1. Cleaning Code - what did the engineer actually execute?

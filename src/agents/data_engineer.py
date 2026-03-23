@@ -20,6 +20,7 @@ from src.utils.contract_validator import (
     derive_contract_scope_from_workstreams,
 )
 from src.utils.cleaning_contract_semantics import expand_required_feature_selectors
+from src.utils.artifact_obligations import build_data_engineer_artifact_obligations
 from src.utils.sandbox_deps import (
     BASE_ALLOWLIST,
     EXTENDED_ALLOWLIST,
@@ -206,9 +207,16 @@ class DataEngineerAgent:
 
         artifact_requirements = contract.get("artifact_requirements")
         if isinstance(artifact_requirements, dict):
+            artifact_focus: Dict[str, Any] = {}
+            for key in ("cleaned_dataset", "enriched_dataset", "schema_binding"):
+                value = artifact_requirements.get(key)
+                if isinstance(value, dict) and value:
+                    artifact_focus[key] = value
             clean_dataset = artifact_requirements.get("clean_dataset")
-            if isinstance(clean_dataset, dict) and clean_dataset:
-                focus["artifact_requirements"] = {"clean_dataset": clean_dataset}
+            if isinstance(clean_dataset, dict) and clean_dataset and "cleaned_dataset" not in artifact_focus:
+                artifact_focus["clean_dataset"] = clean_dataset
+            if artifact_focus:
+                focus["artifact_requirements"] = artifact_focus
 
         if de_view:
             view_focus: Dict[str, Any] = {}
@@ -218,6 +226,7 @@ class DataEngineerAgent:
                 "optional_passthrough_columns",
                 "output_path",
                 "output_manifest_path",
+                "artifact_requirements",
                 "cleaning_gates",
                 "column_transformations",
                 "column_dtype_targets",
@@ -386,6 +395,305 @@ class DataEngineerAgent:
         )
         return any(marker in text for marker in repair_markers)
 
+    def _truncate_prompt_text(
+        self,
+        text: str,
+        *,
+        max_len: int = 8000,
+        head_len: int = 5000,
+        tail_len: int = 2000,
+    ) -> str:
+        value = str(text or "")
+        if len(value) <= max_len:
+            return value
+        safe_head = max(0, min(head_len, max_len))
+        safe_tail = max(0, min(tail_len, max_len - safe_head))
+        if safe_head + safe_tail == 0:
+            return value[:max_len]
+        return value[:safe_head] + "\n...[TRUNCATED]...\n" + value[-safe_tail:]
+
+    def _looks_like_editable_code(self, code: str) -> bool:
+        text = str(code or "").strip()
+        if not text or text.startswith("# Error"):
+            return False
+        return bool(
+            re.search(
+                r"(?m)^\s*(from\s+\w+|import\s+\w+|def\s+\w+|class\s+\w+|if\s+__name__|"
+                r"if\s+|for\s+|while\s+|try:|with\s+|[A-Za-z_]\w*\s*=|print\(|raise\s+)",
+                text,
+            )
+        )
+
+    def _strip_runtime_injection_from_previous_code(self, previous_code: str) -> str:
+        text = str(previous_code or "")
+        if not text:
+            return ""
+        marker = "json.dumps = _safe_dumps_json"
+        idx = text.find(marker)
+        if idx == -1:
+            return text.strip()
+        tail = text[idx + len(marker):].lstrip()
+        return tail.strip() or text.strip()
+
+    def _extract_json_after_marker(self, text: str, marker: str) -> Dict[str, Any]:
+        raw = str(text or "")
+        if not raw or not marker:
+            return {}
+        idx = raw.rfind(marker)
+        if idx == -1:
+            return {}
+        tail = raw[idx + len(marker):].lstrip()
+        if not tail:
+            return {}
+        decoder = json.JSONDecoder()
+        try:
+            payload, _ = decoder.raw_decode(tail)
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _normalize_feedback_record(
+        self,
+        feedback_record: Optional[Dict[str, Any]],
+        data_audit: str,
+    ) -> Dict[str, Any]:
+        record = feedback_record if isinstance(feedback_record, dict) else {}
+        if not record:
+            record = self._extract_json_after_marker(
+                data_audit,
+                "LATEST_ITERATION_FEEDBACK_RECORD_JSON:",
+            )
+        if not isinstance(record, dict):
+            return {}
+        normalized = {
+            "agent": str(record.get("agent") or "data_engineer"),
+            "source": str(record.get("source") or "unknown"),
+            "status": str(record.get("status") or "UNKNOWN"),
+            "iteration": int(record.get("iteration") or 0),
+            "feedback": str(record.get("feedback") or ""),
+            "failed_gates": [str(x) for x in (record.get("failed_gates") or []) if str(x).strip()],
+            "required_fixes": [str(x) for x in (record.get("required_fixes") or []) if str(x).strip()],
+            "hard_failures": [str(x) for x in (record.get("hard_failures") or []) if str(x).strip()],
+            "runtime_error_tail": str(record.get("runtime_error_tail") or ""),
+            "evidence": record.get("evidence") if isinstance(record.get("evidence"), list) else [],
+        }
+        normalized["failed_gates"] = list(dict.fromkeys(normalized["failed_gates"]))[:12]
+        normalized["required_fixes"] = list(dict.fromkeys(normalized["required_fixes"]))[:12]
+        normalized["hard_failures"] = list(dict.fromkeys(normalized["hard_failures"]))[:8]
+        normalized["feedback"] = self._truncate_prompt_text(
+            normalized["feedback"],
+            max_len=1800,
+            head_len=1400,
+            tail_len=300,
+        )
+        normalized["runtime_error_tail"] = self._truncate_prompt_text(
+            normalized["runtime_error_tail"],
+            max_len=1800,
+            head_len=1200,
+            tail_len=400,
+        )
+        return normalized
+
+    def _extract_labeled_repair_sections(
+        self,
+        text: str,
+        allowed_labels: Optional[List[str]] = None,
+    ) -> Dict[str, str]:
+        raw = str(text or "")
+        if not raw.strip():
+            return {}
+        allowed = set(str(item).strip() for item in (allowed_labels or []) if str(item).strip())
+        sections: Dict[str, str] = {}
+        current_label = ""
+        buffer: List[str] = []
+
+        def _flush() -> None:
+            nonlocal current_label, buffer
+            if not current_label:
+                return
+            body = "\n".join(buffer).strip()
+            if body:
+                sections[current_label] = body
+            current_label = ""
+            buffer = []
+
+        for raw_line in raw.splitlines():
+            line = str(raw_line or "").rstrip()
+            match = re.match(r"^([A-Z][A-Z0-9_]{2,}):\s*(.*)$", line)
+            if match:
+                label = str(match.group(1) or "").strip()
+                if current_label == "LLM_FAILURE_EXPLANATION" and label in {"WHERE", "WHY", "FIX", "DIAGNOSTIC"}:
+                    buffer.append(line.strip())
+                    continue
+                if allowed and label not in allowed:
+                    _flush()
+                    continue
+                _flush()
+                current_label = label
+                first_value = str(match.group(2) or "").strip()
+                buffer = [first_value] if first_value else []
+                continue
+            if current_label:
+                buffer.append(line)
+        _flush()
+        return sections
+
+    def _extract_explainer_directives(self, text: str) -> Dict[str, Any]:
+        directives: Dict[str, Any] = {
+            "where": "",
+            "why": "",
+            "fixes": [],
+            "diagnostics": [],
+        }
+        raw = str(text or "")
+        if not raw.strip():
+            return directives
+        for raw_line in raw.splitlines():
+            line = str(raw_line or "").strip()
+            if not line or ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            label_norm = str(label or "").strip().upper()
+            value_text = str(value or "").strip(" -\t")
+            if not value_text:
+                continue
+            if label_norm == "WHERE" and not directives["where"]:
+                directives["where"] = value_text
+            elif label_norm == "WHY" and not directives["why"]:
+                directives["why"] = value_text
+            elif label_norm == "FIX":
+                directives["fixes"].append(value_text)
+            elif label_norm == "DIAGNOSTIC":
+                directives["diagnostics"].append(value_text)
+        directives["fixes"] = list(dict.fromkeys([str(x) for x in directives["fixes"] if str(x).strip()]))[:6]
+        directives["diagnostics"] = list(
+            dict.fromkeys([str(x) for x in directives["diagnostics"] if str(x).strip()])
+        )[:4]
+        return directives
+
+    def _build_compact_repair_error_context(
+        self,
+        data_audit: str,
+        normalized_feedback: Dict[str, Any],
+    ) -> str:
+        section_order = [
+            "PREFLIGHT_ERROR_CONTEXT",
+            "RUNTIME_ERROR_CONTEXT",
+            "TRACEBACK_TAIL_20",
+            "ERROR_SNIPPET",
+            "WHY_IT_HAPPENED",
+            "ERROR_DIAGNOSIS",
+            "GATE_IMPLEMENTATION_HINTS",
+            "REPAIR_HINTS",
+            "LLM_FAILURE_EXPLANATION",
+        ]
+        sections = self._extract_labeled_repair_sections(data_audit, allowed_labels=section_order)
+        lines: List[str] = []
+        for label in section_order:
+            body = str(sections.get(label) or "").strip()
+            if not body:
+                continue
+            lines.append(f"{label}:")
+            lines.append(
+                self._truncate_prompt_text(
+                    body,
+                    max_len=900 if label in {"RUNTIME_ERROR_CONTEXT", "TRACEBACK_TAIL_20"} else 700,
+                    head_len=600,
+                    tail_len=180,
+                )
+            )
+        if normalized_feedback.get("feedback"):
+            lines.append("LATEST_FEEDBACK_SUMMARY:")
+            lines.append(
+                self._truncate_prompt_text(
+                    str(normalized_feedback.get("feedback") or ""),
+                    max_len=500,
+                    head_len=350,
+                    tail_len=120,
+                )
+            )
+        if not lines:
+            return self._truncate_prompt_text(data_audit, max_len=2200, head_len=1500, tail_len=500) or "{}"
+        return "\n".join(item for item in lines if str(item).strip())
+
+    def _build_repair_prompt_context(
+        self,
+        *,
+        data_audit: str,
+        previous_code: str,
+        feedback_record: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        normalized = self._normalize_feedback_record(feedback_record, data_audit)
+        repair_sections = self._extract_labeled_repair_sections(
+            data_audit,
+            allowed_labels=[
+                "PREFLIGHT_ERROR_CONTEXT",
+                "RUNTIME_ERROR_CONTEXT",
+                "TRACEBACK_TAIL_20",
+                "ERROR_SNIPPET",
+                "WHY_IT_HAPPENED",
+                "ERROR_DIAGNOSIS",
+                "GATE_IMPLEMENTATION_HINTS",
+                "REPAIR_HINTS",
+                "LLM_FAILURE_EXPLANATION",
+            ],
+        )
+        explainer_directives = self._extract_explainer_directives(
+            repair_sections.get("LLM_FAILURE_EXPLANATION", "")
+        )
+        patch_objectives: List[str] = []
+        if explainer_directives.get("fixes"):
+            patch_objectives.extend(
+                [str(item) for item in (explainer_directives.get("fixes") or []) if str(item).strip()]
+            )
+        if normalized.get("required_fixes"):
+            patch_objectives.extend(normalized.get("required_fixes") or [])
+        repair_hints = repair_sections.get("REPAIR_HINTS")
+        if repair_hints:
+            for raw_line in str(repair_hints).splitlines():
+                cleaned = str(raw_line or "").strip().lstrip("- ").strip()
+                if cleaned:
+                    patch_objectives.append(cleaned)
+        if normalized.get("failed_gates"):
+            patch_objectives.append(
+                "Resolve failed gates without regressing already-working logic: "
+                + ", ".join((normalized.get("failed_gates") or [])[:5])
+            )
+        if normalized.get("hard_failures") and not any("hard failure" in item.lower() for item in patch_objectives):
+            patch_objectives.append(
+                "Clear the active hard failure(s) first: "
+                + ", ".join((normalized.get("hard_failures") or [])[:4])
+            )
+        if normalized.get("runtime_error_tail") and not any("runtime root cause" in item.lower() for item in patch_objectives):
+            patch_objectives.insert(0, "Fix the runtime root cause first, then keep artifact/output behavior stable.")
+        if explainer_directives.get("where") and not any("failure location" in item.lower() for item in patch_objectives):
+            patch_objectives.append(
+                "Patch the failure location implicated by the latest evidence: "
+                + str(explainer_directives.get("where") or "")
+            )
+        if not patch_objectives:
+            patch_objectives = [
+                "Apply the smallest coherent patch that fixes the active blocker and preserves the working parts of the cleaning pipeline."
+            ]
+        patch_objectives = list(dict.fromkeys([str(item) for item in patch_objectives if str(item).strip()]))[:8]
+        must_preserve = [
+            "Keep owned output paths and manifest/output-closure logic intact unless the failure explicitly requires changing them.",
+            "Preserve working cleaning stages that are not implicated by the latest failure evidence.",
+            "Return the full updated script body, not snippets or diffs.",
+        ]
+        return {
+            "feedback_record_json": json.dumps(normalized or {}, indent=2, ensure_ascii=False),
+            "patch_objectives": "\n".join(f"- {item}" for item in patch_objectives[:8]),
+            "must_preserve": "\n".join(f"- {item}" for item in must_preserve),
+            "error_context": self._build_compact_repair_error_context(data_audit, normalized) or "{}",
+            "previous_code": self._truncate_prompt_text(
+                self._strip_runtime_injection_from_previous_code(previous_code),
+                max_len=12000,
+                head_len=9000,
+                tail_len=2200,
+            ),
+        }
+
     def _read_csv_header(
         self,
         input_path: str,
@@ -506,6 +814,9 @@ class DataEngineerAgent:
         contract_min: Optional[Dict[str, Any]] = None,
         de_view: Optional[Dict[str, Any]] = None,
         repair_mode: bool = False,
+        previous_code: Optional[str] = None,
+        feedback_record: Optional[Dict[str, Any]] = None,
+        artifact_obligations: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Generates a Python script to clean and standardize the dataset.
@@ -575,6 +886,14 @@ class DataEngineerAgent:
         contract_context = self._build_contract_focus_context(contract_context, de_view or {})
         contract_json = json.dumps(compress_long_lists(contract_context)[0], indent=2)
         de_view_json = json.dumps(compress_long_lists(de_view)[0], indent=2)
+        if not isinstance(artifact_obligations, dict) or not artifact_obligations:
+            artifact_obligations = build_data_engineer_artifact_obligations(contract)
+        if not isinstance(artifact_obligations, dict):
+            artifact_obligations = {}
+        artifact_obligations_json = json.dumps(
+            compress_long_lists(artifact_obligations)[0],
+            indent=2,
+        )
         de_output_path = str(de_view.get("output_path") or "").strip()
         de_manifest_path = str(
             de_view.get("output_manifest_path")
@@ -635,7 +954,9 @@ class DataEngineerAgent:
         artifact_requirements = contract.get("artifact_requirements")
         clean_dataset_cfg = {}
         if isinstance(artifact_requirements, dict):
-            clean_dataset_candidate = artifact_requirements.get("clean_dataset")
+            clean_dataset_candidate = artifact_requirements.get("cleaned_dataset")
+            if not isinstance(clean_dataset_candidate, dict):
+                clean_dataset_candidate = artifact_requirements.get("clean_dataset")
             if isinstance(clean_dataset_candidate, dict):
                 clean_dataset_cfg = clean_dataset_candidate
         column_transformations = de_view.get("column_transformations")
@@ -724,6 +1045,10 @@ class DataEngineerAgent:
         ===================================================================
         1) DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT + DE_VIEW_CONTEXT (authoritative for
            what you own, what you must write, and the DE-visible scope)
+        ARTIFACT_OBLIGATIONS_CONTEXT
+           (lossless extraction of artifact bindings already declared in the contract;
+           use it to reconcile each artifact against its declared binding fields and
+           source_contract_paths. It introduces no new semantics.)
         2) CLEANING_GATES_CONTEXT + required_columns + required_feature_selectors
            (authoritative for what must be cleaned, retained, or validated)
         3) COLUMN_RESOLUTION_CONTEXT + DATA_SAMPLE_CONTEXT
@@ -859,6 +1184,9 @@ class DataEngineerAgent:
 
         - The operation order matters: null handling → type conversion → validation.
           Getting this wrong silently corrupts data. Reason about dependencies.
+        - ARTIFACT_OBLIGATIONS_CONTEXT is a contract extraction layer, not new authority.
+          Use it to reconcile exact per-artifact bindings. Do not treat it as permission
+          to add undeclared columns, outputs, or extension policies.
         - Do not impute outcome/target columns unless the contract explicitly requests it.
           Preserve missingness for partially labeled targets (e.g., test set rows).
         - Preserve split/partition columns exactly as-is.
@@ -874,11 +1202,16 @@ class DataEngineerAgent:
         - For identity resolution, missing contact/company values are lack of evidence.
           A senior implementation only drops or merges rows when the available signals
           defensibly support duplicate identity for THIS dataset.
+        - If artifact_requirements declares both cleaned_dataset and enriched_dataset,
+          do not collapse them into a single schema. Materialize each artifact from
+          its own declared binding, and do not carry cleaned_dataset passthrough
+          columns into enriched_dataset unless that binding explicitly declares them.
         - The manifest must reflect ACTUAL operations performed, not planned ones.
           If an imputation ran, log it. If it was skipped (no nulls found), say so.
 
         REPAIR RULES (when OPERATING_MODE is REPAIR):
         - Read RUNTIME_ERROR_CONTEXT/PREFLIGHT_ERROR_CONTEXT and diagnose root cause first.
+        - If a previous script body is provided, patch that script body first instead of regenerating from zero.
         - Keep already-correct logic stable; fix only what failed.
         - Prioritize executable syntax and required artifacts.
 
@@ -904,6 +1237,7 @@ class DataEngineerAgent:
         Optional Passthrough Columns: $optional_passthrough_columns
 
         DE_VIEW_CONTEXT: $de_view_context
+        ARTIFACT_OBLIGATIONS_CONTEXT: $artifact_obligations_context
         EXECUTION_CONTRACT_CONTEXT: $execution_contract_context
         CLEANING_GATES_CONTEXT: $cleaning_gates_context
         COLUMN_RESOLUTION_CONTEXT: $column_resolution_context
@@ -922,7 +1256,7 @@ class DataEngineerAgent:
         """
 
         USER_TEMPLATE = (
-            "Analyze the owned deliverables, cleaning gates, column dtype targets, "
+            "Analyze the owned deliverables, artifact obligations, cleaning gates, column dtype targets, "
             "column resolution context, and data sample. Reason first about the deliverable closure for THIS "
             "run — which artifacts you must write, how each one is materialized, "
             "and how the cleaning plan supports them. Then reason about the correct "
@@ -931,6 +1265,32 @@ class DataEngineerAgent:
             "the runbook advises. "
             "Then generate the complete cleaning script."
         )
+        USER_REPAIR_TEMPLATE = """
+        MODE: REPAIR_EDITOR
+        You are editing a previously generated cleaning script body. Do not regenerate from zero
+        unless the previous script body is clearly unusable.
+
+        LATEST_ITERATION_FEEDBACK_RECORD_JSON:
+        $feedback_record_json
+
+        ACTIVE_PATCH_OBJECTIVES:
+        $patch_objectives
+
+        WHAT_TO_PRESERVE:
+        $must_preserve
+
+        REPAIR_ERROR_CONTEXT:
+        $error_context
+
+        PREVIOUS_SCRIPT_BODY_TO_PATCH:
+        $previous_code
+
+        Repair task:
+        - Apply a minimal but sufficient patch to the previous script body.
+        - Keep already-working logic stable unless it directly caused the failure.
+        - Preserve output paths, owned artifact materialization, and manifest logic unless fixing them is part of the patch.
+        - Return ONLY the full updated Python script body (not a diff, not snippets, not markdown).
+        """
 
         # Rendering
         required_columns_payload = de_view.get("required_columns") or strategy.get("required_columns", [])
@@ -955,6 +1315,7 @@ class DataEngineerAgent:
             data_audit=data_audit,
             execution_contract_context=contract_json,
             de_view_context=de_view_json,
+            artifact_obligations_context=artifact_obligations_json,
             outlier_policy_context=outlier_policy_json,
             column_resolution_context=column_resolution_context_json,
             column_transformations_context=column_transformations_json,
@@ -972,7 +1333,20 @@ class DataEngineerAgent:
             repair_notes=repair_notes,
             pipeline_scope_guidance=pipeline_scope_guidance,
         )
-        self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE
+        patch_mode_active = bool(
+            effective_repair_mode
+            and self._looks_like_editable_code(previous_code or "")
+        )
+        if patch_mode_active:
+            repair_prompt_context = self._build_repair_prompt_context(
+                data_audit=data_audit,
+                previous_code=str(previous_code or ""),
+                feedback_record=feedback_record,
+            )
+            user_message = render_prompt(USER_REPAIR_TEMPLATE, **repair_prompt_context)
+        else:
+            user_message = USER_TEMPLATE
+        self.last_prompt = system_prompt + "\n\nUSER:\n" + user_message
         print(f"DEBUG: DE System Prompt Len: {len(system_prompt)}")
         print(f"DEBUG: DE System Prompt Preview: {system_prompt[:300]}...")
         if len(system_prompt) < 100:
@@ -983,13 +1357,13 @@ class DataEngineerAgent:
         def _call_model():
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": USER_TEMPLATE},
+                {"role": "user", "content": user_message},
             ]
             response, model_used = call_chat_with_fallback(
                 self.client,
                 messages,
                 [self.model_name, self.fallback_model_name],
-                call_kwargs={"temperature": 0.1},
+                call_kwargs={"temperature": 0.0 if patch_mode_active else 0.1},
                 logger=self.logger,
                 context_tag="data_engineer",
             )
