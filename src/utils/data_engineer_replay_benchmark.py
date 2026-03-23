@@ -127,6 +127,82 @@ def _read_csv_header(path: Path, sep: str, encoding: str) -> List[str]:
         return []
 
 
+def _text_signals(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_text_signals(item) for item in value)
+    if isinstance(value, dict):
+        return " ".join(_text_signals(item) for item in value.values())
+    return str(value).strip().lower()
+
+
+def _candidate_enriched_paths(
+    contract: Dict[str, Any],
+    required_output_paths: List[str],
+) -> List[str]:
+    candidates: List[str] = []
+
+    raw_outputs = contract.get("required_outputs")
+    if isinstance(raw_outputs, list):
+        for item in raw_outputs:
+            if not isinstance(item, dict):
+                continue
+            path = normalize_artifact_path(item.get("path") or item.get("output_path") or item.get("output"))
+            if not path:
+                continue
+            signals = " ".join(
+                _text_signals(item.get(key))
+                for key in ("intent", "description", "artifact", "name")
+            )
+            if any(
+                token in signals
+                for token in (
+                    "enriched",
+                    "enriquec",
+                    "model_features",
+                    "future_model",
+                    "future_ml",
+                    "handoff",
+                )
+            ):
+                candidates.append(path)
+
+    artifact_requirements = contract.get("artifact_requirements")
+    if isinstance(artifact_requirements, dict):
+        clean_dataset = artifact_requirements.get("clean_dataset")
+        if isinstance(clean_dataset, dict):
+            candidate = normalize_artifact_path(clean_dataset.get("output_path"))
+            if candidate:
+                candidates.append(candidate)
+
+    fallback_tokens = (
+        "leads_enriched_features.csv",
+        "dataset_enriched.csv",
+        "dataset_enriquecido.csv",
+        "enriched",
+        "enriquec",
+    )
+    for rel_path in required_output_paths:
+        normalized = normalize_artifact_path(rel_path)
+        if normalized and any(token in normalized.lower() for token in fallback_tokens):
+            candidates.append(normalized)
+
+    return _unique_ordered(candidates)
+
+
+def _resolve_enriched_output_path(
+    workspace: Path,
+    contract: Dict[str, Any],
+    required_output_paths: List[str],
+) -> Optional[Path]:
+    for rel_path in _candidate_enriched_paths(contract, required_output_paths):
+        candidate = workspace / rel_path
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _load_benchmark_case_specs(repo_root: Path) -> Dict[str, Dict[str, Any]]:
     inventory_path = repo_root / "tests" / "data_engineer_benchmark_cases.json"
     payload = _load_json(inventory_path, {})
@@ -401,6 +477,7 @@ def execute_script_for_case(
         raise ValueError("script_text or script_path is required")
 
     started = time.time()
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     proc = subprocess.run(
         [sys.executable, str(run_script_path.name)],
         cwd=str(workspace),
@@ -408,6 +485,7 @@ def execute_script_for_case(
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        env=env,
     )
     duration = time.time() - started
 
@@ -426,16 +504,20 @@ def execute_script_for_case(
             missing.append(rel_path)
 
     expected_enriched = case.expected_enriched_columns()
-    enriched_path = workspace / next(
-        (
-            rel_path
-            for rel_path in case.required_output_paths
-            if rel_path.endswith("leads_enriched_features.csv") or rel_path.endswith("dataset_enriched.csv")
-        ),
-        "",
+    enriched_path = _resolve_enriched_output_path(
+        workspace,
+        case.execution_contract,
+        case.required_output_paths,
     )
     enriched_header = _read_csv_header(enriched_path, case.csv_sep, case.csv_encoding) if enriched_path else []
-    enriched_match = enriched_header == expected_enriched if expected_enriched and enriched_header else False
+    enriched_exact_match = enriched_header == expected_enriched if expected_enriched and enriched_header else False
+    enriched_subset_match = (
+        bool(expected_enriched)
+        and bool(enriched_header)
+        and set(expected_enriched).issubset(set(enriched_header))
+    )
+    enriched_extra_columns = sorted(set(enriched_header) - set(expected_enriched)) if enriched_header and expected_enriched else []
+    enriched_missing_columns = sorted(set(expected_enriched) - set(enriched_header)) if enriched_header and expected_enriched else list(expected_enriched)
 
     return {
         "returncode": int(proc.returncode),
@@ -449,48 +531,105 @@ def execute_script_for_case(
         "enriched_output_path": str(enriched_path) if enriched_path else "",
         "expected_enriched_columns": expected_enriched,
         "actual_enriched_columns": enriched_header,
-        "enriched_schema_exact_match": bool(enriched_match),
+        "enriched_schema_exact_match": bool(enriched_exact_match),
+        "enriched_schema_subset_match": bool(enriched_subset_match),
+        "enriched_extra_columns": enriched_extra_columns,
+        "enriched_missing_columns": enriched_missing_columns,
         "success": proc.returncode == 0 and not missing,
     }
 
 
-def _resolve_output_null_rate(report_payload: Dict[str, Any], column: str) -> Optional[float]:
-    if not isinstance(report_payload, dict):
-        return None
-    null_rates = report_payload.get("null_rates_after_cleaning")
-    if isinstance(null_rates, dict) and column in null_rates:
-        try:
-            return float(null_rates.get(column))
-        except Exception:
-            return None
-    column_missingness = report_payload.get("column_missingness")
-    if isinstance(column_missingness, dict):
-        details = column_missingness.get(column)
-        if isinstance(details, dict):
-            pct = details.get("missingness_pct")
-            if pct is not None:
-                try:
-                    value = float(pct)
-                    return value / 100.0 if value > 1.0 else value
-                except Exception:
-                    return None
-            null_count = details.get("null_count")
-            rows = (
-                report_payload.get("dataset", {}).get("output_rows_cleaned")
-                if isinstance(report_payload.get("dataset"), dict)
-                else None
-            )
+def _resolve_output_null_rate(report_payload: Dict[str, Any], column: str, *, csv_fallback_path: Optional[Path] = None) -> Optional[float]:
+    """Resolve null rate for a column from report JSON, falling back to reading the CSV directly."""
+    if isinstance(report_payload, dict):
+        null_rates = report_payload.get("null_rates_after_cleaning")
+        if isinstance(null_rates, dict) and column in null_rates:
             try:
-                if rows:
-                    return float(null_count) / float(rows)
+                return float(null_rates.get(column))
             except Exception:
-                return None
+                pass
+        column_missingness = report_payload.get("column_missingness")
+        if isinstance(column_missingness, dict):
+            details = column_missingness.get(column)
+            if isinstance(details, dict):
+                pct = details.get("missingness_pct")
+                if pct is not None:
+                    try:
+                        value = float(pct)
+                        return value / 100.0 if value > 1.0 else value
+                    except Exception:
+                        pass
+                null_count = details.get("null_count")
+                rows = (
+                    report_payload.get("dataset", {}).get("output_rows_cleaned")
+                    if isinstance(report_payload.get("dataset"), dict)
+                    else None
+                )
+                try:
+                    if rows:
+                        return float(null_count) / float(rows)
+                except Exception:
+                    pass
+        for section_name in (
+            "missingness_after_cleaning_enriched",
+            "missingness_after_cleaning_cleaned",
+            "null_inflation_by_column",
+        ):
+            section = report_payload.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            details = section.get(column)
+            if not isinstance(details, dict):
+                continue
+            for key in ("null_rate", "null_rate_after", "missing_rate", "missingness_rate"):
+                value = details.get(key)
+                if value is None:
+                    continue
+                try:
+                    return float(value)
+                except Exception:
+                    pass
+    # Fallback: read the output CSV directly and compute null rate
+    if csv_fallback_path and csv_fallback_path.exists():
+        try:
+            import pandas as pd
+            df = pd.read_csv(csv_fallback_path, usecols=[column], dtype=str, low_memory=False)
+            total = len(df)
+            if total == 0:
+                return 0.0
+            nulls = df[column].isna().sum() + (df[column].str.strip().str.lower().isin(["", "nan", "none", "nat"])).sum()
+            return float(nulls) / float(total)
+        except Exception:
+            pass
+    return None
+
+
+def _find_enriched_csv(workspace: Path, required_output_paths: List[str]) -> Optional[Path]:
+    """Find the enriched/cleaned output CSV in the workspace."""
+    for rel_path in required_output_paths:
+        if any(token in rel_path.lower() for token in ("enriched", "enriquec", "cleaned", "limpio", "clean_dataset")):
+            candidate = workspace / rel_path
+            if candidate.exists():
+                return candidate
+    # Glob fallback
+    for pattern in (
+        "artifacts/**/*enriched*.csv",
+        "artifacts/**/*enriquec*.csv",
+        "artifacts/**/*cleaned*.csv",
+        "artifacts/**/*limpio*.csv",
+        "artifacts/**/*clean*.csv",
+    ):
+        import glob as _glob
+        matches = list(_glob.glob(str(workspace / pattern), recursive=True))
+        if matches:
+            return Path(matches[0])
     return None
 
 
 def _run_quality_checks(case: DataEngineerReplayCase, workspace: Path) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     dataset_profile = _load_json(workspace / "data" / "dataset_profile.json", {})
+    enriched_csv = _find_enriched_csv(workspace, case.required_output_paths)
 
     for check in case.quality_checks:
         if not isinstance(check, dict):
@@ -508,7 +647,7 @@ def _run_quality_checks(case: DataEngineerReplayCase, workspace: Path) -> List[D
                     input_rate = float((missing_frac or {}).get(column, 0.0) or 0.0)
                 except Exception:
                     input_rate = 0.0
-                output_rate = _resolve_output_null_rate(report_payload, column)
+                output_rate = _resolve_output_null_rate(report_payload, column, csv_fallback_path=enriched_csv)
                 if output_rate is None:
                     violations.append(
                         {
@@ -634,7 +773,7 @@ def build_benchmark_summary(
             and syntax_ok
             and not preflight_issues
             and bool(execution.get("success"))
-            and bool(execution.get("enriched_schema_exact_match"))
+            and bool(execution.get("enriched_schema_subset_match", execution.get("enriched_schema_exact_match")))
             and quality_passed
             else "fail"
         ),

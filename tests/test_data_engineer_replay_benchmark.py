@@ -3,6 +3,7 @@ from pathlib import Path
 
 from src.utils.data_engineer_replay_benchmark import (
     DataEngineerReplayCase,
+    _resolve_output_null_rate,
     _run_quality_checks,
     execute_script_for_case,
     load_data_engineer_replay_case,
@@ -89,6 +90,66 @@ raise RuntimeError("boom")
     assert result["required_outputs_missing_count"] == 3
 
 
+def test_execute_script_for_case_detects_spanish_enriched_output(tmp_path):
+    csv_path = tmp_path / "input.csv"
+    csv_path.write_text("feature_a,target\n1,0\n2,1\n", encoding="utf-8")
+    case = DataEngineerReplayCase(
+        run_id="synthetic-spanish",
+        repo_root=REPO_ROOT,
+        run_dir=tmp_path,
+        csv_path=csv_path,
+        business_objective="benchmark",
+        csv_encoding="utf-8",
+        csv_sep=",",
+        csv_decimal=".",
+        strategy={"target_columns": ["target"]},
+        execution_contract={
+            "required_outputs": [
+                {
+                    "intent": "dataset_enriquecido_csv",
+                    "path": "artifacts/clean/dataset_enriquecido.csv",
+                    "description": "Enriched dataset containing only model_features and target",
+                }
+            ],
+            "model_features": ["feature_a"],
+            "target_columns": ["target"],
+        },
+        de_view={"required_columns": ["feature_a", "target"]},
+        data_audit="audit",
+        required_output_paths=[
+            "artifacts/clean/dataset_limpio.csv",
+            "artifacts/clean/dataset_enriquecido.csv",
+            "artifacts/clean/cleaning_manifest.json",
+        ],
+        model_features=["feature_a"],
+        target_columns=["target"],
+        prompt_path=None,
+        baseline_script_path=None,
+        baseline_error_path=None,
+        dataset_profile_path=None,
+        worker_input_path=None,
+        de_context_path=None,
+        quality_checks=[],
+    )
+    script = """
+import json
+import os
+import pandas as pd
+
+os.makedirs("artifacts/clean", exist_ok=True)
+df = pd.read_csv("data/raw.csv")
+df.to_csv("artifacts/clean/dataset_limpio.csv", index=False)
+df[["feature_a", "target"]].to_csv("artifacts/clean/dataset_enriquecido.csv", index=False)
+with open("artifacts/clean/cleaning_manifest.json", "w", encoding="utf-8") as f:
+    json.dump({"ok": True}, f)
+"""
+    result = execute_script_for_case(case, workspace_dir=tmp_path / "workspace_spanish", script_text=script)
+
+    assert result["success"] is True
+    assert result["enriched_output_path"].endswith("dataset_enriquecido.csv")
+    assert result["enriched_schema_exact_match"] is True
+
+
 def test_data_engineer_benchmark_cases_inventory_references_existing_artifacts():
     inventory_path = REPO_ROOT / "tests" / "data_engineer_benchmark_cases.json"
     payload = json.loads(inventory_path.read_text(encoding="utf-8"))
@@ -153,3 +214,15 @@ def test_quality_check_no_all_placeholder_dedup_drops(tmp_path):
     results = _run_quality_checks(case, workspace)
     assert results[0]["passed"] is False
     assert results[0]["violations"][0]["lead_id"] == "L1"
+
+
+def test_resolve_output_null_rate_supports_missingness_after_cleaning_sections():
+    report_payload = {
+        "missingness_after_cleaning_enriched": {
+            "created_at": {"null_rate": 0.12},
+            "last_activity_at": {"null_rate_after": 0.34},
+        }
+    }
+
+    assert _resolve_output_null_rate(report_payload, "created_at") == 0.12
+    assert _resolve_output_null_rate(report_payload, "last_activity_at") == 0.34
