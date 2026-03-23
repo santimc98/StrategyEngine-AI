@@ -229,7 +229,20 @@ def _repair_gate_lists(contract: Dict[str, Any]) -> Dict[str, Any]:
                 if semantic_key in payload and semantic_key not in params:
                     params[semantic_key] = payload.get(semantic_key)
             gate_obj = {"name": name, "severity": severity, "params": params}
-            for semantic_key in ("condition", "evidence_required", "action_if_fail"):
+            for semantic_key in (
+                "condition",
+                "evidence_required",
+                "action_if_fail",
+                "action_type",
+                "column_phase",
+                "final_state",
+                "applies_to",
+                "phase_scope",
+                "active_in_phases",
+                "phases",
+                "review_phases",
+                "stage_scope",
+            ):
                 if semantic_key in payload and payload.get(semantic_key) not in (None, ""):
                     gate_obj[semantic_key] = payload.get(semantic_key)
             normalized.append(gate_obj)
@@ -246,4 +259,3 @@ def apply_contract_schema_registry_repairs(contract: Dict[str, Any] | None) -> D
     repaired = _repair_required_feature_selectors(repaired)
     repaired = _repair_gate_lists(repaired)
     return repaired
-

@@ -557,7 +557,14 @@ _GATE_PHASE_KEYS = (
     "review_phases",
     "stage_scope",
 )
-_GATE_EXTRA_KEYS = ("condition", "evidence_required", "action_if_fail") + _GATE_PHASE_KEYS
+_GATE_EXTRA_KEYS = (
+    "condition",
+    "evidence_required",
+    "action_if_fail",
+    "action_type",
+    "column_phase",
+    "final_state",
+) + _GATE_PHASE_KEYS
 _BASELINE_ONLY_REVIEWER_GATES = {
     "baseline_simplicity_enforcement",
     "model_selection_priority",

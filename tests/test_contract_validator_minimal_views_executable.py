@@ -14,6 +14,19 @@ def _base_full_pipeline_contract():
             "outcome": ["target"],
             "post_decision_audit_only": [],
             "unknown": [],
+            "identifiers": ["id"],
+            "time_columns": [],
+        },
+        "allowed_feature_sets": {
+            "segmentation_features": [],
+            "model_features": ["feature_a"],
+            "forbidden_features": [],
+            "audit_only_features": [],
+        },
+        "active_workstreams": {
+            "cleaning": True,
+            "feature_engineering": True,
+            "model_training": True,
         },
         "artifact_requirements": {
             "clean_dataset": {
@@ -49,6 +62,95 @@ def _base_full_pipeline_contract():
         "objective_analysis": {"problem_type": "prediction"},
         "iteration_policy": {"max_iterations": 2},
     }
+
+
+def test_validate_contract_minimal_readonly_accepts_cleaning_feature_prep_without_model_training():
+    contract = {
+        "scope": "cleaning_only",
+        "strategy_title": "CRM cleanup and feature prep",
+        "business_objective": (
+            "Limpiar el CRM y dejar un dataset enriquecido con variables predictoras "
+            "para una futura run de modelado, sin entrenar un modelo final en esta run."
+        ),
+        "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
+        "canonical_columns": ["lead_id", "created_at", "country", "engagement_score", "target_future"],
+        "column_roles": {
+            "pre_decision": ["country", "engagement_score"],
+            "decision": [],
+            "outcome": ["target_future"],
+            "post_decision_audit_only": [],
+            "unknown": [],
+            "identifiers": ["lead_id"],
+            "time_columns": ["created_at"],
+        },
+        "allowed_feature_sets": {
+            "segmentation_features": ["country"],
+            "model_features": ["country", "engagement_score"],
+            "forbidden_features": [],
+            "audit_only_features": [],
+        },
+        "active_workstreams": {
+            "cleaning": True,
+            "feature_engineering": True,
+            "model_training": False,
+        },
+        "future_ml_handoff": {
+            "enabled": True,
+            "primary_target": "target_future",
+            "target_columns": ["target_future"],
+            "readiness_goal": "future_classification_run",
+        },
+        "artifact_requirements": {
+            "clean_dataset": {
+                "required_columns": ["lead_id", "created_at", "country", "engagement_score", "target_future"],
+                "required_feature_selectors": [{"type": "list", "value": ["country", "engagement_score"]}],
+                "output_path": "data/cleaned_data.csv",
+                "output_manifest_path": "data/cleaning_manifest.json",
+            },
+            "required_files": [
+                {"path": "data/cleaned_data.csv"},
+                {"path": "data/cleaning_manifest.json"},
+                {"path": "analysis/feature_readiness_report.json"},
+            ],
+        },
+        "required_outputs": [
+            "data/cleaned_data.csv",
+            "data/cleaning_manifest.json",
+            "analysis/feature_readiness_report.json",
+        ],
+        "column_dtype_targets": {
+            "lead_id": {"target_dtype": "string"},
+            "created_at": {"target_dtype": "datetime64[ns]"},
+            "target_future": {"target_dtype": "int64"},
+        },
+        "cleaning_gates": [{"name": "schema_integrity", "severity": "HARD", "params": {}}],
+        "qa_gates": [{"name": "feature_readiness_documented", "severity": "HARD", "params": {}}],
+        "reviewer_gates": [{"name": "handoff_is_traceable", "severity": "HARD", "params": {}}],
+        "data_engineer_runbook": {"steps": ["clean", "deduplicate", "derive engagement_score", "persist"]},
+        "iteration_policy": {"max_iterations": 2},
+        "optimization_policy": {
+            "enabled": False,
+            "max_rounds": 1,
+            "quick_eval_folds": 0,
+            "full_eval_folds": 0,
+            "min_delta": 0,
+            "patience": 0,
+            "allow_model_switch": False,
+            "allow_ensemble": False,
+            "allow_hpo": False,
+            "allow_feature_engineering": True,
+            "allow_calibration": False,
+        },
+        "model_features": ["country", "engagement_score"],
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    assert result.get("accepted") is True
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.evaluation_spec" not in rules
+    assert "contract.validation_requirements" not in rules
+    assert "contract.ml_engineer_runbook" not in rules
 
 
 def test_validate_contract_minimal_readonly_rejects_missing_de_manifest_path():
@@ -402,6 +504,20 @@ def test_validate_contract_minimal_readonly_requires_scale_columns_for_explicit_
     assert "contract.cleaning_transforms_scale_missing" in rules
 
 
+def test_validate_contract_minimal_readonly_does_not_treat_mixed_format_numeric_cleaning_as_feature_scaling():
+    contract = _base_full_pipeline_contract()
+    contract["data_engineer_runbook"] = {
+        "steps": [
+            "normalize mixed-format numeric fields and boolean fields before persisting the clean dataset",
+        ]
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_transforms_scale_missing" not in rules
+
+
 def test_validate_contract_minimal_readonly_rejects_low_canonical_coverage_without_selectors():
     contract = _base_full_pipeline_contract()
     contract["canonical_columns"] = ["id", "target"]
@@ -515,6 +631,212 @@ def test_validate_contract_minimal_readonly_allows_target_mapping_when_observed_
 
     rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
     assert "contract.target_mapping_consistency" not in rules
+
+
+def test_validate_contract_minimal_readonly_allows_drop_action_gates_on_drop_columns():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["id", "feature_a", "target", "debug_col"]
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["id", "feature_a", "target"]
+    clean_dataset["column_transformations"] = {
+        "drop_columns": ["debug_col"],
+        "scale_columns": [],
+    }
+    contract["cleaning_gates"] = [
+        {
+            "name": "drop_debug_col",
+            "severity": "HARD",
+            "action_type": "drop",
+            "final_state": "removed",
+            "params": {"target_columns": ["debug_col"]},
+        }
+    ]
+
+    result = validate_contract_minimal_readonly(contract, column_inventory=contract["canonical_columns"])
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_gate_required_columns_contradiction" not in rules
+    assert "contract.cleaning_gate_drop_conflict" not in rules
+
+
+def test_validate_contract_minimal_readonly_allows_hard_transform_columns_in_optional_passthrough():
+    contract = _base_full_pipeline_contract()
+    contract["active_workstreams"] = {
+        "cleaning": True,
+        "feature_engineering": True,
+        "model_training": False,
+    }
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["id", "feature_a", "target"]
+    clean_dataset["optional_passthrough_columns"] = ["raw_event_ts"]
+    contract["cleaning_gates"] = [
+        {
+            "name": "parse_raw_event_ts",
+            "severity": "HARD",
+            "action_type": "parse",
+            "params": {"target_columns": ["raw_event_ts"]},
+        }
+    ]
+
+    result = validate_contract_minimal_readonly(contract, column_inventory=["id", "feature_a", "target", "raw_event_ts"])
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_gate_required_columns_contradiction" not in rules
+
+
+def test_validate_contract_minimal_readonly_allows_processing_only_passthrough_columns_to_be_parsed_then_dropped():
+    contract = _base_full_pipeline_contract()
+    contract["active_workstreams"] = {
+        "cleaning": True,
+        "feature_engineering": True,
+        "model_training": False,
+    }
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["id", "feature_a", "target"]
+    clean_dataset["optional_passthrough_columns"] = ["raw_event_ts"]
+    clean_dataset["column_transformations"] = {
+        "drop_columns": ["raw_event_ts"],
+        "scale_columns": [],
+    }
+    contract["cleaning_gates"] = [
+        {
+            "name": "parse_raw_event_ts",
+            "severity": "HARD",
+            "action_type": "parse",
+            "params": {"target_columns": ["raw_event_ts"]},
+        }
+    ]
+
+    result = validate_contract_minimal_readonly(contract, column_inventory=["id", "feature_a", "target", "raw_event_ts"])
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_gate_required_columns_contradiction" not in rules
+    assert "contract.cleaning_gate_drop_conflict" not in rules
+
+
+def test_validate_contract_minimal_readonly_allows_zero_eval_folds_when_model_training_is_disabled():
+    contract = _base_full_pipeline_contract()
+    contract["active_workstreams"] = {
+        "cleaning": True,
+        "feature_engineering": True,
+        "model_training": False,
+    }
+    contract["optimization_policy"] = {
+        "enabled": False,
+        "max_rounds": 1,
+        "quick_eval_folds": 0,
+        "full_eval_folds": 0,
+        "min_delta": 0,
+        "patience": 0,
+        "allow_model_switch": False,
+        "allow_ensemble": False,
+        "allow_hpo": False,
+        "allow_feature_engineering": True,
+        "allow_calibration": False,
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.optimization_policy_value" not in rules
+
+
+def test_validate_contract_minimal_readonly_allows_zero_max_rounds_when_model_training_is_disabled():
+    contract = _base_full_pipeline_contract()
+    contract["active_workstreams"] = {
+        "cleaning": True,
+        "feature_engineering": True,
+        "model_training": False,
+    }
+    contract["optimization_policy"] = {
+        "enabled": False,
+        "max_rounds": 0,
+        "quick_eval_folds": 0,
+        "full_eval_folds": 0,
+        "min_delta": 0,
+        "patience": 0,
+        "allow_model_switch": False,
+        "allow_ensemble": False,
+        "allow_hpo": False,
+        "allow_feature_engineering": True,
+        "allow_calibration": False,
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.optimization_policy_value" not in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_zero_eval_folds_when_model_training_is_enabled():
+    contract = _base_full_pipeline_contract()
+    contract["optimization_policy"] = {
+        "enabled": True,
+        "max_rounds": 1,
+        "quick_eval_folds": 0,
+        "full_eval_folds": 0,
+        "min_delta": 0,
+        "patience": 0,
+        "allow_model_switch": True,
+        "allow_ensemble": True,
+        "allow_hpo": True,
+        "allow_feature_engineering": True,
+        "allow_calibration": True,
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.optimization_policy_value" in rules
+
+
+def test_validate_contract_minimal_readonly_rejects_zero_max_rounds_when_model_training_is_enabled():
+    contract = _base_full_pipeline_contract()
+    contract["optimization_policy"] = {
+        "enabled": True,
+        "max_rounds": 0,
+        "quick_eval_folds": 1,
+        "full_eval_folds": 1,
+        "min_delta": 0,
+        "patience": 0,
+        "allow_model_switch": True,
+        "allow_ensemble": True,
+        "allow_hpo": True,
+        "allow_feature_engineering": True,
+        "allow_calibration": True,
+    }
+
+    result = validate_contract_minimal_readonly(contract)
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.optimization_policy_value" in rules
+
+
+def test_validate_contract_minimal_readonly_inferrs_drop_semantics_from_gate_name_and_intent():
+    contract = _base_full_pipeline_contract()
+    contract["canonical_columns"] = ["id", "feature_a", "target", "debug_col"]
+    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
+    clean_dataset["required_columns"] = ["id", "feature_a", "target"]
+    clean_dataset["column_transformations"] = {
+        "drop_columns": ["debug_col"],
+        "scale_columns": [],
+    }
+    contract["cleaning_gates"] = [
+        {
+            "name": "drop_debug_col",
+            "severity": "HARD",
+            "params": {
+                "intent": "Drop debug columns before persisting the clean dataset.",
+                "target_columns": ["debug_col"],
+            },
+        }
+    ]
+
+    result = validate_contract_minimal_readonly(contract, column_inventory=contract["canonical_columns"])
+
+    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
+    assert "contract.cleaning_gate_required_columns_contradiction" not in rules
+    assert "contract.cleaning_gate_drop_conflict" not in rules
 
 
 def test_validate_contract_minimal_readonly_allows_multi_output_outcomes_with_anchor_primary_target():

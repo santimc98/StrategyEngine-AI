@@ -61,6 +61,33 @@ SCOPE_ALIAS_VALUES = {
     "model_only",
 }
 
+_ACTIVE_WORKSTREAM_FALSE_MARKERS = (
+    "sin priorizar",
+    "sin entrenar",
+    "sin entrenamiento",
+    "future run",
+    "future prediction",
+    "future modelling",
+    "future modeling",
+    "segunda run",
+    "siguiente run",
+    "previo al modelado",
+    "previo al entrenamiento",
+    "before modeling",
+    "before training",
+    "not prioritize model training",
+    "without prioritizing",
+)
+
+_FEATURE_PREP_MARKERS = (
+    "feature engineering",
+    "feature eng",
+    "variables predictoras",
+    "variables predictivas",
+    "predictive variables",
+    "predictoras",
+)
+
 ITERATION_POLICY_LIMIT_KEYS = (
     "max_iterations",
     "metric_improvement_max",
@@ -168,7 +195,7 @@ def normalize_optimization_policy(policy: Any) -> Dict[str, Any]:
     for key in OPTIMIZATION_POLICY_BOOL_KEYS:
         normalized[key] = _coerce_bool_value(policy.get(key), defaults[key])
     for key in OPTIMIZATION_POLICY_INT_KEYS:
-        minimum = 1 if key != "patience" else 0
+        minimum = 0 if key in {"max_rounds", "quick_eval_folds", "full_eval_folds", "patience"} else 1
         normalized[key] = _coerce_int_value(policy.get(key), defaults[key], minimum)
     for key in OPTIMIZATION_POLICY_FLOAT_KEYS:
         normalized[key] = _coerce_float_value(policy.get(key), defaults[key], 0.0)
@@ -177,6 +204,20 @@ def normalize_optimization_policy(policy: Any) -> Dict[str, Any]:
             continue
         normalized[key] = value
     return normalized
+
+
+def _optimization_policy_int_minimum(contract: Dict[str, Any], key: str) -> int:
+    if key == "patience":
+        return 0
+    if key in {"max_rounds", "quick_eval_folds", "full_eval_folds"}:
+        workstreams = resolve_contract_active_workstreams(contract)
+        optimization_policy = contract.get("optimization_policy")
+        optimization_disabled = False
+        if isinstance(optimization_policy, dict):
+            optimization_disabled = not _coerce_bool_value(optimization_policy.get("enabled"), True)
+        if optimization_disabled or not bool(workstreams.get("model_training")):
+            return 0
+    return 1
 
 
 def _normalize_metric_name(name: str) -> str:
@@ -2343,7 +2384,7 @@ def validate_contract_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
             if key not in optimization_policy:
                 continue
             value = optimization_policy.get(key)
-            min_value = 0 if key == "patience" else 1
+            min_value = _optimization_policy_int_minimum(contract, key)
             try:
                 numeric = int(float(value))
                 if numeric < min_value:
@@ -2466,11 +2507,153 @@ def normalize_contract_scope(scope_value: Any) -> str:
     token = str(scope_value or "").strip().lower()
     if token in CONTRACT_SCOPE_VALUES:
         return token
-    if token in {"cleaning", "clean", "clean_only"}:
+    if token in {
+        "cleaning",
+        "clean",
+        "clean_only",
+        "data_preparation",
+        "data_prep",
+        "data_quality",
+        "feature_preparation",
+        "feature_prep",
+        "future_ml_prep",
+    }:
         return "cleaning_only"
     if token in {"ml", "training", "modeling", "model_only"}:
         return "ml_only"
     return "full_pipeline"
+
+
+def _boolish(value: Any, default: Optional[bool] = None) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"1", "true", "yes", "y", "on", "enabled", "si", "sí"}:
+            return True
+        if token in {"0", "false", "no", "n", "off", "disabled"}:
+            return False
+    return default
+
+
+def _text_contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(marker in lowered for marker in markers)
+
+
+def resolve_contract_active_workstreams(contract: Any) -> Dict[str, Any]:
+    """
+    Resolve the active workstreams from the canonical contract.
+
+    Priority:
+    1. Explicit contract.active_workstreams from the planner.
+    2. Backward-compatible inference from scope + semantic contract evidence.
+
+    This lets the planner express runs such as "cleaning + feature prep for a
+    future modeling run" without being forced into ML training semantics.
+    """
+    payload = contract if isinstance(contract, dict) else {}
+    declared = payload.get("active_workstreams")
+    objective_text = " ".join(
+        str(value or "")
+        for value in (
+            payload.get("business_objective"),
+            payload.get("strategy_title"),
+            ((payload.get("task_semantics") or {}).get("objective_type") if isinstance(payload.get("task_semantics"), dict) else ""),
+            ((payload.get("task_semantics") or {}).get("problem_family") if isinstance(payload.get("task_semantics"), dict) else ""),
+        )
+        if str(value or "").strip()
+    )
+    scope = normalize_contract_scope(payload.get("scope"))
+    artifact_requirements = payload.get("artifact_requirements") if isinstance(payload.get("artifact_requirements"), dict) else {}
+    clean_dataset = artifact_requirements.get("clean_dataset") if isinstance(artifact_requirements, dict) else {}
+    required_outputs = payload.get("required_outputs") if isinstance(payload.get("required_outputs"), list) else []
+    required_outputs_text = " ".join(str(item or "") for item in required_outputs)
+    has_explicit_eval = isinstance(payload.get("evaluation_spec"), dict) and bool(payload.get("evaluation_spec"))
+    has_explicit_validation = isinstance(payload.get("validation_requirements"), dict) and bool(payload.get("validation_requirements"))
+    has_ml_runbook = _runbook_present(payload.get("ml_engineer_runbook"))
+    has_model_artifacts = any(
+        any(token in str(path or "").lower() for token in ("cv_metrics", "metrics", "model.pkl", "model.bin", "submission"))
+        for path in required_outputs
+    )
+    future_prep_signal = _text_contains_any(objective_text, _ACTIVE_WORKSTREAM_FALSE_MARKERS)
+    feature_prep_signal = _text_contains_any(objective_text, _FEATURE_PREP_MARKERS)
+    declared_features = bool(payload.get("derived_columns")) or bool(payload.get("feature_engineering_plan")) or bool(payload.get("model_features"))
+
+    result = {
+        "cleaning": False,
+        "feature_engineering": False,
+        "model_training": False,
+        "review": True,
+        "translation": True,
+    }
+    explicit_flags: set[str] = set()
+    if isinstance(declared, dict):
+        for key, aliases in {
+            "cleaning": ("cleaning", "data_cleaning", "data_quality", "data_prep", "data_preparation"),
+            "feature_engineering": ("feature_engineering", "feature_prep", "feature_preparation"),
+            "model_training": ("model_training", "training", "ml_training", "modeling", "model_fitting"),
+            "review": ("review", "qa_review"),
+            "translation": ("translation", "reporting"),
+        }.items():
+            resolved = None
+            for alias in aliases:
+                if alias in declared:
+                    resolved = _boolish(declared.get(alias))
+                    if resolved is not None:
+                        break
+            if resolved is not None:
+                result[key] = resolved
+                explicit_flags.add(key)
+        notes = declared.get("notes")
+        if isinstance(notes, str) and notes.strip():
+            result["notes"] = notes.strip()
+
+    if "cleaning" not in explicit_flags and not result["cleaning"]:
+        result["cleaning"] = bool(
+            scope in {"cleaning_only", "full_pipeline"}
+            or clean_dataset
+            or _runbook_present(payload.get("data_engineer_runbook"))
+            or _gate_list_valid(payload.get("cleaning_gates"))
+        )
+
+    if "feature_engineering" not in explicit_flags and not result["feature_engineering"]:
+        result["feature_engineering"] = bool(
+            declared_features
+            or feature_prep_signal
+            or result["cleaning"]
+            and bool(payload.get("model_features"))
+        )
+
+    if "model_training" not in explicit_flags and not result["model_training"]:
+        inferred_ml = bool(
+            scope in {"ml_only", "full_pipeline"}
+            and (has_explicit_eval or has_explicit_validation or has_ml_runbook or has_model_artifacts)
+        )
+        if future_prep_signal and scope != "ml_only":
+            inferred_ml = False
+        result["model_training"] = inferred_ml
+
+    if "review" not in explicit_flags and not result["review"]:
+        result["review"] = True
+
+    if "translation" not in explicit_flags and not result["translation"]:
+        result["translation"] = True
+
+    return result
+
+
+def derive_contract_scope_from_workstreams(contract: Any) -> str:
+    workstreams = resolve_contract_active_workstreams(contract)
+    if bool(workstreams.get("model_training")) and bool(workstreams.get("cleaning")):
+        return "full_pipeline"
+    if bool(workstreams.get("model_training")):
+        return "ml_only"
+    return "cleaning_only"
 
 
 def _gate_has_consumable_name(gate: Dict[str, Any]) -> bool:
@@ -2524,7 +2707,7 @@ _SCALE_TARGET_PATTERN = re.compile(
     r"\b("
     r"column|columns|columna|columnas|"
     r"feature|features|variable|variables|"
-    r"predictor|predictors|input|inputs|numeric|numerical"
+    r"predictor|predictors|input|inputs"
     r")\b",
     re.IGNORECASE,
 )
@@ -2534,6 +2717,14 @@ _SCHEMA_STANDARDIZATION_PATTERN = re.compile(
 )
 _DTYPE_QUALIFIER_PATTERN = re.compile(
     r"\b(dtype|dtypes|data\s*type|data\s*types|tipo\s*de\s*dato|tipos\s*de\s*datos)\b",
+    re.IGNORECASE,
+)
+_FORMAT_COERCION_PATTERN = re.compile(
+    r"\b("
+    r"mixed[\s-]*format|format|formats|percentage|percentages|percent|"
+    r"string|strings|boolean|booleans|parse|parsing|parsed|coerce|coercion|"
+    r"canonicaliz|standardized?\s+format|type\s+cleaning|format\s+cleaning"
+    r")\b",
     re.IGNORECASE,
 )
 _ACTION_NEGATION_PATTERN = re.compile(
@@ -2555,6 +2746,34 @@ _COLUMN_REF_KEYS = {
     "column_names",
     "canonical_column",
     "canonical_columns",
+}
+
+_GATE_ACTION_PATTERNS: Dict[str, re.Pattern[str]] = {
+    "drop": re.compile(
+        r"\b(drop|discard|remove|exclude|eliminar|descartar|quitar|exclude)\b",
+        re.IGNORECASE,
+    ),
+    "parse": re.compile(r"\b(parse|parsing|parsed|parsear|parseo)\b", re.IGNORECASE),
+    "coerce": re.compile(
+        r"\b(coerce|coercion|cast|casting|convert|conversion|convertir|coercionar)\b",
+        re.IGNORECASE,
+    ),
+    "impute": re.compile(
+        r"\b(impute|imputing|imputation|fill\s+missing|rellenar|imputar)\b",
+        re.IGNORECASE,
+    ),
+    "standardize": re.compile(
+        r"\b(standardize|standardise|normalize|normalise|canonicaliz|normalize|normalizar|estandarizar)\b",
+        re.IGNORECASE,
+    ),
+    "derive": re.compile(
+        r"\b(derive|derived|compute|computed|create|creating|engineer|engineering|generar|derivar)\b",
+        re.IGNORECASE,
+    ),
+    "check": re.compile(
+        r"\b(check|verify|ensure|validate|validation|assert|comprobar|validar|asegurar)\b",
+        re.IGNORECASE,
+    ),
 }
 
 
@@ -2675,6 +2894,9 @@ def _has_non_negated_feature_scaling_action(text: str) -> bool:
         # "dtype normalization" / "data type normalization" is type coercion, not feature scaling.
         if _DTYPE_QUALIFIER_PATTERN.search(clause):
             continue
+        # Cleaning/coercion of mixed-format numeric/text/boolean fields is not feature scaling.
+        if _FORMAT_COERCION_PATTERN.search(clause):
+            continue
         if target_is_local:
             return True
         # Ignore schema/format standardization; that is structural cleaning, not feature scaling.
@@ -2706,6 +2928,39 @@ def _extract_columns_from_value(value: Any) -> List[str]:
     return values
 
 
+def _infer_gate_action_type(gate: Dict[str, Any]) -> str:
+    if not isinstance(gate, dict):
+        return ""
+    explicit = str(gate.get("action_type") or "").strip().lower()
+    if explicit:
+        return explicit
+    text_parts: List[str] = []
+    for key in ("name", "id", "gate", "condition", "evidence_required", "action_if_fail"):
+        value = gate.get(key)
+        if isinstance(value, str) and value.strip():
+            text_parts.append(value)
+    params = gate.get("params")
+    if isinstance(params, dict):
+        for key in ("intent", "description", "purpose", "summary", "action"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                text_parts.append(value)
+    joined = " \n ".join(text_parts)
+    for action_type, pattern in _GATE_ACTION_PATTERNS.items():
+        if pattern.search(joined):
+            return action_type
+    return ""
+
+
+def _gate_targets_removed(gate: Dict[str, Any]) -> bool:
+    if not isinstance(gate, dict):
+        return False
+    final_state = str(gate.get("final_state") or "").strip().lower()
+    if final_state == "removed":
+        return True
+    return _infer_gate_action_type(gate) == "drop"
+
+
 def _collect_gate_column_refs(gates: Any, hard_only: bool = True) -> List[str]:
     if not isinstance(gates, list):
         return []
@@ -2718,6 +2973,33 @@ def _collect_gate_column_refs(gates: Any, hard_only: bool = True) -> List[str]:
             continue
         refs.extend(_extract_columns_from_value(gate))
     return list(dict.fromkeys([ref for ref in refs if isinstance(ref, str) and ref.strip()]))
+
+
+def _collect_gate_column_refs_by_mode(
+    gates: Any,
+    *,
+    hard_only: bool = True,
+) -> Tuple[List[str], List[str]]:
+    keep_refs: List[str] = []
+    drop_refs: List[str] = []
+    if not isinstance(gates, list):
+        return keep_refs, drop_refs
+    for gate in gates:
+        if not isinstance(gate, dict):
+            continue
+        severity = str(gate.get("severity") or "HARD").strip().upper()
+        if hard_only and severity != "HARD":
+            continue
+        refs = [
+            ref
+            for ref in _extract_columns_from_value(gate)
+            if isinstance(ref, str) and ref.strip()
+        ]
+        if _gate_targets_removed(gate):
+            drop_refs.extend(refs)
+        else:
+            keep_refs.extend(refs)
+    return list(dict.fromkeys(keep_refs)), list(dict.fromkeys(drop_refs))
 
 
 def _resolve_cleaning_column_transformations(clean_dataset: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -3634,8 +3916,10 @@ def validate_contract_minimal_readonly(
                 )
             )
 
-    requires_cleaning = scope in {"cleaning_only", "full_pipeline"}
-    requires_ml = scope in {"ml_only", "full_pipeline"}
+    active_workstreams = resolve_contract_active_workstreams(contract)
+    requires_cleaning = bool(active_workstreams.get("cleaning"))
+    requires_ml = bool(active_workstreams.get("model_training"))
+    requires_feature_prep = bool(active_workstreams.get("feature_engineering"))
     artifact_requirements = contract.get("artifact_requirements")
     clean_dataset_cfg = {}
     if isinstance(artifact_requirements, dict):
@@ -3899,8 +4183,12 @@ def validate_contract_minimal_readonly(
                     )
                 )
 
-        hard_gate_cols = _collect_gate_column_refs(contract.get("cleaning_gates"), hard_only=True)
-        hard_gate_norm = {col.lower(): col for col in hard_gate_cols}
+        hard_gate_keep_cols, hard_gate_drop_cols = _collect_gate_column_refs_by_mode(
+            contract.get("cleaning_gates"),
+            hard_only=True,
+        )
+        hard_gate_norm = {col.lower(): col for col in hard_gate_keep_cols}
+        hard_gate_drop_norm = {col.lower(): col for col in hard_gate_drop_cols}
         # Wide-schema: HARD gates may reference selector family tokens
         # (e.g. "PIXEL_FEATURES") instead of individual columns.  Treat
         # declared selector names / family_ids as "covered" so they don't
@@ -3930,14 +4218,38 @@ def validate_contract_minimal_readonly(
                     gate_missing[:20],
                 )
             )
-        gate_drop_conflict = [hard_gate_norm[key] for key in sorted(set(hard_gate_norm) & set(drop_norm))]
+        # Non-drop HARD gates may legitimately depend on processing-only/transient
+        # columns that are later removed from the persisted clean artifact.  That
+        # intent is modeled explicitly via optional_passthrough_columns, so only
+        # treat the overlap as contradictory when the dropped column is not
+        # declared as passthrough coverage for execution-time transforms.
+        gate_drop_conflict = [
+            hard_gate_norm[key]
+            for key in sorted((set(hard_gate_norm) & set(drop_norm)) - set(passthrough_norm))
+        ]
         if gate_drop_conflict:
             issues.append(
                 _strict_issue(
                     "contract.cleaning_gate_drop_conflict",
                     "error",
-                    "HARD cleaning gates cannot target columns also declared in drop_columns.",
+                    "HARD cleaning gates cannot target columns also declared in drop_columns unless those columns are "
+                    "explicitly modeled as optional_passthrough_columns for processing-only use.",
                     gate_drop_conflict[:20],
+                )
+            )
+        # Drop-action gates are allowed to reference dropped columns; that is
+        # semantic alignment, not contradiction.
+        drop_gate_missing = [
+            hard_gate_drop_norm[key]
+            for key in sorted(set(hard_gate_drop_norm) - set(drop_norm))
+        ]
+        if drop_gate_missing:
+            issues.append(
+                _strict_issue(
+                    "contract.cleaning_gate_drop_targets_missing",
+                    "warning",
+                    "Drop-action HARD cleaning gates should target columns that are also declared in drop_columns.",
+                    drop_gate_missing[:20],
                 )
             )
         if selector_drop_reasons and has_declared_selectors:
@@ -3954,7 +4266,7 @@ def validate_contract_minimal_readonly(
                     )
                 )
 
-        if requires_ml:
+        if requires_ml or requires_feature_prep:
             ml_required_cols, ml_selector_hints = _collect_ml_required_columns(contract)
             if ml_selector_hints:
                 if not has_declared_selectors:
@@ -3983,7 +4295,7 @@ def validate_contract_minimal_readonly(
                     _strict_issue(
                         "contract.clean_dataset_ml_columns_missing",
                         "error",
-                        "full_pipeline contract leaves ML-required columns outside clean_dataset coverage "
+                        "Contract leaves future-ML / feature-engineering required columns outside clean_dataset coverage "
                         "(required_columns/optional_passthrough_columns/required_feature_selectors).",
                         missing_ml_cols[:25],
                     )
@@ -4137,7 +4449,7 @@ def validate_contract_minimal_readonly(
                 _strict_issue(
                     "contract.evaluation_spec",
                     "error",
-                    "evaluation_spec missing/empty for ML scope; fail-closed (ML objective context incomplete).",
+                    "evaluation_spec missing/empty while model_training is active; fail-closed (ML objective context incomplete).",
                     evaluation_spec,
                 )
             )
@@ -4164,7 +4476,7 @@ def validate_contract_minimal_readonly(
                 _strict_issue(
                     "contract.validation_requirements",
                     "error",
-                    "validation_requirements missing/empty for ML scope; fail-closed (benchmark traceability required).",
+                    "validation_requirements missing/empty while model_training is active; fail-closed (benchmark traceability required).",
                     contract.get("validation_requirements"),
                 )
             )
@@ -4173,7 +4485,7 @@ def validate_contract_minimal_readonly(
                 _strict_issue(
                     "contract.ml_engineer_runbook",
                     "error",
-                    "ml_engineer_runbook missing for ML scope; fail-closed (ML execution contract incomplete).",
+                    "ml_engineer_runbook missing while model_training is active; fail-closed (ML execution contract incomplete).",
                     contract.get("ml_engineer_runbook"),
                 )
             )
@@ -4416,7 +4728,7 @@ def validate_contract_minimal_readonly(
         for key in OPTIMIZATION_POLICY_INT_KEYS:
             if key not in optimization_policy:
                 continue
-            min_value = 0 if key == "patience" else 1
+            min_value = _optimization_policy_int_minimum(contract, key)
             try:
                 numeric = int(float(optimization_policy.get(key)))
                 if numeric < min_value:
