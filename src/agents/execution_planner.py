@@ -40,6 +40,8 @@ from src.utils.column_sets import build_column_manifest, summarize_column_sets
 from src.utils.contract_validator import (
     validate_contract_minimal_readonly,
     normalize_contract_scope,
+    resolve_contract_active_workstreams,
+    derive_contract_scope_from_workstreams,
     is_probably_path,
     is_file_path,
     _normalize_selector_entry,
@@ -53,7 +55,7 @@ from src.utils.contract_schema_registry import (
 )
 from src.utils.contract_response_schema import (
     EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS,
-    EXECUTION_CONTRACT_TRANSPORT_SCHEMA,
+    EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS,
 )
 from src.utils.problem_capabilities import (
     infer_problem_capabilities,
@@ -89,8 +91,24 @@ contract based on your semantic understanding of what the downstream agents will
 """
 
 CONTRACT_SCHEMA_EXAMPLES_TEXT = build_contract_schema_examples_text()
+COMPILER_OPERATIONAL_SCHEMA_EXAMPLES_TEXT = """
+- iteration_policy: {"max_iterations": 3, "metric_improvement_max": 0, "runtime_fix_max": 3, "compliance_bootstrap_max": 2}
+- column_dtype_targets: {"created_at": {"target_dtype": "datetime", "nullable": true, "role": "time_columns", "source": "support_context_profile"}}
+- gate_list_example: [{"name": "drop_debug_columns", "severity": "HARD", "action_type": "drop", "final_state": "removed", "params": {"target_columns": ["debug_col"]}}, {"name": "no_null_target", "severity": "HARD", "action_type": "check", "params": {"column": "target"}}]
+- required_outputs_example: [{"intent": "cleaned_dataset", "path": "artifacts/clean/dataset_cleaned.csv", "required": true, "owner": "data_engineer", "kind": "dataset"}]
+- artifact_requirements.clean_dataset:
+  {"output_path": "artifacts/clean/dataset_cleaned.csv", "output_manifest_path": "artifacts/clean/cleaning_manifest.json", "required_columns": ["id", "feature_a", "target"], "optional_passthrough_columns": ["raw_event_ts"], "required_feature_selectors": [], "column_transformations": {"drop_columns": ["debug_col"], "scale_columns": ["feature_a"]}}
+- future_ml_handoff: {"enabled": true, "primary_target": "target", "target_columns": ["target"], "readiness_goal": "dataset ready for later ML", "notes": "training deferred to a later run"}
+- agent_interfaces.data_engineer (optional thin delta example):
+  {"focus": ["traceability_artifacts", "deduplication_survivorship"]}
+- agent_interfaces.cleaning_reviewer (optional thin delta example):
+  {"review_emphasis": ["temporal_sanity", "leakage_screening"]}
+- agent_interfaces.ml_engineer (optional thin delta example):
+  {"handoff_notes": "Use top-level model_features and required_outputs as the authoritative handoff inputs."}
+""".strip()
 
 _EXECUTION_CONTRACT_TOOL_NAME = "emit_execution_contract"
+_EXECUTION_SEMANTIC_CORE_TOOL_NAME = "emit_execution_semantic_core"
 _EXECUTION_CONTRACT_PATCH_TOOL_NAME = "emit_execution_contract_patch"
 _JSON_PATCH_VALUE_SCHEMA: Dict[str, Any] = {
     "anyOf": [
@@ -179,57 +197,242 @@ class _OpenRouterAdapter:
                 allowed = fcc.get("allowedFunctionNames", [])
                 if allowed:
                     call_kwargs["tool_choice"] = {"type": "function", "function": {"name": allowed[0]}}
+        raw_api = getattr(self._client.chat.completions, "with_raw_response", None)
+        if raw_api is not None and hasattr(raw_api, "create"):
+            try:
+                raw_response = raw_api.create(**call_kwargs)
+                response = raw_response.parse() if hasattr(raw_response, "parse") else raw_response
+                raw_body = _read_openai_raw_response_body(raw_response)
+                if raw_body:
+                    try:
+                        setattr(response, "_codex_raw_body", raw_body)
+                    except Exception:
+                        pass
+                return response
+            except Exception:
+                pass
         return self._client.chat.completions.create(**call_kwargs)
 
-MINIMAL_CONTRACT_COMPILER_PROMPT = """
-You are an Execution Contract Compiler for a multi-agent business intelligence system.
+SEMANTIC_EXECUTION_PLANNER_PROMPT = """
+You are a Semantic Execution Planner for a multi-agent business intelligence system.
 
-Goal:
+MISSION
+- Decide what this run should actually do before any formal contract compilation happens.
+- Produce ONE semantic_core JSON object that captures the authoritative meaning of the run.
+- Reason from business objective, strategy, column inventory, and dataset profile.
+- Prioritize contextual understanding over rigid scope heuristics.
+
+SOURCE OF TRUTH AND PRECEDENCE
+1. business_objective + strategy define the run intent and business meaning.
+2. column_inventory + dataset profile define what columns actually exist and what is defensible to keep, exclude, or hand off.
+3. If text-level strategy hints conflict with structural evidence from the dataset, prefer the safer structural interpretation.
+- Never let heuristic hints override explicit target, role, or column evidence.
+- Never let abstract feature family labels replace explicit future-ready feature decisions.
+
+What semantic_core must decide:
+- the real run intent
+- active_workstreams
+- whether model_training is active now or deferred
+- future_ml_handoff when a future target exists but model training is not part of this run
+- column_roles
+- allowed_feature_sets
+- model_features
+- required_outputs
+- cleaning / QA / reviewer gate intent
+- data_engineer_runbook
+- optimization_policy
+
+SEMANTIC PLANNING WORKFLOW (MANDATORY)
+- Before emitting JSON, reason through the run like a senior planner:
+  1. Determine what the business is asking this run to achieve now.
+  2. Decide which workstreams are active now versus deferred to a later run.
+  3. Classify columns into semantic roles grounded in business meaning and leakage risk.
+  4. Decide which columns are defensible future modeling candidates versus audit-only, excluded, or uncertain.
+  5. Close every dependency implied by the semantics you already declared.
+- If feature_engineering is active or a future_ml_handoff exists, materialize an explicit non-empty model_features list whenever the context already supports defensible future-ready predictors.
+- allowed_feature_sets may describe conceptual families, but model_features must name explicit columns whenever this run is preparing a future modeling subset.
+- Do not leave model_features empty merely because the current run is not training a model.
+- If the context genuinely does not justify any future-ready model features, reduce the future modeling handoff/readiness claim instead of emitting an empty model_features list.
+
+Hard rules:
+- Return ONLY the semantic_core JSON object.
+- Do not output chain-of-thought, notes, or markdown.
+- Do not emit artifact_requirements, column_dtype_targets, iteration_policy, evaluation_spec, or validation_requirements.
+- Those are contract compilation responsibilities for a later step.
+- A future target does NOT imply model_training=true.
+- If the business objective says the current run is cleaning / feature preparation for a future ML run,
+  set active_workstreams.model_training=false even if the dataset contains a target column.
+- Prefer grounded semantic intent over template completion.
+- Never choose full_pipeline only because a future predictive target exists.
+- A senior semantic_core must be internally closed:
+  - if you declare future_ml_handoff, feature_engineering, or a future modeling subset, model_features must be explicitly closed from the safe columns you already identified.
+  - if you declare exclusion/leakage/admin/PII buckets, model_features must exclude those columns unless the context explicitly justifies retention.
+  - if you declare allowed_feature_sets as conceptual families, also close the concrete modeling-ready subset through model_features.
+
+Required top-level keys in semantic_core:
+- scope
+- strategy_title
+- business_objective
+- output_dialect
+- canonical_columns
+- required_outputs
+- column_roles
+- allowed_feature_sets
+- task_semantics
+- active_workstreams
+- model_features
+- cleaning_gates
+- qa_gates
+- reviewer_gates
+- data_engineer_runbook
+- optimization_policy
+
+Conditionally required:
+- future_ml_handoff when model_training=false but a future target/modeling handoff is clearly defined.
+"""
+
+MINIMAL_CONTRACT_COMPILER_PROMPT = """
+You are a Senior Execution Contract Compiler for a multi-agent business intelligence system.
+
+MISSION
 - Produce ONE JSON execution contract that downstream agents can execute and review.
-- Reason from business objective, strategy, column inventory, and dataset profile to produce an executable contract.
-- Obey a minimal stable interface, but do not let the schema turn into slot-filling without semantic justification.
+- Compile the contract from SEMANTIC_CORE_AUTHORITY_JSON and supporting context.
+- This is Task B: contract compilation, not run reinterpretation.
+- Build the smallest executable contract that preserves the semantic core and gives downstream agents exactly what they need.
+- Compile only the minimal operational layer needed to make the contract executable.
+- Your job is to COMPILE the contract, not to reinterpret or renegotiate the run intent.
+
+SOURCE OF TRUTH AND PRECEDENCE
+1) SEMANTIC_CORE_AUTHORITY_JSON is the authoritative semantic source of truth for this run.
+2) SUPPORT_CONTEXT exists only to help compilation quality, traceability, and defensible defaults.
+3) Fixed contract grammar is stable; contract content must remain context-driven.
+- Never override SEMANTIC_CORE_AUTHORITY_JSON with SUPPORT_CONTEXT.
+- Do not widen scope, renegotiate intent, or re-decide whether model_training is active.
+- Do NOT set model_training=true merely because a future target exists.
+- Never choose full_pipeline only because a future predictive target exists.
+- Use the fixed scaffold only as grammar; use context as the source of meaning.
+
+SENIOR COMPILATION WORKFLOW (MANDATORY)
+- Before emitting JSON, reason through the run like a senior engineer compiling a spec:
+  1. Identify what the semantic core already decided and preserve it.
+  2. Identify the minimal operational layer required to execute this run now.
+  3. Materialize only the artifacts, column coverage, gates, dtypes, policies, and interfaces that this run actually needs.
+  4. Close every dependency implied by the semantics you already declared.
+- Never choose contract content by template alone when SEMANTIC_CORE_AUTHORITY_JSON + SUPPORT_CONTEXT provide enough evidence.
+- The fixed scaffold is universal across runs: section names, JSON shapes, invariants, and stable field conventions.
+- The CONTENT of the contract must remain context-driven: required columns, transforms, gate params, dtype targets, artifacts, and handoff details.
+- agent_interfaces belong to the contextual content layer only when additive consumer-specific hints are actually needed.
+- Downstream views are built from the top-level contract first; if you emit agent_interfaces, keep them as thin deltas so views stay thin adapters, not semantic re-interpreters.
 
 Phased contract compilation protocol (use internally as a guide, not as a rigid checklist):
 - Phase 1 FACTS_EXTRACTOR:
-  - Extract only grounded facts from provided inputs (strategy/objective/column inventory/profile).
+  - Extract grounded facts from semantic_core, strategy/objective, column inventory, and profile context.
   - Resolve ambiguities conservatively; do not invent columns or artifacts.
 - Phase 2 CONTRACT_BUILDER:
-  - Turn the grounded facts into executable fields that downstream agents can consume.
-  - Keep interfaces consumable by data_engineer, ml_engineer, QA, reviewers, and translator views.
+  - Turn grounded facts into executable fields that downstream agents can consume.
+  - Keep interfaces consumable by data_engineer, ml_engineer, QA, reviewers, and only lightweight reporting aides for translator/results_advisor when useful.
 - Phase 2B SEMANTIC_CLOSURE:
   - Close all dependent canonical sections implied by the semantics you already declared.
   - Do not leave critical meaning stranded in strategy text, task_semantics, gates, or runbooks.
   - If you state a target, metric, split protocol, feature set, or anchor column anywhere,
     mirror it into the canonical sections that downstream agents execute against.
 - Phase 3 GATE_COMPOSER:
-  - Compose only the gates justified by the contract and risk surface, using stable semantics (name/severity/params).
+  - Compose only the gates justified by the contract and risk surface, using stable semantics.
   - Prefer universal gate primitives; avoid one-off ad hoc gates when an equivalent primitive exists.
 - Phase 4 VALIDATOR_REPAIR:
-  - Verify schema/semantics and downstream-consumer compatibility.
+  - Verify schema, semantics, and downstream-consumer compatibility.
   - If issues exist, apply minimal edits; do not regenerate unrelated valid sections.
 
-Output discipline:
+OUTPUT DISCIPLINE
 - Return only the final contract JSON object.
+- Return ONLY valid JSON (no markdown, no code fences, no comments).
 - Do not output phase traces, reasoning notes, or chain-of-thought.
-- You are emitting the canonical execution contract itself, not a summary.
 - Never return {} or placeholder-empty top-level sections.
 - Populate every required canonical section with grounded content from the inputs.
 - Keep the canonical contract semantic-first: include grounded intent and interfaces, not filler.
-- You MUST populate every required section listed below. No section will be auto-filled or projected after your output. If you omit a required section, it will be missing in the final contract and downstream agents will fail.
-- A senior planner never leaves a contract semantically half-compiled.  If one section implies another,
+- Prefer the shortest valid contract that preserves semantics.
+- Keep required_outputs objects minimal by default: prefer path + intent + required + owner + kind; omit descriptions unless they are needed to disambiguate meaning.
+- agent_interfaces is OPTIONAL. Include it only when a downstream agent needs additive guidance beyond what the top-level contract already expresses.
+- Preserve SEMANTIC_CORE_AUTHORITY_JSON exactly for:
+  - scope
+  - active_workstreams
+  - task_semantics
+  - column_roles
+  - allowed_feature_sets
+  - model_features
+  - future_ml_handoff (when present)
+- Preserve the SEMANTIC INTENT of required_outputs from SEMANTIC_CORE_AUTHORITY_JSON.
+- If semantic_core required_outputs are conceptual deliverables, compile them into artifact outputs without dropping the intent.
+- A senior planner never leaves a contract semantically half-compiled. If one section implies another,
   you must close that dependency inside the contract you return.
 
-Return format:
-- Return ONLY valid JSON (no markdown, no code fences, no comments).
-
-COMPLETE CONTRACT REQUIREMENT — All of the following top-level keys MUST be present in your output:
+COMPLETE CONTRACT REQUIREMENT — treat this as canonical grammar and invariants, not as a blind template to fill.
+- Your output MUST be a semantically closed canonical contract.
+Always include these top-level keys:
   contract_version, scope, strategy_title, business_objective, output_dialect,
   canonical_columns, required_outputs, column_roles, allowed_feature_sets,
-  task_semantics, artifact_requirements, model_features, cleaning_gates, qa_gates,
-  reviewer_gates, data_engineer_runbook, ml_engineer_runbook, column_dtype_targets,
-  validation_requirements, evaluation_spec, iteration_policy, optimization_policy.
+  task_semantics, active_workstreams, artifact_requirements, model_features,
+  cleaning_gates, qa_gates, reviewer_gates, data_engineer_runbook,
+  column_dtype_targets, iteration_policy, optimization_policy.
 
-Sections you MUST generate yourself (previously auto-projected, now YOUR responsibility):
+Conditionally required top-level keys:
+  - Include ml_engineer_runbook, evaluation_spec, and validation_requirements
+    when and only when active_workstreams.model_training = true.
+  - Include future_ml_handoff when a future target or future modeling handoff
+    is clearly defined but model_training is not part of the current run.
+
+Compilation responsibilities for Task B:
+
+- Preserve these semantic sections VERBATIM from SEMANTIC_CORE_AUTHORITY_JSON unless only shape normalization is needed:
+  - scope
+  - active_workstreams
+  - future_ml_handoff
+  - task_semantics
+  - column_roles
+  - allowed_feature_sets
+  - model_features
+  - strategy_title
+  - business_objective
+  - output_dialect
+- Preserve required_outputs semantically, not necessarily literally:
+  - when semantic_core already contains file paths, keep them
+  - when semantic_core contains conceptual deliverable labels, materialize them as required_outputs objects with path + intent
+
+- Your main job is to materialize the minimal operational layer required for execution:
+  - artifact_requirements.clean_dataset
+  - column_dtype_targets
+  - iteration_policy
+  - executable gate objects for cleaning_gates / qa_gates / reviewer_gates
+  - optional lightweight agent_interfaces only when top-level contract alone is insufficient for a consumer's focus
+  - evaluation_spec and validation_requirements only when active_workstreams.model_training = true
+
+- Treat these as context-derived sections, not template sections:
+  - artifact_requirements.clean_dataset.required_columns
+  - artifact_requirements.clean_dataset.column_transformations
+  - column_dtype_targets
+  - gate params and gate names
+  - required_outputs materializations needed for execution
+  - iteration_policy values
+  - agent_interfaces.* blocks
+
+- If model_training = false:
+  - do NOT invent training, CV, or benchmark sections
+  - preserve future_ml_handoff
+  - compile a handoff-ready cleaning / feature-prep contract instead of a fake ML contract
+
+- agent_interfaces:
+  - Top-level contract is the primary source for downstream views; agent_interfaces are additive only.
+  - Omit blocks that would merely duplicate top-level truth.
+  - If included, keep each block thin: focus notes, review emphasis, handoff notes, or other small consumer-specific hints.
+  - Never mirror full gate lists, full dtype maps, full required_outputs, or full artifact_requirements into agent_interfaces when those already exist top-level.
+  - Include ml_engineer only when model_training=true OR future_ml_handoff.enabled=true, and keep future-handoff blocks lightweight.
+  - translator and results_advisor are OPTIONAL light interfaces, not contract-critical interfaces.
+  - Only include translator/results_advisor blocks when the contract has explicit reporting/evidence/decisioning structure that benefits from a small dedicated interface.
+  - If included, translator/results_advisor blocks must stay lightweight and must not drive execution semantics.
+  - Do NOT create any failure_explainer interface. Runtime debugging context belongs to runtime failure handling, not to the execution contract.
+  - Each block should expose only what that agent needs that is NOT already obvious from the top-level contract.
+  - agent_interfaces must never introduce semantics that are absent from the top-level contract.
+  - If a field appears in agent_interfaces, it must remain compatible with the authoritative top-level contract.
 
 - evaluation_spec: object with keys:
   - objective_type: string (e.g. "binary_classification", "multiclass", "regression", "multi_output_classification")
@@ -240,6 +443,7 @@ Sections you MUST generate yourself (previously auto-projected, now YOUR respons
   Derive these from task_semantics, column_roles.outcome, and the business objective.
   If the metric or protocol appears in strategy, qa_gates, reviewer_gates, or runbooks,
   it MUST also be materialized here.  Do not leave metric semantics only in gate prose.
+  REQUIRED only when active_workstreams.model_training = true.
 
 - validation_requirements: object with keys:
   - method: string ("cross_validation" or "holdout")
@@ -248,6 +452,7 @@ Sections you MUST generate yourself (previously auto-projected, now YOUR respons
   - params: object (e.g. {"n_splits": 5, "n_repeats": 2, "stratify": true} for CV)
   Derive from task_semantics and the nature of the problem.
   If you define a validation protocol anywhere else in the contract, close it here explicitly.
+  REQUIRED only when active_workstreams.model_training = true.
 
 - iteration_policy: object with keys:
   - max_iterations: int (total pipeline attempts; default 6 for full_pipeline, 3 for cleaning_only)
@@ -273,19 +478,30 @@ Sections you MUST generate yourself (previously auto-projected, now YOUR respons
   columns that contaminate the feature set.
   If you declare model_features / allowed_feature_sets / column_roles, you must close clean_dataset coverage
   from those declarations instead of leaving coverage implicit.
+- artifact_requirements.clean_dataset.optional_passthrough_columns: list[str] for processing-only dependencies.
+  Use this when a column is required to execute HARD parse/coerce/standardize/derive gates, temporal logic,
+  deduplication, or intermediate derivation, but is not guaranteed to survive in every persisted clean artifact.
+  Do not force every transform-only dependency into required_columns if it is operationally needed but not part of the
+  final clean dataset schema.
 
 Canonical contract interface (required top-level sections):
 - scope: one of ["cleaning_only", "ml_only", "full_pipeline"]
-  - cleaning_only: Use ONLY for pure ETL/data quality tasks where no modeling, analysis, or prediction is requested.
-  - full_pipeline: The STANDARD for predictive/prescriptive constraints. Use this whenever a model or analysis is the goal, even if data is dirty (the pipeline handles cleaning automatically).
-  - ml_only: Use only if input data is explicitly stated to be pre-cleaned and trusted.
+  - scope is a compatibility projection for downstream routing, not the semantic brain of the contract.
+  - cleaning_only: the current run performs cleaning / data quality / feature preparation only, even if a future target or future modeling handoff exists.
+  - ml_only: the current run trains/evaluates a model on already trusted pre-cleaned data.
+  - full_pipeline: the current run must both clean data and train/evaluate a model in the same run.
+  - Never choose full_pipeline only because a future predictive target exists. Use full_pipeline only when the current run must actually train/evaluate a model now.
 - strategy_title: string
 - business_objective: string
 - output_dialect: object (csv sep/decimal/encoding when known)
 - canonical_columns: list[str]
-- required_outputs: list[str] artifact file paths (REQUIRED items only)
-- required_output_artifacts (optional): list[object] rich metadata with:
-  - path, required, owner, kind, description, id(optional)
+- required_outputs:
+  - either list[str] artifact file paths
+  - OR list[object] with at least {"path": "..."} and, when materializing semantic deliverables, prefer
+    {"intent": "<semantic_output_name>", "path": "...", "required": true, "owner": "...", "kind": "...", "description": "..."}
+  - prefer minimal objects; description/source/id are optional and should usually be omitted unless they add necessary meaning
+- required_output_artifacts (optional legacy parallel metadata):
+  - path, intent(optional), required, owner, kind, description, id(optional)
 - column_roles: object mapping role -> list[str]
   Role definitions (ML execution context):
   - outcome: ONLY the target variable(s) the model predicts (usually one column).
@@ -323,6 +539,8 @@ Scope-dependent required fields:
   - cleaning_gates: list of gate objects
   - data_engineer_runbook: object/list/string with actionable steps
   - artifact_requirements.clean_dataset.required_columns: list[str]
+  - artifact_requirements.clean_dataset.optional_passthrough_columns (optional but strongly preferred when transform-only
+    execution dependencies exist): list[str]
   - artifact_requirements.clean_dataset.required_feature_selectors (optional): list[object]
     to represent wide feature families compactly (regex/prefix/range/list/all_columns_except)
   - artifact_requirements.clean_dataset.output_path: file path for cleaned CSV
@@ -341,7 +559,7 @@ Scope-dependent required fields:
     - if selector-drop policy is active, any required_columns / optional_passthrough_columns /
       HARD-gate columns must remain outside selector coverage as non-droppable anchors
     (do not encode these decisions only in free-text runbook)
-- If scope includes ML ("ml_only" or "full_pipeline"):
+- If active_workstreams.model_training = true:
   - qa_gates: list of gate objects
   - reviewer_gates: list of gate objects
   - ml_engineer_runbook: object/list/string with actionable steps
@@ -352,22 +570,35 @@ Scope-dependent required fields:
   - required_outputs MUST include a metrics JSON artifact (e.g. "metrics/evaluation.json" or "artifacts/ml/cv_metrics.json").
     The downstream system reads this file to extract the primary metric value for review board evaluation.
     Without it, the metric cannot be tracked across iterations.
+- If active_workstreams.model_training = false but active_workstreams.feature_engineering = true:
+  - Do NOT invent model-training evaluation sections just to satisfy a rigid template.
+  - Instead, make future_ml_handoff, leakage controls, clean_dataset coverage, and derived/selected feature readiness explicit.
 
 Gate object contract (for cleaning_gates / qa_gates / reviewer_gates):
 - preferred shape: {"name": string, "severity": "HARD"|"SOFT", "params": object}
+- preferred semantic extensions for universal validation:
+  - action_type: one of ["drop", "parse", "coerce", "impute", "standardize", "derive", "check"]
+  - column_phase: one of ["input", "transform", "output"] when useful
+  - final_state: one of ["removed", "retained", "derived", "validated"] when useful
 - optional semantic keys: "condition", "evidence_required", "action_if_fail"
 - avoid anonymous dicts: each gate must have a consumable identifier.
 - if you start from semantic wording like metric/check/rule, map it into "name" and keep the original key inside params.
 
 Hard rules:
 - Do not invent columns not present in column_inventory.
-- required_outputs must be artifact paths, never conceptual labels.
+- In the compiled contract, required_outputs must always materialize to artifact paths.
+- If SEMANTIC_CORE_AUTHORITY_JSON uses conceptual deliverable labels, preserve them via required_outputs[*].intent
+  instead of dropping them.
 - Keep de_view executable from contract alone: include both cleaned output CSV and cleaning manifest JSON paths.
 - Contract precedence for DE must be coherent: HARD cleaning_gates + required_columns + explicit column_transformations
   are binding and must not contradict runbook narrative.
-- For full_pipeline contracts, clean_dataset coverage must include ML-required columns
-  (outcome/decision/model features), either explicitly in required_columns/optional_passthrough_columns
-  or through required_feature_selectors.
+- For any contract with future ML handoff or feature engineering, clean_dataset coverage must include
+  future-model-required columns (outcome/decision/model features), either explicitly in
+  required_columns/optional_passthrough_columns or through required_feature_selectors.
+- If a HARD cleaning gate or transform references a column, that column must be covered by
+  required_columns, optional_passthrough_columns, or required_feature_selectors.
+  Use optional_passthrough_columns for execution dependencies that must remain available during processing
+  but are not part of the final clean artifact schema.
 - For high-dimensional feature spaces, do not enumerate every feature column in narrative fields.
   Declare feature families with required_feature_selectors and keep explicit columns as anchors
   (target/split/ids/critical business fields).
@@ -383,27 +614,194 @@ Hard rules:
   [-128, 127]).
 - Every requirement must be consumable by at least one downstream agent view.
 - Follow evidence_policy from INPUTS: use direct evidence first, grounded inference second, and avoid unsupported assumptions.
-- Prefer omitting non-grounded operational detail over inventing it. Downstream runtime may project conservative operational defaults from the canonical contract, but it must not invent business intent.
-- Prefer grounded inference over omission for dependent canonical sections. If the contract already contains enough semantic evidence
-  to derive evaluation, validation, required clean coverage, or anchor dtypes, you must derive and materialize them.
+- For required operational sections, prefer conservative grounded derivation over omission.
+- Omit only optional non-executable extras. Never leave a required operational section empty when it is derivable
+  from SEMANTIC_CORE_AUTHORITY_JSON plus SUPPORT_CONTEXT.
 - Semantic closure rules:
-  - Targets declared in task_semantics / column_roles.outcome must be reflected in evaluation_spec.primary_target and evaluation_spec.label_columns.
-  - The optimization metric declared or implied anywhere in strategy, business objective, or gates must be reflected in both
+  - If active_workstreams.model_training = true, targets declared in task_semantics / column_roles.outcome must be reflected in evaluation_spec.primary_target and evaluation_spec.label_columns.
+  - If active_workstreams.model_training = true, the optimization metric declared or implied anywhere in strategy, business objective, or gates must be reflected in both
     evaluation_spec.primary_metric and validation_requirements.primary_metric.
-  - Validation protocol declared or implied anywhere in strategy, gates, or runbooks must be reflected in validation_requirements.method and params.
-  - Model features and role buckets must close artifact_requirements.clean_dataset.required_columns for all non-decision columns needed by ML.
+  - If active_workstreams.model_training = true, validation protocol declared or implied anywhere in strategy, gates, or runbooks must be reflected in validation_requirements.method and params.
+  - If active_workstreams.feature_engineering = true or future_ml_handoff.enabled = true, model features and role buckets must close artifact_requirements.clean_dataset.required_columns for all non-decision columns needed by future ML.
+  - If cleaning_gates or column_transformations reference columns needed only during parsing/coercion/standardization/derivation,
+    close that dependency through artifact_requirements.clean_dataset.optional_passthrough_columns instead of silently dropping it.
   - Anchor columns (outcome, identifiers, split, time, decision) must have explicit entries in column_dtype_targets.
 - You may add extra fields if useful, but do not omit required minimum fields.
 
-CAPABILITY DETECTION (reason from objective and strategy, do NOT use keyword matching):
-When generating the contract, determine semantically whether the objective requires:
-- resampling / cross-validation: Set resampling fields in validation_requirements.
-- decisioning / ranking / action output: Set decisioning_requirements with appropriate columns.
-- explanations / interpretability: Set explanation columns in scored_rows_schema.
-- visualizations: Set visual_requirements in artifact_requirements.
-Base your decisions on the MEANING of the business objective and strategy, not on the
-presence or absence of specific keywords. Set boolean flags and structured specs in the
-contract based on your semantic understanding of what the downstream agents will need.
+Optional capability extensions:
+- Add extra structured capability sections only when they are clearly implied by
+  SEMANTIC_CORE_AUTHORITY_JSON or strongly reinforced by SUPPORT_CONTEXT.
+- Do not invent optional capability blocks for a cleaning-only run.
+"""
+
+CONTRACT_VALIDATION_ADJUDICATOR_PROMPT = """
+You are a Contract Validation Adjudicator for a multi-agent execution planner.
+
+Goal:
+- Review only AMBIGUOUS validation issues after deterministic validation.
+- Decide whether each ambiguous issue is a real blocking contradiction, a warning, or already semantically resolved.
+- Reason from context, not from rigid lexical rules.
+
+Authority and precedence:
+- SEMANTIC_CORE_AUTHORITY_JSON is the semantic source of truth.
+- COMPILED_CONTRACT_JSON is the candidate executable contract.
+- AMBIGUOUS_ISSUES_JSON contains only issues already flagged as adjudicable by deterministic validation.
+- SUPPORT_CONTEXT is reinforcement only; never override semantic_core with it.
+
+Decision policy:
+- clear: the contract is semantically valid for this issue and the issue should be removed.
+- downgrade_warning: the contract is acceptable, but the issue should remain as a warning.
+- keep_error: the issue is a real blocking contradiction and should remain an error.
+
+Examples of acceptable semantic compilation:
+- semantic required outputs like "cleaned_dataset" become concrete artifact outputs with matching intent.
+- a cleaning gate whose action is to drop leakage/admin columns aligns with drop_columns rather than contradicting it.
+
+Hard rules:
+- Do not invent missing contract fields.
+- Do not rewrite the contract.
+- Only adjudicate the listed ambiguous issues.
+- Return ONLY valid JSON.
+
+Return format:
+{
+  "issue_verdicts": [
+    {
+      "issue_index": 0,
+      "decision": "clear" | "downgrade_warning" | "keep_error",
+      "reason": "short explanation"
+    }
+  ]
+}
+
+
+def _read_openai_raw_response_body(raw_response: Any) -> str:
+    if raw_response is None:
+        return ""
+    text_attr = getattr(raw_response, "text", None)
+    try:
+        if callable(text_attr):
+            raw = text_attr()
+        else:
+            raw = text_attr
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+    except Exception:
+        pass
+    http_response = getattr(raw_response, "http_response", None)
+    if http_response is not None:
+        try:
+            raw = getattr(http_response, "text", None)
+            if callable(raw):
+                raw = raw()
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if isinstance(raw, str) and raw.strip():
+                return raw
+        except Exception:
+            pass
+    return ""
+
+
+def _coerce_provider_text(value: Any, depth: int = 0) -> str:
+    if depth > 8 or value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in (
+            "text",
+            "content",
+            "output_text",
+            "reasoning",
+            "reasoning_content",
+            "value",
+            "arguments",
+        ):
+            if key not in value:
+                continue
+            text = _coerce_provider_text(value.get(key), depth + 1)
+            if text:
+                return text
+        for key in ("tool_calls", "parts", "items", "output"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                parts = [_coerce_provider_text(item, depth + 1) for item in nested]
+                joined = "\n".join(part for part in parts if part).strip()
+                if joined:
+                    return joined
+        for key in ("message", "delta", "function", "function_call", "functionCall", "parsed", "response"):
+            if key not in value:
+                continue
+            text = _coerce_provider_text(value.get(key), depth + 1)
+            if text:
+                return text
+        for nested in value.values():
+            text = _coerce_provider_text(nested, depth + 1)
+            if text:
+                return text
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = [_coerce_provider_text(item, depth + 1) for item in value]
+        return "\n".join(part for part in parts if part).strip()
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            text = _coerce_provider_text(model_dump(exclude_none=True), depth + 1)
+            if text:
+                return text
+        except Exception:
+            pass
+
+    for attr in (
+        "text",
+        "content",
+        "output_text",
+        "reasoning",
+        "reasoning_content",
+        "value",
+        "arguments",
+        "parsed",
+        "message",
+        "delta",
+        "function",
+        "function_call",
+        "functionCall",
+        "parts",
+    ):
+        if not hasattr(value, attr):
+            continue
+        text = _coerce_provider_text(getattr(value, attr), depth + 1)
+        if text:
+            return text
+    return ""
+
+
+def _build_explicit_transport_failure(
+    rule: str,
+    message: str,
+    *,
+    phase: str,
+    item: Any = None,
+) -> Dict[str, Any]:
+    return {
+        "status": "error",
+        "accepted": False,
+        "issues": [
+            {
+                "severity": "error",
+                "rule": rule,
+                "message": message,
+                "item": item,
+            }
+        ],
+        "summary": {"error_count": 1, "warning_count": 0, "phase": phase},
+    }
 """
 
 CONTRACT_SOURCE_OF_TRUTH_POLICY_V1 = {
@@ -531,7 +929,7 @@ PHASED_CONTRACT_COMPILATION_PROTOCOL_V1 = {
         "rules": [
             "preserve downstream consumer compatibility",
             "use stable canonical field shapes",
-            "keep required_outputs as list[str] paths",
+            "keep required_outputs as artifact outputs, using object form with intent when semantic deliverables are materialized",
         ],
     },
     "phase_3_gate_composer": {
@@ -758,8 +1156,9 @@ def _apply_schema_coercion(contract: Dict[str, Any]) -> Dict[str, Any]:
     )
     _DICT_KEYS = (
         "output_dialect", "column_roles", "allowed_feature_sets",
-        "task_semantics", "artifact_requirements", "evaluation_spec",
-        "validation_requirements", "iteration_policy", "column_dtype_targets",
+        "task_semantics", "active_workstreams", "future_ml_handoff",
+        "artifact_requirements", "evaluation_spec", "validation_requirements",
+        "iteration_policy", "column_dtype_targets",
     )
     for k in _LIST_KEYS:
         if k in contract and not isinstance(contract[k], list):
@@ -783,8 +1182,11 @@ def _apply_schema_coercion(contract: Dict[str, Any]) -> Dict[str, Any]:
     # derived_columns: normalize dict/mixed -> list[str]
     contract["derived_columns"] = _extract_derived_column_names(contract.get("derived_columns"))
 
-    # Scope alias resolution
-    if "scope" in contract:
+    # Scope compatibility projection: preserve explicit active workstreams as the
+    # semantic authority and derive a routing-compatible scope from them.
+    if isinstance(contract.get("active_workstreams"), dict):
+        contract["scope"] = derive_contract_scope_from_workstreams(contract)
+    elif "scope" in contract:
         contract["scope"] = normalize_contract_scope(contract.get("scope"))
 
     # Optimization policy defaults merge
@@ -831,10 +1233,12 @@ def _apply_minimal_path_resolution(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 def _apply_planner_structural_support(contract: Dict[str, Any] | None) -> Dict[str, Any]:
     """
-    Apply only non-semantic structural support to planner output.
+    Build an optional deterministic compatibility projection of planner output.
 
-    Post-migration: no auto-projection of operational sections.
-    Only path resolution, artifact alignment, and schema coercion.
+    The returned object is never authoritative. It exists only for auxiliary
+    projections, diagnostics, or backwards-compatible consumers. The raw
+    planner contract remains the source of truth and must not be mutated by
+    this helper.
     """
     if not isinstance(contract, dict):
         return {}
@@ -963,7 +1367,7 @@ def _build_transport_validation(payload: Any) -> Dict[str, Any]:
             {
                 "severity": "error",
                 "rule": "contract.transport_payload_not_object",
-                "message": "Planner tool payload must be a JSON object.",
+                "message": "Planner payload must be a JSON object.",
                 "item": type(payload).__name__ if payload is not None else None,
             }
         )
@@ -1023,6 +1427,609 @@ def _build_transport_validation(payload: Any) -> Dict[str, Any]:
         "issues": issues,
         "summary": {"error_count": error_count, "warning_count": warning_count, "phase": "transport"},
     }
+
+
+def _build_semantic_core_transport_validation(payload: Any) -> Dict[str, Any]:
+    issues: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "semantic_core.transport_payload_not_object",
+                "message": "Semantic planner tool payload must be a JSON object.",
+                "item": type(payload).__name__ if payload is not None else None,
+            }
+        )
+        return {
+            "status": "error",
+            "accepted": False,
+            "issues": issues,
+            "summary": {"error_count": 1, "warning_count": 0, "phase": "semantic_transport"},
+        }
+
+    if not payload:
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "semantic_core.transport_payload_empty",
+                "message": "Semantic planner returned an empty JSON object.",
+                "item": {},
+            }
+        )
+        return {
+            "status": "error",
+            "accepted": False,
+            "issues": issues,
+            "summary": {"error_count": 1, "warning_count": 0, "phase": "semantic_transport"},
+        }
+
+    missing = [key for key in EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS if key not in payload]
+    if missing:
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "semantic_core.missing_required_keys",
+                "message": "Semantic planner omitted required semantic_core sections.",
+                "item": missing[:20],
+            }
+        )
+
+    empty_required = [
+        key
+        for key in EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS
+        if key in payload and not _is_meaningful_contract_value(payload.get(key))
+    ]
+    if empty_required:
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "semantic_core.required_keys_empty",
+                "message": "Semantic planner emitted required semantic_core sections with empty values.",
+                "item": empty_required[:20],
+            }
+        )
+
+    workstreams = payload.get("active_workstreams")
+    if isinstance(workstreams, dict):
+        if workstreams.get("model_training") is False:
+            future_handoff = payload.get("future_ml_handoff")
+            target_columns = (
+                ((payload.get("task_semantics") or {}).get("target_columns"))
+                if isinstance(payload.get("task_semantics"), dict)
+                else None
+            )
+            if isinstance(target_columns, list) and target_columns and not isinstance(future_handoff, dict):
+                issues.append(
+                    {
+                        "severity": "error",
+                        "rule": "semantic_core.future_ml_handoff_missing",
+                        "message": "future_ml_handoff is required when semantic_core defers model training but keeps a future target.",
+                        "item": {"target_columns": target_columns[:8]},
+                    }
+                )
+
+    error_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() in {"error", "fail"}])
+    warning_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() == "warning"])
+    return {
+        "status": "ok" if error_count == 0 else "error",
+        "accepted": error_count == 0,
+        "issues": issues,
+        "summary": {"error_count": error_count, "warning_count": warning_count, "phase": "semantic_transport"},
+    }
+
+
+def _canonicalize_string_list(values: Any) -> List[str]:
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized.append(text)
+    return normalized
+
+
+def _normalize_semantic_token(value: Any) -> str:
+    token = re.sub(r"[^0-9a-zA-Z]+", "_", str(value or "").strip().lower()).strip("_")
+    return token
+
+
+def _looks_like_materialized_output_path(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    text = value.strip()
+    lower = text.lower()
+    if "*" in text:
+        return True
+    if re.match(r"^[a-zA-Z]:[\\/]", text):
+        return True
+    if lower.startswith(("data/", "static/", "reports/", "artifacts/")):
+        return True
+    if "/" in text or "\\" in text:
+        return True
+    return False
+
+
+def _extract_required_output_descriptor(item: Any) -> Dict[str, Any]:
+    path = ""
+    intent = ""
+    semantic_aliases: List[str] = []
+
+    def _add_alias(value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        text = value.strip()
+        if not text:
+            return
+        normalized = _normalize_semantic_token(text)
+        if normalized and normalized not in semantic_aliases:
+            semantic_aliases.append(normalized)
+        basename = os.path.basename(text.replace("\\", "/")).strip()
+        if basename and basename != text:
+            basename_norm = _normalize_semantic_token(basename)
+            if basename_norm and basename_norm not in semantic_aliases:
+                semantic_aliases.append(basename_norm)
+        else:
+            basename = text
+        stem, ext = os.path.splitext(basename)
+        if stem and ext:
+            stem_norm = _normalize_semantic_token(stem)
+            if stem_norm and stem_norm not in semantic_aliases:
+                semantic_aliases.append(stem_norm)
+
+    if isinstance(item, str):
+        text = item.strip()
+        if text:
+            if _looks_like_materialized_output_path(text):
+                path = text
+            else:
+                intent = text
+                _add_alias(text)
+    elif isinstance(item, dict):
+        for key in ("path", "output", "file", "filename", "output_path"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                candidate = value.strip()
+                if _looks_like_materialized_output_path(candidate):
+                    path = candidate
+                    break
+        for key in ("intent", "artifact", "id", "name", "deliverable", "label", "semantic_output"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                cleaned = value.strip()
+                _add_alias(cleaned)
+                if not intent:
+                    intent = cleaned
+        if not intent:
+            description = item.get("description")
+            if isinstance(description, str) and description.strip() and len(description.strip()) <= 128:
+                intent = description.strip()
+        _add_alias(item.get("description"))
+    elif item not in (None, ""):
+        _add_alias(str(item))
+        if not intent:
+            intent = str(item)
+
+    if path:
+        _add_alias(path)
+    if intent:
+        _add_alias(intent)
+    return {
+        "path": path,
+        "path_norm": str(path).replace("\\", "/").strip().lower() if _looks_like_materialized_output_path(path) else "",
+        "intent": intent,
+        "intent_norm": _normalize_semantic_token(intent),
+        "semantic_norms": semantic_aliases,
+        "raw": str(item),
+    }
+
+
+def _build_semantic_guard_validation(
+    semantic_core: Dict[str, Any] | None,
+    compiled_contract: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    issues: List[Dict[str, Any]] = []
+    if not isinstance(semantic_core, dict) or not semantic_core:
+        return {
+            "status": "ok",
+            "accepted": True,
+            "issues": [],
+            "summary": {"error_count": 0, "warning_count": 0, "phase": "semantic_guard"},
+        }
+    if not isinstance(compiled_contract, dict) or not compiled_contract:
+        issues.append(
+            {
+                "severity": "error",
+                "rule": "semantic_guard.contract_missing",
+                "message": "Compiled contract missing while semantic_core exists.",
+                "item": {},
+            }
+        )
+        return {
+            "status": "error",
+            "accepted": False,
+            "issues": issues,
+            "summary": {"error_count": 1, "warning_count": 0, "phase": "semantic_guard"},
+        }
+
+    def _record_conflict(
+        rule: str,
+        message: str,
+        item: Any = None,
+        *,
+        severity: str = "error",
+        extras: Dict[str, Any] | None = None,
+    ) -> None:
+        issue: Dict[str, Any] = {
+            "severity": severity,
+            "rule": rule,
+            "message": message,
+            "item": item,
+        }
+        if isinstance(extras, dict):
+            issue.update(extras)
+        issues.append(issue)
+
+    semantic_resolved_workstreams = resolve_contract_active_workstreams(semantic_core)
+    compiled_resolved_workstreams = resolve_contract_active_workstreams(compiled_contract)
+    semantic_expected_scope = derive_contract_scope_from_workstreams(
+        {
+            "scope": semantic_core.get("scope"),
+            "active_workstreams": semantic_resolved_workstreams,
+        }
+    )
+    compiled_effective_scope = derive_contract_scope_from_workstreams(
+        {
+            "scope": compiled_contract.get("scope"),
+            "active_workstreams": compiled_resolved_workstreams,
+        }
+    )
+
+    if semantic_expected_scope and compiled_effective_scope:
+        if semantic_expected_scope != compiled_effective_scope:
+            _record_conflict(
+                "semantic_guard.scope_changed",
+                "Compiled contract changed the effective authoritative scope from semantic_core.",
+                {
+                    "semantic_scope": semantic_core.get("scope"),
+                    "semantic_effective_scope": semantic_expected_scope,
+                    "compiled_scope": compiled_contract.get("scope"),
+                    "compiled_effective_scope": compiled_effective_scope,
+                },
+            )
+
+    semantic_workstreams = semantic_core.get("active_workstreams")
+    compiled_workstreams = compiled_contract.get("active_workstreams")
+    if semantic_resolved_workstreams:
+        if not compiled_resolved_workstreams:
+            _record_conflict(
+                "semantic_guard.active_workstreams_missing",
+                "Compiled contract omitted active_workstreams from semantic_core.",
+                {},
+            )
+        else:
+            for key in ("cleaning", "feature_engineering", "model_training"):
+                if compiled_resolved_workstreams.get(key) is not semantic_resolved_workstreams.get(key):
+                    _record_conflict(
+                        "semantic_guard.active_workstreams_changed",
+                        "Compiled contract changed active_workstreams from semantic_core.",
+                        {
+                            "field": key,
+                            "semantic": semantic_resolved_workstreams.get(key),
+                            "compiled": compiled_resolved_workstreams.get(key),
+                            "semantic_declared": semantic_workstreams if isinstance(semantic_workstreams, dict) else None,
+                            "compiled_declared": compiled_workstreams if isinstance(compiled_workstreams, dict) else None,
+                        },
+                    )
+
+    semantic_task = semantic_core.get("task_semantics")
+    compiled_task = compiled_contract.get("task_semantics")
+    if isinstance(semantic_task, dict):
+        if not isinstance(compiled_task, dict):
+            _record_conflict(
+                "semantic_guard.task_semantics_missing",
+                "Compiled contract omitted task_semantics from semantic_core.",
+                {},
+            )
+        else:
+            for key in ("problem_family", "objective_type", "primary_target", "prediction_unit"):
+                semantic_value = semantic_task.get(key)
+                compiled_value = compiled_task.get(key)
+                if semantic_value not in (None, "", []) and compiled_value not in (None, "", []):
+                    if semantic_value != compiled_value:
+                        _record_conflict(
+                            "semantic_guard.task_semantics_changed",
+                            "Compiled contract changed task_semantics from semantic_core.",
+                            {"field": key, "semantic": semantic_value, "compiled": compiled_value},
+                        )
+            semantic_targets = _canonicalize_string_list(semantic_task.get("target_columns"))
+            compiled_targets = _canonicalize_string_list(compiled_task.get("target_columns"))
+            if semantic_targets and compiled_targets and semantic_targets != compiled_targets:
+                _record_conflict(
+                    "semantic_guard.target_columns_changed",
+                    "Compiled contract changed target_columns from semantic_core.",
+                    {"semantic": semantic_targets, "compiled": compiled_targets},
+                )
+
+    semantic_features = _canonicalize_string_list(semantic_core.get("model_features"))
+    compiled_features = _canonicalize_string_list(compiled_contract.get("model_features"))
+    if semantic_features and compiled_features != semantic_features:
+        _record_conflict(
+            "semantic_guard.model_features_changed",
+            "Compiled contract changed top-level model_features from semantic_core.",
+            {"semantic": semantic_features, "compiled": compiled_features},
+        )
+
+    semantic_outputs_raw = (
+        semantic_core.get("required_outputs")
+        if isinstance(semantic_core.get("required_outputs"), list)
+        else []
+    )
+    compiled_outputs_raw = (
+        compiled_contract.get("required_outputs")
+        if isinstance(compiled_contract.get("required_outputs"), list)
+        else []
+    )
+    semantic_output_descriptors = [
+        _extract_required_output_descriptor(item) for item in semantic_outputs_raw if item not in (None, "")
+    ]
+    compiled_output_descriptors = [
+        _extract_required_output_descriptor(item) for item in compiled_outputs_raw if item not in (None, "")
+    ]
+    compiled_output_paths = {
+        desc.get("path_norm")
+        for desc in compiled_output_descriptors
+        if desc.get("path_norm")
+    }
+    compiled_output_intents: set[str] = set()
+    for desc in compiled_output_descriptors:
+        for token in desc.get("semantic_norms") or []:
+            if token:
+                compiled_output_intents.add(str(token))
+    missing_output_paths: List[str] = []
+    missing_output_intents: List[str] = []
+    for descriptor in semantic_output_descriptors:
+        semantic_path = descriptor.get("path_norm") or ""
+        semantic_intent = descriptor.get("intent_norm") or ""
+        semantic_aliases = {
+            str(token)
+            for token in (descriptor.get("semantic_norms") or [])
+            if str(token or "").strip()
+        }
+        if semantic_path:
+            if semantic_path not in compiled_output_paths:
+                missing_output_paths.append(descriptor.get("path") or descriptor.get("raw") or "")
+            continue
+        if semantic_aliases:
+            if semantic_aliases.isdisjoint(compiled_output_intents):
+                missing_output_intents.append(descriptor.get("intent") or descriptor.get("raw") or "")
+            continue
+        if semantic_intent and semantic_intent not in compiled_output_intents:
+            missing_output_intents.append(descriptor.get("intent") or descriptor.get("raw") or "")
+    if missing_output_paths:
+        _record_conflict(
+            "semantic_guard.required_outputs_dropped",
+            "Compiled contract dropped file-like required_outputs declared by semantic_core.",
+            missing_output_paths,
+        )
+    if missing_output_intents:
+        _record_conflict(
+            "semantic_guard.required_outputs_dropped",
+            "Compiled contract did not preserve the semantic intent of required_outputs declared by semantic_core.",
+            {
+                "missing_semantic_outputs": missing_output_intents,
+                "compiled_required_outputs": copy.deepcopy(compiled_outputs_raw),
+            },
+            extras={
+                "adjudicable": True,
+                "ambiguity_type": "required_output_materialization",
+            },
+        )
+
+    semantic_roles = semantic_core.get("column_roles")
+    compiled_roles = compiled_contract.get("column_roles")
+    if isinstance(semantic_roles, dict):
+        if not isinstance(compiled_roles, dict):
+            _record_conflict(
+                "semantic_guard.column_roles_missing",
+                "Compiled contract omitted column_roles from semantic_core.",
+                {},
+            )
+        else:
+            for bucket in (
+                "pre_decision",
+                "decision",
+                "outcome",
+                "post_decision_audit_only",
+                "identifiers",
+                "time_columns",
+            ):
+                semantic_bucket = set(x.lower() for x in _canonicalize_string_list(semantic_roles.get(bucket)))
+                compiled_bucket = set(x.lower() for x in _canonicalize_string_list(compiled_roles.get(bucket)))
+                if semantic_bucket and not semantic_bucket.issubset(compiled_bucket):
+                    _record_conflict(
+                        "semantic_guard.column_roles_changed",
+                        "Compiled contract dropped semantic_core column role assignments.",
+                        {
+                            "bucket": bucket,
+                            "missing": sorted(list(semantic_bucket - compiled_bucket)),
+                        },
+                    )
+
+    semantic_future = semantic_core.get("future_ml_handoff")
+    compiled_future = compiled_contract.get("future_ml_handoff")
+    if isinstance(semantic_future, dict):
+        if not isinstance(compiled_future, dict):
+            _record_conflict(
+                "semantic_guard.future_ml_handoff_missing",
+                "Compiled contract omitted future_ml_handoff from semantic_core.",
+                {},
+            )
+        else:
+            for key in ("enabled", "primary_target", "readiness_goal"):
+                semantic_value = semantic_future.get(key)
+                compiled_value = compiled_future.get(key)
+                if semantic_value not in (None, "", []) and compiled_value not in (None, "", []):
+                    if semantic_value != compiled_value:
+                        _record_conflict(
+                            "semantic_guard.future_ml_handoff_changed",
+                            "Compiled contract changed future_ml_handoff from semantic_core.",
+                            {"field": key, "semantic": semantic_value, "compiled": compiled_value},
+                        )
+
+    error_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() in {"error", "fail"}])
+    warning_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() == "warning"])
+    return {
+        "status": "ok" if error_count == 0 else "error",
+        "accepted": error_count == 0,
+        "issues": issues,
+        "summary": {"error_count": error_count, "warning_count": warning_count, "phase": "semantic_guard"},
+    }
+
+
+def _merge_validation_results(base_result: Dict[str, Any] | None, extra_result: Dict[str, Any] | None) -> Dict[str, Any]:
+    base = copy.deepcopy(base_result) if isinstance(base_result, dict) else {
+        "status": "ok",
+        "accepted": True,
+        "issues": [],
+        "summary": {"error_count": 0, "warning_count": 0},
+    }
+    extra = extra_result if isinstance(extra_result, dict) else None
+    if not extra:
+        return base
+    merged_issues = list(base.get("issues") or [])
+    merged_issues.extend(list(extra.get("issues") or []))
+    error_count = 0
+    warning_count = 0
+    for issue in merged_issues:
+        if not isinstance(issue, dict):
+            continue
+        severity = str(issue.get("severity") or "").lower()
+        if severity in {"error", "fail"}:
+            error_count += 1
+        elif severity == "warning":
+            warning_count += 1
+    base["issues"] = merged_issues
+    base["accepted"] = error_count == 0
+    base["status"] = "ok" if error_count == 0 else "error"
+    summary = dict(base.get("summary") or {})
+    summary["error_count"] = error_count
+    summary["warning_count"] = warning_count
+    if extra.get("summary") and isinstance(extra.get("summary"), dict):
+        summary["semantic_guard_phase"] = extra["summary"].get("phase")
+    base["summary"] = summary
+    return base
+
+
+def _collect_adjudicable_validation_issues(validation_result: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    if not isinstance(validation_result, dict):
+        return []
+    issues = validation_result.get("issues")
+    if not isinstance(issues, list):
+        return []
+    adjudicable: List[Dict[str, Any]] = []
+    for idx, issue in enumerate(issues):
+        if not isinstance(issue, dict):
+            continue
+        severity = str(issue.get("severity") or "").lower()
+        if severity not in {"error", "fail", "warning"}:
+            continue
+        if issue.get("adjudicable") is True:
+            payload = copy.deepcopy(issue)
+            payload["issue_index"] = idx
+            adjudicable.append(payload)
+    return adjudicable
+
+
+def _apply_validation_adjudication(
+    validation_result: Dict[str, Any] | None,
+    adjudication_result: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if not isinstance(validation_result, dict):
+        return {
+            "status": "error",
+            "accepted": False,
+            "issues": [
+                {
+                    "severity": "error",
+                    "rule": "contract.validation_result_missing",
+                    "message": "Validation result missing before adjudication.",
+                }
+            ],
+            "summary": {"error_count": 1, "warning_count": 0},
+        }
+    if not isinstance(adjudication_result, dict):
+        return copy.deepcopy(validation_result)
+    verdicts = adjudication_result.get("issue_verdicts")
+    if not isinstance(verdicts, list) or not verdicts:
+        return copy.deepcopy(validation_result)
+    result = copy.deepcopy(validation_result)
+    issues = list(result.get("issues") or [])
+    clear_indices: set[int] = set()
+    downgrade_indices: Dict[int, str] = {}
+    keep_indices: Dict[int, str] = {}
+    for verdict in verdicts:
+        if not isinstance(verdict, dict):
+            continue
+        try:
+            issue_index = int(verdict.get("issue_index"))
+        except Exception:
+            continue
+        decision = str(verdict.get("decision") or "").strip().lower()
+        reason = str(verdict.get("reason") or "").strip()
+        if issue_index < 0 or issue_index >= len(issues):
+            continue
+        if decision == "clear":
+            clear_indices.add(issue_index)
+        elif decision == "downgrade_warning":
+            downgrade_indices[issue_index] = reason
+        elif decision == "keep_error":
+            keep_indices[issue_index] = reason
+    merged_issues: List[Dict[str, Any]] = []
+    for idx, issue in enumerate(issues):
+        if not isinstance(issue, dict):
+            continue
+        if idx in clear_indices:
+            continue
+        updated = dict(issue)
+        if idx in downgrade_indices:
+            updated["severity"] = "warning"
+            updated["adjudicated"] = True
+            updated["adjudication_decision"] = "downgrade_warning"
+            if downgrade_indices[idx]:
+                updated["adjudication_reason"] = downgrade_indices[idx]
+        elif idx in keep_indices:
+            updated["adjudicated"] = True
+            updated["adjudication_decision"] = "keep_error"
+            if keep_indices[idx]:
+                updated["adjudication_reason"] = keep_indices[idx]
+        merged_issues.append(updated)
+    error_count = 0
+    warning_count = 0
+    for issue in merged_issues:
+        severity = str(issue.get("severity") or "").lower()
+        if severity in {"error", "fail"}:
+            error_count += 1
+        elif severity == "warning":
+            warning_count += 1
+    result["issues"] = merged_issues
+    result["accepted"] = error_count == 0
+    result["status"] = "ok" if error_count == 0 else "error"
+    summary = dict(result.get("summary") or {})
+    summary["error_count"] = error_count
+    summary["warning_count"] = warning_count
+    summary["adjudicated"] = True
+    result["summary"] = summary
+    result["adjudication"] = copy.deepcopy(adjudication_result)
+    return result
 
 
 def _build_patch_transport_validation(payload: Any) -> Dict[str, Any]:
@@ -2357,6 +3364,52 @@ def _extract_json_object(text: str) -> Optional[str]:
     return None
 
 
+def _close_truncated_json_tail(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    repaired = text.rstrip()
+    if not repaired:
+        return repaired
+
+    stack: List[str] = []
+    in_str = False
+    escape = False
+    for ch in repaired:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            continue
+        if ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+            continue
+        if ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+            continue
+
+    if in_str:
+        repaired += '"'
+
+    closing: List[str] = []
+    while stack:
+        opener = stack.pop()
+        closing.append("}" if opener == "{" else "]")
+    if closing:
+        repaired += "".join(closing)
+
+    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+    return repaired
+
+
 def _repair_common_json_damage(text: str) -> str:
     if not isinstance(text, str):
         return ""
@@ -2396,6 +3449,8 @@ def _repair_common_json_damage(text: str) -> str:
     if repaired_lines:
         repaired = "\n".join(repaired_lines)
         repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+
+    repaired = _close_truncated_json_tail(repaired)
 
     return repaired
 
@@ -5755,18 +6810,8 @@ def build_contract_min(
         }
     optimization_policy = normalize_optimization_policy(contract.get("optimization_policy"))
 
-    scope = normalize_contract_scope(contract.get("scope"))
-    if scope not in {"cleaning_only", "ml_only", "full_pipeline"}:
-        has_cleaning = bool(artifact_requirements.get("clean_dataset"))
-        has_ml = bool(validation_requirements)
-        if has_cleaning and has_ml:
-            scope = "full_pipeline"
-        elif has_cleaning:
-            scope = "cleaning_only"
-        elif has_ml:
-            scope = "ml_only"
-        else:
-            scope = "full_pipeline"
+    active_workstreams = resolve_contract_active_workstreams(contract)
+    scope = derive_contract_scope_from_workstreams({**contract, "active_workstreams": active_workstreams})
 
     from src.utils.contract_accessors import CONTRACT_VERSION_V41, normalize_contract_version
     # ------------------------------------------------------------------
@@ -5810,6 +6855,12 @@ def build_contract_min(
         "target_columns": resolved_target_columns,
         "decision_columns": decision_cols,
         "column_roles": column_roles,
+        "active_workstreams": active_workstreams,
+        "future_ml_handoff": (
+            copy.deepcopy(contract.get("future_ml_handoff"))
+            if isinstance(contract.get("future_ml_handoff"), dict)
+            else {}
+        ),
         "allowed_feature_sets": {
             "segmentation_features": segmentation_features,
             "model_features": model_features,
@@ -6751,8 +7802,8 @@ def _ensure_contract_visual_policy(
     """
     if not isinstance(contract, dict):
         return contract
-    scope = normalize_contract_scope(contract.get("scope"))
-    if scope not in {"ml_only", "full_pipeline"}:
+    active_workstreams = resolve_contract_active_workstreams(contract)
+    if not bool(active_workstreams.get("model_training")):
         return contract
 
     strategy_payload = strategy if isinstance(strategy, dict) else {}
@@ -6939,6 +7990,7 @@ class ExecutionPlannerAgent:
         self.last_prompt = None
         self.last_response = None
         self.last_contract_diagnostics = None
+        self.last_semantic_core = None
 
     @staticmethod
     def _estimate_prompt_tokens(prompt: str) -> int:
@@ -6981,6 +8033,105 @@ class ExecutionPlannerAgent:
         }
 
     @staticmethod
+    def _coerce_provider_text(value: Any, depth: int = 0) -> str:
+        if depth > 8 or value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, dict):
+            for key in (
+                "text",
+                "content",
+                "output_text",
+                "reasoning",
+                "reasoning_content",
+                "value",
+                "arguments",
+            ):
+                if key not in value:
+                    continue
+                text = ExecutionPlannerAgent._coerce_provider_text(value.get(key), depth + 1)
+                if text:
+                    return text
+            for key in ("tool_calls", "parts", "items", "output"):
+                nested = value.get(key)
+                if isinstance(nested, list):
+                    parts = [ExecutionPlannerAgent._coerce_provider_text(item, depth + 1) for item in nested]
+                    joined = "\n".join(part for part in parts if part).strip()
+                    if joined:
+                        return joined
+            for key in ("message", "delta", "function", "function_call", "functionCall", "parsed", "response"):
+                if key not in value:
+                    continue
+                text = ExecutionPlannerAgent._coerce_provider_text(value.get(key), depth + 1)
+                if text:
+                    return text
+            for nested in value.values():
+                text = ExecutionPlannerAgent._coerce_provider_text(nested, depth + 1)
+                if text:
+                    return text
+            return ""
+        if isinstance(value, (list, tuple)):
+            parts = [ExecutionPlannerAgent._coerce_provider_text(item, depth + 1) for item in value]
+            return "\n".join(part for part in parts if part).strip()
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            try:
+                text = ExecutionPlannerAgent._coerce_provider_text(model_dump(exclude_none=True), depth + 1)
+                if text:
+                    return text
+            except Exception:
+                pass
+        for attr in (
+            "text",
+            "content",
+            "output_text",
+            "reasoning",
+            "reasoning_content",
+            "value",
+            "arguments",
+            "parsed",
+            "message",
+            "delta",
+            "function",
+            "function_call",
+            "functionCall",
+            "parts",
+        ):
+            try:
+                raw = getattr(value, attr)
+            except Exception:
+                continue
+            text = ExecutionPlannerAgent._coerce_provider_text(raw, depth + 1)
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _build_explicit_transport_failure(
+        rule: str,
+        message: str,
+        *,
+        phase: str,
+        item: Any = None,
+    ) -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "accepted": False,
+            "issues": [
+                {
+                    "severity": "error",
+                    "rule": rule,
+                    "message": message,
+                    "item": item,
+                }
+            ],
+            "summary": {"error_count": 1, "warning_count": 0, "phase": phase},
+        }
+
+    @staticmethod
     def _extract_openai_response_text(response: Any) -> str:
         if response is None:
             return ""
@@ -7013,8 +8164,8 @@ class ExecutionPlannerAgent:
         except Exception:
             pass
         try:
-            choices = getattr(response, "choices", None) or []
-            if choices:
+            choices = getattr(response, "choices", None)
+            if isinstance(choices, list) and choices:
                 message = getattr(choices[0], "message", None)
                 tool_calls = getattr(message, "tool_calls", None) if message is not None else None
                 if tool_calls:
@@ -7023,14 +8174,57 @@ class ExecutionPlannerAgent:
                     if isinstance(arguments, str) and arguments.strip():
                         return arguments.strip()
                 content = getattr(message, "content", None) if message is not None else None
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
+                text = ExecutionPlannerAgent._coerce_provider_text(content)
+                if text:
+                    return text
+                for attr in ("reasoning", "reasoning_content", "parsed"):
+                    text = ExecutionPlannerAgent._coerce_provider_text(getattr(message, attr, None))
+                    if text:
+                        return text
         except Exception:
             pass
         text = getattr(response, "text", None)
         if isinstance(text, str) and text.strip():
             return text.strip()
+        raw_body = getattr(response, "_codex_raw_body", None)
+        if isinstance(raw_body, str) and raw_body.strip():
+            try:
+                parsed_raw = json.loads(raw_body)
+            except Exception:
+                parsed_raw = raw_body
+            text = ExecutionPlannerAgent._coerce_provider_text(parsed_raw)
+            if text:
+                return text
+        model_dump = getattr(response, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump(exclude_none=True)
+            except Exception:
+                dumped = None
+            text = ExecutionPlannerAgent._coerce_provider_text(dumped)
+            if text:
+                return text
         return ""
+
+    @staticmethod
+    def _extract_completion_tokens(response: Any, usage_metadata: Any = None) -> int:
+        if isinstance(usage_metadata, dict):
+            try:
+                return int(usage_metadata.get("completion_tokens") or 0)
+            except Exception:
+                pass
+        usage = getattr(response, "usage", None) or getattr(response, "usage_metadata", None)
+        if usage is not None:
+            try:
+                return int(getattr(usage, "completion_tokens", None) or 0)
+            except Exception:
+                pass
+            if isinstance(usage, dict):
+                try:
+                    return int(usage.get("completion_tokens") or 0)
+                except Exception:
+                    pass
+        return 0
 
     @staticmethod
     def _extract_openai_finish_reason(response: Any) -> Any:
@@ -7042,8 +8236,8 @@ class ExecutionPlannerAgent:
         except Exception:
             return None
         try:
-            choices = getattr(response, "choices", None) or []
-            if choices:
+            choices = getattr(response, "choices", None)
+            if isinstance(choices, list) and choices:
                 return getattr(choices[0], "finish_reason", None)
         except Exception:
             return None
@@ -7061,21 +8255,9 @@ class ExecutionPlannerAgent:
         generation_config = self._generation_config_for_prompt(prompt, output_token_floor=output_token_floor)
         if hasattr(model_client, "generate_content"):
             used_config = dict(generation_config or {})
-            used_config.pop("response_mime_type", None)
             used_config.pop("response_schema", None)
-            tool_name = _EXECUTION_CONTRACT_PATCH_TOOL_NAME if tool_mode == "patch" else _EXECUTION_CONTRACT_TOOL_NAME
-            tool_schema = (
-                copy.deepcopy(_EXECUTION_CONTRACT_PATCH_SCHEMA)
-                if tool_mode == "patch"
-                else copy.deepcopy(EXECUTION_CONTRACT_TRANSPORT_SCHEMA)
-            )
-            tool_description = (
-                "Return a minimal repair payload for the current canonical execution contract."
-                if tool_mode == "patch"
-                else "Return the complete canonical execution contract JSON object."
-            )
-            used_config["tools"] = [self._build_gemini_function_tool(tool_name, tool_description, tool_schema)]
-            used_config["tool_config"] = self._build_gemini_tool_config(tool_name)
+            used_config.pop("tools", None)
+            used_config.pop("tool_config", None)
             try:
                 response = model_client.generate_content(prompt, generation_config=used_config)
             except TypeError:
@@ -7563,7 +8745,9 @@ class ExecutionPlannerAgent:
         planner_candidate_invalid: Dict[str, Any] | None = None
         planner_candidate_invalid_raw: str | None = None
         planner_candidate_invalid_meta: Dict[str, Any] | None = None
+        planner_semantic_core: Dict[str, Any] | None = None
         planner_contract_canonical: Dict[str, Any] | None = None
+        last_semantic_transport_validation: Dict[str, Any] | None = None
 
         def _write_text(path: str, content: str) -> None:
             try:
@@ -7589,7 +8773,9 @@ class ExecutionPlannerAgent:
 
         def _persist_contracts(
             full_contract: Dict[str, Any] | None,
+            semantic_core: Dict[str, Any] | None = None,
             canonical_contract: Dict[str, Any] | None = None,
+            projection_contract: Dict[str, Any] | None = None,
             diagnostics_payload: Dict[str, Any] | None = None,
             invalid_contract: Dict[str, Any] | None = None,
             invalid_raw: str | None = None,
@@ -7597,15 +8783,24 @@ class ExecutionPlannerAgent:
         ) -> None:
             if not planner_dir:
                 return
+            if semantic_core:
+                _write_json(os.path.join(planner_dir, "semantic_core.json"), semantic_core)
             if canonical_contract:
                 _write_json(os.path.join(planner_dir, "contract_canonical.json"), canonical_contract)
             if full_contract:
                 _write_json(os.path.join(planner_dir, "contract_full.json"), full_contract)
+                _write_json(os.path.join(planner_dir, "contract_raw.json"), full_contract)
+            if projection_contract:
+                _write_json(os.path.join(planner_dir, "contract_projection.json"), projection_contract)
             if planner_diag:
                 _write_json(os.path.join(planner_dir, "planner_diag.json"), {"attempts": planner_diag})
             if diagnostics_payload:
                 _write_json(
                     os.path.join(planner_dir, "contract_diagnostics.json"),
+                    diagnostics_payload,
+                )
+                _write_json(
+                    os.path.join(planner_dir, "contract_validation_report.json"),
                     diagnostics_payload,
                 )
             if isinstance(invalid_contract, dict) and invalid_contract:
@@ -7807,7 +9002,7 @@ class ExecutionPlannerAgent:
             return "\n".join(lines) if lines else "No issues reported."
 
         def _validate_contract_quality(contract_payload: Dict[str, Any] | None) -> Dict[str, Any]:
-            payload_for_validation = _apply_planner_structural_support(
+            payload_for_validation = copy.deepcopy(
                 contract_payload if isinstance(contract_payload, dict) else {}
             )
             base_result: Dict[str, Any]
@@ -7858,6 +9053,68 @@ class ExecutionPlannerAgent:
                 }
 
             return base_result
+
+        def _adjudicate_ambiguous_validation_issues(
+            semantic_core_payload: Dict[str, Any] | None,
+            compiled_contract: Dict[str, Any] | None,
+            validation_result: Dict[str, Any] | None,
+            *,
+            model_client: Any,
+            model_name: str,
+        ) -> Dict[str, Any]:
+            adjudicable_issues = _collect_adjudicable_validation_issues(validation_result)
+            if not adjudicable_issues or model_client is None:
+                return copy.deepcopy(validation_result) if isinstance(validation_result, dict) else {}
+            semantic_json = _compress_text_preserve_ends(
+                json.dumps(semantic_core_payload or {}, ensure_ascii=False, indent=2),
+                max_chars=7000,
+                head=4500,
+                tail=2500,
+            )
+            contract_json = _compress_text_preserve_ends(
+                json.dumps(compiled_contract or {}, ensure_ascii=False, indent=2),
+                max_chars=12000,
+                head=8000,
+                tail=4000,
+            )
+            issues_json = json.dumps(adjudicable_issues, ensure_ascii=False, indent=2)
+            support_context_payload = {
+                "business_objective": business_objective or strategy.get("business_objective") or "",
+                "strategy_title": strategy.get("strategy_title") or strategy.get("title") or "",
+                "column_inventory_size": len(column_inventory or []),
+                "column_inventory_sample": [str(col) for col in (column_inventory or [])[:25] if col],
+            }
+            prompt = (
+                CONTRACT_VALIDATION_ADJUDICATOR_PROMPT
+                + "\n\nSEMANTIC_CORE_AUTHORITY_JSON:\n"
+                + semantic_json
+                + "\n\nCOMPILED_CONTRACT_JSON:\n"
+                + contract_json
+                + "\n\nAMBIGUOUS_ISSUES_JSON:\n"
+                + issues_json
+                + "\n\nSUPPORT_CONTEXT:\n"
+                + json.dumps(support_context_payload, ensure_ascii=False, indent=2)
+            )
+            try:
+                response, _ = self._generate_content_with_budget(
+                    model_client,
+                    prompt,
+                    output_token_floor=768,
+                    model_name=model_name,
+                    tool_mode="contract",
+                )
+                response_text = self._extract_openai_response_text(response)
+                parsed_payload, _ = _parse_json_response(response_text)
+                if not isinstance(parsed_payload, dict):
+                    return copy.deepcopy(validation_result) if isinstance(validation_result, dict) else {}
+                adjudicated = _apply_validation_adjudication(validation_result, parsed_payload)
+                if isinstance(adjudicated, dict):
+                    summary = dict(adjudicated.get("summary") or {})
+                    summary["adjudicator_model"] = model_name
+                    adjudicated["summary"] = summary
+                return adjudicated
+            except Exception:
+                return copy.deepcopy(validation_result) if isinstance(validation_result, dict) else {}
 
         _ROLE_BUCKETS = (
             "pre_decision",
@@ -8136,7 +9393,7 @@ class ExecutionPlannerAgent:
                     "Set scope to one of: cleaning_only, ml_only, full_pipeline."
                 ),
                 "contract.required_outputs_path": (
-                    "required_outputs must contain artifact file paths only (no conceptual labels)."
+                    "required_outputs must materialize to artifact paths; when preserving semantic deliverables, use object entries with path + intent."
                 ),
                 "contract.column_dtype_targets": (
                     "Each column_dtype_targets entry must be an object with key 'target_dtype' "
@@ -8203,7 +9460,8 @@ class ExecutionPlannerAgent:
                 "Schema registry examples:\n"
                 + CONTRACT_SCHEMA_EXAMPLES_TEXT
                 + "\n"
-                "scope MUST be one of: cleaning_only, ml_only, full_pipeline.\n"
+                "scope MUST be one of: cleaning_only, ml_only, full_pipeline, and it must be compatible with active_workstreams.\n"
+                "If the run is data cleaning / feature preparation for a future ML run, set active_workstreams.model_training=false and prefer scope=cleaning_only.\n"
                 "Do not invent columns outside column_inventory.\n"
                 "Use downstream_consumer_interface + evidence_policy from ORIGINAL INPUTS.\n"
                 "column_dtype_targets values MUST use key target_dtype (never key type).\n"
@@ -8231,10 +9489,11 @@ class ExecutionPlannerAgent:
                 "Never place wildcard selector tokens (e.g., pixel*) inside required_columns.\n"
                 "If strategy/data indicate robust outlier handling, include optional outlier_policy with "
                 "enabled/apply_stage/target_columns/report_path/strict.\n"
-                "For ML scopes, include non-empty evaluation_spec and ensure objective_analysis.problem_type "
+                "When active_workstreams.model_training=true, include non-empty evaluation_spec and validation_requirements and ensure objective_analysis.problem_type "
                 "(or evaluation_spec.objective_type) and non-empty column_roles.\n"
-                "For ML scopes, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
+                "When active_workstreams.model_training=true, include artifact_requirements.visual_requirements and reporting_policy.plot_spec "
                 "aligned with strategy/evidence so views can request the right visuals.\n"
+                "When active_workstreams.model_training=false but future_ml_handoff is in scope, do not invent training/CV sections; instead make future_ml_handoff and clean_dataset coverage explicit.\n"
                 "Gate lists must be executable by downstream views: use gate objects with "
                 "{name, severity, params} (severity in HARD|SOFT). If using metric/check/rule language, "
                 "map it to name and keep semantic details in params.\n"
@@ -8501,7 +9760,18 @@ class ExecutionPlannerAgent:
                 return diagnostics
 
             try:
-                validation_result = _validate_contract_quality(copy.deepcopy(contract))
+                validation_result = _merge_validation_results(
+                    _validate_contract_quality(copy.deepcopy(contract)),
+                    _build_semantic_guard_validation(planner_semantic_core, contract),
+                )
+                diagnostics_model_client = self._build_model_client(self.model_name) if self.client else None
+                validation_result = _adjudicate_ambiguous_validation_issues(
+                    planner_semantic_core,
+                    contract,
+                    validation_result,
+                    model_client=diagnostics_model_client,
+                    model_name=self.model_name,
+                )
             except Exception as err:
                 validation_result = {
                     "status": "error",
@@ -8563,12 +9833,13 @@ class ExecutionPlannerAgent:
             return diagnostics
 
         def _finalize_and_persist(contract, where, llm_success: bool):
+            projection_contract = None
             if (
                 isinstance(contract, dict)
                 and contract
                 and any(_is_meaningful_contract_value(value) for value in contract.values())
             ):
-                contract = _apply_planner_structural_support(contract)
+                projection_contract = _apply_planner_structural_support(contract)
 
                 def _llm_minimal_repair_provider(
                     current_contract: Dict[str, Any],
@@ -8599,7 +9870,7 @@ class ExecutionPlannerAgent:
                         "Preferred shape: {\"changes\": {...}} (minimal nested fields only).\n"
                         "Alternative shape: {\"patch\": [{\"op\":\"replace\",\"path\":\"/a/b\",\"value\":...}]}\n"
                         "Do NOT regenerate the full contract.\n"
-                        "Keep required_outputs as list[str].\n"
+                        "Keep required_outputs as artifact outputs; if rich object entries already exist, preserve them.\n"
                         "Preserve required_output_artifacts and spec_extraction.deliverables if present.\n"
                         + "Attempt "
                         + str(attempt)
@@ -8638,35 +9909,33 @@ class ExecutionPlannerAgent:
                         return {"changes": parsed.get("judgment_patch")}
                     return {"changes": parsed}
 
-                contract, post_validation, post_repair_trace = _validate_repair_revalidate_loop(
-                    contract=contract,
-                    validator_fn=lambda payload: _validate_contract_quality(payload),
-                    repair_provider=_llm_minimal_repair_provider,
-                    max_iterations=2,
+                post_validation = _merge_validation_results(
+                    _validate_contract_quality(contract),
+                    _build_semantic_guard_validation(planner_semantic_core, contract),
                 )
-                if isinstance(post_repair_trace, list) and post_repair_trace:
-                    if len(post_repair_trace) > 1:
-                        print(
-                            "POST_FINAL_REPAIR_LOOP: "
-                            + ", ".join(
-                                [
-                                    f"attempt={row.get('attempt')} accepted={row.get('accepted')}"
-                                    for row in post_repair_trace
-                                    if isinstance(row, dict)
-                                ]
-                            )
-                        )
-                    if isinstance(post_validation, dict) and _validation_result_accepted(post_validation):
-                        llm_success = True if self.client else llm_success
+                post_validation = _adjudicate_ambiguous_validation_issues(
+                    planner_semantic_core,
+                    contract,
+                    post_validation,
+                    model_client=self._build_model_client(self.model_name) if self.client else None,
+                    model_name=self.model_name,
+                )
             diagnostics = _build_contract_diagnostics(contract if isinstance(contract, dict) else {}, where, llm_success)
             self.last_contract_diagnostics = diagnostics
             _persist_contracts(
                 contract if isinstance(contract, dict) else {},
+                semantic_core=planner_semantic_core,
                 canonical_contract=planner_contract_canonical,
+                projection_contract=projection_contract,
                 diagnostics_payload=diagnostics,
                 invalid_contract=planner_candidate_invalid,
                 invalid_raw=planner_candidate_invalid_raw,
                 invalid_meta=planner_candidate_invalid_meta,
+            )
+            self.last_semantic_core = (
+                copy.deepcopy(planner_semantic_core)
+                if isinstance(planner_semantic_core, dict)
+                else None
             )
             self.last_contract_canonical = (
                 copy.deepcopy(planner_contract_canonical)
@@ -8784,6 +10053,107 @@ class ExecutionPlannerAgent:
             max_chars=2000,
             head=1300,
             tail=700,
+        )
+        compiler_data_summary = _compress_text_preserve_ends(
+            data_summary_str,
+            max_chars=6000,
+            head=4000,
+            tail=2000,
+        )
+        compiler_strategy_context: Dict[str, Any] = {}
+        if isinstance(strategy, dict):
+            for key in (
+                "title",
+                "objective_type",
+                "objective_reasoning",
+                "success_metric",
+                "validation_strategy",
+                "validation_rationale",
+                "analysis_type",
+                "hypothesis",
+                "required_columns",
+                "techniques",
+                "fallback_chain",
+                "reasoning",
+            ):
+                value = strategy.get(key)
+                if value not in (None, "", [], {}):
+                    compiler_strategy_context[key] = value
+            if strategy_feature_families:
+                compiler_strategy_context["feature_families"] = strategy_feature_families
+        compiler_dtypes = {}
+        if isinstance(data_profile, dict):
+            dtypes_candidate = data_profile.get("dtypes")
+            if isinstance(dtypes_candidate, dict):
+                compiler_dtypes = dtypes_candidate
+        compiler_support_context_payload = {
+            "business_objective": business_objective,
+            "strategy_compilation_reinforcement": compiler_strategy_context,
+            "relevant_columns_compact": relevant_columns_compact,
+            "column_inventory_compact": column_inventory_compact,
+            "column_manifest": {
+                "mode": manifest_mode or "none",
+                "anchors": manifest_for_prompt.get("anchors", []) if isinstance(manifest_for_prompt, dict) else [],
+                "families": manifest_for_prompt.get("families", []) if isinstance(manifest_for_prompt, dict) else [],
+            },
+            "strategy_feature_family_hints": strategy_feature_family_hints,
+            "data_profile_summary": compiler_data_summary,
+            "observed_dtype_hints": compiler_dtypes,
+            "output_dialect": output_dialect or "unknown",
+            "env_constraints": env_constraints or {"forbid_inplace_column_creation": True},
+            "contract_source_of_truth_policy": CONTRACT_SOURCE_OF_TRUTH_POLICY_V1,
+            "support_context_precedence": {
+                "role": "reinforcement_only",
+                "semantic_core_wins_on_conflict": True,
+                "ignore_heuristic_target_candidates_when_semantic_core_declares_primary_target": True,
+            },
+            "compiler_operational_targets": {
+                "must_materialize": [
+                    "artifact_requirements.clean_dataset",
+                    "column_dtype_targets",
+                    "iteration_policy",
+                    "gate_object_shapes",
+                    "evaluation_spec_when_model_training_true",
+                    "validation_requirements_when_model_training_true",
+                ],
+                "must_not_reinterpret": [
+                    "scope",
+                    "active_workstreams",
+                    "future_ml_handoff",
+                    "task_semantics",
+                    "column_roles",
+                    "allowed_feature_sets",
+                    "model_features",
+                ],
+            },
+            "agent_interface_policy": {
+                "mode": "optional_thin_deltas",
+                "top_level_contract_is_primary_source_for_views": True,
+                "avoid_shadow_contracts_inside_interfaces": True,
+                "good_interface_examples": [
+                    "focus",
+                    "review_emphasis",
+                    "handoff_notes",
+                    "owned_deliverable_notes",
+                ],
+                "avoid_repeating_top_level_sections": [
+                    "required_outputs",
+                    "artifact_requirements",
+                    "cleaning_gates",
+                    "qa_gates",
+                    "reviewer_gates",
+                    "column_dtype_targets",
+                    "full_column_lists",
+                ],
+                "translator_results_advisor_policy": "lightweight_only",
+                "failure_explainer_policy": "exclude_from_contract",
+            },
+            "domain_expert_critique": critique_for_prompt or "None",
+        }
+        compiler_support_context = json.dumps(
+            compiler_support_context_payload,
+            indent=2,
+            ensure_ascii=False,
         )
         user_input = f"""
 strategy:
@@ -8915,6 +10285,21 @@ domain_expert_critique:
         # LLM self-verifies completeness before returning.  The checklist is
         # derived from the authoritative required-keys list — never hardcoded
         # for a specific dataset or competition.
+        semantic_required_keys_csv = ", ".join(EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS)
+        semantic_checklist = (
+            "\n\nBEFORE YOU RETURN â€” self-check your semantic_core JSON.\n"
+            f"Every key listed here MUST be a top-level key in your output: {semantic_required_keys_csv}.\n"
+            "If the current run prepares data/features for future ML, active_workstreams.model_training must stay false.\n"
+            "If a future target exists but model_training=false, include future_ml_handoff.\n"
+            "Do not emit compilation-only sections like artifact_requirements, iteration_policy, column_dtype_targets, evaluation_spec, or validation_requirements.\n"
+        )
+        semantic_prompt = (
+            SEMANTIC_EXECUTION_PLANNER_PROMPT
+            + "\n\nINPUTS:\n"
+            + user_input
+            + semantic_checklist
+        )
+
         _required_keys_csv = ", ".join(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)
         _closing_checklist = (
             "\n\nBEFORE YOU RETURN — self-check your JSON against this contract completeness checklist.\n"
@@ -8928,21 +10313,31 @@ domain_expert_critique:
             "- If a metric appears anywhere in strategy/objective/gates/runbooks, it must appear in both evaluation_spec.primary_metric and validation_requirements.primary_metric.\n"
             "- If a validation protocol is implied anywhere, validation_requirements must close it explicitly.\n"
             "- If model_features / allowed_feature_sets / column_roles imply ML input columns, artifact_requirements.clean_dataset.required_columns must cover them.\n"
-            "- If anchor columns exist (outcome, identifiers, split, time, decision), column_dtype_targets must include explicit entries for those anchors."
+            "- If anchor columns exist (outcome, identifiers, split, time, decision), column_dtype_targets must include explicit entries for those anchors.\n"
+            "- Prefer a compact contract: do not duplicate top-level sections inside agent_interfaces.\n"
+            "- Only emit agent_interfaces blocks when additive consumer-specific hints are genuinely useful.\n"
+            "- translator/results_advisor blocks are optional and should remain lightweight if included.\n"
+            "- Do not create any failure_explainer block."
         )
 
         full_prompt = (
             MINIMAL_CONTRACT_COMPILER_PROMPT
-            + "\n\nSCHEMA REGISTRY EXAMPLES:\n"
-            + CONTRACT_SCHEMA_EXAMPLES_TEXT
-            + "\n\nINPUTS:\n"
-            + user_input
+            + "\n\nOPERATIONAL SCHEMA EXAMPLES:\n"
+            + COMPILER_OPERATIONAL_SCHEMA_EXAMPLES_TEXT
+            + "\n\nSUPPORT_CONTEXT:\n"
+            + compiler_support_context
             + _closing_checklist
         )
         model_chain = [m for m in (self.model_chain or [self.model_name]) if m]
+        # Planner is intentionally one-shot: one semantic pass + one compile pass.
+        # Do not fan out across fallback models here; if the first attempt fails,
+        # persist the failure and abort so we can improve reasoning quality instead
+        # of hiding it behind retries.
+        active_model_chain = model_chain[:1]
 
         contract: Dict[str, Any] | None = None
         llm_success = False
+        semantic_success = False
         best_candidate: Dict[str, Any] | None = None
         best_canonical_candidate: Dict[str, Any] | None = None
         best_validation: Dict[str, Any] | None = None
@@ -8956,21 +10351,162 @@ domain_expert_critique:
         latest_response_text_for_repair: str | None = None
         latest_parse_feedback_for_repair: str | None = None
 
-        max_quality_rounds = 3
-        try:
-            max_quality_rounds = max(1, int(os.getenv("EXECUTION_PLANNER_QUALITY_ROUNDS", "3")))
-        except Exception:
-            max_quality_rounds = 3
+        max_quality_rounds = 1
 
-        current_prompt = full_prompt
-        current_prompt_name = "prompt_attempt_1.txt"
-        current_tool_mode = "contract"
+        current_prompt = semantic_prompt
+        current_prompt_name = "semantic_prompt_attempt_1.txt"
+        current_tool_mode = "semantic"
         attempt_counter = 0
 
+        semantic_response_text: str | None = None
         if contract is None:
+            for model_idx, model_name in enumerate(active_model_chain, start=1):
+                attempt_counter += 1
+                response_text = ""
+                response = None
+                parse_error = None
+                finish_reason = None
+                usage_metadata = None
+                generation_config_used: Dict[str, Any] | None = None
+                self.last_prompt = current_prompt
+                self.last_response = None
+                response_name = (
+                    f"semantic_response_attempt_1_m{model_idx}.txt"
+                    if len(active_model_chain) > 1
+                    else "semantic_response_attempt_1.txt"
+                )
+                try:
+                    model_client = self._build_model_client(model_name)
+                    if model_client is None:
+                        parse_error = ValueError(f"Planner client unavailable for model {model_name}")
+                    else:
+                        response, generation_config_used = self._generate_content_with_budget(
+                            model_client,
+                            current_prompt,
+                            output_token_floor=2048,
+                            model_name=model_name,
+                            tool_mode="semantic",
+                        )
+                        response_text = self._extract_openai_response_text(response)
+                        semantic_response_text = response_text
+                        self.last_response = response_text
+                except Exception as err:
+                    parse_error = err
+
+                if response is not None:
+                    finish_reason = self._extract_openai_finish_reason(response)
+                    usage_metadata = _normalize_usage_metadata(
+                        getattr(response, "usage", None) or getattr(response, "usage_metadata", None)
+                    )
+                    if not str(response_text or "").strip():
+                        completion_tokens = self._extract_completion_tokens(response, usage_metadata)
+                        if completion_tokens > 0 and parse_error is None:
+                            parse_error = ValueError(
+                                f"EMPTY_COMPLETION_WITH_TOKENS: finish_reason={finish_reason} completion_tokens={completion_tokens}"
+                            )
+
+                _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
+
+                parsed_payload, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
+                if parse_exc:
+                    parse_error = parse_exc
+                parsed_semantic = parsed_payload if isinstance(parsed_payload, dict) else None
+                if (
+                    not str(response_text or "").strip()
+                    and isinstance(parse_error, ValueError)
+                    and "EMPTY_COMPLETION_WITH_TOKENS" in str(parse_error)
+                ):
+                    semantic_validation = ExecutionPlannerAgent._build_explicit_transport_failure(
+                        "semantic_core.transport_empty_completion",
+                        "Semantic planner response text was empty despite non-zero completion tokens; provider payload could not be extracted.",
+                        phase="semantic_transport",
+                        item={
+                            "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                            "completion_tokens": self._extract_completion_tokens(response, usage_metadata),
+                        },
+                    )
+                else:
+                    semantic_validation = _build_semantic_core_transport_validation(parsed_semantic)
+                last_semantic_transport_validation = semantic_validation
+                if parsed_payload is not None and not isinstance(parsed_payload, dict):
+                    parse_error = ValueError("Parsed semantic_core JSON is not an object")
+                elif not _transport_validation_accepted(semantic_validation):
+                    transport_issue = None
+                    issues = semantic_validation.get("issues")
+                    if isinstance(issues, list):
+                        for issue in issues:
+                            if isinstance(issue, dict) and issue.get("rule"):
+                                transport_issue = str(issue.get("rule"))
+                                break
+                    parse_error = ValueError(
+                        f"Semantic core invalid: {transport_issue or 'missing_or_trivial_semantic_core'}"
+                    )
+                    parsed_semantic = None
+
+                planner_diag.append(
+                    {
+                        "stage": "semantic_core",
+                        "model_name": model_name,
+                        "attempt_index": attempt_counter,
+                        "quality_round": 0,
+                        "prompt_char_len": len(current_prompt or ""),
+                        "response_char_len": len(response_text or ""),
+                        "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                        "generation_config": _safe_json_serializable(generation_config_used),
+                        "usage_metadata": usage_metadata,
+                        "had_json_parse_error": not isinstance(parsed_payload, dict),
+                        "transport_status": str(semantic_validation.get("status") or "").lower(),
+                        "transport_issue_rules": [
+                            str(issue.get("rule"))
+                            for issue in (semantic_validation.get("issues") or [])
+                            if isinstance(issue, dict) and issue.get("rule")
+                        ][:12],
+                        "parse_error_type": type(parse_error).__name__ if parse_error else None,
+                        "parse_error_message": str(parse_error) if parse_error else None,
+                        "quality_status": None,
+                        "quality_issue_rules": [],
+                        "quality_error_count": None,
+                        "quality_warning_count": None,
+                        "quality_accepted": bool(parsed_semantic),
+                        "quality_error": None if parsed_semantic else "semantic_core_invalid",
+                    }
+                )
+
+                if isinstance(parsed_semantic, dict):
+                    planner_semantic_core = copy.deepcopy(parsed_semantic)
+                    semantic_success = True
+                    break
+
+        if not semantic_success and not isinstance(planner_candidate_invalid_meta, dict):
+            planner_candidate_invalid_meta = {
+                "reason": "semantic_core_invalid",
+                "attempt_count": len(planner_diag),
+                "fallback_mode": "semantic_stage_failed",
+                "transport_validation": last_semantic_transport_validation,
+            }
+            planner_candidate_invalid_raw = semantic_response_text
+
+        full_prompt = ""
+        if isinstance(planner_semantic_core, dict):
+            semantic_authority_json = json.dumps(planner_semantic_core, indent=2, ensure_ascii=False)
+            full_prompt = (
+                MINIMAL_CONTRACT_COMPILER_PROMPT
+                + "\n\nOPERATIONAL SCHEMA EXAMPLES:\n"
+                + COMPILER_OPERATIONAL_SCHEMA_EXAMPLES_TEXT
+                + "\n\nSEMANTIC_CORE_AUTHORITY_JSON:\n"
+                + semantic_authority_json
+                + "\n\nSUPPORT_CONTEXT:\n"
+                + compiler_support_context
+                + _closing_checklist
+            )
+            current_prompt = full_prompt
+            current_prompt_name = "prompt_attempt_1.txt"
+            current_tool_mode = "contract"
+
+        if contract is None and semantic_success:
             for quality_round in range(1, max_quality_rounds + 1):
                 round_has_candidate = False
-                for model_idx, model_name in enumerate(model_chain, start=1):
+                for model_idx, model_name in enumerate(active_model_chain, start=1):
                     attempt_counter += 1
                     self.last_prompt = current_prompt
                     response_text = ""
@@ -8983,7 +10519,7 @@ domain_expert_critique:
                     validation_result: Dict[str, Any] | None = None
                     quality_accepted = False
 
-                    if len(model_chain) > 1:
+                    if len(active_model_chain) > 1:
                         response_name = f"response_attempt_{quality_round}_m{model_idx}.txt"
                     else:
                         response_name = f"response_attempt_{quality_round}.txt"
@@ -9010,6 +10546,12 @@ domain_expert_critique:
                         usage_metadata = _normalize_usage_metadata(
                             getattr(response, "usage", None) or getattr(response, "usage_metadata", None)
                         )
+                        if not str(response_text or "").strip():
+                            completion_tokens = self._extract_completion_tokens(response, usage_metadata)
+                            if completion_tokens > 0 and parse_error is None:
+                                parse_error = ValueError(
+                                    f"EMPTY_COMPLETION_WITH_TOKENS: finish_reason={finish_reason} completion_tokens={completion_tokens}"
+                                )
 
                     _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
 
@@ -9046,11 +10588,27 @@ domain_expert_critique:
                             had_json_parse_error = False
                     else:
                         parsed = _unwrap_execution_contract_transport(parsed_payload)
-                        transport_validation_result = _build_transport_validation(parsed)
+                        if (
+                            not str(response_text or "").strip()
+                            and isinstance(parse_error, ValueError)
+                            and "EMPTY_COMPLETION_WITH_TOKENS" in str(parse_error)
+                        ):
+                            transport_validation_result = ExecutionPlannerAgent._build_explicit_transport_failure(
+                                "contract.transport_empty_completion",
+                                "Contract compiler response text was empty despite non-zero completion tokens; provider payload could not be extracted.",
+                                phase="transport",
+                                item={
+                                    "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                                    "completion_tokens": self._extract_completion_tokens(response, usage_metadata),
+                                },
+                            )
+                            parsed = None
+                        else:
+                            transport_validation_result = _build_transport_validation(parsed)
                         if parsed_payload is not None and not isinstance(parsed_payload, dict):
                             parse_error = ValueError("Parsed JSON is not an object")
                         elif parsed is None and parse_error is None:
-                            parse_error = ValueError("Parsed tool payload is missing a contract object")
+                            parse_error = ValueError("Parsed planner payload is missing a contract object")
                         elif not _transport_validation_accepted(transport_validation_result):
                             transport_issue = None
                             issues = transport_validation_result.get("issues")
@@ -9068,9 +10626,19 @@ domain_expert_critique:
                     if parsed is not None and isinstance(parsed, dict):
                         round_has_candidate = True
                         planner_contract_canonical = copy.deepcopy(parsed)
-                        candidate_for_validation = _apply_planner_structural_support(parsed)
+                        candidate_for_validation = copy.deepcopy(parsed)
                         try:
-                            validation_result = _validate_contract_quality(copy.deepcopy(candidate_for_validation))
+                            validation_result = _merge_validation_results(
+                                _validate_contract_quality(copy.deepcopy(candidate_for_validation)),
+                                _build_semantic_guard_validation(planner_semantic_core, candidate_for_validation),
+                            )
+                            validation_result = _adjudicate_ambiguous_validation_issues(
+                                planner_semantic_core,
+                                candidate_for_validation,
+                                validation_result,
+                                model_client=model_client,
+                                model_name=model_name,
+                            )
                         except Exception as val_err:
                             validation_result = {
                                 "status": "error",
@@ -9156,6 +10724,7 @@ domain_expert_critique:
 
                     planner_diag.append(
                         {
+                            "stage": "contract_compile",
                             "model_name": model_name,
                             "attempt_index": attempt_counter,
                             "quality_round": quality_round,
@@ -9218,7 +10787,7 @@ domain_expert_critique:
                         continue
 
                     planner_contract_canonical = copy.deepcopy(parsed)
-                    contract = _apply_planner_structural_support(parsed)
+                    contract = copy.deepcopy(parsed)
                     llm_success = True
                     break
 
@@ -9273,14 +10842,22 @@ domain_expert_critique:
 
         if contract is None:
             invalid_contract = (
-                latest_canonical_for_repair
-                if isinstance(latest_canonical_for_repair, dict) and latest_canonical_for_repair
-                else (best_canonical_candidate if isinstance(best_canonical_candidate, dict) and best_canonical_candidate else None)
+                best_canonical_candidate
+                if isinstance(best_canonical_candidate, dict) and best_canonical_candidate
+                else (
+                    latest_canonical_for_repair
+                    if isinstance(latest_canonical_for_repair, dict) and latest_canonical_for_repair
+                    else None
+                )
             )
             invalid_raw = (
-                latest_response_text_for_repair
-                if isinstance(latest_response_text_for_repair, str) and latest_response_text_for_repair.strip()
-                else (best_response_text if isinstance(best_response_text, str) and best_response_text.strip() else None)
+                best_response_text
+                if isinstance(best_response_text, str) and best_response_text.strip()
+                else (
+                    latest_response_text_for_repair
+                    if isinstance(latest_response_text_for_repair, str) and latest_response_text_for_repair.strip()
+                    else None
+                )
             )
             planner_candidate_invalid = invalid_contract
             planner_candidate_invalid_raw = invalid_raw
@@ -9298,7 +10875,7 @@ domain_expert_critique:
             if isinstance(previous_invalid_meta, dict) and previous_invalid_meta:
                 planner_candidate_invalid_meta = {**previous_invalid_meta, **planner_candidate_invalid_meta}
             if isinstance(invalid_contract, dict) and any(_is_meaningful_contract_value(value) for value in invalid_contract.values()):
-                contract = _apply_planner_structural_support(invalid_contract)
+                contract = copy.deepcopy(invalid_contract)
             else:
                 contract = {}
             if isinstance(invalid_contract, dict):

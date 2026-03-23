@@ -1,4 +1,5 @@
 from src.agents.execution_planner import ExecutionPlannerAgent, _ensure_optimization_policy
+from src.utils.contract_validator import normalize_optimization_policy
 
 
 def test_ensure_optimization_policy_backfills_defaults():
@@ -24,4 +25,27 @@ def test_execution_planner_fallback_contract_without_api_key():
     )
     # With no LLM client, contract is essentially empty
     assert isinstance(contract, dict)
+
+
+def test_normalize_optimization_policy_preserves_zero_rounds_for_disabled_cleaning_only_policy():
+    policy = normalize_optimization_policy(
+        {
+            "enabled": False,
+            "max_rounds": 0,
+            "quick_eval_folds": 0,
+            "full_eval_folds": 0,
+            "min_delta": 0,
+            "patience": 0,
+            "allow_model_switch": False,
+            "allow_ensemble": False,
+            "allow_hpo": False,
+            "allow_feature_engineering": True,
+            "allow_calibration": False,
+        }
+    )
+
+    assert policy.get("enabled") is False
+    assert policy.get("max_rounds") == 0
+    assert policy.get("quick_eval_folds") == 0
+    assert policy.get("full_eval_folds") == 0
 

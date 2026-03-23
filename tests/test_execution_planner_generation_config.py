@@ -48,14 +48,14 @@ def test_execution_planner_generation_config_includes_response_schema_when_enabl
 def test_execution_planner_canonical_schema_required_surface_is_semantic_first():
     assert "task_semantics" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
     assert "artifact_requirements" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
-    # Post-migration: these are now required (LLM must generate them, no auto-projection)
-    assert "evaluation_spec" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
-    assert "validation_requirements" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
     assert "iteration_policy" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
     assert "column_dtype_targets" in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
+    # These remain conditional capability sections, not universal top-level requirements.
+    assert "evaluation_spec" not in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
+    assert "validation_requirements" not in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
 
 
-def test_execution_planner_generate_content_retries_without_response_schema(monkeypatch):
+def test_execution_planner_generate_content_uses_plain_json_generation_without_tool_calling(monkeypatch):
     agent = ExecutionPlannerAgent(api_key=None)
 
     class _FakeModel:
@@ -72,26 +72,27 @@ def test_execution_planner_generate_content_retries_without_response_schema(monk
     assert getattr(response, "text", "") == "{}"
     assert len(fake_model.calls) == 1
     first_cfg = fake_model.calls[0].get("generation_config") or {}
-    assert "tools" in first_cfg
-    assert "tool_config" in first_cfg
-    assert "response_mime_type" not in first_cfg
+    assert "tools" not in first_cfg
+    assert "tool_config" not in first_cfg
+    assert first_cfg.get("response_mime_type") == "application/json"
     assert "response_schema" not in first_cfg
-    assert "tools" in used_config
-    assert "tool_config" in used_config
+    assert "tools" not in used_config
+    assert "tool_config" not in used_config
+    assert used_config.get("response_mime_type") == "application/json"
 
 
-def test_execution_planner_defaults_to_google_function_calling_stack(monkeypatch):
+def test_execution_planner_defaults_to_openrouter_json_generation_stack(monkeypatch):
     monkeypatch.delenv("EXECUTION_PLANNER_PRIMARY_MODEL", raising=False)
     monkeypatch.delenv("EXECUTION_PLANNER_MODEL", raising=False)
 
     agent = ExecutionPlannerAgent(api_key=None)
 
-    assert agent.provider == "google"
-    assert agent.model_name == "gemini-3.1-pro-preview"
+    assert agent.provider == "openrouter"
+    assert agent.model_name == "google/gemini-3.1-pro-preview"
 
 
-def test_execution_planner_uses_google_api_key_env(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+def test_execution_planner_uses_openrouter_api_key_env(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
 
     captured = {}
 
@@ -101,15 +102,15 @@ def test_execution_planner_uses_google_api_key_env(monkeypatch):
             captured["model_name"] = model_name
 
     monkeypatch.setattr(
-        "src.agents.execution_planner._GeminiGenerateContentAdapter",
+        "src.agents.execution_planner._OpenRouterAdapter",
         _FakeAdapter,
     )
 
     agent = ExecutionPlannerAgent()
 
-    assert agent.provider == "google"
-    assert captured.get("api_key") == "test-google-key"
-    assert captured.get("model_name") == "gemini-3.1-pro-preview"
+    assert agent.provider == "openrouter"
+    assert captured.get("api_key") == "test-openrouter-key"
+    assert captured.get("model_name") == "google/gemini-3.1-pro-preview"
 
 
 def test_execution_planner_extracts_tool_call_arguments():
