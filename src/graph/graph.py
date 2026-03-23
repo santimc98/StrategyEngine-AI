@@ -110,6 +110,7 @@ from src.utils.case_alignment import build_case_alignment_report
 from src.utils.data_engineer_preflight import data_engineer_preflight
 from src.utils.contract_accessors import (
     get_clean_dataset_output_path,
+    get_cleaning_gates,
     get_clean_manifest_path,
     get_canonical_columns,
     get_artifact_requirements,
@@ -118,6 +119,7 @@ from src.utils.contract_accessors import (
     get_declared_file_schema,
     get_outcome_columns,
     get_required_outputs,
+    get_required_outputs_by_owner,
     get_column_roles,
     get_validation_requirements,
     get_qa_gates,
@@ -130,12 +132,17 @@ from src.utils.contract_accessors import (
 )
 from src.utils.contract_validator import (
     normalize_contract_scope,
+    resolve_contract_active_workstreams,
+    derive_contract_scope_from_workstreams,
     get_default_optimization_policy,
     normalize_optimization_policy,
 )
 from src.utils.contract_views import (
     build_contract_views_projection,
+    build_contract_view_projection_reports,
+    list_view_projection_report_errors,
     persist_views,
+    persist_view_projection_reports,
 )
 from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
 from src.utils.cleaning_executor import execute_cleaning_plan
@@ -3305,13 +3312,50 @@ def _persist_output_contract_report(
     from src.utils.output_contract import build_output_contract_report
     
     contract = state.get("execution_contract", {}) if isinstance(state, dict) else {}
-    
-    # Build comprehensive report using the unified helper
-    report = build_output_contract_report(
-        contract=contract,
-        work_dir=".",  # Current working directory
-        reason=reason,
-    )
+
+    if not isinstance(contract, dict) or not contract:
+        normalized_reason = str(reason or "execution_contract_unavailable").strip() or "execution_contract_unavailable"
+        report = {
+            "present": [],
+            "missing": [],
+            "missing_optional": [],
+            "summary": "Contract unavailable; output contract could not be evaluated.",
+            "artifact_requirements_report": {
+                "status": "error",
+                "files_report": {
+                    "present": [],
+                    "missing": [],
+                    "missing_optional": [],
+                    "summary": "Contract unavailable; required files were not evaluated.",
+                },
+                "row_count_report": {
+                    "checked": [],
+                    "mismatches": [],
+                    "errors": [],
+                    "summary": "Contract unavailable; row-count validation was not evaluated.",
+                },
+                "scored_rows_report": {
+                    "exists": False,
+                    "applicable": False,
+                    "present_columns": [],
+                    "missing_columns": [],
+                    "missing_any_of_groups": [],
+                    "matched_any_of_groups": [],
+                    "missing_any_of_groups_with_severity": [],
+                    "summary": "Contract unavailable; scored_rows validation was not evaluated.",
+                },
+                "summary": "Contract unavailable; artifact requirements were not evaluated.",
+            },
+            "overall_status": "error",
+            "reason": normalized_reason,
+        }
+    else:
+        # Build comprehensive report using the unified helper
+        report = build_output_contract_report(
+            contract=contract,
+            work_dir=".",  # Current working directory
+            reason=reason,
+        )
     
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -5272,6 +5316,8 @@ def _infer_artifact_type(path: str, deliverable_kind: str | None = None) -> str:
 
 def _infer_produced_by(path: str) -> str:
     lower = str(path or "").lower()
+    if "/qa/" in lower or "\\qa\\" in lower or lower.startswith("artifacts/qa/"):
+        return "qa_reviewer"
     if "clean" in lower or "cleaning" in lower:
         return "data_engineer"
     if "strategy_spec" in lower:
@@ -5323,6 +5369,71 @@ def _merge_artifact_index_entries(
         if path:
             merged[path] = item
     return list(merged.values())
+
+
+def _extract_runner_reported_artifact_paths(runner_result: Dict[str, Any] | None) -> List[str]:
+    if not isinstance(runner_result, dict):
+        return []
+
+    candidates: List[str] = []
+    downloaded = runner_result.get("downloaded")
+    if isinstance(downloaded, dict):
+        candidates.extend(str(path) for path in downloaded.keys() if str(path or "").strip())
+    elif isinstance(downloaded, list):
+        candidates.extend(str(path) for path in downloaded if str(path or "").strip())
+
+    for payload in (
+        runner_result.get("status_payload"),
+        runner_result.get("error"),
+        runner_result.get("error_raw"),
+    ):
+        if not isinstance(payload, dict):
+            continue
+        for key in ("uploaded_outputs", "uploaded", "present", "required_outputs_present", "downloaded"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                candidates.extend(str(path) for path in values if str(path or "").strip())
+
+    return _normalize_output_path_list(candidates)
+
+
+def _persist_runner_artifact_index(
+    state: Dict[str, Any] | None,
+    runner_result: Dict[str, Any] | None,
+    *,
+    contract: Dict[str, Any] | None = None,
+    extra_paths: List[str] | None = None,
+) -> List[Dict[str, Any]]:
+    state = state if isinstance(state, dict) else {}
+    contract_payload = contract if isinstance(contract, dict) else (
+        state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    )
+
+    artifact_paths = _extract_runner_reported_artifact_paths(runner_result)
+    if isinstance(extra_paths, list):
+        artifact_paths.extend(str(path) for path in extra_paths if str(path or "").strip())
+    artifact_paths = _normalize_output_path_list(artifact_paths)
+    if not artifact_paths:
+        existing = state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else state.get("produced_artifact_index")
+        return existing if isinstance(existing, list) else []
+
+    existing_index = state.get("artifact_index")
+    if not isinstance(existing_index, list):
+        existing_index = state.get("produced_artifact_index")
+    if not isinstance(existing_index, list):
+        existing_index = _load_json_any("data/produced_artifact_index.json")
+    normalized_existing = existing_index if isinstance(existing_index, list) else []
+    deliverables = _resolve_contract_deliverables(contract_payload)
+    additions = _build_artifact_index(artifact_paths, deliverables if isinstance(deliverables, list) else None)
+    merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/produced_artifact_index.json", merged_index)
+    except Exception as idx_err:
+        print(f"Warning: failed to persist runner artifact index: {idx_err}")
+    state["artifact_index"] = merged_index
+    state["produced_artifact_index"] = merged_index
+    return merged_index
 
 
 def _merge_non_empty_policy(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -5443,9 +5554,32 @@ def _validate_projected_views_for_execution(
     views: Dict[str, Any],
 ) -> List[str]:
     errors: List[str] = []
-    scope = normalize_contract_scope((contract or {}).get("scope"))
-    requires_cleaning = scope in {"cleaning_only", "full_pipeline"}
-    requires_ml = scope in {"ml_only", "full_pipeline"}
+    contract = contract if isinstance(contract, dict) else {}
+
+    def _normalize_artifact_path_set(values: Any) -> set[str]:
+        return {path.lower() for path in _normalize_output_path_list(values)}
+
+    def _extract_gate_name_set(values: Any) -> set[str]:
+        names: set[str] = set()
+        if not isinstance(values, list):
+            return names
+        for item in values:
+            if isinstance(item, dict):
+                name = str(item.get("name") or item.get("id") or item.get("gate") or "").strip().lower()
+                if name:
+                    names.add(name)
+            elif isinstance(item, str):
+                text = item.strip().lower()
+                if text:
+                    names.add(text)
+        return names
+
+    active_workstreams = resolve_contract_active_workstreams(contract)
+    requires_cleaning = bool(active_workstreams.get("cleaning"))
+    requires_ml = bool(active_workstreams.get("model_training"))
+    expected_qa_outputs = _normalize_artifact_path_set(get_required_outputs_by_owner(contract, "qa_engineer"))
+    expected_qa_gates = _extract_gate_name_set(get_qa_gates(contract))
+    requires_qa = bool(expected_qa_outputs or expected_qa_gates)
     outlier_policy = contract.get("outlier_policy") if isinstance(contract, dict) else {}
     outlier_policy_enabled = False
     outlier_policy_stage = ""
@@ -5466,8 +5600,20 @@ def _validate_projected_views_for_execution(
         outlier_policy_enabled and outlier_policy_stage in {"", "data_engineer", "both"}
     )
 
-    de_view = views.get("de_view") if isinstance(views, dict) else None
     if requires_cleaning:
+        de_view = views.get("de_view") if isinstance(views, dict) else None
+        expected_de_outputs = _normalize_artifact_path_set(get_required_outputs_by_owner(contract, "data_engineer"))
+        if not expected_de_outputs:
+            fallback_outputs: List[str] = []
+            clean_output = get_clean_dataset_output_path(contract)
+            clean_manifest = get_clean_manifest_path(contract)
+            if _is_artifact_path_like(clean_output):
+                fallback_outputs.append(str(clean_output))
+            if _is_artifact_path_like(clean_manifest):
+                fallback_outputs.append(str(clean_manifest))
+            expected_de_outputs = _normalize_artifact_path_set(fallback_outputs)
+        expected_cleaning_gates = _extract_gate_name_set(get_cleaning_gates(contract))
+
         if not isinstance(de_view, dict) or not de_view:
             errors.append("de_view_missing")
         else:
@@ -5495,6 +5641,14 @@ def _validate_projected_views_for_execution(
                 errors.append("de_view_data_engineer_runbook_missing")
             if outlier_requires_cleaning_views and not isinstance(de_view.get("outlier_policy"), dict):
                 errors.append("de_view_outlier_policy_missing")
+            if expected_de_outputs:
+                de_view_outputs = _normalize_artifact_path_set(de_view.get("required_outputs"))
+                if not expected_de_outputs.issubset(de_view_outputs):
+                    errors.append("de_view_required_outputs_incomplete")
+            if expected_cleaning_gates:
+                de_view_gate_names = _extract_gate_name_set(de_view.get("cleaning_gates"))
+                if not expected_cleaning_gates.issubset(de_view_gate_names):
+                    errors.append("de_view_cleaning_gates_incomplete")
 
         cleaning_view = views.get("cleaning_view") if isinstance(views, dict) else None
         if not isinstance(cleaning_view, dict) or not cleaning_view:
@@ -5512,11 +5666,47 @@ def _validate_projected_views_for_execution(
                 errors.append("cleaning_view_cleaning_gates_empty")
             if outlier_requires_cleaning_views and not isinstance(cleaning_view.get("outlier_policy"), dict):
                 errors.append("cleaning_view_outlier_policy_missing")
+            if expected_cleaning_gates:
+                cleaning_view_gate_names = _extract_gate_name_set(cleaning_view.get("cleaning_gates"))
+                if not expected_cleaning_gates.issubset(cleaning_view_gate_names):
+                    errors.append("cleaning_view_cleaning_gates_incomplete")
+            if expected_de_outputs:
+                cleaning_view_outputs = _normalize_artifact_path_set(cleaning_view.get("required_outputs"))
+                if not expected_de_outputs.issubset(cleaning_view_outputs):
+                    errors.append("cleaning_view_required_outputs_incomplete")
+
+        if requires_qa:
+            qa_view = views.get("qa_view") if isinstance(views, dict) else None
+            if not isinstance(qa_view, dict) or not qa_view:
+                errors.append("qa_view_missing")
+            else:
+                qa_view_gates = _extract_gate_name_set(qa_view.get("qa_gates"))
+                if expected_qa_gates and not expected_qa_gates.issubset(qa_view_gates):
+                    errors.append("qa_view_qa_gates_incomplete")
+                qa_subject = str(qa_view.get("review_subject") or "").strip().lower()
+                if qa_subject not in {"data_engineer", "ml_engineer"}:
+                    errors.append("qa_view_review_subject_missing")
+                qa_artifacts = _normalize_artifact_path_set(
+                    qa_view.get("qa_required_outputs")
+                    or (qa_view.get("artifact_requirements") or {}).get("qa_required_outputs")
+                    or []
+                )
+                if expected_qa_outputs and not expected_qa_outputs.issubset(qa_artifacts):
+                    errors.append("qa_view_required_outputs_incomplete")
+                subject_outputs = _normalize_artifact_path_set(
+                    qa_view.get("subject_required_outputs")
+                    or qa_view.get("artifacts_to_verify")
+                    or []
+                )
+                if qa_subject == "data_engineer" and expected_de_outputs and not expected_de_outputs.issubset(subject_outputs):
+                    errors.append("qa_view_subject_outputs_incomplete")
 
     if requires_ml:
         ml_view = views.get("ml_view") if isinstance(views, dict) else None
         reviewer_view = views.get("reviewer_view") if isinstance(views, dict) else None
         qa_view = views.get("qa_view") if isinstance(views, dict) else None
+        expected_ml_outputs = _normalize_artifact_path_set(get_required_outputs_by_owner(contract, "ml_engineer"))
+        expected_reviewer_gates = _extract_gate_name_set(get_reviewer_gates(contract))
 
         if not isinstance(ml_view, dict) or not ml_view:
             errors.append("ml_view_missing")
@@ -5532,13 +5722,106 @@ def _validate_projected_views_for_execution(
                 isinstance(path, str) and _is_artifact_path_like(path) for path in required_outputs
             ):
                 errors.append("ml_view_required_outputs_missing")
+            ml_view_outputs = _normalize_artifact_path_set(required_outputs)
+            if expected_ml_outputs and not expected_ml_outputs.issubset(ml_view_outputs):
+                errors.append("ml_view_required_outputs_incomplete")
+            if expected_qa_gates:
+                ml_view_qa_gates = _extract_gate_name_set(ml_view.get("qa_gates"))
+                if not expected_qa_gates.issubset(ml_view_qa_gates):
+                    errors.append("ml_view_qa_gates_incomplete")
+            if expected_reviewer_gates:
+                ml_view_reviewer_gates = _extract_gate_name_set(ml_view.get("reviewer_gates"))
+                if not expected_reviewer_gates.issubset(ml_view_reviewer_gates):
+                    errors.append("ml_view_reviewer_gates_incomplete")
 
         if not isinstance(reviewer_view, dict) or not reviewer_view:
             errors.append("reviewer_view_missing")
+        elif expected_reviewer_gates:
+            reviewer_view_gates = _extract_gate_name_set(reviewer_view.get("reviewer_gates"))
+            if not expected_reviewer_gates.issubset(reviewer_view_gates):
+                errors.append("reviewer_view_reviewer_gates_incomplete")
+
         if not isinstance(qa_view, dict) or not qa_view:
             errors.append("qa_view_missing")
+        else:
+            qa_view_gates = _extract_gate_name_set(qa_view.get("qa_gates"))
+            if expected_qa_gates and not expected_qa_gates.issubset(qa_view_gates):
+                errors.append("qa_view_qa_gates_incomplete")
+            qa_subject = str(qa_view.get("review_subject") or "").strip().lower()
+            if qa_subject not in {"data_engineer", "ml_engineer"}:
+                errors.append("qa_view_review_subject_missing")
+            if qa_subject == "ml_engineer":
+                qa_subject_outputs = _normalize_artifact_path_set(
+                    qa_view.get("subject_required_outputs")
+                    or qa_view.get("artifacts_to_verify")
+                    or []
+                )
+                if expected_ml_outputs and not expected_ml_outputs.issubset(qa_subject_outputs):
+                    errors.append("qa_view_subject_outputs_incomplete")
+            qa_artifacts = _normalize_artifact_path_set(
+                qa_view.get("qa_required_outputs")
+                or (qa_view.get("artifact_requirements") or {}).get("qa_required_outputs")
+                or []
+            )
+            if expected_qa_outputs and not expected_qa_outputs.issubset(qa_artifacts):
+                errors.append("qa_view_required_outputs_incomplete")
 
     return errors
+
+
+def _get_view_profile_context(state: Dict[str, Any] | None) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    if not isinstance(state, dict):
+        return {}, {}
+    data_profile = state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {}
+    dataset_profile = state.get("dataset_profile") if isinstance(state.get("dataset_profile"), dict) else {}
+    if not dataset_profile and isinstance(state.get("profile"), dict):
+        dataset_profile = state.get("profile")
+    return data_profile, dataset_profile
+
+
+def _project_contract_views_from_state(
+    state: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+    artifact_index: Any,
+    *,
+    cleaning_code: str | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    data_profile, dataset_profile = _get_view_profile_context(state)
+    return build_contract_views_projection(
+        contract if isinstance(contract, dict) else {},
+        artifact_index,
+        cleaning_code=cleaning_code,
+        data_profile=data_profile,
+        dataset_profile=dataset_profile,
+    )
+
+
+def _persist_column_resolution_context(
+    views: Dict[str, Any],
+    *,
+    base_dir: str = "data",
+    run_bundle_dir: str | None = None,
+) -> str:
+    context: Dict[str, Any] = {}
+    if isinstance(views, dict):
+        for key in ("de_view", "cleaning_view"):
+            view = views.get(key)
+            candidate = view.get("column_resolution_context") if isinstance(view, dict) else None
+            if isinstance(candidate, dict) and candidate:
+                context = candidate
+                break
+    if not context:
+        return ""
+    path = os.path.join(base_dir, "column_resolution_context.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(context, f, indent=2, ensure_ascii=False)
+    if run_bundle_dir:
+        bundle_path = os.path.join(run_bundle_dir, "column_resolution_context.json")
+        os.makedirs(os.path.dirname(bundle_path), exist_ok=True)
+        with open(bundle_path, "w", encoding="utf-8") as f:
+            json.dump(context, f, indent=2, ensure_ascii=False)
+    return path
 
 
 def _build_contract_views(
@@ -5552,7 +5835,7 @@ def _build_contract_views(
         required_outputs = _resolve_required_outputs(contract, state)
         deliverables = _resolve_contract_deliverables(contract)
         artifact_index = _build_artifact_index(required_outputs, deliverables)
-    projected_views = build_contract_views_projection(contract, artifact_index)
+    projected_views = _project_contract_views_from_state(state, contract, artifact_index)
     de_view = projected_views.get("de_view") or {}
     ml_view = projected_views.get("ml_view") or {}
     cleaning_view = projected_views.get("cleaning_view") or {}
@@ -5570,14 +5853,31 @@ def _build_contract_views(
         "results_advisor_view": results_advisor_view,
     }
     view_errors = _validate_projected_views_for_execution(contract, views)
+    projection_reports = build_contract_view_projection_reports(contract, views, contract_min=contract_min)
+    projection_report_errors = list_view_projection_report_errors(projection_reports)
+    for error in projection_report_errors:
+        if error not in view_errors:
+            view_errors.append(error)
+    column_resolution_context_path = _persist_column_resolution_context(
+        views,
+        base_dir="data",
+        run_bundle_dir=state.get("run_bundle_dir"),
+    )
     view_paths = persist_views(
         views,
+        base_dir="data",
+        run_bundle_dir=state.get("run_bundle_dir"),
+    )
+    projection_report_paths = persist_view_projection_reports(
+        projection_reports,
         base_dir="data",
         run_bundle_dir=state.get("run_bundle_dir"),
     )
     return {
         "contract_views": views,
         "contract_view_paths": view_paths,
+        "contract_view_projection_reports": projection_reports,
+        "contract_view_projection_report_paths": projection_report_paths,
         "artifact_index": artifact_index,
         "de_view": de_view,
         "ml_view": ml_view,
@@ -5588,6 +5888,7 @@ def _build_contract_views(
         "results_advisor_view": results_advisor_view,
         "contract_views_projection_ok": not view_errors,
         "contract_views_projection_errors": view_errors,
+        "column_resolution_context_path": column_resolution_context_path,
     }
 
 def _deliverable_id_from_path(path: str) -> str:
@@ -16051,6 +16352,9 @@ def _resolve_de_output_artifacts(state: Dict[str, Any]) -> tuple[str, str, List[
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
     if not isinstance(de_view, dict):
         de_view = {}
+    contract = state.get("execution_contract")
+    if not isinstance(contract, dict):
+        contract = {}
     output_path = _normalize_output_path(str(de_view.get("output_path") or ""))
     manifest_path = _normalize_output_path(
         str(
@@ -16059,7 +16363,29 @@ def _resolve_de_output_artifacts(state: Dict[str, Any]) -> tuple[str, str, List[
             or ""
         )
     )
+
     required_artifacts: List[str] = []
+
+    def _append_artifact(candidate: Any) -> None:
+        if isinstance(candidate, dict):
+            candidate = (
+                candidate.get("path")
+                or candidate.get("output_path")
+                or candidate.get("output")
+                or candidate.get("file")
+                or candidate.get("filename")
+                or ""
+            )
+        if not isinstance(candidate, str):
+            return
+        normalized = _normalize_output_path(candidate)
+        if normalized:
+            required_artifacts.append(normalized)
+
+    for candidate in get_required_outputs_by_owner(contract, "data_engineer"):
+        _append_artifact(candidate)
+    for candidate in de_view.get("required_outputs") or []:
+        _append_artifact(candidate)
     if output_path:
         required_artifacts.append(output_path)
     if manifest_path:
@@ -16322,6 +16648,12 @@ def _execute_data_engineer_via_heavy_runner(
                 "local_input_uri_missing": local_input_uri_missing,
             },
         )
+
+    _persist_runner_artifact_index(
+        state,
+        heavy_result,
+        contract=state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else None,
+    )
 
     downloaded = heavy_result.get("downloaded") or {}
     missing = list(heavy_result.get("missing_artifacts") or [])
@@ -17125,8 +17457,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
         evaluation_spec = {}
     if not isinstance(contract, dict):
         contract = {}
-    contract_scope = normalize_contract_scope(contract.get("scope")) if isinstance(contract, dict) else ""
-    if not evaluation_spec and contract_scope in {"ml_only", "full_pipeline"}:
+    contract_workstreams = resolve_contract_active_workstreams(contract if isinstance(contract, dict) else {})
+    if not evaluation_spec and bool(contract_workstreams.get("model_training")):
         print("Warning: execution_contract has no evaluation_spec; reviewers will use contract-level gates only.")
     # LLM-first policy: do not mutate the planner contract with deterministic
     # scaffold or enrichment defaults at runtime. The graph may validate and
@@ -17137,9 +17469,14 @@ def run_execution_planner(state: AgentState) -> AgentState:
         data_dir = _abs_in_work(work_dir_abs, "data")
         os.makedirs(data_dir, exist_ok=True)
         dump_json(_abs_in_work(work_dir_abs, "data/execution_contract.json"), contract)
+        dump_json(_abs_in_work(work_dir_abs, "data/execution_contract_raw.json"), contract)
         if planner_contract_diagnostics:
             dump_json(
                 _abs_in_work(work_dir_abs, "data/execution_contract_diagnostics.json"),
+                planner_contract_diagnostics,
+            )
+            dump_json(
+                _abs_in_work(work_dir_abs, "data/execution_contract_validation_report.json"),
                 planner_contract_diagnostics,
             )
         dump_json(_abs_in_work(work_dir_abs, "data/plan.json"), execution_plan)
@@ -17160,7 +17497,9 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 run_id,
                 [
                     _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+                    _abs_in_work(work_dir_abs, "data/execution_contract_raw.json"),
                     _abs_in_work(work_dir_abs, "data/execution_contract_diagnostics.json"),
+                    _abs_in_work(work_dir_abs, "data/execution_contract_validation_report.json"),
                 ],
             )
             log_agent_snapshot(
@@ -17182,8 +17521,10 @@ def run_execution_planner(state: AgentState) -> AgentState:
             "pipeline_aborted_reason": "execution_contract_invalid",
             "execution_planner_failed": True,
             "execution_contract": contract,
+            "execution_contract_raw_path": "data/execution_contract_raw.json",
             "execution_contract_diagnostics": planner_contract_diagnostics,
             "execution_contract_diagnostics_path": "data/execution_contract_diagnostics.json",
+            "execution_contract_validation_report_path": "data/execution_contract_validation_report.json",
         }
     try:
         _update_column_inventory_required_columns(
@@ -17209,7 +17550,9 @@ def run_execution_planner(state: AgentState) -> AgentState:
             run_id,
             [
                 _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+                _abs_in_work(work_dir_abs, "data/execution_contract_raw.json"),
                 _abs_in_work(work_dir_abs, "data/execution_contract_diagnostics.json"),
+                _abs_in_work(work_dir_abs, "data/execution_contract_validation_report.json"),
                 _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
                 _abs_in_work(work_dir_abs, "data/plan.json"),
             ],
@@ -17282,8 +17625,10 @@ def run_execution_planner(state: AgentState) -> AgentState:
             "pipeline_aborted_reason": "execution_contract_views_invalid",
             "execution_planner_failed": True,
             "execution_contract": contract,
+            "execution_contract_raw_path": "data/execution_contract_raw.json",
             "execution_contract_diagnostics": planner_contract_diagnostics,
             "execution_contract_diagnostics_path": "data/execution_contract_diagnostics.json",
+            "execution_contract_validation_report_path": "data/execution_contract_validation_report.json",
             "contract_views_projection_ok": False,
             "contract_views_projection_errors": view_projection_errors,
         }
@@ -17316,11 +17661,13 @@ def run_execution_planner(state: AgentState) -> AgentState:
     policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
     result = {
         "execution_contract": contract,
+        "execution_contract_raw_path": "data/execution_contract_raw.json",
         "execution_planner_failed": False,
     }
     if planner_contract_diagnostics:
         result["execution_contract_diagnostics"] = planner_contract_diagnostics
         result["execution_contract_diagnostics_path"] = "data/execution_contract_diagnostics.json"
+        result["execution_contract_validation_report_path"] = "data/execution_contract_validation_report.json"
     # V4.1: Do NOT add execution_plan to result (legacy key)
     if evaluation_spec:
         result["evaluation_spec"] = evaluation_spec
@@ -17402,6 +17749,71 @@ def _planner_contract_invalid_for_execution(state: Dict[str, Any]) -> bool:
         return True
 
     return False
+
+
+def _resolve_qa_view_from_state(state: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    qa_view = state.get("qa_view") or (state.get("contract_views") or {}).get("qa_view")
+    if isinstance(qa_view, dict) and qa_view:
+        return qa_view
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    if not isinstance(contract, dict) or not contract:
+        return {}
+    projected = _project_contract_views_from_state(
+        state,
+        contract,
+        state.get("artifact_index") or [],
+        cleaning_code=state.get("cleaning_code") if isinstance(state.get("cleaning_code"), str) else None,
+    )
+    qa_view = projected.get("qa_view")
+    return qa_view if isinstance(qa_view, dict) else {}
+
+
+def _infer_qa_review_subject(contract: Dict[str, Any] | None, qa_view: Dict[str, Any] | None = None) -> str:
+    if isinstance(qa_view, dict):
+        explicit = str(qa_view.get("review_subject") or "").strip().lower()
+        if explicit in {"data_engineer", "ml_engineer"}:
+            return explicit
+    contract = contract if isinstance(contract, dict) else {}
+    active_workstreams = resolve_contract_active_workstreams(contract)
+    de_outputs = get_required_outputs_by_owner(contract, "data_engineer")
+    ml_outputs = get_required_outputs_by_owner(contract, "ml_engineer")
+    if bool(active_workstreams.get("model_training")) and ml_outputs:
+        return "ml_engineer"
+    if de_outputs:
+        return "data_engineer"
+    if ml_outputs:
+        return "ml_engineer"
+    scope = derive_contract_scope_from_workstreams(contract)
+    if scope in {"ml_only", "full_pipeline"}:
+        return "ml_engineer"
+    return "data_engineer"
+
+
+def _should_run_qa_after_data_engineer(state: Dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    qa_view = _resolve_qa_view_from_state(state)
+    review_subject = _infer_qa_review_subject(contract, qa_view)
+    if review_subject != "data_engineer":
+        return False
+    qa_gates = qa_view.get("qa_gates") if isinstance(qa_view, dict) else []
+    artifacts_to_verify = []
+    qa_output_paths = []
+    if isinstance(qa_view, dict):
+        artifacts_to_verify = qa_view.get("artifacts_to_verify") or qa_view.get("subject_required_outputs") or []
+        qa_output_paths = qa_view.get("qa_required_outputs") or []
+    if not isinstance(artifacts_to_verify, list):
+        artifacts_to_verify = []
+    if not isinstance(qa_output_paths, list):
+        qa_output_paths = []
+    if not qa_output_paths:
+        qa_output_paths = get_required_outputs_by_owner(contract, "qa_engineer")
+    if not artifacts_to_verify:
+        artifacts_to_verify = get_required_outputs_by_owner(contract, "data_engineer")
+    return bool(qa_gates or qa_output_paths) and bool(artifacts_to_verify or qa_output_paths)
 
 
 def run_data_engineer(state: AgentState) -> AgentState:
@@ -17674,7 +18086,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
     execution_contract = state.get("execution_contract") or _load_json_safe("data/execution_contract.json") or {}
     de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
     if not isinstance(de_view, dict) or not de_view:
-        projected_views = build_contract_views_projection(execution_contract or {}, state.get("artifact_index") or [])
+        projected_views = _project_contract_views_from_state(
+            state if isinstance(state, dict) else {},
+            execution_contract or {},
+            state.get("artifact_index") or [],
+        )
         de_view = projected_views.get("de_view") or {}
     de_output_path = str(de_view.get("output_path") or "").strip()
     de_manifest_path = str(
@@ -20380,11 +20796,24 @@ def check_data_success(state: AgentState):
     contract = state.get("execution_contract") if isinstance(state, dict) else {}
     if not isinstance(contract, dict):
         contract = {}
-    scope = normalize_contract_scope(contract.get("scope"))
+    scope = derive_contract_scope_from_workstreams(contract)
     if scope == "cleaning_only":
+        if _should_run_qa_after_data_engineer(state if isinstance(state, dict) else {}):
+            return "success_cleaning_only_qa"
         return "success_cleaning_only"
 
     return "success"
+
+
+def check_qa_reviewer_route(state: AgentState):
+    contract = state.get("execution_contract") if isinstance(state, dict) else {}
+    if not isinstance(contract, dict):
+        contract = {}
+    qa_view = _resolve_qa_view_from_state(state if isinstance(state, dict) else {})
+    review_subject = _infer_qa_review_subject(contract, qa_view)
+    if review_subject == "data_engineer":
+        return "translator"
+    return "review_board"
 
 
 def check_steward_context_success(state: AgentState):
@@ -20681,7 +21110,11 @@ def run_engineer(state: AgentState) -> AgentState:
         if "ml_view" in sig.parameters:
             ml_view = state.get("ml_view") or (state.get("contract_views") or {}).get("ml_view")
             if not isinstance(ml_view, dict) or not ml_view:
-                projected_views = build_contract_views_projection(execution_contract or {}, state.get("artifact_index") or [])
+                projected_views = _project_contract_views_from_state(
+                    state if isinstance(state, dict) else {},
+                    execution_contract or {},
+                    state.get("artifact_index") or [],
+                )
                 ml_view = projected_views.get("ml_view") or {}
             kwargs["ml_view"] = ml_view
             try:
@@ -21333,7 +21766,8 @@ def run_reviewer(state: AgentState) -> AgentState:
     evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
     reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
     if not isinstance(reviewer_view, dict) or not reviewer_view:
-        projected_views = build_contract_views_projection(
+        projected_views = _project_contract_views_from_state(
+            state if isinstance(state, dict) else {},
             state.get("execution_contract", {}) or {},
             state.get("artifact_index") or [],
         )
@@ -21483,6 +21917,93 @@ def run_reviewer(state: AgentState) -> AgentState:
             "budget_counters": counters,
         }
 
+def _resolve_qa_subject_code(
+    state: Dict[str, Any] | None,
+    qa_context: Dict[str, Any] | None,
+    review_subject: str,
+) -> str:
+    if not isinstance(state, dict):
+        state = {}
+    if str(review_subject or "").strip().lower() == "data_engineer":
+        code = state.get("cleaning_code") or state.get("generated_code") or ""
+    else:
+        code = state.get("generated_code") or state.get("cleaning_code") or ""
+    if isinstance(code, str) and code.strip():
+        return code
+    path_candidates: List[str] = []
+    if isinstance(qa_context, dict):
+        hint = qa_context.get("subject_code_path_hint")
+        if isinstance(hint, str) and hint.strip():
+            path_candidates.append(hint.strip())
+    path_candidates.extend(
+        [
+            "artifacts/data_engineer_last.py" if str(review_subject or "").strip().lower() == "data_engineer" else "",
+            "artifacts/ml_engineer_last.py",
+            "artifacts/data_engineer_last.py",
+        ]
+    )
+    seen: set[str] = set()
+    for candidate in path_candidates:
+        normalized = str(candidate or "").strip()
+        if not normalized or normalized in seen or not os.path.exists(normalized):
+            continue
+        seen.add(normalized)
+        try:
+            with open(normalized, "r", encoding="utf-8") as fh:
+                loaded = fh.read()
+            if loaded.strip():
+                return loaded
+        except Exception:
+            continue
+    return ""
+
+
+def _persist_qa_validation_report(
+    qa_context: Dict[str, Any] | None,
+    qa_result: Dict[str, Any] | None,
+    *,
+    review_subject: str,
+    contract_source: str,
+    code_path_hint: str = "",
+) -> List[str]:
+    qa_context = qa_context if isinstance(qa_context, dict) else {}
+    qa_result = qa_result if isinstance(qa_result, dict) else {}
+    qa_paths = qa_context.get("qa_required_outputs")
+    if not isinstance(qa_paths, list):
+        qa_paths = []
+    normalized_paths = [str(path or "").strip() for path in qa_paths if isinstance(path, str) and str(path or "").strip()]
+    if not normalized_paths:
+        normalized_paths = ["artifacts/qa/data_validation_results.json"]
+    payload = {
+        "status": qa_result.get("status"),
+        "feedback": qa_result.get("feedback"),
+        "failed_gates": qa_result.get("failed_gates") or [],
+        "required_fixes": qa_result.get("required_fixes") or [],
+        "hard_failures": qa_result.get("hard_failures") or [],
+        "warnings": qa_result.get("warnings") or [],
+        "evidence": qa_result.get("evidence") or [],
+        "qa_gates_evaluated": qa_result.get("qa_gates_evaluated") or [],
+        "review_subject": review_subject,
+        "contract_source": contract_source,
+        "artifacts_to_verify": qa_context.get("artifacts_to_verify") or qa_context.get("subject_required_outputs") or [],
+        "subject_required_outputs": qa_context.get("subject_required_outputs") or [],
+        "qa_required_outputs": normalized_paths,
+        "subject_code_path_hint": code_path_hint or qa_context.get("subject_code_path_hint") or "",
+    }
+    written: List[str] = []
+    for path in normalized_paths:
+        try:
+            folder = os.path.dirname(path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=False)
+            written.append(path)
+        except Exception:
+            continue
+    return written
+
+
 def run_qa_reviewer(state: AgentState) -> AgentState:
     print("--- QA REVIEWER AGENT ---")
     abort_state = _abort_if_requested(state, "qa_reviewer")
@@ -21503,7 +22024,6 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         }
     if run_id:
         log_run_event(run_id, "qa_reviewer_start", {})
-    code = state['generated_code']
     strategy = state.get('selected_strategy', {})
     business_objective = state.get('business_objective', '')
 
@@ -21522,25 +22042,41 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             qa_context = {}
             contract_source = "fallback"
         qa_context["_contract_source"] = contract_source
-        execution_profile = state.get("ml_execution_profile")
-        if not isinstance(execution_profile, dict) or not execution_profile:
-            execution_profile = _build_ml_execution_profile_for_prompt(
-                state if isinstance(state, dict) else {},
-                code=str(code or ""),
-                ml_plan=state.get("ml_plan") if isinstance(state.get("ml_plan"), dict) else None,
+        review_subject = _infer_qa_review_subject(contract, qa_context)
+        if (
+            review_subject == "data_engineer"
+            and not str(qa_context.get("review_subject") or "").strip()
+            and state.get("generated_code")
+            and not state.get("cleaning_code")
+            and (
+                isinstance(state.get("ml_plan"), dict)
+                or isinstance(state.get("ml_execution_profile"), dict)
+                or bool(state.get("ml_data_path"))
             )
-        if execution_profile:
-            qa_context["execution_profile"] = execution_profile
+        ):
+            review_subject = "ml_engineer"
+        qa_context["review_subject"] = review_subject
+        code = _resolve_qa_subject_code(state if isinstance(state, dict) else {}, qa_context, review_subject)
+        execution_profile = {}
+        if review_subject == "ml_engineer":
+            execution_profile = state.get("ml_execution_profile")
+            if not isinstance(execution_profile, dict) or not execution_profile:
+                execution_profile = _build_ml_execution_profile_for_prompt(
+                    state if isinstance(state, dict) else {},
+                    code=str(code or ""),
+                    ml_plan=state.get("ml_plan") if isinstance(state.get("ml_plan"), dict) else None,
+                )
+            if execution_profile:
+                qa_context["execution_profile"] = execution_profile
 
-        # Wire ML Plan for QA coherence check (Senior Reasoning)
-        qa_context.setdefault("evaluation_spec", {})
-        if isinstance(qa_context["evaluation_spec"], dict):
-             ml_plan_for_qa = state.get("ml_plan")
-             if not ml_plan_for_qa:
-                 ml_plan_for_qa = _load_json_safe("data/ml_plan.json")
-             qa_context["evaluation_spec"]["ml_plan"] = ml_plan_for_qa or {}
-             qa_context["evaluation_spec"]["data_profile"] = state.get("data_profile") or {}
-             qa_context["evaluation_spec"]["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings") or {}
+            qa_context.setdefault("evaluation_spec", {})
+            if isinstance(qa_context["evaluation_spec"], dict):
+                 ml_plan_for_qa = state.get("ml_plan")
+                 if not ml_plan_for_qa:
+                     ml_plan_for_qa = _load_json_safe("data/ml_plan.json")
+                 qa_context["evaluation_spec"]["ml_plan"] = ml_plan_for_qa or {}
+                 qa_context["evaluation_spec"]["data_profile"] = state.get("data_profile") or {}
+                 qa_context["evaluation_spec"]["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings") or {}
         dataset_semantics_summary = state.get("dataset_semantics_summary")
         if dataset_semantics_summary:
             qa_context["dataset_semantics_summary"] = dataset_semantics_summary
@@ -21550,7 +22086,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         hypothesis_packet_ctx = state.get("ml_improvement_hypothesis_packet")
         if isinstance(hypothesis_packet_ctx, dict) and hypothesis_packet_ctx:
             qa_context["ml_improvement_hypothesis_packet"] = hypothesis_packet_ctx
-        metric_round_active_ctx = bool(state.get("ml_improvement_round_active"))
+        metric_round_active_ctx = bool(review_subject == "ml_engineer" and state.get("ml_improvement_round_active"))
         qa_context["metric_improvement_round_active"] = metric_round_active_ctx
         qa_context["augmentation_requested"] = bool(
             metric_round_active_ctx
@@ -21619,6 +22155,20 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                 gate_context["edit_instructions"] = fix_block
             if streak >= 5:
                 msg = f"CRITICAL: QA Rejected code {streak} times consecutively. Quality Standard not met."
+                qa_paths = _persist_qa_validation_report(
+                    qa_context,
+                    static_result,
+                    review_subject=review_subject,
+                    contract_source=contract_source,
+                    code_path_hint=str(qa_context.get("subject_code_path_hint") or ""),
+                )
+                artifact_index = state.get("artifact_index")
+                if not isinstance(artifact_index, list):
+                    artifact_index = []
+                artifact_index = _merge_artifact_index_entries(
+                    artifact_index,
+                    _build_artifact_index(list(qa_paths), [{"path": path, "kind": "report"} for path in qa_paths]),
+                )
                 return {
                     "review_verdict": "REJECTED",
                     "review_feedback": feedback,
@@ -21626,14 +22176,36 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                     "error_message": msg,
                     "last_gate_context": gate_context,
                     "qa_reject_streak": streak,
+                    "qa_last_result": static_result,
+                    "qa_report_path": qa_paths[0] if qa_paths else "",
+                    "qa_review_subject": review_subject,
+                    "artifact_index": artifact_index,
                     "budget_counters": counters,
                 }
+            qa_paths = _persist_qa_validation_report(
+                qa_context,
+                static_result,
+                review_subject=review_subject,
+                contract_source=contract_source,
+                code_path_hint=str(qa_context.get("subject_code_path_hint") or ""),
+            )
+            artifact_index = state.get("artifact_index")
+            if not isinstance(artifact_index, list):
+                artifact_index = []
+            artifact_index = _merge_artifact_index_entries(
+                artifact_index,
+                _build_artifact_index(list(qa_paths), [{"path": path, "kind": "report"} for path in qa_paths]),
+            )
             return {
                 "review_verdict": "REJECTED",
                 "review_feedback": feedback,
                 "feedback_history": current_history,
                 "last_gate_context": gate_context,
                 "qa_reject_streak": streak,
+                "qa_last_result": static_result,
+                "qa_report_path": qa_paths[0] if qa_paths else "",
+                "qa_review_subject": review_subject,
+                "artifact_index": artifact_index,
                 "budget_counters": counters,
             }
 
@@ -21690,6 +22262,20 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             gate_context["edit_instructions"] = fix_block
 
         review_verdict = status if status in {"APPROVED", "APPROVE_WITH_WARNINGS"} else "APPROVED"
+        qa_paths = _persist_qa_validation_report(
+            qa_context,
+            qa_result,
+            review_subject=review_subject,
+            contract_source=contract_source,
+            code_path_hint=str(qa_context.get("subject_code_path_hint") or ""),
+        )
+        artifact_index = state.get("artifact_index")
+        if not isinstance(artifact_index, list):
+            artifact_index = []
+        artifact_index = _merge_artifact_index_entries(
+            artifact_index,
+            _build_artifact_index(list(qa_paths), [{"path": path, "kind": "report"} for path in qa_paths]),
+        )
         if run_id:
             log_run_event(run_id, "qa_reviewer_complete", {"status": status})
         if run_id:
@@ -21701,6 +22287,7 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                 context={
                     "business_objective": business_objective,
                     "execution_profile": qa_context.get("execution_profile") if isinstance(qa_context, dict) else {},
+                    "review_subject": review_subject,
                 },
                 verdicts=qa_result,
             )
@@ -21709,6 +22296,10 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             "feedback_history": current_history,
             "last_gate_context": gate_context,
             "qa_reject_streak": streak,
+            "qa_last_result": qa_result,
+            "qa_report_path": qa_paths[0] if qa_paths else "",
+            "qa_review_subject": review_subject,
+            "artifact_index": artifact_index,
             "budget_counters": counters,
         }
 
@@ -22146,6 +22737,12 @@ def execute_code(state: AgentState) -> AgentState:
                         "gcloud_flag": heavy_result.get("gcloud_flag"),
                     },
                 )
+
+            _persist_runner_artifact_index(
+                state,
+                heavy_result,
+                contract=contract,
+            )
 
             heavy_error_kind = None
             heavy_error_context = None
@@ -24074,7 +24671,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 if ok:
                     reviewer_view = state.get("reviewer_view") or (state.get("contract_views") or {}).get("reviewer_view")
                     if not isinstance(reviewer_view, dict) or not reviewer_view:
-                        projected_views = build_contract_views_projection(
+                        projected_views = _project_contract_views_from_state(
+                            state if isinstance(state, dict) else {},
                             review_contract,
                             state.get("artifact_index") or [],
                         )
@@ -29851,7 +30449,8 @@ def run_translator(state: AgentState) -> AgentState:
     report_state.setdefault("sandbox_failed", state.get("sandbox_failed", False))
     translator_view = state.get("translator_view") or (state.get("contract_views") or {}).get("translator_view")
     if not isinstance(translator_view, dict) or not translator_view:
-        projected_views = build_contract_views_projection(
+        projected_views = _project_contract_views_from_state(
+            report_state if isinstance(report_state, dict) else {},
             report_state.get("execution_contract", {}) or {},
             report_state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json") or [],
         )
@@ -30150,7 +30749,9 @@ def run_translator(state: AgentState) -> AgentState:
                 run_id,
                 [
                     _abs_in_work(work_dir_abs, "data/execution_contract.json"),
+                    _abs_in_work(work_dir_abs, "data/execution_contract_raw.json"),
                     _abs_in_work(work_dir_abs, "data/execution_contract_diagnostics.json"),
+                    _abs_in_work(work_dir_abs, "data/execution_contract_validation_report.json"),
                     _abs_in_work(work_dir_abs, "data/evaluation_spec.json"),
                     _abs_in_work(work_dir_abs, "data/produced_artifact_index.json"),
                 ],
@@ -30380,8 +30981,18 @@ workflow.add_conditional_edges(
     check_data_success,
     {
         "success": "engineer",
+        "success_cleaning_only_qa": "qa_reviewer",
         "success_cleaning_only": "translator",
         "failed": "translator"
+    }
+)
+
+workflow.add_conditional_edges(
+    "qa_reviewer",
+    check_qa_reviewer_route,
+    {
+        "translator": "translator",
+        "review_board": "review_board",
     }
 )
 
