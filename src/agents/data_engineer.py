@@ -8,7 +8,6 @@ from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.code_extract import extract_code_block
-from src.utils.senior_protocol import SENIOR_ENGINEERING_PROTOCOL
 from src.utils.contract_accessors import (
     get_cleaning_gates,
     get_declared_artifacts,
@@ -169,14 +168,21 @@ class DataEngineerAgent:
                 {str(item) for item in BANNED_ALWAYS_ALLOWLIST if str(item).strip()}
             ),
             "version_hints": {
-                "python": "3.11",
-                "pandas": pandas_spec,
+                "python": "3.11+",
+                "pandas": pandas_spec or "2.x",
             },
             "guidance": [
                 "Import only allowlisted roots.",
                 "Use stable public APIs compatible with version_hints.",
-                "Avoid deprecated kwargs/behaviors when equivalent safe idioms exist.",
                 "Keep script portable across local and cloudrun runner modes.",
+            ],
+            "pandas_pitfalls": [
+                "df.describe(datetime_is_numeric=True) removed in pandas 2.x — omit the kwarg.",
+                "Series.str.replace(pat, repl): repl must be a string or callable, NOT pd.NA/np.nan. Use .where() or .mask() instead.",
+                "pd.to_datetime(infer_datetime_format=True) deprecated — omit the kwarg, pandas 2.x infers by default.",
+                "Series.replace({dict}, np.nan) works, but Series.replace(list, np.nan) inside .apply() raises ValueError — use .map() or .where() instead.",
+                "Int64/Float64 nullable dtypes: use pd.array() or .astype('Int64') after imputation, not before.",
+                "print() with unicode characters (checkmarks, arrows) fails on Windows cp1252 — use ASCII-safe characters only.",
             ],
         }
 
@@ -731,29 +737,95 @@ class DataEngineerAgent:
         try:
             import pandas as pd  # local-only for prompt context enrichment
 
-            preview = pd.read_csv(
+            # Full read for statistics, dtype=str to preserve raw values
+            df_full = pd.read_csv(
                 path,
-                nrows=max_rows,
                 dtype=str,
                 sep=csv_sep or ",",
                 decimal=csv_decimal or ".",
                 encoding=csv_encoding or "utf-8",
                 low_memory=False,
             )
-            preview_cols = [str(col) for col in preview.columns.tolist()]
-            truncated = len(preview_cols) > max_cols
-            shown_cols = preview_cols[:max_cols]
+            total_rows = len(df_full)
+            all_cols = [str(c) for c in df_full.columns.tolist()]
+            truncated = len(all_cols) > max_cols
+            shown_cols = all_cols[:max_cols]
+
+            # Statistical profile per column
+            column_profiles: Dict[str, Any] = {}
+            for col in shown_cols:
+                series = df_full[col]
+                null_count = int(series.isna().sum())
+                non_null = series.dropna()
+                n_unique = int(non_null.nunique())
+                profile: Dict[str, Any] = {
+                    "null_pct": round(null_count / total_rows * 100, 1) if total_rows else 0,
+                    "null_count": null_count,
+                    "unique_count": n_unique,
+                }
+
+                # Top values with frequency (capped for prompt size)
+                if 0 < n_unique <= 30:
+                    top_n = min(n_unique, 6)
+                    vc = non_null.value_counts(dropna=True).head(top_n)
+                    profile["top_values"] = {
+                        str(k): int(v) for k, v in vc.items()
+                    }
+                elif 30 < n_unique <= 500:
+                    vc = non_null.value_counts(dropna=True).head(4)
+                    profile["top_values"] = {
+                        str(k): int(v) for k, v in vc.items()
+                    }
+                elif n_unique > 500:
+                    profile["high_cardinality"] = True
+
+                # Detect numeric-like columns
+                numeric_series = pd.to_numeric(non_null, errors="coerce")
+                numeric_valid = numeric_series.dropna()
+                if len(numeric_valid) > len(non_null) * 0.5 and len(numeric_valid) > 0:
+                    profile["looks_numeric"] = True
+                    profile["numeric_min"] = float(numeric_valid.min())
+                    profile["numeric_max"] = float(numeric_valid.max())
+                    profile["numeric_mean"] = round(float(numeric_valid.mean()), 4)
+                    unparsed_count = len(non_null) - len(numeric_valid)
+                    if unparsed_count > 0:
+                        profile["numeric_unparsed_count"] = unparsed_count
+
+                # Detect datetime-like columns
+                if not profile.get("looks_numeric"):
+                    sample_for_dt = non_null.head(200)
+                    if len(sample_for_dt) > 0:
+                        dt_parsed = pd.to_datetime(sample_for_dt, errors="coerce")
+                        dt_valid_count = int(dt_parsed.notna().sum())
+                        if dt_valid_count > len(sample_for_dt) * 0.4:
+                            profile["looks_datetime"] = True
+                            profile["datetime_parse_rate_sample"] = round(
+                                dt_valid_count / len(sample_for_dt) * 100, 1
+                            )
+                            # Detect raw format patterns
+                            raw_sample = sample_for_dt.head(20).tolist()
+                            format_signatures = set()
+                            for val in raw_sample:
+                                v = str(val).strip()
+                                if not v:
+                                    continue
+                                sig = re.sub(r"\d", "D", v)
+                                format_signatures.add(sig)
+                            if format_signatures:
+                                profile["observed_format_patterns"] = sorted(format_signatures)[:5]
+
+                column_profiles[col] = profile
+
+            # Preview rows (first N)
+            preview = df_full.head(max_rows)
             payload = {
                 "status": "available",
                 "path": path,
-                "shape_preview": {"rows": int(preview.shape[0]), "cols": int(preview.shape[1])},
-                "preview_columns": shown_cols,
-                "preview_columns_truncated": truncated,
+                "dataset_shape": {"total_rows": total_rows, "total_cols": len(all_cols)},
+                "columns": all_cols,
+                "columns_truncated_in_profile": truncated,
+                "column_profiles": column_profiles,
                 "preview_rows": preview[shown_cols].fillna("<NA>").to_dict(orient="records"),
-                "dtypes_preview": {col: str(dtype) for col, dtype in preview[shown_cols].dtypes.items()},
-                "null_counts_preview": {
-                    col: int(preview[shown_cols][col].isnull().sum()) for col in shown_cols
-                },
             }
         except Exception as sample_err:
             payload = {
@@ -1019,8 +1091,10 @@ class DataEngineerAgent:
         You are a Senior Data Engineer. Your mission is to produce one deterministic,
         executable Python cleaning script for the dataset described below.
 
-        === SENIOR ENGINEERING PROTOCOL ===
-        $senior_engineering_protocol
+        You are producing executable artifacts under a contract. Be deterministic
+        and audit-friendly. Include a Decision Log, Assumptions, Trade-offs, and
+        Risk Register as short comment blocks (2-5 bullets each) at the top of
+        the script, focused on engineering choices for THIS specific dataset.
 
         OPERATING_MODE: $operating_mode
         MODE_NOTE: $repair_notes
@@ -1169,13 +1243,8 @@ class DataEngineerAgent:
         - Missing required columns → fail fast with ValueError.
         - Use only dependencies from RUNTIME_DEPENDENCY_CONTEXT.
 
-        SANDBOX SECURITY — BLOCKED IMPORTS:
-        sys, subprocess, socket, requests, httpx, urllib, ftplib, paramiko,
-        selenium, playwright, openai, google.generativeai, builtins,
-        eval(), exec(), compile(), __import__()
-        ALLOWED: pandas, numpy, sklearn, scipy, xgboost, lightgbm, matplotlib,
-        seaborn, json, os.path, os.makedirs, csv, math, statistics, collections,
-        itertools, functools, typing, warnings, re, datetime, pathlib.Path
+        SANDBOX: Import only modules listed in RUNTIME_DEPENDENCY_CONTEXT allowlist.
+        No network, no subprocess, no eval/exec.
 
         ===================================================================
         DATA INTEGRITY PRINCIPLES
@@ -1195,9 +1264,21 @@ class DataEngineerAgent:
         - For temporal, amount, and rate columns, preserve signal before declaring data
           invalid. Senior cleaning distinguishes heterogeneous but recoverable formats
           from truly unparseable values.
+        - USE THE DATASET PROFILE IN DATA_SAMPLE_CONTEXT as your primary evidence for
+          reasoning about null rates, cardinality, numeric ranges, and date formats.
+          A column with 24% nulls in the raw data should NOT become 69% nulls after
+          your cleaning — that means your parser is too aggressive. Check null_pct
+          before and after each transformation mentally.
         - A parsed datetime column is not automatically a hard completeness gate.
           Treat complete non-null coverage as a contractual requirement only when the
           contract, gate semantics, or business-critical role explicitly demands it.
+        - If column_profiles shows looks_datetime with observed_format_patterns, use
+          those patterns to guide your parsing strategy. Multiple format signatures
+          means you need multi-stage parsing, not a single pd.to_datetime() call.
+        - If column_profiles shows looks_numeric with numeric_unparsed_count > 0,
+          those unparsed values are likely placeholders or locale-specific formats.
+          Clean them before casting, do not let to_numeric(errors='coerce') silently
+          null them out without checking the inflation impact.
         - Create parent directories before writing. Preserve deterministic column order.
         - For identity resolution, missing contact/company values are lack of evidence.
           A senior implementation only drops or merges rows when the available signals
@@ -1208,6 +1289,9 @@ class DataEngineerAgent:
           columns into enriched_dataset unless that binding explicitly declares them.
         - The manifest must reflect ACTUAL operations performed, not planned ones.
           If an imputation ran, log it. If it was skipped (no nulls found), say so.
+        - PANDAS COMPATIBILITY: Check pandas_pitfalls in RUNTIME_DEPENDENCY_CONTEXT
+          before using any deprecated or version-sensitive API. This prevents the
+          most common runtime failures.
 
         REPAIR RULES (when OPERATING_MODE is REPAIR):
         - Read RUNTIME_ERROR_CONTEXT/PREFLIGHT_ERROR_CONTEXT and diagnose root cause first.
@@ -1257,12 +1341,17 @@ class DataEngineerAgent:
 
         USER_TEMPLATE = (
             "Analyze the owned deliverables, artifact obligations, cleaning gates, column dtype targets, "
-            "column resolution context, and data sample. Reason first about the deliverable closure for THIS "
-            "run — which artifacts you must write, how each one is materialized, "
-            "and how the cleaning plan supports them. Then reason about the correct "
-            "operation order for THIS specific dataset — which columns need null "
-            "handling before type conversion, which gates impose constraints, what "
-            "the runbook advises. "
+            "column resolution context, and the DATASET PROFILE (column_profiles in DATA_SAMPLE_CONTEXT). "
+            "Reason first about the deliverable closure for THIS run — which artifacts you must write, "
+            "how each one is materialized, and how the cleaning plan supports them. "
+            "Then reason about the correct operation order for THIS specific dataset — "
+            "use the column_profiles to decide: which columns need null handling (check null_pct), "
+            "which look numeric vs datetime (check looks_numeric, looks_datetime), "
+            "what format patterns exist (check observed_format_patterns), "
+            "and what the actual cardinality and value distribution is (check unique_count, top_values). "
+            "For each parsing step, mentally verify that your approach will not inflate nulls "
+            "beyond the raw null_pct shown in the profile. "
+            "Check pandas_pitfalls in RUNTIME_DEPENDENCY_CONTEXT before using any pandas API. "
             "Then generate the complete cleaning script."
         )
         USER_REPAIR_TEMPLATE = """
@@ -1286,6 +1375,9 @@ class DataEngineerAgent:
         $previous_code
 
         Repair task:
+        - Consult the column_profiles in DATA_SAMPLE_CONTEXT (system prompt) to verify your
+          parsing approach matches the actual data patterns (null_pct, looks_datetime,
+          observed_format_patterns, looks_numeric). Do not guess — use the profile.
         - Apply a minimal but sufficient patch to the previous script body.
         - Keep already-working logic stable unless it directly caused the failure.
         - Preserve output paths, owned artifact materialization, and manifest logic unless fixing them is part of the patch.
@@ -1325,7 +1417,6 @@ class DataEngineerAgent:
             runtime_dependency_context=runtime_dependency_context_json,
             selector_expansion_context=selector_expansion_context,
             data_sample_context=data_sample_context,
-            senior_engineering_protocol=SENIOR_ENGINEERING_PROTOCOL,
             de_output_path=de_output_path,
             de_manifest_path=de_manifest_path,
             outlier_report_path=outlier_report_path,
