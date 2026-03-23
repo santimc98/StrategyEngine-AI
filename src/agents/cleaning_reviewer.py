@@ -405,6 +405,12 @@ def _review_cleaning_impl(
         final_result = _enforce_contract_strict_rejection(normalize_cleaning_reviewer_result(deterministic_result))
         return final_result, "LLM_DISABLED", "deterministic"
 
+    cleaning_quality_summary = _build_cleaning_quality_summary(
+        cleaned_csv_path=cleaned_csv_path,
+        raw_csv_path=raw_csv_path,
+        dialect_cleaned=dialect_cleaned,
+        dialect_raw=dialect_raw,
+    )
     prompt, payload = _build_llm_prompt(
         gates=gates,
         required_columns=required_columns,
@@ -418,6 +424,7 @@ def _review_cleaning_impl(
         dataset_profile=dataset_profile,
         column_resolution_context=column_resolution_context,
         artifact_obligations=artifact_obligations,
+        cleaning_quality_summary=cleaning_quality_summary,
     )
     print(f"DEBUG: Cleaning Reviewer calling OpenRouter ({model_name})...")
     try:
@@ -425,7 +432,12 @@ def _review_cleaning_impl(
             model=model_name,
             messages=[
                 {"role": "system", "content": prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+                {"role": "user", "content": (
+                    "Analyze this evidence payload. Pay special attention to cleaning_quality_summary "
+                    "(if present) for null inflation and possible datetime parsing failures. "
+                    "Then evaluate each cleaning gate and return your JSON verdict.\n\n"
+                    + json.dumps(payload, ensure_ascii=True)
+                )},
             ],
             response_format={"type": "json_object"},
             temperature=0.2,
@@ -1532,6 +1544,74 @@ def _assemble_result(
     return result
 
 
+def _build_cleaning_quality_summary(
+    cleaned_csv_path: str,
+    raw_csv_path: Optional[str],
+    dialect_cleaned: Dict[str, Any],
+    dialect_raw: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a per-column null-rate comparison (raw vs cleaned) for LLM review.
+
+    Returns a compact dict the LLM can use to detect null inflation,
+    datetime parsing failures, and unexpected data loss.
+    """
+    try:
+        sep_c = dialect_cleaned.get("sep", ",")
+        enc_c = dialect_cleaned.get("encoding", "utf-8")
+        cleaned = pd.read_csv(cleaned_csv_path, dtype=str, sep=sep_c, encoding=enc_c, nrows=2000)
+    except Exception:
+        return None
+
+    raw = None
+    if raw_csv_path:
+        try:
+            sep_r = (dialect_raw or {}).get("sep", ",")
+            enc_r = (dialect_raw or {}).get("encoding", "utf-8")
+            raw = pd.read_csv(raw_csv_path, dtype=str, sep=sep_r, encoding=enc_r, nrows=2000)
+        except Exception:
+            pass
+
+    summary: Dict[str, Any] = {"cleaned_rows": len(cleaned), "columns": {}}
+    if raw is not None:
+        summary["raw_rows"] = len(raw)
+
+    for col in cleaned.columns:
+        is_null = cleaned[col].isna() | (cleaned[col].str.strip() == "")
+        cleaned_null_pct = round(float(is_null.sum()) / max(len(cleaned), 1) * 100, 1)
+        col_info: Dict[str, Any] = {"cleaned_null_pct": cleaned_null_pct}
+
+        if raw is not None and col in raw.columns:
+            raw_null = raw[col].isna() | (raw[col].str.strip() == "")
+            raw_null_pct = round(float(raw_null.sum()) / max(len(raw), 1) * 100, 1)
+            col_info["raw_null_pct"] = raw_null_pct
+            col_info["null_inflation_pp"] = round(cleaned_null_pct - raw_null_pct, 1)
+
+        # Detect datetime columns that became mostly NaT
+        non_null = cleaned[col].dropna()
+        if len(non_null) > 0:
+            sample_vals = non_null.head(20).tolist()
+            nat_like = sum(1 for v in sample_vals if str(v).strip().lower() in ("nat", "none", "nan", ""))
+            if nat_like > len(sample_vals) * 0.5 and cleaned_null_pct > 50:
+                col_info["warning"] = "possible_datetime_parsing_failure"
+
+        summary["columns"][col] = col_info
+
+    # Keep only columns with notable null inflation or high null rates
+    notable = {}
+    for col, info in summary["columns"].items():
+        if info.get("null_inflation_pp", 0) > 5 or info.get("cleaned_null_pct", 0) > 30:
+            notable[col] = info
+    if notable:
+        summary["notable_columns"] = notable
+
+    # Cap total payload size: only include notable columns in the final output
+    if len(summary["columns"]) > 30:
+        summary["columns"] = {k: v for k, v in list(summary["columns"].items())[:30]}
+        summary["columns_truncated"] = True
+
+    return summary
+
+
 def _build_llm_prompt(
     gates: List[Dict[str, Any]],
     required_columns: List[str],
@@ -1545,6 +1625,7 @@ def _build_llm_prompt(
     dataset_profile: Optional[Dict[str, Any]] = None,
     column_resolution_context: Optional[Dict[str, Any]] = None,
     artifact_obligations: Optional[Dict[str, Any]] = None,
+    cleaning_quality_summary: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     system_prompt = (
         "You are a Senior Data Scientist reviewing data cleaning output.\n\n"
@@ -1554,13 +1635,13 @@ def _build_llm_prompt(
         "- Do not apply rigid heuristics when the context does not justify them.\n\n"
         "SOURCE OF TRUTH AND PRECEDENCE\n"
         "1. cleaning_gates + required_columns + column_roles + dialect + contract_source_used in the payload are authoritative review scope.\n"
-        "2. artifact_obligations + column_resolution_context + cleaning_code + facts + data_profile are primary evidence of what the Data Engineer actually did and what the data looked like.\n"
+        "2. artifact_obligations + column_resolution_context + cleaning_code + facts + data_profile + cleaning_quality_summary are primary evidence of what the Data Engineer actually did and what the data looked like.\n"
         "3. deterministic_gate_results are supporting evidence only. They may help focus attention, but they do NOT override the contract or your evidence-based judgment.\n"
         "4. artifact_obligations is a lossless extraction of artifact bindings already declared in the contract. It introduces no new semantics.\n"
         "5. If sources conflict, preserve contract intent and prefer direct evidence from artifact_obligations/column_resolution_context/cleaning_code/data_profile over shallow pattern matching.\n\n"
         "REVIEW DECISION WORKFLOW (MANDATORY)\n"
         "1. Understand the contract first: what gates were requested, what columns matter, and what would count as a real violation.\n"
-        "2. Read the available evidence pack: artifact_obligations, facts, column_resolution_context, data_profile, cleaning_code, and deterministic_gate_results.\n"
+        "2. Read the available evidence pack: artifact_obligations, facts, column_resolution_context, data_profile, cleaning_quality_summary, cleaning_code, and deterministic_gate_results.\n"
         "3. For each gate, reason about the gate's intent before deciding pass/fail.\n"
         "4. Reject only when you have contract-relevant evidence of a real violation.\n"
         "5. If evidence is ambiguous or incomplete, prefer PASSED or PASSED_WITH_WARNING reasoning over unsupported failure.\n"
@@ -1568,6 +1649,13 @@ def _build_llm_prompt(
         "HIGH-RISK EXAMPLES (GUIDANCE, NOT A SUBSTITUTE FOR REASONING)\n"
         "- no_semantic_rescale: do not infer rescaling from low numeric ranges alone. Look for explicit code evidence such as division by constants, scaler objects, or explicit multiplicative rescaling. If data is already in a low range but no such code exists, that is not a violation.\n"
         "- no_synthetic_data: distinguish between generating synthetic rows/datasets and limited stochastic operations such as noise or imputation support. Reject only when the code clearly fabricates data beyond the contract.\n\n"
+        "NULL INFLATION DETECTION (CRITICAL)\n"
+        "- The payload may include 'cleaning_quality_summary' with per-column null rates before (raw) and after (cleaned) cleaning.\n"
+        "- If any column shows null_inflation_pp > 35, the Data Engineer's parsing likely destroyed valid data.\n"
+        "  Common cause: single-pass datetime parsing (e.g., dayfirst=True destroying ISO dates, or dayfirst=False destroying DD-MM-YYYY dates).\n"
+        "- Check 'notable_columns' for columns flagged with 'possible_datetime_parsing_failure'.\n"
+        "- A broken parser that inflates nulls from ~24% to ~94% is a HARD failure — require multi-stage parsing.\n"
+        "- Expected null inflation from placeholders/impossible dates is ~25-30pp, not 70pp.\n\n"
         "DECISION RULES\n"
         "- If any HARD gate fails, status must be REJECTED.\n"
         "- If only SOFT gates fail, status must be APPROVE_WITH_WARNINGS.\n"
@@ -1575,7 +1663,7 @@ def _build_llm_prompt(
         "- When evidence is insufficient, mark the gate as PASSED and add a warning.\n"
         "- Do not reject based on data ranges alone; you must find contract-relevant evidence.\n\n"
         "EVIDENCE REQUIREMENT\n"
-        "- Any REJECT must cite specific evidence from cleaning_code, facts, or data_profile.\n"
+        "- Any REJECT must cite specific evidence from cleaning_code, facts, data_profile, or cleaning_quality_summary.\n"
         "- Format: EVIDENCE: <source>#<detail> -> <snippet>\n"
         "- Example: EVIDENCE: cleaning_code#line42 -> df['pixel'] = df['pixel'] / 255\n"
         "- If you cannot find concrete evidence, do not reject; explain the uncertainty as a warning.\n\n"
@@ -1638,7 +1726,6 @@ def _build_llm_prompt(
 
     # 2. Data Profile - what are the actual data characteristics?
     if dataset_profile and isinstance(dataset_profile, dict):
-        # Extract relevant summary for LLM
         profile_summary = {}
         if "numeric_summary" in dataset_profile:
             profile_summary["numeric_ranges"] = dataset_profile["numeric_summary"]
@@ -1646,8 +1733,19 @@ def _build_llm_prompt(
             profile_summary["column_types"] = dataset_profile["column_types"]
         if "basic_stats" in dataset_profile:
             profile_summary["basic_stats"] = dataset_profile["basic_stats"]
+        # Include null rates and datetime parse info for quality assessment
+        if "null_rates" in dataset_profile:
+            profile_summary["null_rates"] = dataset_profile["null_rates"]
+        if "datetime_columns" in dataset_profile:
+            profile_summary["datetime_columns"] = dataset_profile["datetime_columns"]
+        if "column_profiles" in dataset_profile:
+            profile_summary["column_profiles"] = dataset_profile["column_profiles"]
         if profile_summary:
             payload["data_profile"] = profile_summary
+
+    # 3. Cleaning Quality Summary - raw vs cleaned null rates comparison
+    if cleaning_quality_summary and isinstance(cleaning_quality_summary, dict):
+        payload["cleaning_quality_summary"] = cleaning_quality_summary
 
     return system_prompt, payload
 
