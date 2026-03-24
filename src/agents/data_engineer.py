@@ -1243,8 +1243,13 @@ class DataEngineerAgent:
         - Missing required columns → fail fast with ValueError.
         - Use only dependencies from RUNTIME_DEPENDENCY_CONTEXT.
 
-        SANDBOX: Import only modules listed in RUNTIME_DEPENDENCY_CONTEXT allowlist.
-        No network, no subprocess, no eval/exec.
+        SANDBOX SECURITY - BLOCKED IMPORTS (HARD CONSTRAINT):
+        - Import only modules listed in RUNTIME_DEPENDENCY_CONTEXT allowlist.
+        - NO NETWORK/FS OPS: no network access, no subprocess, no shell, no eval/exec.
+        - BLOCKED IMPORTS include subprocess, socket, requests, httpx, urllib, ftplib,
+          paramiko, selenium, playwright, openai, google.generativeai, builtins.
+        - Forbidden file-destructive calls: os.remove, os.unlink, pathlib.Path.unlink,
+          shutil.rmtree, os.rmdir.
 
         ===================================================================
         DATA INTEGRITY PRINCIPLES

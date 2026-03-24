@@ -11,6 +11,14 @@ from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 
+try:
+    import google.generativeai as genai  # type: ignore
+except Exception:
+    class _GenAIShim:
+        GenerativeModel = None
+
+    genai = _GenAIShim()
+
 load_dotenv()
 from src.utils.pii_scrubber import PIIScrubber
 
@@ -211,15 +219,27 @@ class StewardAgent:
         """
         Initializes the Steward Agent via OpenRouter.
         """
+        self.provider = "openrouter"
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
-        if not self.api_key:
-            raise ValueError("OPENROUTER_API_KEY is required.")
-
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://openrouter.ai/api/v1",
-        )
+        google_api_key = api_key or os.getenv("GOOGLE_API_KEY")
         self.model_name = os.getenv("STEWARD_MODEL", "google/gemini-3-flash-preview")
+        self.client = None
+        if self.api_key:
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url="https://openrouter.ai/api/v1",
+            )
+        elif google_api_key and getattr(genai, "GenerativeModel", None):
+            self.provider = "gemini"
+            try:
+                configure = getattr(genai, "configure", None)
+                if callable(configure):
+                    configure(api_key=google_api_key)
+            except Exception:
+                pass
+            self.client = genai.GenerativeModel(self.model_name)
+        if self.client is None:
+            raise ValueError("OPENROUTER_API_KEY or GOOGLE_API_KEY is required.")
         self.last_prompt = None
         self.last_response = None
 
@@ -371,12 +391,16 @@ class StewardAgent:
             )
             self.last_prompt = system_prompt
 
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": system_prompt}],
-                temperature=0.2,
-            )
-            summary = (response.choices[0].message.content or "").strip()
+            if self.provider == "gemini" and hasattr(self.client, "generate_content"):
+                response = self.client.generate_content(system_prompt)
+                summary = str(getattr(response, "text", "") or "").strip()
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": system_prompt}],
+                    temperature=0.2,
+                )
+                summary = (response.choices[0].message.content or "").strip()
             self.last_response = summary
 
             # Diagnostic logging for empty responses (best-effort, no PII)

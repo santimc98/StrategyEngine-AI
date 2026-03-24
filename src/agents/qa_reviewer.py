@@ -400,17 +400,30 @@ class QAReviewerAgent:
         )
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "Return only valid JSON."},
-                    {"role": "user", "content": repair_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-            repaired_text = response.choices[0].message.content
-            trace["used_response_schema"] = False
+            if self.provider == "gemini":
+                repaired_text, used_config = self._generate_gemini_json(
+                    repair_prompt,
+                    generation_config={
+                        "temperature": 0.0,
+                        "response_mime_type": "application/json",
+                        "response_schema": copy.deepcopy(schema),
+                    },
+                )
+                trace["used_response_schema"] = bool(
+                    isinstance(used_config, dict) and "response_schema" in used_config
+                )
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": "Return only valid JSON."},
+                        {"role": "user", "content": repair_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+                repaired_text = response.choices[0].message.content
+                trace["used_response_schema"] = False
             parsed, parsed_trace = parse_json_object_with_repair(
                 str(repaired_text or ""),
                 actor="qa_reviewer_json_repair",
@@ -445,10 +458,11 @@ class QAReviewerAgent:
             '  "failed_gates": [],\n'
             '  "required_fixes": []\n'
             '}\n\n'
-            f"Valid gate names: {json.dumps(qa_gate_names)}\n\n"
-            "Your previous (malformed) response started with:\n"
-            f"{str(failed_response_preview or '')[:3000]}\n\n"
-            "Now return ONLY the corrected JSON."
+            + "Valid gate names: "
+            + json.dumps(qa_gate_names)
+            + "\n\nYour previous (malformed) response started with:\n"
+            + str(failed_response_preview or "")[:3000]
+            + "\n\nNow return ONLY the corrected JSON."
         )
 
         try:

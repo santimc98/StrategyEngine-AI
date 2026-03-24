@@ -589,19 +589,6 @@ def _resolve_cleaning_manifest_path_from_state(
     return normalize_artifact_path(fallback)
 
 
-def _resolve_declared_file_schema_from_state(
-    state: Dict[str, Any] | None,
-    target: str,
-    *,
-    owner: str | None = None,
-    kind: str | None = None,
-) -> Dict[str, Any]:
-    state_obj = state if isinstance(state, dict) else {}
-    contract_full, _ = _resolve_contract_pair_from_state(state_obj)
-    schema = get_declared_file_schema(contract_full, target, owner=owner, kind=kind)
-    return schema if isinstance(schema, dict) else {}
-
-
 def _load_declared_json_artifact_from_state(
     state: Dict[str, Any] | None,
     target: str,
@@ -2850,17 +2837,6 @@ def _packet_implied_hard_gate_failures(
             if matched:
                 break
     return list(dict.fromkeys([name for name in implied if name]))
-
-
-def _build_gate_resolution_fix(gate_spec: Dict[str, Any]) -> str:
-    gate_name = str(gate_spec.get("name") or "unknown_gate").strip()
-    params = gate_spec.get("params") if isinstance(gate_spec.get("params"), dict) else {}
-    hints: List[str] = []
-    for key, value in params.items():
-        if isinstance(value, (str, int, float, bool)) and str(value).strip():
-            hints.append(f"{key}={value}")
-    hint_text = f" ({', '.join(hints[:3])})" if hints else ""
-    return f"Resolve active HARD gate '{gate_name}'{hint_text}."
 
 
 def _enforce_review_packet_contract_consistency(
@@ -15946,10 +15922,10 @@ def _build_backend_memory_decision(
     n_cols_hint = _safe_int(hints.get("cols") or hints.get("n_cols"), 0)
     heavy_size_signal = bool(file_mb >= 200 or est_rows >= 1_000_000 or n_cols_hint >= 1000)
 
-    if state.get("sandbox_memory_failure_detected"):
+    if state.get("sandbox_memory_failure_detected") or state.get("e2b_memory_failure_detected"):
         return {
             "use_heavy": True,
-            "reason": "sandbox_memory_failure_fallback",
+            "reason": "e2b_memory_failure_fallback",
             "safe_budget_gb": safe_budget_gb,
             "sandbox_limit_gb": sandbox_limit_gb,
             "estimate": estimate,
@@ -15981,14 +15957,14 @@ def _build_backend_memory_decision(
         if peak_gb <= safe_budget_gb:
             return {
                 "use_heavy": False,
-                "reason": "sandbox_memory_safe",
+                "reason": "e2b_memory_safe",
                 "safe_budget_gb": safe_budget_gb,
                 "sandbox_limit_gb": sandbox_limit_gb,
                 "estimate": estimate,
             }
         return {
             "use_heavy": True,
-            "reason": "est_memory_exceeds_sandbox_safe",
+            "reason": "est_memory_exceeds_e2b_safe",
             "safe_budget_gb": safe_budget_gb,
             "sandbox_limit_gb": sandbox_limit_gb,
             "estimate": estimate,
@@ -16004,7 +15980,7 @@ def _build_backend_memory_decision(
         }
     return {
         "use_heavy": False,
-        "reason": "sandbox_default",
+        "reason": "e2b_default",
         "safe_budget_gb": safe_budget_gb,
         "sandbox_limit_gb": sandbox_limit_gb,
         "estimate": estimate,
@@ -16303,10 +16279,10 @@ def _build_de_backend_memory_decision(
 
     large_signal = bool(file_mb >= 200 or est_rows >= 800_000 or n_cols >= 1_000)
     medium_signal = bool(file_mb >= 50 or est_rows >= 200_000)
-    if state.get("de_sandbox_memory_failure_detected"):
+    if state.get("de_sandbox_memory_failure_detected") or state.get("de_e2b_memory_failure_detected"):
         return {
             "use_heavy": True,
-            "reason": "sandbox_memory_failure_fallback",
+            "reason": "e2b_memory_failure_fallback",
             "safe_budget_gb": safe_budget_gb,
             "sandbox_limit_gb": sandbox_limit_gb,
             "estimated_peak_gb": estimated_peak_gb,
@@ -16320,7 +16296,7 @@ def _build_de_backend_memory_decision(
         if estimated_peak_gb <= safe_budget_gb:
             return {
                 "use_heavy": False,
-                "reason": "sandbox_memory_safe_de",
+                "reason": "e2b_memory_safe",
                 "safe_budget_gb": safe_budget_gb,
                 "sandbox_limit_gb": sandbox_limit_gb,
                 "estimated_peak_gb": estimated_peak_gb,
@@ -16331,7 +16307,7 @@ def _build_de_backend_memory_decision(
             }
         return {
             "use_heavy": True,
-            "reason": "de_est_memory_exceeds_sandbox_safe",
+            "reason": "de_est_memory_exceeds_e2b_safe",
             "safe_budget_gb": safe_budget_gb,
             "sandbox_limit_gb": sandbox_limit_gb,
             "estimated_peak_gb": estimated_peak_gb,
@@ -16367,7 +16343,7 @@ def _build_de_backend_memory_decision(
         }
     return {
         "use_heavy": False,
-        "reason": "de_sandbox_default",
+        "reason": "de_e2b_default",
         "safe_budget_gb": safe_budget_gb,
         "sandbox_limit_gb": sandbox_limit_gb,
         "estimated_peak_gb": None,
@@ -16429,13 +16405,35 @@ def _detect_de_heavy_runner_protocol_mismatch(
         for path in (expected_outputs or [])
         if isinstance(path, str) and path.strip()
     }
-    missing_ml_outputs = bool(expected) and all(token.lower() in err_text for token in expected)
+    if expected:
+        missing_ml_outputs = all(token.lower() in err_text for token in expected)
+    else:
+        legacy_ml_outputs = {
+            "data/metrics.json",
+            "data/scored_rows.csv",
+            "data/alignment_check.json",
+        }
+        missing_ml_outputs = all(token in err_text for token in legacy_ml_outputs)
     if not missing_ml_outputs:
         return False
     cleaned_success_logged = "cleaned data written to" in str(heavy_log_text or "").lower()
     downloaded_keys = set(downloaded.keys()) if isinstance(downloaded, dict) else set()
     expected_output_seen = any(path in downloaded_keys for path in expected)
     return bool(cleaned_success_logged or expected_output_seen)
+
+
+def _should_run_e2b_after_de_heavy_result(de_heavy_result: Dict[str, Any] | None) -> bool:
+    """
+    Backward-compatible alias for the DE fallback policy.
+
+    Policy:
+    - No heavy result: run E2B/local sandbox.
+    - Heavy runner unavailable: run fallback sandbox.
+    - Heavy runner attempted (ok or failed): do not run sandbox in same cycle.
+    """
+    if not isinstance(de_heavy_result, dict):
+        return True
+    return bool(de_heavy_result.get("unavailable"))
 
 
 def _resolve_de_output_artifacts(state: Dict[str, Any]) -> tuple[str, str, List[str]]:
@@ -16868,20 +16866,6 @@ def _execute_data_engineer_via_heavy_runner(
         "outlier_report_path": optional_outlier_report,
         "outlier_report_downloaded": outlier_report_downloaded,
     }
-
-
-def _should_run_sandbox_after_de_heavy_result(de_heavy_result: Dict[str, Any] | None) -> bool:
-    """
-    Decide whether to run standard sandbox after a DE heavy-runner attempt.
-
-    Policy:
-    - No heavy result: run sandbox.
-    - Heavy runner unavailable: run sandbox fallback.
-    - Heavy runner attempted (ok or failed): do not run sandbox in same cycle.
-    """
-    if not isinstance(de_heavy_result, dict):
-        return True
-    return bool(de_heavy_result.get("unavailable"))
 
 
 def _finalize_heavy_execution(
@@ -24413,6 +24397,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "metrics.json",
         kind="metrics",
     )
+    if not metrics_path:
+        fallback_metrics_path = os.path.join("data", "metrics.json")
+        if os.path.exists(fallback_metrics_path):
+            metrics_path = fallback_metrics_path
     scored_rows_path = _resolve_declared_artifact_path_from_state(
         state if isinstance(state, dict) else {},
         "scored_rows.csv",
@@ -24495,8 +24483,16 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
 
     # 5.5.1) Metrics schema consistency (mean inside CI)
-    if metrics_report:
-        ci_issues = validate_metrics_ci_consistency(metrics_report)
+    # Even when we cannot resolve a normalized metrics_report, the raw metrics
+    # payload may still contain structurally invalid CI blocks. Validate that
+    # directly instead of silently approving.
+    ci_validation_payload = (
+        metrics_report
+        if isinstance(metrics_report, dict) and metrics_report
+        else (raw_metrics_payload if raw_metrics_present else {})
+    )
+    if ci_validation_payload:
+        ci_issues = validate_metrics_ci_consistency(ci_validation_payload)
         if ci_issues:
             status = "NEEDS_IMPROVEMENT"
             issue_text = ", ".join(ci_issues)
@@ -24561,6 +24557,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         state if isinstance(state, dict) else {},
         "alignment_check.json",
     )
+    if not alignment_path:
+        fallback_alignment_path = os.path.join("data", "alignment_check.json")
+        if os.path.exists(fallback_alignment_path):
+            alignment_path = fallback_alignment_path
     alignment_check = _load_json_safe(alignment_path) if alignment_path else {}
     alignment_requirements = []
     if isinstance(evaluation_spec, dict):
@@ -29591,6 +29591,23 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         and isinstance(winner_entry, dict)
         and bool(winner_entry.get("eligible"))
     )
+    board_verdict_payload = (
+        state.get("review_board_verdict")
+        if isinstance(state.get("review_board_verdict"), dict)
+        else {}
+    )
+    board_verdict_raw = (
+        board_verdict_payload.get("final_review_verdict")
+        or board_verdict_payload.get("status")
+        or ""
+    )
+    board_verdict_status = normalize_review_status(board_verdict_raw)
+    board_verdict_approved = bool(str(board_verdict_raw).strip()) and _is_approved_review_status(board_verdict_status)
+    advisor_veto_applied = False
+    if isinstance(meets_min_delta_packet, bool) and not meets_min_delta_packet and not board_verdict_approved:
+        advisor_veto_applied = True
+        selected_candidate_eligible = False
+        selection_metric_improved = False
     incumbent_selection.update(
         {
             "metric_name": metric_name,
@@ -29610,6 +29627,8 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 if isinstance(meets_min_delta_packet, bool)
                 else None
             ),
+            "advisor_veto_applied": bool(advisor_veto_applied),
+            "review_board_approved": bool(board_verdict_approved),
         }
     )
     improved_by_metric = bool(selection_metric_improved)

@@ -485,6 +485,26 @@ class ReviewerAgent:
             )
         return config
 
+    def _generate_gemini_json(
+        self,
+        prompt: str,
+        *,
+        generation_config: Dict[str, Any] | None = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        if not self.client:
+            raise RuntimeError("Gemini client not configured")
+        config = dict(generation_config or self._generation_config)
+        try:
+            response = self.client.generate_content(prompt, generation_config=config)
+            return _coerce_llm_response_text(response), config
+        except Exception as err:
+            if not self._is_response_schema_unsupported_error(err):
+                raise
+            fallback_config = dict(config)
+            fallback_config.pop("response_schema", None)
+            response = self.client.generate_content(prompt, generation_config=fallback_config)
+            return _coerce_llm_response_text(response), fallback_config
+
     @staticmethod
     def _is_response_schema_unsupported_error(err: Exception) -> bool:
         message = str(err or "").lower()
@@ -540,17 +560,30 @@ class ReviewerAgent:
         )
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "Return only valid JSON."},
-                    {"role": "user", "content": repair_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-            repaired_text = response.choices[0].message.content
-            trace["used_response_schema"] = False
+            if self.provider == "gemini":
+                repaired_text, used_config = self._generate_gemini_json(
+                    repair_prompt,
+                    generation_config={
+                        "temperature": 0.0,
+                        "response_mime_type": "application/json",
+                        "response_schema": copy.deepcopy(schema),
+                    },
+                )
+                trace["used_response_schema"] = bool(
+                    isinstance(used_config, dict) and "response_schema" in used_config
+                )
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": "Return only valid JSON."},
+                        {"role": "user", "content": repair_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                )
+                repaired_text = response.choices[0].message.content
+                trace["used_response_schema"] = False
             parsed, parsed_trace = parse_json_object_with_repair(
                 str(repaired_text or ""),
                 actor="reviewer_json_repair",

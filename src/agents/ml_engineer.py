@@ -1,3 +1,4 @@
+import copy
 import os
 import logging
 import re
@@ -194,10 +195,11 @@ class MLEngineerAgent:
         used_fallback: bool = False,
         source: str = "openrouter",
     ) -> None:
-        prompt_text = f"{system_prompt}\n\nUSER:\n{user_prompt}"
+        prompt_text = str(system_prompt or "") + "\n\nUSER:\n" + str(user_prompt or "")
         response_text = str(response or "")
-        self.last_prompt = prompt_text
-        self.last_response = response_text
+        if not self.last_prompt_trace:
+            self.last_prompt = prompt_text
+            self.last_response = response_text
         self.last_prompt_trace.append(
             {
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -1550,6 +1552,45 @@ class MLEngineerAgent:
             max_str_len=350,
             max_list_items=8,
         )
+
+    def _build_editor_scope_brief(
+        self,
+        repair_scope: Dict[str, Any] | None,
+    ) -> str:
+        repair_scope = repair_scope if isinstance(repair_scope, dict) else {}
+        lines: List[str] = []
+        phase = str(repair_scope.get("phase") or "").strip()
+        scope_policy = str(repair_scope.get("scope_policy") or "").strip().lower()
+        editable_targets = repair_scope.get("editable_targets")
+        protected_regions = repair_scope.get("protected_regions")
+        invariants = repair_scope.get("must_preserve_invariants")
+
+        if scope_policy == "patch_only":
+            if phase:
+                lines.append(f"{phase} patch-only mode is ACTIVE.")
+            else:
+                lines.append("patch-only mode is ACTIVE.")
+            lines.append(
+                "Treat all regions outside REPAIR SCOPE as frozen unless new verified evidence directly implicates them."
+            )
+
+        if isinstance(editable_targets, list):
+            editable = [str(item).strip() for item in editable_targets if str(item).strip()]
+            if editable:
+                lines.append(f"Editable targets: {'; '.join(editable)}.")
+
+        if isinstance(protected_regions, list):
+            protected = [str(item).strip() for item in protected_regions if str(item).strip()]
+            if protected:
+                lines.append(f"Protected regions: {'; '.join(protected)}.")
+
+        if isinstance(invariants, list):
+            kept = [str(item).strip() for item in invariants if str(item).strip()]
+            if kept:
+                lines.append("Scope invariants:")
+                lines.extend([f"- {item}" for item in kept[:6]])
+
+        return "\n".join(lines).strip()
 
     def _resolve_optimization_mode_inputs(
         self,
@@ -4420,12 +4461,9 @@ class MLEngineerAgent:
         ).strip().upper()
         optimization_round_hint = bool(
             previous_code
-            and (
-                raw_handoff_mode in {"optimize", "metric_optimize", "improve"}
-                or "metric_improvement" in raw_handoff_source
-                or "actor_critic" in raw_handoff_source
-                or raw_status in {"OPTIMIZATION_REQUIRED", "IMPROVEMENT_REQUIRED"}
-                or bool(raw_editor_constraints.get("must_apply_hypothesis"))
+            and self._is_metric_optimization_context(
+                gate_context=gate_context,
+                handoff_payload=raw_handoff,
             )
         )
         canonical_columns_hint = (
@@ -4879,6 +4917,7 @@ class MLEngineerAgent:
 
         ACTIVE FIX CONTEXT:
         $fixes_bullets
+        - Metric-improvement round enforcement is ACTIVE. If the current handoff is not an optimization round, treat this as a contract-preservation invariant only.
         - Diagnose the smallest coherent edit set that resolves the active blocker.
         - If a traceback exists, fix its root cause before optional improvements.
         - Treat REPAIR GROUND TRUTH as higher priority than heuristic summaries when they conflict.
@@ -4903,11 +4942,20 @@ class MLEngineerAgent:
         WHAT FAILED (phase: $phase_classification):
         $error_feedback
 
+        REPAIR GROUND TRUTH (verified environment facts, authoritative):
+        $repair_ground_truth
+
         VERIFIED ENVIRONMENT FACTS (authoritative — trust these over assumptions):
         $repair_ground_truth
 
         EDIT SCOPE:
         $repair_scope
+
+        REPAIR SCOPE (authoritative edit boundaries):
+        $repair_scope
+
+        SCOPE ENFORCEMENT:
+        $editor_scope_brief
 
         WHAT TO CHANGE:
         $patch_objectives
@@ -4917,6 +4965,7 @@ class MLEngineerAgent:
         - Hypothesis: $hypothesis_packet_json
         - Iteration handoff: $iteration_handoff_json
         - Recent attempts: $last_run_memory
+        - Metric-improvement round enforcement is ACTIVE. If the current handoff is not an optimization round, treat this as a contract-preservation invariant only.
 
         WHAT TO PROTECT:
         $must_preserve
@@ -4935,6 +4984,7 @@ class MLEngineerAgent:
 
         USER_EDITOR_OPTIMIZATION_TEMPLATE = """
         MODE: METRIC_IMPROVEMENT
+        MODE: CODE_EDITOR_MODE_OPTIMIZATION
         You are editing an incumbent script to improve its metric. Do not regenerate from zero.
 
         CURRENT STATE (phase: $phase_classification):
@@ -4943,7 +4993,21 @@ class MLEngineerAgent:
         - Recent attempts: $recent_tracker
         - Feedback digest: $optimization_feedback_brief
 
+        CURRENT TASK CONTEXT
+        CURRENT PHASE: $phase_classification
+        CURRENT ROUND BRIEF:
+        $optimization_round_brief
+        CURRENT EVIDENCE BRIEF:
+        $current_evidence_brief
+        RECENT ATTEMPTS:
+        $recent_tracker
+        FEEDBACK DIGEST:
+        $optimization_feedback_brief
+
         HYPOTHESIS TO TEST:
+        $active_hypothesis_brief
+
+        ACTIVE HYPOTHESIS BRIEF:
         $active_hypothesis_brief
 
         IMPLEMENTATION HINTS:
@@ -4952,8 +5016,17 @@ class MLEngineerAgent:
         VERIFIED ENVIRONMENT FACTS (authoritative):
         $repair_ground_truth
 
+        REPAIR GROUND TRUTH:
+        $repair_ground_truth
+
         EDIT SCOPE:
         $repair_scope
+
+        REPAIR SCOPE:
+        $repair_scope
+
+        SCOPE ENFORCEMENT:
+        $editor_scope_brief
 
         WHAT TO CHANGE:
         $patch_objectives
@@ -4961,6 +5034,9 @@ class MLEngineerAgent:
         WHAT TO PROTECT:
         $must_preserve
         Locked invariants: $invariants_lock
+
+        LOCKED INVARIANTS:
+        $invariants_lock
 
         PREVIOUS SCRIPT:
         $previous_code
@@ -5101,6 +5177,11 @@ class MLEngineerAgent:
                 max_str_len=220,
                 max_list_items=20,
             )
+            editor_scope_brief = self._build_editor_scope_brief(
+                handoff_payload.get("repair_scope")
+                if isinstance(handoff_payload.get("repair_scope"), dict)
+                else {}
+            )
             if optimization_editor_mode:
                 optimization_inputs = self._resolve_optimization_mode_inputs(
                     handoff_payload=handoff_payload,
@@ -5125,6 +5206,7 @@ class MLEngineerAgent:
                     optimization_feedback_brief=optimization_briefs.get("optimization_feedback_brief") or "No optimization feedback provided.",
                     patch_objectives=patch_objectives_block,
                     must_preserve=must_preserve_block,
+                    editor_scope_brief=editor_scope_brief or "No explicit scope constraints provided.",
                     previous_code=previous_code_block,
                 )
             else:
@@ -5140,6 +5222,7 @@ class MLEngineerAgent:
                     hypothesis_packet_json=hypothesis_packet_block,
                     patch_objectives=patch_objectives_block,
                     must_preserve=must_preserve_block,
+                    editor_scope_brief=editor_scope_brief or "No explicit scope constraints provided.",
                     previous_code=previous_code_block,
                 )
         elif improve_mode_active:

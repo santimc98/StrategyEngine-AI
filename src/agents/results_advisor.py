@@ -53,6 +53,9 @@ class ResultsAdvisorAgent:
 
     def __init__(self, api_key: Any = None):
         explicit_api_key = api_key
+        explicit_nonempty_api_key = (
+            explicit_api_key is not None and str(explicit_api_key).strip() != ""
+        )
         self.api_key = explicit_api_key if explicit_api_key is not None else os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
             self.client = None
@@ -123,12 +126,13 @@ class ResultsAdvisorAgent:
             self.fe_advice_mode in {"llm", "hybrid"}
             or self.critique_mode in {"llm", "hybrid"}
         ):
-            if self.client is not None:
-                self.fe_provider = "openrouter"
+            if explicit_nonempty_api_key and self.client is not None:
+                self.fe_provider = "mimo"
                 self.fe_client = self.client
-                self.fe_model_name = str(
-                    os.getenv("RESULTS_ADVISOR_LLM_MODEL", self.model_name)
-                ).strip() or self.model_name
+                self.fe_model_name = (
+                    str(os.getenv("RESULTS_ADVISOR_LLM_MODEL", "mimo-v2-flash")).strip()
+                    or "mimo-v2-flash"
+                )
                 self.fe_model_warning = None
             else:
                 (
@@ -145,6 +149,27 @@ class ResultsAdvisorAgent:
                 build_results_advisor_critique_response_schema()
             )
         return config
+
+    def _generate_gemini_json(
+        self,
+        prompt: str,
+        *,
+        generation_config: Dict[str, Any] | None = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        client = self.fe_client or self.critique_client
+        if not client:
+            raise RuntimeError("Gemini client not configured")
+        config = dict(generation_config or self._generation_config)
+        try:
+            response = client.generate_content(prompt, generation_config=config)
+            return _coerce_llm_response_text(response), config
+        except Exception as err:
+            if not self._is_response_schema_unsupported_error(err):
+                raise
+            fallback_config = dict(config)
+            fallback_config.pop("response_schema", None)
+            response = client.generate_content(prompt, generation_config=fallback_config)
+            return _coerce_llm_response_text(response), fallback_config
 
     def _openai_response_format_for_critique(self) -> Dict[str, Any]:
         return {
@@ -1216,15 +1241,19 @@ class ResultsAdvisorAgent:
         )
 
         try:
-            response = self.fe_client.chat.completions.create(
-                model=self.fe_model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-            )
-            content = response.choices[0].message.content
+            if hasattr(self.fe_client, "generate_content") and not hasattr(self.fe_client, "chat"):
+                response = self.fe_client.generate_content(system_prompt + "\n\n" + user_prompt)
+                content = _coerce_llm_response_text(response)
+            else:
+                response = self.fe_client.chat.completions.create(
+                    model=self.fe_model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.1,
+                )
+                content = response.choices[0].message.content
         except Exception:
             return ""
 

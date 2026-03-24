@@ -15,7 +15,6 @@ from src.utils.contract_accessors import (
     get_dataset_artifact_binding,
     get_declared_artifacts,
     get_deliverables_by_owner,
-    get_derived_column_names,
     get_enriched_dataset_output_path,
     get_outlier_policy,
     get_outcome_columns,
@@ -1059,16 +1058,6 @@ def _resolve_row_count_hints(
     return hints
 
 
-def is_identifier_column(col_name: str) -> bool:
-    if not col_name:
-        return False
-    if is_strict_identifier_column(col_name):
-        return True
-    if is_candidate_identifier_column(col_name):
-        return True
-    return False
-
-
 def is_strict_identifier_column(col_name: str) -> bool:
     if not col_name:
         return False
@@ -1784,23 +1773,6 @@ def _resolve_column_roles(contract_min: Dict[str, Any], contract_full: Dict[str,
     if roles_min:
         return roles_min
     return get_column_roles(contract_full)
-
-
-def _extract_roles(roles: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    return {
-        "decision": _coerce_list(roles.get("decision")),
-        "outcome": _coerce_list(roles.get("outcome")),
-        "audit_only": _coerce_list(roles.get("post_decision_audit_only") or roles.get("audit_only")),
-    }
-
-
-def _resolve_derived_columns(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[str]:
-    derived: List[str] = []
-    for source in (contract_min, contract_full):
-        if not isinstance(source, dict):
-            continue
-        derived.extend(get_derived_column_names(source))
-    return list(dict.fromkeys([str(c) for c in derived if c]))
 
 
 def _dedupe_string_list(values: Any) -> List[str]:
@@ -2876,44 +2848,6 @@ def build_cleaning_view(
     return _build_declared_agent_view("cleaning_reviewer", projection_context, contract_min, contract_full)
 
 
-def _project_decisioning_requirements(contract_full: Dict[str, Any]) -> Dict[str, Any]:
-    decisioning = contract_full.get("decisioning_requirements")
-    if isinstance(decisioning, dict):
-        return {
-            "enabled": bool(decisioning.get("enabled")),
-            "required": bool(decisioning.get("required")),
-            "output": decisioning.get("output", {}),
-            "policy_notes": decisioning.get("policy_notes", ""),
-        }
-    return {"enabled": False, "required": False, "output": {}, "policy_notes": ""}
-
-
-def _project_objective_type(contract_full: Dict[str, Any]) -> str:
-    task_semantics = get_task_semantics(contract_full)
-    if isinstance(task_semantics, dict):
-        for key in ("objective_type", "problem_family"):
-            value = str(task_semantics.get(key) or "").strip()
-            if value and value.lower() != "unknown":
-                return value
-    objective_analysis = contract_full.get("objective_analysis")
-    if isinstance(objective_analysis, dict):
-        problem_type = str(objective_analysis.get("problem_type") or "").strip()
-        if problem_type and problem_type.lower() != "unknown":
-            return problem_type
-    evaluation_spec = contract_full.get("evaluation_spec")
-    if isinstance(evaluation_spec, dict):
-        objective_type = str(evaluation_spec.get("objective_type") or "").strip()
-        if objective_type and objective_type.lower() != "unknown":
-            return objective_type
-    capabilities = resolve_problem_capabilities_from_contract(contract_full if isinstance(contract_full, dict) else {})
-    family = str(capabilities.get("family") or "").strip()
-    if family and family != "unknown":
-        return family
-    required_outputs = _project_required_outputs(contract_full)
-    inferred = _infer_objective_from_outputs(required_outputs)
-    return inferred or "unknown"
-
-
 def _resolve_task_semantics(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> Dict[str, Any]:
     for source in (contract_min, contract_full):
         task_semantics = get_task_semantics(source if isinstance(source, dict) else {})
@@ -2937,38 +2871,6 @@ def _resolve_task_semantics(contract_min: Dict[str, Any], contract_full: Dict[st
         "multi_target": len(outcome_columns) > 1,
         "prediction_unit": {"kind": "row", "identifier_columns": identifier_columns},
     }
-
-
-def _project_required_outputs(contract_full: Dict[str, Any]) -> List[str]:
-    outputs = contract_full.get("required_outputs")
-    if not isinstance(outputs, list) or not outputs:
-        outputs = get_required_outputs(contract_full)
-    normalized: List[str] = []
-    seen: set[str] = set()
-
-    def _extract_path(item: Any) -> str:
-        if isinstance(item, str):
-            return item
-        if isinstance(item, dict):
-            for key in ("path", "output", "artifact"):
-                value = item.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value
-        return ""
-
-    for item in outputs:
-        if not item:
-            continue
-        text = _extract_path(item).replace("\\", "/").strip()
-        if not text:
-            continue
-        key = text.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append(text)
-    return normalized
-
 
 def _project_artifact_requirements(contract_full: Dict[str, Any]) -> Dict[str, Any]:
     artifact_reqs = contract_full.get("artifact_requirements")
@@ -3517,14 +3419,6 @@ def persist_view_projection_reports(
             with open(bundle_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
     return paths
-
-
-def sanitize_contract_min_for_de(contract_min: Dict[str, Any] | None) -> Dict[str, Any]:
-    if not isinstance(contract_min, dict):
-        return {}
-    sanitized = dict(contract_min)
-    sanitized.pop("business_objective", None)
-    return sanitized
 
 
 def persist_views(

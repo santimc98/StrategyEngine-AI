@@ -366,22 +366,33 @@ Before emitting JSON, reason through:
 3. Close every dependency: model_features must name explicit columns (not just conceptual families) whenever this run prepares a future modeling subset. Do not leave model_features empty while claiming future-ML readiness.
 4. Verify consistency: every column in model_features appears in column_roles.pre_decision. Every column in column_roles.outcome is excluded from model_features.
 
+CANONICAL_COLUMNS
+canonical_columns must list ALL columns from column_inventory that this run acknowledges. This is the dataset's full column manifest — not just anchor columns or role-specific subsets. If column_inventory has 42 columns and none are excluded, canonical_columns has 42 entries. The compiler and downstream agents use canonical_columns as the ground truth for what columns exist.
+
 SCOPE REASONING
 - scope is a routing signal, not the semantic brain of the contract.
 - A future target does NOT imply model_training=true. If this run is cleaning/feature preparation, set model_training=false even when a target column exists.
 - Include future_ml_handoff when model_training=false but a future target/modeling handoff is clearly defined.
-
-RUNBOOK PRINCIPLES
-Runbooks state OBJECTIVES and CONSTRAINTS, not implementation recipes. The downstream agent reasons about the best approach given the data.
-- BAD: "Apply median imputation to all features." GOOD: "Handle missing values appropriately per column distribution."
-- BAD: "Use RepeatedStratifiedKFold(n_splits=5, n_repeats=2)." GOOD: "Use repeated stratified CV with sufficient folds for stable estimates."
-Include hard constraints (leakage prevention, output format) but leave method selection to the agent.
 
 GATE PRINCIPLES
 Gates must be grounded in actual data risk, not template completeness.
 - HARD: failure makes the output corrupt, unsafe, or silently wrong (leakage surviving, target missing, schema violation).
 - SOFT: quality degraded but output remains usable (null rate above threshold, optional format).
 - Do not create gates for impossible conditions. Each gate must address a plausible risk visible in the data.
+
+RUNBOOK AND TECHNIQUE HANDLING — CRITICAL
+The downstream agents (data_engineer, ml_engineer) are senior engineers who reason about method selection given data context. Your runbooks must give them freedom to reason.
+
+Strategy techniques are ADVISORY HYPOTHESES. You MUST abstract them into objectives:
+- If strategy says "LightGBM with learning_rate=0.05, num_leaves=31": write "Train a competitive gradient boosting model optimized for the primary metric."
+- If strategy says "RepeatedStratifiedKFold(n_splits=5, n_repeats=2)": write "Use repeated stratified CV with sufficient folds for stable estimates."
+- If strategy says "median imputation fitted on training folds": write "Handle missing values appropriately, fitting only on training data to prevent leakage."
+- If strategy says "IsotonicRegression on OOF predictions": write "Calibrate predicted probabilities using out-of-fold estimates."
+
+What to KEEP verbatim: hard constraints (leakage columns to exclude, submission row count, output format, monotonicity requirements).
+What to ABSTRACT: model families, hyperparameters, CV configurations, imputation methods, calibration techniques, specific library names.
+
+A runbook that reads like a recipe (step 1 do X, step 2 do Y with parameter Z) is WRONG. A runbook that states objectives and constraints, trusting the agent to reason about implementation, is CORRECT.
 
 OUTPUT
 - Return ONLY the semantic_core JSON object.
@@ -420,6 +431,12 @@ Your main job is materializing the execution layer that semantic_core does not p
 - optimization_policy operational fields (ONLY when model_training=true)
 - agent_interfaces (ONLY when a thin additive hint is genuinely needed beyond top-level contract)
 
+ARTIFACT REQUIREMENTS — MANDATORY FIELDS
+When scope includes cleaning (cleaning_only or full_pipeline):
+- artifact_requirements.cleaned_dataset MUST include output_manifest_path (e.g., "artifacts/clean/cleaning_manifest.json"). The manifest is read by downstream reviewers and QA to verify cleaning provenance.
+- required_outputs MUST include a cleaning_manifest artifact with intent "cleaning_manifest" pointing to the same path.
+Omitting the manifest path causes downstream validation failures because the system cannot resolve the cleaning provenance chain.
+
 DOWNSTREAM CONSUMERS — who reads what and why
 Understanding who consumes each section prevents orphan fields and ensures closure:
 
@@ -446,7 +463,9 @@ RUNBOOK PRINCIPLES
 Runbooks state OBJECTIVES and CONSTRAINTS, not implementation recipes.
 - BAD: "Apply median imputation to all features." GOOD: "Handle missing values appropriately per column distribution."
 - BAD: "Use RepeatedStratifiedKFold(n_splits=5, n_repeats=2)." GOOD: "Use repeated stratified CV with sufficient folds for stable estimates."
+- BAD: "Use LightGBM with learning_rate=0.05, num_leaves=31" (copied from strategy). GOOD: "Train a competitive gradient boosting model, optimizing hyperparameters for the primary metric."
 Hard constraints (leakage prevention, output format, required columns) MUST be explicit. Soft preferences disguised as requirements reduce the agent's ability to reason.
+CRITICAL: Strategy techniques in semantic_core are advisory hypotheses. Do NOT transcribe them as prescriptive steps. Abstract into objectives and let the downstream agent reason about implementation.
 
 GATE PRINCIPLES
 - HARD: failure means corrupt, unsafe, or silently wrong output.
@@ -1309,6 +1328,157 @@ def _build_transport_validation(payload: Any) -> Dict[str, Any]:
         "issues": issues,
         "summary": {"error_count": error_count, "warning_count": warning_count, "phase": "transport"},
     }
+
+
+def _looks_like_legacy_execution_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict) or not payload:
+        return False
+    candidate = payload.get("contract") if isinstance(payload.get("contract"), dict) else payload
+    if not isinstance(candidate, dict) or not candidate:
+        return False
+    legacy_keys = {
+        "feature_engineering_plan",
+        "feature_engineering_tasks",
+        "artifact_requirements",
+        "evaluation_spec",
+        "objective_analysis",
+        "validation_requirements",
+        "preprocessing_requirements",
+        "leakage_execution_plan",
+        "data_analysis",
+        "iteration_policy",
+        "ml_engineer_runbook",
+        "data_engineer_runbook",
+        "column_roles",
+        "required_outputs",
+        "qa_gates",
+        "reviewer_gates",
+    }
+    return any(key in candidate for key in legacy_keys)
+
+
+def _payload_needs_required_key_lift(payload: Any, required_keys: List[str]) -> bool:
+    if not isinstance(payload, dict) or not _looks_like_legacy_execution_payload(payload):
+        return False
+    candidate = payload.get("contract") if isinstance(payload.get("contract"), dict) else payload
+    if not isinstance(candidate, dict):
+        return False
+    canonical_marker_keys = (
+        "scope",
+        "active_workstreams",
+        "task_semantics",
+        "allowed_feature_sets",
+        "column_roles",
+    )
+    canonical_marker_count = sum(
+        1 for key in canonical_marker_keys if _is_meaningful_contract_value(candidate.get(key))
+    )
+    if canonical_marker_count >= 4 and _is_meaningful_contract_value(candidate.get("contract_version")):
+        return False
+    return any(not _is_meaningful_contract_value(candidate.get(key)) for key in required_keys)
+
+
+def _merge_contract_scaffold_with_payload(scaffold: Any, payload: Any) -> Any:
+    if isinstance(scaffold, dict) and isinstance(payload, dict):
+        merged = copy.deepcopy(scaffold)
+        for key, payload_value in payload.items():
+            if key in merged:
+                merged[key] = _merge_contract_scaffold_with_payload(merged.get(key), payload_value)
+                continue
+            merged[key] = copy.deepcopy(payload_value)
+        return merged
+    if isinstance(scaffold, list) and isinstance(payload, list):
+        return copy.deepcopy(payload) if _is_meaningful_contract_value(payload) else copy.deepcopy(scaffold)
+    return copy.deepcopy(payload) if _is_meaningful_contract_value(payload) else copy.deepcopy(scaffold)
+
+
+def _normalize_legacy_execution_payload(
+    payload: Dict[str, Any] | None,
+    *,
+    strategy: Dict[str, Any] | None,
+    column_inventory: List[str] | None,
+    relevant_columns: List[str] | None,
+    data_profile: Dict[str, Any] | None,
+    business_objective_hint: str = "",
+    base_contract: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    candidate = payload.get("contract") if isinstance(payload, dict) and isinstance(payload.get("contract"), dict) else payload
+    if not isinstance(candidate, dict) or not candidate or not _looks_like_legacy_execution_payload(candidate):
+        return None
+
+    scaffold = copy.deepcopy(base_contract) if isinstance(base_contract, dict) and base_contract else None
+    if not isinstance(scaffold, dict) or not scaffold:
+        scaffold = build_contract_min(
+            candidate,
+            strategy,
+            column_inventory,
+            relevant_columns,
+            target_candidates=None,
+            data_profile=data_profile,
+            business_objective_hint=business_objective_hint,
+        )
+    if not isinstance(scaffold, dict) or not scaffold:
+        return None
+
+    merged = _merge_contract_scaffold_with_payload(scaffold, candidate)
+    merged = _sync_execution_contract_outputs(merged, scaffold)
+    merged = _apply_planner_structural_support(merged)
+
+    allowed_sets = merged.get("allowed_feature_sets")
+    if not isinstance(merged.get("model_features"), list):
+        merged["model_features"] = []
+    if not merged.get("model_features") and isinstance(allowed_sets, dict):
+        model_features_raw = allowed_sets.get("model_features")
+        if isinstance(model_features_raw, list):
+            merged["model_features"] = [str(col).strip() for col in model_features_raw if str(col).strip()]
+
+    contract_version = merged.get("contract_version")
+    if contract_version is None:
+        merged["contract_version"] = CONTRACT_VERSION_V41
+
+    return merged
+
+
+def _synthesize_semantic_core_from_contract_candidate(contract_candidate: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    if not isinstance(contract_candidate, dict) or not contract_candidate:
+        return None
+    candidate = _apply_planner_structural_support(copy.deepcopy(contract_candidate))
+    if not isinstance(candidate, dict) or not candidate:
+        return None
+
+    allowed_sets = candidate.get("allowed_feature_sets") if isinstance(candidate.get("allowed_feature_sets"), dict) else {}
+    model_features = candidate.get("model_features")
+    if (not isinstance(model_features, list) or not model_features) and isinstance(allowed_sets.get("model_features"), list):
+        model_features = [str(col).strip() for col in allowed_sets.get("model_features") if str(col).strip()]
+
+    defaults: Dict[str, Any] = {
+        "scope": str(candidate.get("scope") or "cleaning_only"),
+        "strategy_title": str(candidate.get("strategy_title") or "Execution Plan"),
+        "business_objective": str(candidate.get("business_objective") or ""),
+        "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
+        "canonical_columns": [],
+        "required_outputs": [],
+        "column_roles": {},
+        "allowed_feature_sets": {},
+        "task_semantics": {},
+        "active_workstreams": {},
+        "model_features": model_features if isinstance(model_features, list) else [],
+        "cleaning_gates": [],
+        "qa_gates": [],
+        "reviewer_gates": [],
+        "data_engineer_runbook": {},
+        "optimization_policy": normalize_optimization_policy(candidate.get("optimization_policy")),
+    }
+
+    semantic_core: Dict[str, Any] = {}
+    for key in EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS:
+        value = copy.deepcopy(candidate.get(key))
+        if key == "model_features":
+            value = copy.deepcopy(model_features) if isinstance(model_features, list) else value
+        if not _is_meaningful_contract_value(value):
+            value = copy.deepcopy(defaults.get(key))
+        semantic_core[key] = value
+    return semantic_core
 
 
 def _build_semantic_core_transport_validation(payload: Any) -> Dict[str, Any]:
@@ -2279,6 +2449,80 @@ def _sync_execution_contract_outputs(contract: Dict[str, Any], contract_min: Dic
         merged_outputs.append(path)
     if merged_outputs:
         contract["required_outputs"] = merged_outputs
+
+    return contract
+
+
+def _repair_deliverable_invariants(contract: Dict[str, Any], errors: List[Dict[str, Any]] | None) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+
+    artifacts = contract.get("required_output_artifacts")
+    if not isinstance(artifacts, list):
+        artifacts = []
+        contract["required_output_artifacts"] = artifacts
+
+    required_outputs = contract.get("required_outputs")
+    if not isinstance(required_outputs, list):
+        required_outputs = []
+        contract["required_outputs"] = required_outputs
+
+    default_paths = {
+        "dataset": "data/cleaned_data.csv",
+        "metrics": "data/metrics.json",
+        "predictions": "data/predictions.csv",
+        "submission": "data/submission.csv",
+        "report": "reports/report.json",
+    }
+
+    for err in errors or []:
+        if not isinstance(err, dict):
+            continue
+        expected_kind_raw = str(err.get("expected_kind") or "").strip()
+        expected_owner = str(err.get("expected_owner") or "").strip()
+        if not expected_kind_raw or not expected_owner:
+            continue
+
+        candidate_kinds = [token.strip() for token in expected_kind_raw.split("|") if token.strip()]
+        if not candidate_kinds:
+            continue
+
+        promoted = False
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            if artifact.get("kind") not in candidate_kinds or str(artifact.get("owner") or "").strip() != expected_owner:
+                continue
+            if artifact.get("required"):
+                continue
+            artifact["required"] = True
+            artifact_path = str(artifact.get("path") or "").strip()
+            if artifact_path and artifact_path not in required_outputs:
+                required_outputs.append(artifact_path)
+            promoted = True
+            break
+
+        if promoted:
+            continue
+
+        chosen_kind = candidate_kinds[0]
+        default_path = default_paths.get(chosen_kind, f"data/{chosen_kind}.csv")
+        artifacts.append(
+            {
+                "id": f"auto_{chosen_kind}",
+                "path": default_path,
+                "required": True,
+                "kind": chosen_kind,
+                "description": f"Auto-generated to satisfy {err.get('invariant', 'unknown')} invariant.",
+                "owner": expected_owner,
+            }
+        )
+        if default_path not in required_outputs:
+            required_outputs.append(default_path)
+
+    spec = contract.get("spec_extraction")
+    if isinstance(spec, dict):
+        spec["deliverables"] = artifacts
 
     return contract
 
@@ -3780,6 +4024,7 @@ def _collect_strategy_feature_family_hints(strategy_dict: Dict[str, Any]) -> Lis
 def _expand_strategy_feature_families(
     strategy_dict: Dict[str, Any],
     inventory: List[str],
+    data_profile: Dict[str, Any] | None = None,
 ) -> List[str]:
     """
     Expand strategist feature-family hints into concrete columns from inventory.
@@ -3865,11 +4110,40 @@ def _expand_strategy_feature_families(
             out.append(token)
         return list(dict.fromkeys(out))
 
+    # Build numeric column set from data_profile for all_numeric_except support
+    _numeric_type_tokens = {"float64", "float32", "int64", "int32", "int16", "int8", "numeric", "float", "int"}
+    _profile_dtypes: Dict[str, str] = {}
+    if isinstance(data_profile, dict):
+        _raw_dtypes = data_profile.get("dtypes")
+        if isinstance(_raw_dtypes, dict):
+            _profile_dtypes = {str(k): str(v).lower() for k, v in _raw_dtypes.items()}
+    _numeric_inventory_cols: set[str] = set()
+    for _col in inventory:
+        _dtype = _profile_dtypes.get(_col, "")
+        if any(tok in _dtype for tok in _numeric_type_tokens):
+            _numeric_inventory_cols.add(_col)
+
     def _parse_hint(hint: str) -> List[str]:
         text = str(hint or "").strip()
         if not text:
             return []
         cols: List[str] = []
+
+        # all_numeric_except / all_columns_except: "all_numeric_except excluding col1, col2, ..."
+        _all_except_match = re.match(
+            r"all_(numeric|columns?)_?except\b[:\s]*(.*)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if _all_except_match:
+            _mode = _all_except_match.group(1).lower()
+            _except_text = _all_except_match.group(2)
+            # Strip leading "excluding" or "except"
+            _except_text = re.sub(r"^\s*(excluding|except)\s*", "", _except_text, flags=re.IGNORECASE)
+            _except_names = {s.strip() for s in _except_text.split(",") if s.strip()}
+            _base = _numeric_inventory_cols if "numeric" in _mode else inventory_set
+            cols.extend(col for col in inventory if col in _base and col not in _except_names)
+            return list(dict.fromkeys(cols))
 
         # prefix:pixel
         prefix_match = re.search(r"prefix\s*:\s*([A-Za-z_][A-Za-z0-9_]*)", text, flags=re.IGNORECASE)
@@ -3898,13 +4172,31 @@ def _expand_strategy_feature_families(
                     cols.extend(_match_numeric_range(p1, int(s1), int(s2)))
 
         # Explicit regex-like pattern hints: pattern 'pixel[0-9]+'
+        # Check both quoted patterns and the raw text for regex metacharacters.
+        _regex_meta_chars = {"[", "]", "(", ")", "^", "$", "+", "*", "\\", "|"}
         quoted_patterns = re.findall(r"['\"]([^'\"]+)['\"]", text)
         for candidate in quoted_patterns:
-            if any(ch in candidate for ch in ("[", "]", "(", ")", "^", "$", "+", "*", "\\", "|")):
+            if any(ch in candidate for ch in _regex_meta_chars):
                 regex_candidate = candidate
-                # Normalize naive ranges like [0-783] into \d+ (common LLM shorthand)
                 regex_candidate = re.sub(r"\[\d+\s*-\s*\d+\]", r"\\d+", regex_candidate)
                 cols.extend(_match_regex(rf"^{regex_candidate}$"))
+
+        # Unquoted regex: if the hint itself looks like a regex (starts with ^
+        # or contains |, grouping, etc.) and no matches yet, try it directly.
+        if not cols and any(ch in text for ch in _regex_meta_chars):
+            # Avoid false positives: only if it looks like a standalone pattern
+            # (no commas suggesting CSV, no long prose)
+            _stripped = text.strip()
+            if "," not in _stripped and len(_stripped) < 100:
+                cols.extend(_match_regex(_stripped))
+
+        # CSV-style comma-separated column names: "col_a, col_b, col_c"
+        if not cols and "," in text:
+            _csv_parts = [p.strip() for p in text.split(",") if p.strip()]
+            # Accept as CSV if most parts are exact inventory matches
+            _csv_matched = [p for p in _csv_parts if p in inventory_set]
+            if len(_csv_matched) >= len(_csv_parts) * 0.5:
+                cols.extend(_csv_matched)
 
         # Fallback family token prefix match
         if not cols:
@@ -3938,6 +4230,7 @@ def select_relevant_columns(
     column_inventory: List[str] | None,
     data_profile_summary: str | None = None,
     constant_anchor_avoidance: List[str] | None = None,
+    data_profile: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Deterministically select a compact set of relevant columns for planning.
@@ -4006,7 +4299,7 @@ def select_relevant_columns(
     decision_cols: List[str] = []
     outcome_cols: List[str] = []
     audit_only_cols: List[str] = []
-    family_cols_expanded = _expand_strategy_feature_families(strategy_dict, inventory)
+    family_cols_expanded = _expand_strategy_feature_families(strategy_dict, inventory, data_profile=data_profile)
 
     for col in required_cols_raw:
         _add_source(_resolve_inventory(col), "strategy_required_columns", required_cols)
@@ -6258,6 +6551,7 @@ def build_contract_min(
                 enriched_required_columns.append(resolved)
     else:
         future_target_columns = []
+        future_ml_handoff = contract.get("future_ml_handoff")
         if isinstance(future_ml_handoff, dict):
             target_cols = future_ml_handoff.get("target_columns")
             if isinstance(target_cols, list):
@@ -7970,6 +8264,13 @@ class ExecutionPlannerAgent:
                 if model and model not in chain:
                     chain.append(model)
         self.model_chain = chain
+        self._default_model_chain = list(chain)
+        # Optional separate model for Task B (compilation).
+        # Falls back to the primary model when not set.
+        _compiler_model_raw = (
+            os.getenv("EXECUTION_PLANNER_COMPILER_MODEL", "").strip()
+        )
+        self.compiler_model_name: str | None = _compiler_model_raw or None
         self.last_prompt = None
         self.last_response = None
         self.last_contract_diagnostics = None
@@ -8701,18 +9002,14 @@ class ExecutionPlannerAgent:
             column_inventory=column_inventory or [],
             data_profile_summary=data_summary_str,
             constant_anchor_avoidance=constant_anchor_avoidance,
+            data_profile=data_profile,
         )
         relevant_columns = relevant_payload.get("relevant_columns", [])
         relevant_sources = relevant_payload.get("relevant_sources", {})
         omitted_columns_policy = relevant_payload.get("omitted_columns_policy", "")
-        relevant_columns_total_count = int(relevant_payload.get("relevant_columns_total_count") or len(relevant_columns))
-        relevant_columns_truncated = bool(relevant_payload.get("relevant_columns_truncated"))
-        relevant_columns_omitted_count = int(relevant_payload.get("relevant_columns_omitted_count") or 0)
-        relevant_columns_compact = relevant_payload.get("relevant_columns_compact", {})
-        strategy_feature_family_hints = relevant_payload.get("strategy_feature_family_hints", [])
-        strategy_feature_family_expanded_count = int(
-            relevant_payload.get("strategy_feature_family_expanded_count") or 0
-        )
+        # NOTE: relevant_columns_compact, strategy_feature_family_hints,
+        # relevant_columns_total_count, etc. were removed — no longer injected
+        # into user_input or compiler_support_context after context cleanup.
 
         planner_dir = None
         if run_id:
@@ -10020,7 +10317,7 @@ class ExecutionPlannerAgent:
             }
         else:
             column_inventory_payload = column_inventory_sample if inventory_truncated else (column_inventory or [])
-        column_inventory_compact = compact_column_representation(column_inventory or [], max_display=40)
+        # column_inventory_compact removed — no longer in compiler_support_context
         strategy_feature_families = []
         if isinstance(strategy, dict):
             families_candidate = strategy.get("feature_families")
@@ -10070,69 +10367,22 @@ class ExecutionPlannerAgent:
             dtypes_candidate = data_profile.get("dtypes")
             if isinstance(dtypes_candidate, dict):
                 compiler_dtypes = dtypes_candidate
+        # ── Task B support context: lean reinforcement for compiler ──
+        # Only what the compiler needs beyond the semantic_core.
+        # Meta-policies (source_of_truth, precedence, operational_targets,
+        # agent_interface_policy) are already in the prompt or enforced by
+        # the closing checklist — no need to repeat in the context payload.
         compiler_support_context_payload = {
             "business_objective": business_objective,
             "strategy_compilation_reinforcement": compiler_strategy_context,
-            "relevant_columns_compact": relevant_columns_compact,
-            "column_inventory_compact": column_inventory_compact,
             "column_manifest": {
                 "mode": manifest_mode or "none",
                 "anchors": manifest_for_prompt.get("anchors", []) if isinstance(manifest_for_prompt, dict) else [],
                 "families": manifest_for_prompt.get("families", []) if isinstance(manifest_for_prompt, dict) else [],
             },
-            "strategy_feature_family_hints": strategy_feature_family_hints,
             "data_profile_summary": compiler_data_summary,
             "observed_dtype_hints": compiler_dtypes,
             "output_dialect": output_dialect or "unknown",
-            "env_constraints": env_constraints or {"forbid_inplace_column_creation": True},
-            "contract_source_of_truth_policy": CONTRACT_SOURCE_OF_TRUTH_POLICY_V1,
-            "support_context_precedence": {
-                "role": "reinforcement_only",
-                "semantic_core_wins_on_conflict": True,
-                "ignore_heuristic_target_candidates_when_semantic_core_declares_primary_target": True,
-            },
-            "compiler_operational_targets": {
-                "must_materialize": [
-                    "artifact_requirements.cleaned_dataset",
-                    "artifact_requirements.enriched_dataset_when_required",
-                    "column_dtype_targets",
-                    "iteration_policy",
-                    "gate_object_shapes",
-                    "evaluation_spec_when_model_training_true",
-                    "validation_requirements_when_model_training_true",
-                ],
-                "must_not_reinterpret": [
-                    "scope",
-                    "active_workstreams",
-                    "future_ml_handoff",
-                    "task_semantics",
-                    "column_roles",
-                    "allowed_feature_sets",
-                    "model_features",
-                ],
-            },
-            "agent_interface_policy": {
-                "mode": "optional_thin_deltas",
-                "top_level_contract_is_primary_source_for_views": True,
-                "avoid_shadow_contracts_inside_interfaces": True,
-                "good_interface_examples": [
-                    "focus",
-                    "review_emphasis",
-                    "handoff_notes",
-                    "owned_deliverable_notes",
-                ],
-                "avoid_repeating_top_level_sections": [
-                    "required_outputs",
-                    "artifact_requirements",
-                    "cleaning_gates",
-                    "qa_gates",
-                    "reviewer_gates",
-                    "column_dtype_targets",
-                    "full_column_lists",
-                ],
-                "translator_results_advisor_policy": "lightweight_only",
-                "failure_explainer_policy": "exclude_from_contract",
-            },
             "domain_expert_critique": critique_for_prompt or "None",
         }
         compiler_support_context = json.dumps(
@@ -10140,6 +10390,8 @@ class ExecutionPlannerAgent:
             indent=2,
             ensure_ascii=False,
         )
+        # ── Task A user_input: lean context for semantic reasoning ──
+        # Single authoritative source per concept. No redundant column views.
         user_input = f"""
 strategy:
 {strategy_json}
@@ -10147,120 +10399,23 @@ strategy:
 business_objective:
 {business_objective}
 
-relevant_columns:
-{json.dumps(relevant_columns, indent=2)}
-
-relevant_columns_total_count:
-{relevant_columns_total_count}
-
-relevant_columns_truncated:
-{json.dumps(relevant_columns_truncated)}
-
-relevant_columns_omitted_count:
-{relevant_columns_omitted_count}
-
-relevant_columns_compact:
-{json.dumps(relevant_columns_compact, indent=2)}
-
-relevant_sources:
-{json.dumps(relevant_sources, indent=2)}
-
-omitted_columns_policy:
-{omitted_columns_policy}
-
-column_inventory_count:
-{column_inventory_count}
-
-column_inventory_sample:
-{json.dumps(column_inventory_sample, indent=2)}
-
-column_inventory_truncated:
-{json.dumps(inventory_truncated)}
-
-column_inventory:
+column_inventory ({column_inventory_count} columns):
 {json.dumps(column_inventory_payload, indent=2)}
-
-column_inventory_compact:
-{json.dumps(column_inventory_compact, indent=2)}
 
 column_manifest:
 {json.dumps(manifest_for_prompt, indent=2)}
 
-column_manifest_mode:
-{json.dumps(manifest_mode or "none")}
-
-column_manifest_family_count:
-{len(manifest_families)}
-
 column_sets:
 {json.dumps(column_sets_payload, indent=2)}
-
-column_sets_summary:
-{column_sets_summary}
-
-strategy_feature_families:
-{json.dumps(strategy_feature_families, indent=2)}
-
-strategy_feature_family_hints:
-{json.dumps(strategy_feature_family_hints, indent=2)}
-
-strategy_feature_family_expanded_count:
-{strategy_feature_family_expanded_count}
-
-data_profile_summary:
-{data_summary_for_prompt}
-
-target_candidates:
-{json.dumps(target_candidates, indent=2)}
-
-resolved_target:
-{json.dumps(resolved_target)}
-
-column_inventory_path:
-{json.dumps("data/column_inventory.json")}
-
-column_sets_path:
-{json.dumps("data/column_sets.json")}
-
-required_columns_path:
-{json.dumps("data/required_columns.json")}
 
 output_dialect:
 {json.dumps(output_dialect or "unknown")}
 
-env_constraints:
-{json.dumps(env_constraints or {"forbid_inplace_column_creation": True})}
+resolved_target:
+{json.dumps(resolved_target)}
 
-contract_source_of_truth_policy:
-{json.dumps(CONTRACT_SOURCE_OF_TRUTH_POLICY_V1, indent=2)}
-
-downstream_consumer_interface:
-{json.dumps(DOWNSTREAM_CONSUMER_INTERFACE_V1, indent=2)}
-
-evidence_policy:
-{json.dumps(CONTRACT_EVIDENCE_POLICY_V1, indent=2)}
-
-planner_semantic_resolution_policy:
-{json.dumps(PLANNER_SEMANTIC_RESOLUTION_POLICY_V1, indent=2)}
-
-phased_contract_compilation_protocol:
-{json.dumps(PHASED_CONTRACT_COMPILATION_PROTOCOL_V1, indent=2)}
-
-contract_consistency_guardrails:
-{json.dumps({
-    "required_columns_must_be_non_droppable": True,
-    "if_selector_drop_policy_active_required_and_passthrough_must_not_overlap_selectors": True,
-    "if_selector_drop_policy_active_hard_gates_must_not_depend_on_selector_covered_columns": True,
-}, indent=2)}
-
-potential_constant_anchor_avoidance:
-{json.dumps(potential_constant_anchor_avoidance, indent=2)}
-
-potential_constant_anchor_avoidance_source:
-{json.dumps(potential_constant_anchor_avoidance_source)}
-
-potential_constant_anchor_avoidance_confidence:
-{json.dumps(potential_constant_anchor_avoidance_confidence)}
+data_profile_summary:
+{data_summary_for_prompt}
 
 domain_expert_critique:
 {critique_for_prompt or "None"}
@@ -10319,10 +10474,19 @@ domain_expert_critique:
         # persist the failure and abort so we can improve reasoning quality instead
         # of hiding it behind retries.
         active_model_chain = model_chain[:1]
+        explicit_chain_override = list(model_chain) != list(getattr(self, "_default_model_chain", [self.model_name]))
+        # Task B (compilation) can use a separate model optimized for
+        # instruction-following and JSON output via EXECUTION_PLANNER_COMPILER_MODEL.
+        compiler_model_chain = (
+            [self.compiler_model_name]
+            if self.compiler_model_name and not explicit_chain_override
+            else active_model_chain
+        )
 
         contract: Dict[str, Any] | None = None
         llm_success = False
         semantic_success = False
+        legacy_contract_seed_for_compile: Dict[str, Any] | None = None
         best_candidate: Dict[str, Any] | None = None
         best_canonical_candidate: Dict[str, Any] | None = None
         best_validation: Dict[str, Any] | None = None
@@ -10416,17 +10580,56 @@ domain_expert_critique:
                 if parsed_payload is not None and not isinstance(parsed_payload, dict):
                     parse_error = ValueError("Parsed semantic_core JSON is not an object")
                 elif not _transport_validation_accepted(semantic_validation):
-                    transport_issue = None
-                    issues = semantic_validation.get("issues")
-                    if isinstance(issues, list):
-                        for issue in issues:
-                            if isinstance(issue, dict) and issue.get("rule"):
-                                transport_issue = str(issue.get("rule"))
-                                break
-                    parse_error = ValueError(
-                        f"Semantic core invalid: {transport_issue or 'missing_or_trivial_semantic_core'}"
-                    )
-                    parsed_semantic = None
+                    lifted_legacy_contract = None
+                    if _payload_needs_required_key_lift(
+                        parsed_payload,
+                        EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS,
+                    ):
+                        lifted_legacy_contract = _normalize_legacy_execution_payload(
+                            parsed_payload,
+                            strategy=strategy,
+                            column_inventory=column_inventory,
+                            relevant_columns=relevant_columns,
+                            data_profile=data_profile,
+                            business_objective_hint=business_objective or "",
+                        )
+                    if isinstance(lifted_legacy_contract, dict) and lifted_legacy_contract:
+                        synthetic_semantic_core = _synthesize_semantic_core_from_contract_candidate(
+                            lifted_legacy_contract
+                        )
+                        if isinstance(synthetic_semantic_core, dict) and synthetic_semantic_core:
+                            parsed_semantic = synthetic_semantic_core
+                            semantic_validation = {
+                                "status": "ok",
+                                "accepted": True,
+                                "issues": [
+                                    {
+                                        "severity": "warning",
+                                        "rule": "semantic_core.legacy_payload_lift",
+                                        "message": "Legacy/partial planner payload was lifted into a synthetic semantic_core for one-shot compatibility.",
+                                    }
+                                ],
+                                "summary": {"error_count": 0, "warning_count": 1, "phase": "semantic_transport"},
+                            }
+                            last_semantic_transport_validation = semantic_validation
+                            legacy_contract_seed_for_compile = copy.deepcopy(lifted_legacy_contract)
+                            parse_error = None
+                        else:
+                            parsed_semantic = None
+                    else:
+                        parsed_semantic = None
+                    if parsed_semantic is None:
+                        transport_issue = None
+                        issues = semantic_validation.get("issues")
+                        if isinstance(issues, list):
+                            for issue in issues:
+                                if isinstance(issue, dict) and issue.get("rule"):
+                                    transport_issue = str(issue.get("rule"))
+                                    break
+                        parse_error = ValueError(
+                            f"Semantic core invalid: {transport_issue or 'missing_or_trivial_semantic_core'}"
+                        )
+                        parsed_semantic = None
 
                 planner_diag.append(
                     {
@@ -10491,7 +10694,7 @@ domain_expert_critique:
         if contract is None and semantic_success:
             for quality_round in range(1, max_quality_rounds + 1):
                 round_has_candidate = False
-                for model_idx, model_name in enumerate(active_model_chain, start=1):
+                for model_idx, model_name in enumerate(compiler_model_chain, start=1):
                     attempt_counter += 1
                     self.last_prompt = current_prompt
                     response_text = ""
@@ -10504,7 +10707,7 @@ domain_expert_critique:
                     validation_result: Dict[str, Any] | None = None
                     quality_accepted = False
 
-                    if len(active_model_chain) > 1:
+                    if len(compiler_model_chain) > 1:
                         response_name = f"response_attempt_{quality_round}_m{model_idx}.txt"
                     else:
                         response_name = f"response_attempt_{quality_round}.txt"
@@ -10595,20 +10798,65 @@ domain_expert_critique:
                         elif parsed is None and parse_error is None:
                             parse_error = ValueError("Parsed planner payload is missing a contract object")
                         elif not _transport_validation_accepted(transport_validation_result):
-                            transport_issue = None
-                            issues = transport_validation_result.get("issues")
-                            if isinstance(issues, list):
-                                for issue in issues:
-                                    if isinstance(issue, dict) and issue.get("rule"):
-                                        transport_issue = str(issue.get("rule"))
-                                        break
-                            parse_error = ValueError(
-                                f"Transport payload invalid: {transport_issue or 'empty_or_trivial_contract'}"
-                            )
-                            parsed = None
+                            lifted_candidate = None
+                            if _payload_needs_required_key_lift(
+                                parsed_payload,
+                                [key for key in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS if key != "contract_version"],
+                            ):
+                                lifted_candidate = _normalize_legacy_execution_payload(
+                                    parsed_payload,
+                                    strategy=strategy,
+                                    column_inventory=column_inventory,
+                                    relevant_columns=relevant_columns,
+                                    data_profile=data_profile,
+                                    business_objective_hint=business_objective or "",
+                                    base_contract=legacy_contract_seed_for_compile,
+                                )
+                            if isinstance(lifted_candidate, dict) and lifted_candidate:
+                                parsed = lifted_candidate
+                                transport_validation_result = {
+                                    "status": "ok",
+                                    "accepted": True,
+                                    "issues": [
+                                        {
+                                            "severity": "warning",
+                                            "rule": "contract.legacy_payload_lift",
+                                            "message": "Legacy/partial compiler payload was lifted into a canonical contract candidate before validation.",
+                                        }
+                                    ],
+                                    "summary": {"error_count": 0, "warning_count": 1, "phase": "transport"},
+                                }
+                                parse_error = None
+                            else:
+                                transport_issue = None
+                                issues = transport_validation_result.get("issues")
+                                if isinstance(issues, list):
+                                    for issue in issues:
+                                        if isinstance(issue, dict) and issue.get("rule"):
+                                            transport_issue = str(issue.get("rule"))
+                                            break
+                                parse_error = ValueError(
+                                    f"Transport payload invalid: {transport_issue or 'empty_or_trivial_contract'}"
+                                )
+                                parsed = None
 
                     quality_error_message = None
                     if parsed is not None and isinstance(parsed, dict):
+                        if _payload_needs_required_key_lift(
+                            parsed,
+                            [key for key in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS if key != "contract_version"],
+                        ):
+                            lifted_candidate = _normalize_legacy_execution_payload(
+                                parsed,
+                                strategy=strategy,
+                                column_inventory=column_inventory,
+                                relevant_columns=relevant_columns,
+                                data_profile=data_profile,
+                                business_objective_hint=business_objective or "",
+                                base_contract=legacy_contract_seed_for_compile,
+                            )
+                            if isinstance(lifted_candidate, dict) and lifted_candidate:
+                                parsed = lifted_candidate
                         round_has_candidate = True
                         planner_contract_canonical = copy.deepcopy(parsed)
                         candidate_for_validation = copy.deepcopy(parsed)
