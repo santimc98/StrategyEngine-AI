@@ -1687,13 +1687,15 @@ if data_path is not None:
 # Pipeline steps definition (for visual tracker)
 # ---------------------------------------------------------------------------
 PIPELINE_STEPS = [
-    ("steward",        "Auditor",      "&#128270;"),
-    ("strategist",     "Estratega",    "&#129504;"),
-    ("domain_expert",  "Experto",      "&#127942;"),
-    ("data_engineer",  "Ing. Datos",   "&#128295;"),
-    ("engineer",       "Ing. ML",      "&#9881;"),
-    ("evaluate_results","Revisor",     "&#128269;"),
-    ("translator",     "Informe",      "&#128202;"),
+    ("steward",            "Auditor",      "&#128270;"),
+    ("strategist",         "Estratega",    "&#129504;"),
+    ("domain_expert",      "Experto",      "&#127942;"),
+    ("execution_planner",  "Planner",      "&#128220;"),
+    ("data_engineer",      "Ing. Datos",   "&#128295;"),
+    ("engineer",           "Ing. ML",      "&#9881;"),
+    ("evaluate_results",   "Revisor",      "&#128269;"),
+    ("review_board",       "Calidad",      "&#9989;"),
+    ("translator",         "Informe",      "&#128202;"),
 ]
 
 def _render_pipeline(completed_steps: set, active_step: str | None = None, iter_info: str = ""):

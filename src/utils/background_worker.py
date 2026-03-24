@@ -40,12 +40,14 @@ from src.utils.sandbox_provider import (
 
 # Progress weight per step (cumulative %)
 _STEP_PROGRESS = {
-    "steward": 12,
-    "strategist": 22,
-    "domain_expert": 34,
+    "steward": 10,
+    "strategist": 18,
+    "domain_expert": 28,
+    "execution_planner": 38,
     "data_engineer": 48,
     "engineer": 60,
-    "evaluate_results": 82,
+    "evaluate_results": 78,
+    "review_board": 82,
     "translator": 94,
     "generate_pdf": 100,
 }
@@ -54,9 +56,11 @@ _STAGE_NAMES = {
     "steward": "Auditando datos",
     "strategist": "Generando estrategias",
     "domain_expert": "Deliberacion experta",
+    "execution_planner": "Planificando ejecucion",
     "data_engineer": "Limpieza de datos",
     "engineer": "Entrenando modelo ML",
     "evaluate_results": "Evaluando resultados",
+    "review_board": "Revisando calidad",
     "translator": "Generando reporte",
     None: "Completado",
 }
@@ -220,7 +224,32 @@ def main(run_id: str) -> None:
                         append_log(run_id, "Domain Expert", f"  {title} -- {score}/10", "info")
                 sel_title = selected.get("title", "N/A") if isinstance(selected, dict) else "N/A"
                 append_log(run_id, "Domain Expert", f"Estrategia ganadora: {sel_title}", "ok")
+                append_log(run_id, "Execution Planner", "Generando contrato de ejecucion...", "info")
+
+            elif "execution_planner" in event:
+                completed_steps.add("execution_planner")
+                active_step = "data_engineer"
+                current_progress = _STEP_PROGRESS["execution_planner"]
+                contract = final_state.get("execution_contract", {})
+                scope = contract.get("scope", "unknown") if isinstance(contract, dict) else "unknown"
+                workstreams = []
+                if isinstance(contract, dict):
+                    ws = contract.get("active_workstreams", {})
+                    if isinstance(ws, dict):
+                        workstreams = [k for k, v in ws.items() if v]
+                ws_str = ", ".join(workstreams) if workstreams else scope
+                append_log(run_id, "Execution Planner", f"Contrato generado -- scope: {scope}, workstreams: {ws_str}", "ok")
                 append_log(run_id, "Data Engineer", "Ejecutando script de limpieza y estandarizacion...", "info")
+
+            elif "cleaning_reviewer" in event:
+                cr_verdict = final_state.get("cleaning_review_verdict", "")
+                if not cr_verdict:
+                    cr_data = final_state.get("cleaning_review", {})
+                    if isinstance(cr_data, dict):
+                        cr_verdict = cr_data.get("status", "")
+                if cr_verdict:
+                    level = "ok" if "APPROVED" in str(cr_verdict).upper() else "warn"
+                    append_log(run_id, "Cleaning Reviewer", f"Revision de limpieza: {cr_verdict}", level)
 
             elif "data_engineer" in event:
                 completed_steps.add("data_engineer")
@@ -296,10 +325,48 @@ def main(run_id: str) -> None:
                 else:
                     completed_steps.add("engineer")
                     completed_steps.add("evaluate_results")
-                    active_step = "translator"
+                    active_step = "review_board"
                     current_progress = _STEP_PROGRESS["evaluate_results"]
                     metric_str = f" -- {best_metric_name}: {current_metric_value}" if current_metric_value else ""
                     append_log(run_id, "Reviewer", f"Resultados aprobados{metric_str}.", "ok")
+                    append_log(run_id, "Review Board", "Evaluando calidad global del pipeline...", "info")
+
+            elif "review_board" in event:
+                completed_steps.add("review_board")
+                rb_data = final_state.get("review_board_verdict") or final_state.get("review_board_result", {})
+                rb_verdict = ""
+                rb_summary = ""
+                if isinstance(rb_data, dict):
+                    rb_verdict = rb_data.get("final_review_verdict", rb_data.get("status", ""))
+                    rb_summary = rb_data.get("summary", "")
+                elif isinstance(rb_data, str):
+                    rb_verdict = rb_data
+                # Check if metric improvement loop activates
+                needs_metric_loop = rb_verdict == "NEEDS_IMPROVEMENT" or (
+                    isinstance(rb_data, dict) and rb_data.get("status") == "NEEDS_IMPROVEMENT"
+                )
+                if needs_metric_loop and ml_iteration < ml_max_iterations:
+                    active_step = "engineer"
+                    ml_iteration += 1
+                    current_progress = _STEP_PROGRESS["data_engineer"] + int(
+                        (_STEP_PROGRESS["evaluate_results"] - _STEP_PROGRESS["data_engineer"])
+                        * min(ml_iteration / ml_max_iterations, 1.0)
+                    )
+                    reason = ""
+                    if isinstance(rb_data, dict):
+                        actions = rb_data.get("required_actions", [])
+                        if actions and isinstance(actions[0], str):
+                            reason = actions[0][:150]
+                    append_log(run_id, "Review Board", f"Mejora necesaria: {reason or rb_verdict}", "warn")
+                    append_log(run_id, "ML Engineer", f"Loop de mejora activado -- Iteracion {ml_iteration}/{ml_max_iterations}...", "info")
+                else:
+                    active_step = "translator"
+                    current_progress = _STEP_PROGRESS["review_board"]
+                    level = "ok" if "APPROVE" in str(rb_verdict).upper() else "warn"
+                    if rb_summary and len(rb_summary) > 200:
+                        rb_summary = rb_summary[:200] + "..."
+                    msg = f"Veredicto: {rb_verdict}" + (f" -- {rb_summary}" if rb_summary else "")
+                    append_log(run_id, "Review Board", msg, level)
                     append_log(run_id, "Translator", "Generando informe ejecutivo...", "info")
 
             elif "retry_handler" in event:
