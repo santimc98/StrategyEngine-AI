@@ -26,7 +26,7 @@ Thumbs.db
 # Claude Code local settings
 .claude/
 
-# Runtime artifacts
+# ── Runtime artifacts ──────────────────────────────────────────────
 artifacts/
 catboost_info/
 static/plots/*.png
@@ -37,100 +37,39 @@ analysis/
 diff.patch
 run_bundle.zip
 runs/
-# Temporary exception for validation analysis
-!runs/ddc6cb05/
-!runs/ddc6cb05/**
-
-
-
-# Local datasets and generated data workspace
-/data/
-
-# Data artifacts (keep raw fixtures and other CSVs)
-data/cleaned_data.csv
-data/cleaned_full.csv
-data/cleaning_manifest.json
-data/column_mapping_summary.json
-data/execution_contract.json
-data/evaluation_spec.json
-data/integrity_audit_report.json
-data/output_contract_report.json
-data/postmortem_decision.json
-data/leakage_audit.json
-data/steward_llm_trace.json
-data/steward_summary.txt
-data/steward_summary.json
-data/feature_integrity_report.json
-data/weights.json
-data/metrics.json
-data/case_summary.csv
-data/scored_rows.csv
-data/alignment_check.json
-data/run_summary.json
-data/governance_report.json
-data/data_adequacy_report.json
-data/dataset_memory.json
-data/artifact_index.json
-data/dataset_profile.json
-data/executive_summary.md
-data/insights.json
-data/plot_insights.json
-data/report_artifact_manifest.json
-data/report_visual_tables.json
-data/plan.json
-data/qa_static_facts.json
-data/translator_quality_check.json
-data/strategy_spec.json
-data/contract_min.json
-data/run_facts_pack.json
-run_facts_pack.json
-
-# Contract views (generated)
-data/contracts/
-# local artifacts
-/data/case_alignment_report.json
-/tatic/
-models/
-plots/
-reports/
-
-# Run-produced artifact indexes
-data/produced_artifact_index.json
-
-# Run bundles
 run_*.zip
-runs/archive/run_*.zip
-
-claude_plans/
-
-# Large Kaggle datasets (>100MB)
-data/combined_porto_seguros.csv
-data/combined_digit_recognizer.csv
-data/combined_mercari.csv
-data/combined_*.csv
-
-data/ml_plan.json
-data/data_profile.json
-
-# Work directory (runtime artifacts)
+run_facts_pack.json
 work/
 
-# Local analysis notes
+# ── Data workspace (all generated at runtime) ─────────────────────
+/data/
+
+# ── Development / internal docs ───────────────────────────────────
+diffs/
+diffs_updates/
+scripts/
+notebooks/
+bulletproof_tests/
+tools/
+tatic/
+claude_plans/
+test_strategist_output.json
+ARCHITECTURE.md
+SYSTEM_HARDENING_CHECKLIST.md
+PRODUCT_ROADMAP.md
+
+# ── Local analysis notes ──────────────────────────────────────────
 Solución_csvs_ancho.md
 Solucion_csvs_ancho.md
 auditoria_*.md
 
-# Kaggle submissions
+# ── Kaggle submissions ────────────────────────────────────────────
 kaggle_submission/
 
-# Local WiDS 2026 prep workspace
-tools/wids_2026_prep/input/*
-!tools/wids_2026_prep/input/.gitkeep
-tools/wids_2026_prep/output/*
-!tools/wids_2026_prep/output/.gitkeep
-
-# Product roadmap (internal only)
-PRODUCT_ROADMAP.md
+# ── Models / plots / reports (runtime output) ─────────────────────
+models/
+plots/
+reports/
 
 # Encrypted API keys store (never commit)
 data/api_keys.enc

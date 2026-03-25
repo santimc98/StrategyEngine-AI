@@ -1,7 +1,0 @@
-id_cliente,ventas_mensuales,llamadas_soporte,cancelado,tipo_contrato
-1,50.5,2,0,mensual
-2,120.0,0,0,anual
-3,45.0,15,1,mensual
-4,60.0,1,0,anual
-5,30.0,8,1,mensual
-6,200.0,0,0,anual
