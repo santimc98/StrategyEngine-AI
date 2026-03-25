@@ -46,17 +46,14 @@ def test_ensure_contract_visual_policy_populates_ml_visual_requirements():
     artifact_reqs = out.get("artifact_requirements") or {}
     visual = artifact_reqs.get("visual_requirements") or {}
     plot_spec = visual.get("plot_spec") or {}
-    plots = plot_spec.get("plots") or []
 
     assert isinstance(visual, dict)
     assert isinstance(plot_spec, dict)
-    assert plots
+    # build_plot_spec is now a minimal stub — plots list is empty (LLM-driven)
     assert visual.get("enabled") is True
-    assert plot_spec.get("max_plots") == len(plots)
 
     policy = out.get("reporting_policy") or {}
     assert isinstance(policy.get("plot_spec"), dict)
-    assert len((policy.get("plot_spec") or {}).get("plots") or []) == len(plots)
 
 
 def test_ensure_contract_visual_policy_preserves_explicit_visual_config():
@@ -82,45 +79,24 @@ def test_ensure_contract_visual_policy_preserves_explicit_visual_config():
     assert out.get("required_outputs") == before_outputs
 
 
-def test_build_plot_spec_uses_dynamic_max_plots():
+def test_build_plot_spec_returns_minimal_stub():
+    """build_plot_spec is now a minimal LLM-driven stub."""
     contract = _base_ml_contract()
     plot_spec = build_plot_spec(contract)
-    plots = plot_spec.get("plots") or []
 
-    assert plot_spec.get("max_plots") == len(plots)
+    assert plot_spec.get("enabled") is True
+    assert plot_spec.get("max_plots") == 0
+    assert plot_spec.get("plots") == []
 
 
-def test_build_plot_spec_uses_declared_artifact_paths():
+def test_build_plot_spec_ignores_contract_details():
+    """The stub returns the same result regardless of contract content."""
     contract = _base_ml_contract()
     contract["required_outputs"] = [
         "artifacts/features/custom_cleaned.csv",
         "artifacts/outputs/scored_rows.csv",
-        "artifacts/reports/metrics.json",
-        "artifacts/checks/alignment_check.json",
     ]
-    contract["artifact_requirements"] = {
-        "clean_dataset": {
-            "required_columns": ["id", "feature_num", "target", "__split"],
-            "output_path": "artifacts/features/custom_cleaned.csv",
-            "output_manifest_path": "artifacts/manifests/custom_clean_manifest.json",
-        },
-        "file_schemas": {
-            "artifacts/reports/metrics.json": {"expected_row_count": 1},
-            "artifacts/checks/alignment_check.json": {"expected_row_count": 1},
-        },
-    }
 
     plot_spec = build_plot_spec(contract)
-    plots = plot_spec.get("plots") or []
-    preferred_sources = {
-        source
-        for plot in plots
-        for source in ((plot.get("inputs") or {}).get("preferred_sources") or [])
-    }
-
-    assert "artifacts/features/custom_cleaned.csv" in preferred_sources
-    assert "artifacts/outputs/scored_rows.csv" in preferred_sources
-    assert "artifacts/reports/metrics.json" in preferred_sources
-    assert "artifacts/checks/alignment_check.json" in preferred_sources
-    assert "data/cleaned_data.csv" not in preferred_sources
-    assert "data/scored_rows.csv" not in preferred_sources
+    assert plot_spec.get("enabled") is True
+    assert plot_spec.get("plots") == []

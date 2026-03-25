@@ -1315,6 +1315,32 @@ class DataEngineerAgent:
         - cleaning_gates_status: {gate_name: "PASSED"|"WARNING_.."|"FAILED_.."}
 
         ===================================================================
+        DIAGNOSTIC VISUALIZATIONS
+        ===================================================================
+        If the data_engineer_runbook requests EDA or diagnostic plots:
+        - Generate matplotlib/seaborn plots that help understand data quality and transformations.
+        - Save all plots as PNG files in static/plots/ directory (create it with os.makedirs("static/plots", exist_ok=True)).
+        - Use descriptive filenames (e.g., missing_values.png, distributions_before_after.png, correlation_matrix.png).
+        - Keep plots publication-quality: clear titles, axis labels, appropriate figure sizes.
+        - Print the paths of generated plots so they appear in the execution log.
+        - Common EDA plots: missing value heatmaps, numeric distributions, correlation matrices,
+          before/after cleaning comparisons, outlier analysis, categorical value counts.
+        - If runbook does NOT mention plots or visualizations, skip this section entirely.
+
+        PLOT SUMMARIES (required when generating any plot):
+        After generating plots, write a file static/plots/plot_summaries.json containing
+        an array of objects, one per plot. Each object must record the FACTS you already
+        computed — do NOT interpret or narrate, just log the data:
+        [
+          {
+            "filename": "missing_values.png",
+            "title": "Missing values by column",
+            "facts": ["col_X had 12.3% nulls (highest)", "col_Y had 0% nulls", "total nulls reduced from 8.1% to 0.2% after cleaning"]
+          }
+        ]
+        The downstream translator agent will use these facts to build the executive narrative.
+
+        ===================================================================
         AUTHORITATIVE CONTEXT
         ===================================================================
         Input: '$input_path'

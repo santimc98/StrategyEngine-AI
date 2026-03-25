@@ -87,7 +87,7 @@ When generating the contract, determine semantically whether the objective requi
 - resampling / cross-validation: Set resampling fields in validation_requirements.
 - decisioning / ranking / action output: Set decisioning_requirements with appropriate columns.
 - explanations / interpretability: Set explanation columns in scored_rows_schema.
-- visualizations: Set visual_requirements in artifact_requirements.
+- visualizations: Reason about which diagnostic plots best represent this strategy's results. Assign EDA plots to data_engineer_runbook and model result plots to ml_engineer_runbook. Add "static/plots/*.png" to required_outputs.
 Base your decisions on the MEANING of the business objective and strategy, not on the
 presence or absence of specific keywords. Set boolean flags and structured specs in the
 contract based on your semantic understanding of what the downstream agents will need.
@@ -451,6 +451,29 @@ Cleaning Reviewer reads: scope, task_semantics, strategy_title, business_objecti
 
 QA Reviewer reads: scope, task_semantics, qa_gates, artifact_requirements, model_features, allowed_feature_sets, column_roles, canonical_columns, decisioning_requirements.
 => The QA reviewer must verify ML outputs against gates and schema expectations.
+
+VISUALIZATION PLANNING
+Reason about what diagnostic visualizations would best represent the results of THIS specific strategy and assign them to the right agent:
+
+Data Engineer visualizations (EDA / data quality):
+- Only when scope includes cleaning or feature engineering.
+- Examples: missing value heatmaps, distribution plots before/after cleaning, correlation matrices, outlier analysis, feature distributions.
+- Add to data_engineer_runbook: describe what EDA plots to generate and save to static/plots/.
+
+ML Engineer visualizations (model results):
+- Only when model_training=true.
+- Examples: feature importance, CV fold performance, learning curves, prediction distributions, residual plots, confusion matrices, ROC/PR curves.
+- Add to ml_engineer_runbook: describe what model diagnostic plots to generate and save to static/plots/.
+
+Adapt to the problem type:
+- Regression: residuals, predicted vs actual, feature importance.
+- Classification: confusion matrix, ROC curve, feature importance, probability distribution.
+- Time series: forecast vs actual, temporal residuals, trend decomposition.
+- Anomaly detection: anomaly score distribution, flagged vs normal comparison.
+- Cleaning-only: EDA before/after, missing data overview, distribution changes.
+
+Each agent should save plots as PNG files in static/plots/ with descriptive names.
+Add "static/plots/*.png" to required_outputs so the translator can reference them.
 
 COMPILATION REASONING
 Before emitting JSON, reason through:
@@ -7628,341 +7651,13 @@ def build_reporting_policy(
 
 
 def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
-    contract = contract_full if isinstance(contract_full, dict) else {}
-    required_outputs = get_required_outputs(contract)
-    outputs_lower = [str(path).lower() for path in required_outputs if path]
-    cleaned_data_path = get_clean_dataset_output_path(contract)
-    scored_rows_path = (
-        get_declared_artifact_path(contract, "scored_rows.csv")
-        or get_declared_artifact_path(contract, kind="predictions")
-    )
-    metrics_path = (
-        get_declared_artifact_path(contract, "metrics.json", kind="metrics")
-        or get_declared_artifact_path(contract, kind="metrics")
-    )
-    weights_path = (
-        get_declared_artifact_path(contract, "weights.json", kind="weights")
-        or get_declared_artifact_path(contract, kind="weights")
-    )
-    alignment_path = (
-        get_declared_artifact_path(contract, "alignment_check.json")
-        or get_declared_artifact_path(contract, kind="alignment")
-    )
+    """Minimal fallback — returns an empty enabled spec.
 
-    def _has_output(token: str) -> bool:
-        return any(token in path for path in outputs_lower)
-
-    def _dedupe(values: List[str]) -> List[str]:
-        seen = set()
-        out: List[str] = []
-        for item in values:
-            if not item:
-                continue
-            key = str(item)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(key)
-        return out
-
-    def _sample(values: List[str], limit: int) -> List[str]:
-        return _dedupe([str(v) for v in values if v])[:limit]
-
-    def _sources(*values: str) -> List[str]:
-        return _dedupe([str(v) for v in values if v])
-
-    def _safe_column_name(name: str) -> str:
-        if not name:
-            return ""
-        return re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
-
-    def _has_token(name: str, tokens: List[str]) -> bool:
-        if not name:
-            return False
-        normalized = re.sub(r"[^0-9a-zA-Z]+", " ", str(name).lower())
-        return any(tok in normalized.split() for tok in tokens)
-
-    def _infer_objective_type() -> str:
-        eval_spec = contract.get("evaluation_spec") if isinstance(contract, dict) else None
-        if isinstance(eval_spec, dict) and eval_spec.get("objective_type"):
-            return str(eval_spec.get("objective_type"))
-        plan = contract.get("execution_plan") if isinstance(contract, dict) else None
-        if isinstance(plan, dict) and plan.get("objective_type"):
-            return str(plan.get("objective_type"))
-        obj_analysis = contract.get("objective_analysis") if isinstance(contract, dict) else None
-        if isinstance(obj_analysis, dict) and obj_analysis.get("problem_type"):
-            return str(obj_analysis.get("problem_type"))
-        return "unknown"
-
-    objective_type = _infer_objective_type().lower()
-    capabilities = resolve_problem_capabilities_from_contract(
-        contract,
-        objective_text=str(contract.get("business_objective") or ""),
-    )
-
-    is_ranking = is_problem_family(capabilities, "ranking")
-    is_forecast = is_problem_family(capabilities, "forecasting")
-    is_segmentation = is_problem_family(capabilities, "clustering")
-    is_classification = is_problem_family(capabilities, "classification")
-    is_regression = is_problem_family(capabilities, "regression")
-    is_survival = is_problem_family(capabilities, "survival_analysis")
-
-    canonical_columns = get_canonical_columns(contract)
-    canonical_set = set(canonical_columns)
-
-    def _filter_to_canonical(values: List[str]) -> List[str]:
-        if not canonical_set:
-            return [str(v) for v in values if v]
-        return [str(v) for v in values if v in canonical_set]
-
-    roles = get_column_roles(contract)
-    pre_decision = _filter_to_canonical(_coerce_list(roles.get("pre_decision")))
-    decision_cols = _filter_to_canonical(_coerce_list(roles.get("decision")))
-    outcome_cols = _filter_to_canonical(_coerce_list(roles.get("outcome")))
-    audit_only = _filter_to_canonical(
-        _coerce_list(roles.get("post_decision_audit_only") or roles.get("audit_only"))
-    )
-
-    allowed_sets = contract.get("allowed_feature_sets")
-    if not isinstance(allowed_sets, dict):
-        allowed_sets = {}
-    model_features = _filter_to_canonical(_coerce_list(allowed_sets.get("model_features")))
-    segmentation_features = _filter_to_canonical(_coerce_list(allowed_sets.get("segmentation_features")))
-
-    data_analysis = contract.get("data_analysis") if isinstance(contract, dict) else None
-    type_dist = data_analysis.get("type_distribution") if isinstance(data_analysis, dict) else None
-    numeric_cols = _filter_to_canonical(_coerce_list(type_dist.get("numeric"))) if isinstance(type_dist, dict) else []
-    datetime_cols = _filter_to_canonical(_coerce_list(type_dist.get("datetime"))) if isinstance(type_dist, dict) else []
-    categorical_cols = _filter_to_canonical(_coerce_list(type_dist.get("categorical"))) if isinstance(type_dist, dict) else []
-
-    if not datetime_cols:
-        time_tokens = ["date", "time", "timestamp", "period"]
-        datetime_cols = [col for col in canonical_columns if _has_token(col, time_tokens)]
-
-    derived_columns = get_derived_column_names(contract)
-    score_tokens = ["score", "pred", "prob", "prediction"]
-    pred_name_candidates = [col for col in derived_columns if _has_token(col, score_tokens)]
-
-    pred_candidates: List[str] = ["prediction"]
-    for outcome in outcome_cols[:3]:
-        safe = _safe_column_name(outcome)
-        if safe:
-            pred_candidates.extend([f"pred_{safe}", f"predicted_{safe}", f"pred_prob_{safe}"])
-    pred_candidates.extend(pred_name_candidates)
-    pred_candidates = _sample(pred_candidates, 12)
-
-    segment_tokens = ["segment", "segmentation", "cluster", "cohort", "group", "segmento", "cluster_id"]
-    segment_candidates = [col for col in derived_columns if _has_token(col, segment_tokens)]
-    if not segment_candidates:
-        segment_candidates = [col for col in canonical_columns if _has_token(col, segment_tokens)]
-    segment_candidates = _sample(segment_candidates, 8)
-
-    has_scored_rows = _has_output("scored_rows.csv")
-    has_metrics = _has_output("metrics.json")
-    has_alignment = _has_output("alignment_check.json") or _has_output("case_alignment")
-    has_weights = _has_output("weights.json")
-
-    plots: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
-
-    def _add_plot(
-        plot_id: str,
-        title: str,
-        goal: str,
-        plot_type: str,
-        preferred_sources: List[str],
-        required_any: List[str] | None = None,
-        required_all: List[str] | None = None,
-        optional_cols: List[str] | None = None,
-        compute: Dict[str, Any] | None = None,
-        caption_template: str | None = None,
-    ) -> None:
-        if not plot_id or plot_id in seen_ids:
-            return
-        seen_ids.add(plot_id)
-        plot = {
-            "plot_id": plot_id,
-            "title": title,
-            "goal": goal,
-            "type": plot_type,
-            "inputs": {
-                "preferred_sources": preferred_sources,
-                "required_columns_any_of": [required_any] if required_any else [],
-                "required_columns_all_of": required_all or [],
-                "optional_columns": optional_cols or [],
-            },
-            "compute": compute or {},
-            "caption_template": caption_template or "",
-        }
-        plots.append(plot)
-
-    if len(canonical_columns) >= 4 and cleaned_data_path:
-        _add_plot(
-            "missingness_overview",
-            "Missingness by column",
-            "Quantify missing data to focus cleaning and feature engineering.",
-            "bar",
-            _sources(cleaned_data_path),
-            optional_cols=_sample(canonical_columns, 24),
-            compute={"metric": "missing_fraction", "top_k": 20},
-            caption_template="Top missingness rates across columns (top {top_k}).",
-        )
-
-    if numeric_cols and cleaned_data_path:
-        _add_plot(
-            "numeric_distributions",
-            "Numeric feature distributions",
-            "Show the distribution of key numeric features.",
-            "histogram",
-            _sources(cleaned_data_path),
-            required_any=_sample(numeric_cols, 12),
-            optional_cols=_sample(numeric_cols, 12),
-            compute={"x": "AUTO_NUMERIC", "max_columns": min(6, len(numeric_cols))},
-            caption_template="Distributions for selected numeric features.",
-        )
-
-    if datetime_cols and (is_forecast or has_scored_rows) and _sources(cleaned_data_path, scored_rows_path):
-        _add_plot(
-            "trend_over_time",
-            "Trend over time",
-            "Highlight temporal trends for the primary target or prediction.",
-            "timeseries",
-            _sources(cleaned_data_path, scored_rows_path),
-            required_any=_sample(datetime_cols, 6),
-            optional_cols=_sample(datetime_cols, 6),
-            compute={"x": "AUTO_TIME", "y": "AUTO_TARGET_OR_NUMERIC"},
-            caption_template="Trend over time using available temporal columns.",
-        )
-
-    if has_scored_rows and pred_candidates and scored_rows_path:
-        _add_plot(
-            "score_distribution",
-            "Prediction/score distribution",
-            "Summarize the distribution of model outputs.",
-            "histogram",
-            _sources(scored_rows_path, cleaned_data_path),
-            required_any=pred_candidates,
-            compute={"x": "PREDICTION", "bins": 30},
-            caption_template="Distribution of predicted scores.",
-        )
-
-    if has_scored_rows and outcome_cols and (is_classification or is_ranking) and scored_rows_path:
-        _add_plot(
-            "topk_lift",
-            "Top-k outcome lift",
-            "Show outcome rate across score buckets.",
-            "bar",
-            _sources(scored_rows_path),
-            required_any=pred_candidates,
-            required_all=[outcome_cols[0]],
-            compute={"x": "PREDICTION", "y": outcome_cols[0], "group_by": "decile", "metric": "mean"},
-            caption_template="Outcome rate by score decile.",
-        )
-
-    if has_scored_rows and outcome_cols and is_regression and scored_rows_path:
-        _add_plot(
-            "residuals_scatter",
-            "Prediction vs actual",
-            "Assess residuals and bias in regression outputs.",
-            "scatter",
-            _sources(scored_rows_path),
-            required_any=pred_candidates,
-            required_all=[outcome_cols[0]],
-            compute={"x": "PREDICTION", "y": outcome_cols[0]},
-            caption_template="Predicted vs actual values.",
-        )
-
-    if has_scored_rows and outcome_cols and pred_candidates and is_survival and scored_rows_path:
-        _add_plot(
-            "survival_risk_vs_time",
-            "Risk vs event time",
-            "Contrast predicted risk against observed event time on labeled rows.",
-            "scatter",
-            _sources(scored_rows_path),
-            required_any=pred_candidates,
-            required_all=[outcome_cols[0]],
-            compute={"x": "PREDICTION", "y": outcome_cols[0], "color": "AUTO_EVENT"},
-            caption_template="Predicted survival risk versus observed event time.",
-        )
-
-    if has_weights or has_metrics:
-        _add_plot(
-            "feature_weights",
-            "Feature weights/importance",
-            "Highlight the strongest feature contributions or weights.",
-            "bar",
-            _sources(weights_path, metrics_path),
-            compute={"metric": "weights", "top_k": 20},
-            caption_template="Top contributing features (if weights available).",
-        )
-
-    if has_alignment and alignment_path:
-        _add_plot(
-            "alignment_check_summary",
-            "Alignment check summary",
-            "Visualize alignment requirements or validation outcomes.",
-            "bar",
-            _sources(alignment_path),
-            compute={"metric": "alignment_requirements", "top_k": 12},
-            caption_template="Alignment check results by requirement.",
-        )
-
-    if (is_segmentation or segmentation_features or segment_candidates) and _sources(scored_rows_path, cleaned_data_path):
-        _add_plot(
-            "segment_sizes",
-            "Segment distribution",
-            "Show sizes or performance by segment where available.",
-            "bar",
-            _sources(scored_rows_path, cleaned_data_path),
-            required_any=segment_candidates,
-            compute={"x": "SEGMENT_COLUMN", "metric": "count", "top_k": 20},
-            caption_template="Segment sizes based on available segment identifiers.",
-        )
-
-    trimmed_plots = plots
-    max_plots = len(trimmed_plots)
-
-    return {
-        "enabled": bool(trimmed_plots),
-        "max_plots": max_plots,
-        "plots": trimmed_plots,
-    }
-
-
-
-# _contains_visual_token removed (seniority refactoring): visual detection is now LLM-driven.
-
-
-def _map_plot_type(plot_type: str | None) -> str:
-    if not plot_type:
-        return "other"
-    normalized = str(plot_type).lower()
-    mapping = {
-        "histogram": "distribution",
-        "bar": "comparison",
-        "line": "timeseries",
-        "timeseries": "timeseries",
-        "scatter": "comparison",
-        "heatmap": "comparison",
-        "box": "distribution",
-        "pie": "comparison",
-        "area": "timeseries",
-    }
-    return mapping.get(normalized, "other")
-
-
-def _extract_columns_from_inputs(plot: Dict[str, Any]) -> List[str]:
-    inputs = plot.get("inputs") if isinstance(plot.get("inputs"), dict) else {}
-    columns: List[str] = []
-    for key in ("required_columns_any_of", "required_columns_all_of", "optional_columns"):
-        value = inputs.get(key)
-        if isinstance(value, list):
-            for entry in value:
-                if isinstance(entry, list):
-                    columns.extend([str(item) for item in entry if item])
-                elif entry:
-                    columns.append(str(entry))
-    return columns
+    Plot selection is now LLM-driven: the execution planner reasons about which
+    visualizations each agent should produce based on the strategy context.
+    This function only signals that visuals are structurally allowed.
+    """
+    return {"enabled": True, "max_plots": 0, "plots": []}
 
 
 def _build_visual_requirements(
@@ -7970,96 +7665,32 @@ def _build_visual_requirements(
     strategy: Dict[str, Any],
     business_objective: str,
 ) -> Dict[str, Any]:
-    vision_text = _normalize_text(
-        strategy.get("analysis_type"),
-        strategy.get("techniques"),
-        strategy.get("notes"),
-        strategy.get("description"),
-        strategy.get("objective_type"),
-        business_objective,
-        contract.get("business_objective"),
-        contract.get("strategy_title"),
-    )
-    # LLM-driven: visual requirements are now set by the LLM in the contract.
-    # Fallback heuristic: enable visuals if strategy/objective mention visualization concepts.
-    enabled = bool(vision_text and any(tok in vision_text.split() for tok in ("visual", "plot", "chart", "graph", "diagram", "figure")))
-    # Check if contract already has explicit visual config from LLM
-    existing_visual = contract.get("artifact_requirements", {}).get("visual_requirements") if isinstance(contract.get("artifact_requirements"), dict) else None
-    if isinstance(existing_visual, dict) and existing_visual.get("enabled"):
-        enabled = True
-    required = isinstance(existing_visual, dict) and bool(existing_visual.get("required"))
+    """Minimal visual requirements — LLM-driven visualization selection.
 
-    dataset_profile = (
-        contract.get("dataset_profile") if isinstance(contract.get("dataset_profile"), dict) else {}
+    The execution planner LLM now reasons about which plots each agent should
+    produce. This function only provides structural defaults and preserves
+    any explicit LLM-provided visual config from the contract.
+    """
+    existing_visual = (
+        contract.get("artifact_requirements", {}).get("visual_requirements")
+        if isinstance(contract.get("artifact_requirements"), dict)
+        else None
     )
-    row_count = 0
-    if dataset_profile:
-        for key in ("row_count", "rows", "estimated_rows"):
-            val = dataset_profile.get(key)
-            if isinstance(val, (int, float)) and val > 0:
-                row_count = int(val)
-                break
-    sampling_strategy = "random" if row_count > 50000 else "none"
-    max_rows_for_plot = 5000
-    if row_count and row_count < max_rows_for_plot:
-        max_rows_for_plot = max(row_count, 1000)
+    if isinstance(existing_visual, dict) and existing_visual:
+        return existing_visual
 
     outputs_dir = "static/plots"
     artifact_reqs = contract.get("artifact_requirements")
     if isinstance(artifact_reqs, dict):
         outputs_dir = artifact_reqs.get("visual_outputs_dir") or artifact_reqs.get("outputs_dir") or outputs_dir
 
-    plot_spec = build_plot_spec(contract) if enabled else {"enabled": False, "plots": [], "max_plots": 0}
-    plots = plot_spec.get("plots") if isinstance(plot_spec.get("plots"), list) else []
-    column_roles = get_column_roles(contract)
-    outcome_cols = [str(c) for c in (column_roles.get("outcome") or []) if c]
-    items: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for idx, plot in enumerate(plots):
-        if not isinstance(plot, dict):
-            continue
-        plot_id = str(plot.get("plot_id") or plot.get("id") or f"visual_{idx}")
-        safe_id = re.sub(r"[^0-9a-zA-Z]+", "_", plot_id).strip("_").lower() or f"visual_{idx}"
-        if safe_id in seen_ids:
-            safe_id = f"{safe_id}_{idx}"
-        seen_ids.add(safe_id)
-        goal = str(plot.get("goal") or plot.get("title") or "Visual insight")
-        inputs = plot.get("inputs") if isinstance(plot.get("inputs"), dict) else {}
-        preferred_sources = [str(src) for src in (inputs.get("preferred_sources") or []) if src]
-        columns_from_plot = _extract_columns_from_inputs(plot)
-        requires_target = any(col in outcome_cols for col in columns_from_plot)
-        requires_predictions = any("scored_rows.csv" in src for src in preferred_sources)
-        requires_segments = "segment" in safe_id or "segment" in goal.lower()
-        items.append(
-            {
-                "id": safe_id,
-                "purpose": goal,
-                "type": _map_plot_type(plot.get("type") or plot.get("plot_type")),
-                "inputs": {
-                    "requires_target": requires_target,
-                    "requires_predictions": requires_predictions,
-                    "requires_segments": requires_segments,
-                    "columns_hint": columns_from_plot[:6],
-                },
-                "constraints": {
-                    "max_rows_for_plot": max_rows_for_plot,
-                    "sampling_strategy": sampling_strategy,
-                },
-                "expected_filename": f"{safe_id}.png",
-            }
-        )
-    notes = (
-        "Visual requirements are contract-driven. If items are listed, produce each exactly and store status in data/visuals_status.json."
-        if items
-        else "Visual requirements are disabled for this strategy."
-    )
     return {
-        "enabled": enabled,
-        "required": required,
+        "enabled": True,
+        "required": False,
         "outputs_dir": outputs_dir,
-        "items": items,
-        "notes": notes,
-        "plot_spec": plot_spec,
+        "items": [],
+        "notes": "Visualization selection is LLM-driven. The execution planner specifies which plots each agent should generate.",
+        "plot_spec": build_plot_spec(contract),
     }
 
 
@@ -8068,14 +7699,10 @@ def _ensure_contract_visual_policy(
     strategy: Dict[str, Any] | None,
     business_objective: str | None,
 ) -> Dict[str, Any]:
-    """
-    Ensure ML-capable contracts expose visual requirements and plot spec through
-    canonical contract fields consumed by downstream views.
+    """Ensure contracts expose visual requirements through canonical fields.
 
-    Rules:
-    - Preserve explicit LLM-provided visual config when present.
-    - Fill missing pieces from contract/strategy context (no dataset hardcodes).
-    - Keep reporting_policy.plot_spec aligned with artifact_requirements.visual_requirements.plot_spec.
+    Preserves explicit LLM-provided visual config. Only fills structural
+    defaults when the LLM didn't specify visualization requirements.
     """
     if not isinstance(contract, dict):
         return contract
@@ -8085,117 +7712,16 @@ def _ensure_contract_visual_policy(
 
     strategy_payload = strategy if isinstance(strategy, dict) else {}
     objective_text = str(
-        business_objective
-        or contract.get("business_objective")
-        or ""
+        business_objective or contract.get("business_objective") or ""
     )
 
-    generated_visuals = _build_visual_requirements(contract, strategy_payload, objective_text)
-    auto_plot_spec = build_plot_spec(contract)
+    visual_reqs = _build_visual_requirements(contract, strategy_payload, objective_text)
+
     artifact_reqs = contract.get("artifact_requirements")
     if not isinstance(artifact_reqs, dict):
         artifact_reqs = {}
-    existing_visuals = artifact_reqs.get("visual_requirements")
-    has_explicit_visuals = isinstance(existing_visuals, dict) and bool(existing_visuals)
-    explicit_enabled = (
-        isinstance(existing_visuals, dict)
-        and isinstance(existing_visuals.get("enabled"), bool)
-    )
-    explicit_required = (
-        isinstance(existing_visuals, dict)
-        and isinstance(existing_visuals.get("required"), bool)
-    )
-
-    merged_visuals: Dict[str, Any] = dict(generated_visuals)
-    if isinstance(existing_visuals, dict):
-        for key in ("enabled", "required", "outputs_dir", "notes"):
-            if key in existing_visuals:
-                merged_visuals[key] = existing_visuals.get(key)
-        existing_items = existing_visuals.get("items")
-        if isinstance(existing_items, list) and existing_items:
-            merged_visuals["items"] = existing_items
-        existing_plot_spec = existing_visuals.get("plot_spec")
-        if isinstance(existing_plot_spec, dict) and existing_plot_spec:
-            merged_visuals["plot_spec"] = existing_plot_spec
-
-    plot_spec = merged_visuals.get("plot_spec")
-    if has_explicit_visuals:
-        if not isinstance(plot_spec, dict):
-            plot_spec = {}
-    else:
-        generated_plots = (
-            plot_spec.get("plots") if isinstance(plot_spec, dict) and isinstance(plot_spec.get("plots"), list) else []
-        )
-        if not generated_plots:
-            plot_spec = auto_plot_spec
-        elif not isinstance(plot_spec, dict) or not plot_spec:
-            plot_spec = auto_plot_spec
-    plots = plot_spec.get("plots") if isinstance(plot_spec.get("plots"), list) else []
-    normalized_plot_spec = dict(plot_spec)
-    normalized_plot_spec["enabled"] = bool(normalized_plot_spec.get("enabled", bool(plots)))
-    normalized_plot_spec["max_plots"] = int(normalized_plot_spec.get("max_plots", len(plots)))
-    merged_visuals["plot_spec"] = normalized_plot_spec
-
-    if not explicit_enabled:
-        merged_visuals["enabled"] = bool(plots)
-    if not explicit_required:
-        merged_visuals["required"] = bool(generated_visuals.get("required", False))
-    outputs_dir = merged_visuals.get("outputs_dir")
-    if not isinstance(outputs_dir, str) or not outputs_dir.strip():
-        merged_visuals["outputs_dir"] = "static/plots"
-    if not isinstance(merged_visuals.get("notes"), str):
-        merged_visuals["notes"] = str(generated_visuals.get("notes") or "")
-
-    items = merged_visuals.get("items")
-    if not isinstance(items, list) or not items:
-        merged_visuals["items"] = generated_visuals.get("items", []) if isinstance(generated_visuals.get("items"), list) else []
-        items = merged_visuals.get("items")
-
-    normalized_items: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for idx, item in enumerate(items if isinstance(items, list) else []):
-        if not isinstance(item, dict):
-            continue
-        plot_id = str(item.get("id") or item.get("plot_id") or f"visual_{idx}")
-        safe_id = re.sub(r"[^0-9a-zA-Z]+", "_", plot_id).strip("_").lower() or f"visual_{idx}"
-        if safe_id in seen_ids:
-            safe_id = f"{safe_id}_{idx}"
-        seen_ids.add(safe_id)
-        normalized = dict(item)
-        normalized["id"] = safe_id
-        expected_filename = normalized.get("expected_filename")
-        if not isinstance(expected_filename, str) or not expected_filename.strip():
-            normalized["expected_filename"] = f"{safe_id}.png"
-        normalized_items.append(normalized)
-    merged_visuals["items"] = normalized_items
-    if not isinstance(existing_visuals, dict) or "notes" not in existing_visuals:
-        if bool(merged_visuals.get("enabled")) and normalized_items:
-            merged_visuals["notes"] = (
-                "Visual requirements are contract-driven. If items are listed, produce each exactly and "
-                "store status in data/visuals_status.json."
-            )
-        else:
-            merged_visuals["notes"] = "Visual requirements are disabled for this strategy."
-
-    artifact_reqs["visual_requirements"] = merged_visuals
+    artifact_reqs["visual_requirements"] = visual_reqs
     contract["artifact_requirements"] = artifact_reqs
-
-    required_outputs = contract.get("required_outputs")
-    if not isinstance(required_outputs, list):
-        required_outputs = []
-    if bool(merged_visuals.get("required")) and normalized_items:
-        outputs_dir = str(merged_visuals.get("outputs_dir") or "static/plots")
-        for item in normalized_items:
-            expected = item.get("expected_filename")
-            if not expected:
-                continue
-            if os.path.isabs(str(expected)):
-                plot_path = str(expected)
-            else:
-                plot_path = os.path.normpath(os.path.join(outputs_dir, str(expected)))
-            if is_probably_path(plot_path) and plot_path not in required_outputs:
-                required_outputs.append(plot_path)
-    contract["required_outputs"] = required_outputs
 
     policy = contract.get("reporting_policy")
     if not isinstance(policy, dict):
@@ -8206,7 +7732,7 @@ def _ensure_contract_visual_policy(
             contract,
         )
     policy = dict(policy)
-    policy["plot_spec"] = merged_visuals.get("plot_spec")
+    policy["plot_spec"] = visual_reqs.get("plot_spec", {"enabled": True, "max_plots": 0, "plots": []})
     contract["reporting_policy"] = policy
     return contract
 

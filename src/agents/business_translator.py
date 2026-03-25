@@ -2321,9 +2321,6 @@ class BusinessTranslatorAgent:
             } if _canonical_metric_name and _canonical_metric_value is not None else None,
         }
 
-        # CSV previews (first rows of generated artifacts)
-        csv_previews_block = state.get("csv_previews") or ""
-
         context_appendix = {
             "reporting_policy": reporting_policy_context,
             "translator_view": translator_view_context,
@@ -2340,10 +2337,10 @@ class BusinessTranslatorAgent:
             "case_summary_context": case_summary_context,
             "scored_rows_context": scored_rows_context,
             "plot_insights_json": plot_insights,
+            "plot_summaries": state.get("plot_summaries") if isinstance(state.get("plot_summaries"), list) else None,
             "recommendations_preview": recommendations_preview,
             "run_timeline_context": run_timeline_context,
             "metric_loop_context": metric_loop_context if metric_loop_context else None,
-            "artifact_csv_previews": csv_previews_block if csv_previews_block else None,
         }
 
         # ── Pipeline scope awareness ─────────────────────────────────
@@ -2482,29 +2479,32 @@ For FULL_PIPELINE or ML_ONLY scope, the report must contain at minimum:
   2) What happened and key findings (## Hallazgos Clave)
   3) Visual analysis with charts (## Análisis Visual)
   4) Risks and limitations (## Riesgos)
-  5) Artifact previews — include CSV previews if available (## Artefactos Generados)
-  6) Recommended next actions (## Próximas Acciones)
-  7) Evidence trail (## Evidencia Usada)
+  5) Recommended next actions (## Próximas Acciones)
+  6) Evidence trail (## Evidencia Usada)
 
 For CLEANING_ONLY scope, adapt the report structure:
   1) Data quality assessment (## Evaluación de Calidad de Datos)
   2) Cleaning operations performed (## Operaciones de Limpieza)
   3) Visual analysis with charts (## Análisis Visual)
   4) Validation results and gate compliance (## Resultados de Validación)
-  5) Artifact previews — include CSV previews if available (## Artefactos Generados)
-  6) Risks and data limitations (## Riesgos y Limitaciones)
-  7) Recommendations for data usage (## Recomendaciones)
-  8) Evidence trail (## Evidencia Usada)
+  5) Risks and data limitations (## Riesgos y Limitaciones)
+  6) Recommendations for data usage (## Recomendaciones)
+  7) Evidence trail (## Evidencia Usada)
 
 CHARTS AND VISUALS:
-If plots are available in the visuals context, embed them in the "Análisis Visual"
-section using markdown image syntax: ![description](path/to/plot.png)
-Reference each chart with a 1-2 sentence interpretation of what it shows.
+The Data Engineer and ML Engineer generate diagnostic plots as part of their execution.
+These plots are saved in the static/plots/ directory and listed in plots_local context.
 
-ARTIFACT PREVIEWS:
-If artifact_csv_previews is present in the appendix, include them in the
-"Artefactos Generados" section. Show the HTML table directly — it contains
-the first rows of generated CSV files so the reader can inspect the output.
+If plot_summaries is present in the appendix, it contains factual data for each plot
+(filename, title, and key facts computed by the agent that generated it). Use these
+facts to write a substantive interpretation for each chart:
+- Embed the plot: ![title](static/plots/filename.png)
+- Below each plot, write 2-3 sentences explaining what the chart reveals and why it
+  matters for the business decision. Ground your interpretation in the facts provided.
+
+If plot_summaries is NOT present but plots exist in plots_local, embed them with
+a brief description based on the filename.
+If no plots were generated, omit the "Análisis Visual" section entirely.
 
 If the Outline Plan is non-empty, use it as a starting skeleton but adapt
 freely to improve clarity.

@@ -4341,10 +4341,35 @@ class MLEngineerAgent:
         - For wide datasets, prefer column selectors/column_sets when available.
 
         VISUALS AND DECISIONING
-        - Honor VISUAL_REQUIREMENTS_CONTEXT and PLOT_SPEC_CONTEXT.
-        - Generate requested plots/artifacts only when enabled or required by contract.
+        - If the ml_engineer_runbook requests diagnostic plots, generate them as matplotlib/seaborn PNGs.
+        - Save all plots in static/plots/ directory (create with os.makedirs("static/plots", exist_ok=True)).
+        - Use descriptive filenames (e.g., feature_importance.png, cv_folds.png, prediction_distribution.png).
+        - Keep plots publication-quality: clear titles, axis labels, appropriate figure sizes.
+        - Common ML plots: feature importance (horizontal bar), CV fold performance (bar with mean line),
+          prediction distributions (histogram), residuals (scatter), confusion matrices, ROC/PR curves.
+        - Print paths of generated plots so they appear in the execution log.
+        - Also honor VISUAL_REQUIREMENTS_CONTEXT and PLOT_SPEC_CONTEXT if provided.
         - Honor DECISIONING_REQUIREMENTS_CONTEXT for operational decision columns in scored outputs.
         - If a required visual/decision output cannot be produced, report it in alignment artifacts.
+
+        PLOT SUMMARIES (required when generating any plot):
+        After generating plots, write static/plots/plot_summaries.json containing an array
+        of objects, one per plot. Record the FACTS you already computed — do NOT interpret
+        or narrate, just log the raw data the downstream translator needs:
+        [
+          {
+            "filename": "feature_importance.png",
+            "title": "Top feature importances",
+            "facts": ["feature_A: 0.234 (rank 1)", "feature_B: 0.189 (rank 2)", "top 5 features account for 71% of total importance"]
+          },
+          {
+            "filename": "cv_folds.png",
+            "title": "Cross-validation fold performance",
+            "facts": ["5-fold CV MAE: mean=0.123, std=0.008", "fold 3 worst (0.135), fold 1 best (0.112)"]
+          }
+        ]
+        If a data_engineer already wrote plot_summaries.json, APPEND your entries — load
+        the existing array first, extend it, then write back.
 
         ARTIFACTS AND SERIALIZATION
         - Ensure output directories exist (data/ and static/plots/).
