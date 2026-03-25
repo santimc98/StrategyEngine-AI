@@ -48,10 +48,6 @@ class TestAgentImports:
         from src.agents.strategist import StrategistAgent
         assert StrategistAgent is not None
 
-    def test_import_domain_expert(self):
-        from src.agents.domain_expert import DomainExpertAgent
-        assert DomainExpertAgent is not None
-
     def test_import_model_analyst(self):
         from src.agents.model_analyst import ModelAnalystAgent
         assert ModelAnalystAgent is not None
@@ -121,11 +117,6 @@ class TestAgentInstantiation:
         agent = StrategistAgent(api_key=None)
         assert agent is not None
 
-    def test_instantiate_domain_expert(self):
-        from src.agents.domain_expert import DomainExpertAgent
-        agent = DomainExpertAgent(api_key=None)
-        assert agent is not None
-
     def test_instantiate_model_analyst(self):
         from src.agents.model_analyst import ModelAnalystAgent
         agent = ModelAnalystAgent(api_key=None)
@@ -188,7 +179,6 @@ class TestStdlibImportsPresent:
         "src/agents/cleaning_reviewer.py",
         "src/agents/steward.py",
         "src/agents/strategist.py",
-        "src/agents/domain_expert.py",
         "src/agents/model_analyst.py",
         "src/agents/results_advisor.py",
         "src/agents/review_board.py",

@@ -14779,7 +14779,12 @@ def run_strategist(state: AgentState) -> AgentState:
     column_manifest = state.get("column_manifest")
     if not isinstance(column_manifest, dict) or not column_manifest:
         column_manifest = _load_json_safe("data/column_manifest.json") or {}
-    compute_constraints = _collect_domain_expert_compute_constraints(state if isinstance(state, dict) else {})
+    compute_constraints: Dict[str, Any] = {"runtime_mode": _get_execution_runtime_mode()}
+    _heavy_cfg = _get_heavy_runner_config() or {}
+    if isinstance(_heavy_cfg, dict):
+        _timeout_sec = _heavy_cfg.get("script_timeout_seconds")
+        if isinstance(_timeout_sec, int) and _timeout_sec > 0:
+            compute_constraints["max_runtime_seconds"] = int(_timeout_sec)
     dataset_profile = state.get("profile") if isinstance(state.get("profile"), dict) else None
     if not dataset_profile and isinstance(state.get("dataset_profile"), dict):
         dataset_profile = state.get("dataset_profile")
@@ -15024,34 +15029,6 @@ _TECHNIQUE_PACKAGE_HINTS: Dict[str, List[str]] = {
     "kaplan": ["lifelines"],
     "shap": ["shap"],
 }
-
-
-def _collect_domain_expert_compute_constraints(state: Dict[str, Any]) -> Dict[str, Any]:
-    compute_constraints = {
-        "runtime_mode": _get_execution_runtime_mode(),
-    }
-    heavy_cfg = _get_heavy_runner_config() or {}
-    if isinstance(heavy_cfg, dict):
-        timeout_sec = heavy_cfg.get("script_timeout_seconds")
-        if isinstance(timeout_sec, int) and timeout_sec > 0:
-            compute_constraints["max_runtime_seconds"] = int(timeout_sec)
-    execution_profile = state.get("execution_profile_context")
-    if isinstance(execution_profile, dict):
-        for key in ("max_runtime_seconds", "max_memory_mb", "gpu_available", "cpu_cores"):
-            value = execution_profile.get(key)
-            if value is not None:
-                compute_constraints[key] = value
-    dataset_profile = state.get("profile") if isinstance(state.get("profile"), dict) else None
-    if not dataset_profile and isinstance(state.get("dataset_profile"), dict):
-        dataset_profile = state.get("dataset_profile")
-    if isinstance(dataset_profile, dict):
-        compute_hints = dataset_profile.get("compute_hints")
-        if isinstance(compute_hints, dict):
-            for key in ("estimated_memory_mb", "scale_category", "cross_validation_feasible", "deep_learning_feasible"):
-                value = compute_hints.get(key)
-                if value is not None:
-                    compute_constraints[key] = value
-    return compute_constraints
 
 
 def _required_packages_from_techniques(techniques: Any) -> List[str]:
