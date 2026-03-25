@@ -1689,7 +1689,6 @@ if data_path is not None:
 PIPELINE_STEPS = [
     ("steward",            "Auditor",      "&#128270;"),
     ("strategist",         "Estratega",    "&#129504;"),
-    ("domain_expert",      "Experto",      "&#127942;"),
     ("execution_planner",  "Planner",      "&#128220;"),
     ("data_engineer",      "Ing. Datos",   "&#128295;"),
     ("engineer",           "Ing. ML",      "&#9881;"),

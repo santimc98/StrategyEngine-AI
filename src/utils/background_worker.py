@@ -41,8 +41,7 @@ from src.utils.sandbox_provider import (
 # Progress weight per step (cumulative %)
 _STEP_PROGRESS = {
     "steward": 10,
-    "strategist": 18,
-    "domain_expert": 28,
+    "strategist": 22,
     "execution_planner": 38,
     "data_engineer": 48,
     "engineer": 60,
@@ -54,8 +53,7 @@ _STEP_PROGRESS = {
 
 _STAGE_NAMES = {
     "steward": "Auditando datos",
-    "strategist": "Generando estrategias",
-    "domain_expert": "Deliberacion experta",
+    "strategist": "Generando estrategia",
     "execution_planner": "Planificando ejecucion",
     "data_engineer": "Limpieza de datos",
     "engineer": "Entrenando modelo ML",
@@ -198,32 +196,11 @@ def main(run_id: str) -> None:
 
             elif "strategist" in event:
                 completed_steps.add("strategist")
-                active_step = "domain_expert"
+                active_step = "execution_planner"
                 current_progress = _STEP_PROGRESS["strategist"]
-                strategies = final_state.get("strategies", {})
-                if isinstance(strategies, dict) and "strategies" in strategies:
-                    strat_list = strategies["strategies"]
-                    titles = [s.get("title", "?") for s in strat_list[:3]]
-                    append_log(run_id, "Strategist", f"{len(strat_list)} estrategias generadas:", "ok")
-                    for i, t in enumerate(titles, 1):
-                        append_log(run_id, "Strategist", f"  {i}. {t}", "info")
-                else:
-                    append_log(run_id, "Strategist", "Estrategias generadas.", "ok")
-                append_log(run_id, "Domain Expert", "Evaluando y puntuando cada estrategia...", "info")
-
-            elif "domain_expert" in event:
-                completed_steps.add("domain_expert")
-                active_step = "data_engineer"
-                current_progress = _STEP_PROGRESS["domain_expert"]
                 selected = final_state.get("selected_strategy", {})
-                reviews = final_state.get("domain_expert_reviews", [])
-                if reviews:
-                    for rev in reviews:
-                        score = rev.get("score", "?")
-                        title = rev.get("title", "?")
-                        append_log(run_id, "Domain Expert", f"  {title} -- {score}/10", "info")
                 sel_title = selected.get("title", "N/A") if isinstance(selected, dict) else "N/A"
-                append_log(run_id, "Domain Expert", f"Estrategia ganadora: {sel_title}", "ok")
+                append_log(run_id, "Strategist", f"Estrategia seleccionada: {sel_title}", "ok")
                 append_log(run_id, "Execution Planner", "Generando contrato de ejecucion...", "info")
 
             elif "execution_planner" in event:

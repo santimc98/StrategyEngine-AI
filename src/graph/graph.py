@@ -248,7 +248,6 @@ from src.utils.text_encoding import (
     sanitize_text_payload_with_stats,
     mojibake_score,
 )
-from src.graph.steps.retry_policy import should_reselect_strategy_on_retry
 from src.graph.steps.handoff_utils import (
     extract_preflight_gate_failures,
     extract_preflight_gate_tail,
@@ -14140,12 +14139,10 @@ class AgentState(TypedDict):
     optimization_blueprint: Dict[str, Any]
     ml_optimization_context: Dict[str, Any]
 
-from src.agents.domain_expert import DomainExpertAgent
 
 # Initialize Agents
 steward = StewardAgent()
 strategist = StrategistAgent()
-domain_expert = DomainExpertAgent() # New Agent
 data_engineer = DataEngineerAgent()
 cleaning_reviewer = CleaningReviewerAgent()
 ml_engineer = MLEngineerAgent()
@@ -14266,7 +14263,6 @@ def run_steward(state: AgentState) -> AgentState:
     agent_models = {
         "steward": getattr(getattr(steward, "model", None), "model_name", None),
         "strategist": getattr(getattr(strategist, "model", None), "model_name", None) or getattr(strategist, "model_name", None),
-        "domain_expert": getattr(domain_expert, "model_name", None),
         "execution_planner": getattr(execution_planner, "model_name", None),
         "data_engineer": getattr(data_engineer, "model_name", None),
         "cleaning_reviewer": getattr(cleaning_reviewer, "model_name", None),
@@ -14888,265 +14884,24 @@ def run_strategist(state: AgentState) -> AgentState:
         except Exception as spec_err:
             print(f"Warning: failed to persist strategy_spec.json: {spec_err}")
 
+    # With single-strategy generation the strategist directly selects.
+    # No domain_expert scoring needed — the LLM already reasoned the best strategy.
+    best_strategy = strategies_list[0] if strategies_list else {}
+    print(f"\n🏆 Strategy: {best_strategy.get('title', 'N/A')}")
+
     return {
         "strategies": {"strategies": strategies_list},
+        "selected_strategy": best_strategy,
+        "selection_reason": "Single strategy — directly selected from senior Strategist reasoning.",
         "strategy_spec": strategy_spec,
         "column_validation": column_validation,
         "strategist_json_repair": strategist_json_repair,
         "strategist_diversity_validation": diversity_validation,
-    }
-
-def run_domain_expert(state: AgentState) -> AgentState:
-    print("--- [2.5] Domain Expert: Evaluating & Selecting Strategy ---")
-    abort_state = _abort_if_requested(state, "domain_expert")
-    if abort_state:
-        return abort_state
-
-    strategies_wrapper = state.get('strategies', {})
-    strategies_list = strategies_wrapper.get('strategies', [])
-    business_objective = state.get("business_objective", "")
-    if _minimal_agent_context_enabled():
-        data_summary = _build_senior_summary_context(state if isinstance(state, dict) else {})
-        context_pack = ""
-    else:
-        context_pack = build_context_pack("domain_expert", state if isinstance(state, dict) else {})
-        data_summary = state.get('data_summary', '')
-        data_summary = _prepend_dataset_semantics_summary(data_summary, state)
-        if context_pack:
-            data_summary = f"{context_pack}\n\n{data_summary}" if data_summary else context_pack
-
-    strategy_spec = state.get("strategy_spec")
-    if not isinstance(strategy_spec, dict):
-        strategy_spec = {}
-    column_validation = state.get("column_validation")
-    if not isinstance(column_validation, dict):
-        column_validation = {}
-    compute_constraints = {
-        "runtime_mode": _get_execution_runtime_mode(),
-    }
-    heavy_cfg = _get_heavy_runner_config() or {}
-    if isinstance(heavy_cfg, dict):
-        timeout_sec = heavy_cfg.get("script_timeout_seconds")
-        if isinstance(timeout_sec, int) and timeout_sec > 0:
-            compute_constraints["max_runtime_seconds"] = int(timeout_sec)
-    execution_profile = state.get("execution_profile_context")
-    if isinstance(execution_profile, dict):
-        for key in ("max_runtime_seconds", "max_memory_mb", "gpu_available", "cpu_cores"):
-            value = execution_profile.get(key)
-            if value is not None:
-                compute_constraints[key] = value
-
-    invalid_details_map: Dict[int, Dict[str, Any]] = {}
-    for item in (column_validation.get("invalid_details") or []):
-        if not isinstance(item, dict):
-            continue
-        try:
-            idx = int(item.get("strategy_index"))
-        except Exception:
-            continue
-        invalid_details_map[idx] = item
-    over_budget_map: Dict[int, Dict[str, Any]] = {}
-    for item in (column_validation.get("over_budget_details") or []):
-        if not isinstance(item, dict):
-            continue
-        try:
-            idx = int(item.get("strategy_index"))
-        except Exception:
-            continue
-        over_budget_map[idx] = item
-
-    enriched_strategies: List[Dict[str, Any]] = []
-    for idx, strat in enumerate(strategies_list):
-        if not isinstance(strat, dict):
-            continue
-        enriched = dict(strat)
-        enriched["_strategy_index"] = idx
-        enriched["_title"] = str(strat.get("title") or f"strategy_{idx}")
-        enriched["_meta"] = {
-            "column_validation": {
-                "invalid_count": len((invalid_details_map.get(idx) or {}).get("invalid_columns", [])),
-                "invalid_columns": (invalid_details_map.get(idx) or {}).get("invalid_columns", []),
-                "over_budget": idx in over_budget_map,
-                "max_required_columns": (over_budget_map.get(idx) or {}).get("max_required_columns"),
-                "required_count": (over_budget_map.get(idx) or {}).get("required_count")
-                or (invalid_details_map.get(idx) or {}).get("required_count"),
-            },
-            "strategy_spec": strategy_spec,
-            "compute_constraints": compute_constraints,
-        }
-        enriched_strategies.append(enriched)
-
-    # Deliberation Step — deterministic scoring (no LLM call)
-    evaluation = domain_expert.evaluate_deterministic(
-        data_summary,
-        business_objective,
-        enriched_strategies,
-        compute_constraints=compute_constraints,
-        dataset_memory_context=str(state.get("dataset_memory_context") or ""),
-    )
-    reviews = evaluation.get('reviews', [])
-    review_validation = evaluation.get("review_validation") if isinstance(evaluation, dict) else {}
-    if not isinstance(review_validation, dict):
-        review_validation = {}
-    run_id = state.get("run_id")
-    if run_id:
-        log_agent_snapshot(
-            run_id,
-            "domain_expert",
-            prompt=getattr(domain_expert, "last_prompt", None),
-            response=getattr(domain_expert, "last_response", None) or evaluation,
-            context={
-                "data_summary": data_summary,
-                "business_objective": business_objective,
-                "strategy_count": len(strategies_list) if isinstance(strategies_list, list) else 0,
-                "compute_constraints": compute_constraints,
-                "review_validation": review_validation,
-            },
-        )
-
-    # Selection Logic
-    best_strategy = None
-    best_score = -1.0
-    selection_reason = "Default Selection"
-    selection_validation: Dict[str, Any] = {}
-    candidate_ranking: List[Dict[str, Any]] = []
-
-    print("\n🧐 EXPERT DELIBERATION:")
-    normalized_reviews: List[Dict[str, Any]] = []
-    if isinstance(reviews, list):
-        normalized_reviews = [r for r in reviews if isinstance(r, dict)]
-    title_lookup = {}
-    for rev in normalized_reviews:
-        title = str(rev.get("title") or "").strip().lower()
-        if title:
-            title_lookup[title] = rev
-
-    for idx, strat in enumerate(strategies_list):
-        match = None
-        # Primary: positional index contract
-        if idx < len(normalized_reviews):
-            candidate = normalized_reviews[idx]
-            cand_idx = candidate.get("strategy_index")
-            try:
-                if cand_idx is None or int(cand_idx) == idx:
-                    match = candidate
-            except Exception:
-                pass
-        # Secondary: explicit strategy_index search
-        if match is None:
-            for candidate in normalized_reviews:
-                try:
-                    if int(candidate.get("strategy_index")) == idx:
-                        match = candidate
-                        break
-                except Exception:
-                    continue
-        # Tertiary: fuzzy title match
-        if match is None:
-            strat_title = str(strat.get("title") or "").strip().lower()
-            best_ratio = 0.0
-            best_candidate = None
-            for rev_title, candidate in title_lookup.items():
-                ratio = difflib.SequenceMatcher(None, rev_title, strat_title).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_candidate = candidate
-            if best_candidate is not None and best_ratio >= 0.70:
-                match = best_candidate
-
-        score = _safe_float(match.get('score'), 0.0) if isinstance(match, dict) else 0.0
-        selectable = bool(match.get("selectable", score >= 3.0)) if isinstance(match, dict) else False
-        exec_validation = _validate_selected_strategy_executability(
-            strat if isinstance(strat, dict) else {},
-            review=match if isinstance(match, dict) else None,
-            compute_constraints=compute_constraints if isinstance(compute_constraints, dict) else {},
-        )
-        candidate_ranking.append(
-            {
-                "strategy_index": idx,
-                "title": str(strat.get("title") or f"strategy_{idx}"),
-                "score": score,
-                "selectable": selectable,
-                "executable": bool(exec_validation.get("ok")),
-                "blockers": exec_validation.get("blockers") or [],
-                "warnings": exec_validation.get("warnings") or [],
-                "reasoning": str(match.get("reasoning") or "") if isinstance(match, dict) else "",
-            }
-        )
-
-        print(f"  • Strategy: {strat.get('title')} | Score: {score}/10")
-        if isinstance(match, dict):
-             critique = str(match.get("reasoning") or "")
-             print(f"    - Critique: {critique[:120]}...")
-             print(f"    - Selectable: {selectable}")
-        print(f"    - Executable: {bool(exec_validation.get('ok'))} | Blockers: {exec_validation.get('blockers') or []}")
-
-        if selectable and bool(exec_validation.get("ok")) and score > best_score:
-            best_score = score
-            best_strategy = strat
-            selection_reason = str(match.get('reasoning') or "Highest Score") if isinstance(match, dict) else "Highest Score"
-            selection_validation = exec_validation
-
-    # Fallback: choose best selectable candidate with minimum blockers.
-    if not best_strategy and strategies_list:
-        best_candidate = None
-        for candidate in candidate_ranking:
-            if not candidate.get("selectable"):
-                continue
-            if best_candidate is None:
-                best_candidate = candidate
-                continue
-            cand_blockers = len(candidate.get("blockers") or [])
-            best_blockers = len(best_candidate.get("blockers") or [])
-            if cand_blockers < best_blockers:
-                best_candidate = candidate
-                continue
-            if cand_blockers == best_blockers and _safe_float(candidate.get("score"), 0.0) > _safe_float(best_candidate.get("score"), 0.0):
-                best_candidate = candidate
-        if best_candidate is None and candidate_ranking:
-            best_candidate = max(candidate_ranking, key=lambda c: _safe_float(c.get("score"), 0.0))
-        if isinstance(best_candidate, dict):
-            try:
-                best_idx = int(best_candidate.get("strategy_index"))
-            except Exception:
-                best_idx = 0
-            best_idx = max(0, min(best_idx, len(strategies_list) - 1))
-            best_strategy = strategies_list[best_idx]
-            selection_reason = (
-                "Fallback selection applied due to executability constraints. "
-                f"Chosen strategy_index={best_idx} with blockers={best_candidate.get('blockers') or []}"
-            )
-            selection_validation = {
-                "ok": len(best_candidate.get("blockers") or []) == 0,
-                "blockers": best_candidate.get("blockers") or [],
-                "warnings": best_candidate.get("warnings") or [],
-            }
-        else:
-            best_strategy = strategies_list[0]
-            selection_reason = "Fallback: First strategy selected (no candidate ranking available)."
-            selection_validation = {"ok": False, "blockers": ["no_candidate_ranking"], "warnings": []}
-
-    if not isinstance(best_strategy, dict):
-        best_strategy = {}
-    print(f"\n🏆 WINNER: {best_strategy.get('title')} (Score: {best_score})")
-    print(f"   Reason: {selection_reason}\n")
-
-    ranked_candidates_sorted = sorted(
-        candidate_ranking,
-        key=lambda c: (
-            0 if bool(c.get("selectable")) else 1,
-            len(c.get("blockers") or []),
-            -_safe_float(c.get("score"), 0.0),
-        ),
-    )
-
-    return {
-        "selected_strategy": best_strategy,
-        "selection_reason": selection_reason,
-        "domain_expert_reviews": normalized_reviews,
-        "domain_expert_validation": review_validation,
-        "domain_expert_selection_validation": selection_validation,
-        "domain_expert_ranked_candidates": ranked_candidates_sorted,
+        # Preserve state keys for backward compatibility (no domain_expert node).
+        "domain_expert_reviews": [],
+        "domain_expert_validation": {},
+        "domain_expert_selection_validation": {"ok": True, "blockers": [], "warnings": []},
+        "domain_expert_ranked_candidates": [],
     }
 
 
@@ -23747,163 +23502,9 @@ def retry_handler(state: AgentState) -> AgentState:
     }
     route_reason = "policy_not_evaluated"
 
-    try:
-        state_dict = state if isinstance(state, dict) else {}
-        strategies_wrapper = state_dict.get("strategies") if isinstance(state_dict.get("strategies"), dict) else {}
-        strategies_list = strategies_wrapper.get("strategies") if isinstance(strategies_wrapper, dict) else []
-        selected = state_dict.get("selected_strategy") if isinstance(state_dict.get("selected_strategy"), dict) else None
-        can_reselect, reselect_reason = should_reselect_strategy_on_retry(
-            state_dict,
-            strategies_list if isinstance(strategies_list, list) else [],
-            selected if isinstance(selected, dict) else None,
-        )
-        route_reason = reselect_reason or "policy_default_engineer"
-
-        if can_reselect and isinstance(strategies_list, list) and len(strategies_list) > 1:
-            selected = selected if isinstance(selected, dict) else {}
-            selected_title = str(selected.get("title") or "").strip().lower()
-            selected_index = None
-            for idx, strat in enumerate(strategies_list):
-                if not isinstance(strat, dict):
-                    continue
-                if selected and strat is selected:
-                    selected_index = idx
-                    break
-                if selected_title and str(strat.get("title") or "").strip().lower() == selected_title:
-                    selected_index = idx
-                    break
-            if selected_index is None:
-                selected_index = 0
-
-            strategy_spec = state.get("strategy_spec") if isinstance(state.get("strategy_spec"), dict) else {}
-            column_validation = state.get("column_validation") if isinstance(state.get("column_validation"), dict) else {}
-            compute_constraints = _collect_domain_expert_compute_constraints(state if isinstance(state, dict) else {})
-
-            invalid_details_map: Dict[int, Dict[str, Any]] = {}
-            for item in (column_validation.get("invalid_details") or []):
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    idx = int(item.get("strategy_index"))
-                except Exception:
-                    continue
-                invalid_details_map[idx] = item
-            over_budget_map: Dict[int, Dict[str, Any]] = {}
-            for item in (column_validation.get("over_budget_details") or []):
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    idx = int(item.get("strategy_index"))
-                except Exception:
-                    continue
-                over_budget_map[idx] = item
-
-            alternatives: List[Dict[str, Any]] = []
-            for idx, strat in enumerate(strategies_list):
-                if idx == selected_index or not isinstance(strat, dict):
-                    continue
-                enriched = dict(strat)
-                enriched["_strategy_index"] = idx
-                enriched["_title"] = str(strat.get("title") or f"strategy_{idx}")
-                enriched["_meta"] = {
-                    "column_validation": {
-                        "invalid_count": len((invalid_details_map.get(idx) or {}).get("invalid_columns", [])),
-                        "invalid_columns": (invalid_details_map.get(idx) or {}).get("invalid_columns", []),
-                        "over_budget": idx in over_budget_map,
-                        "max_required_columns": (over_budget_map.get(idx) or {}).get("max_required_columns"),
-                        "required_count": (over_budget_map.get(idx) or {}).get("required_count")
-                        or (invalid_details_map.get(idx) or {}).get("required_count"),
-                    },
-                    "strategy_spec": strategy_spec,
-                    "compute_constraints": compute_constraints,
-                }
-                alternatives.append(enriched)
-
-            if alternatives:
-                data_summary = _build_senior_summary_context(state if isinstance(state, dict) else {})
-                business_objective = str(state.get("business_objective") or "")
-                failure_tail = str(state.get("execution_output") or "")[-2500:]
-                dataset_memory_context = str(state.get("dataset_memory_context") or "")
-                dataset_memory_context = (
-                    f"{dataset_memory_context}\n\nRESELECTION_RUNTIME_CONTEXT:\n{failure_tail}"
-                    if failure_tail
-                    else dataset_memory_context
-                )
-                reselection_eval = domain_expert.evaluate_strategies(
-                    data_summary,
-                    business_objective,
-                    alternatives,
-                    compute_constraints=compute_constraints,
-                    dataset_memory_context=dataset_memory_context,
-                )
-                reselection_reviews = reselection_eval.get("reviews") if isinstance(reselection_eval, dict) else []
-                reselection_reviews = reselection_reviews if isinstance(reselection_reviews, list) else []
-
-                best_alt = None
-                best_alt_score = -1.0
-                best_alt_review = None
-                for alt in alternatives:
-                    alt_idx = int(alt.get("_strategy_index") or -1)
-                    review = None
-                    for rev in reselection_reviews:
-                        if not isinstance(rev, dict):
-                            continue
-                        try:
-                            if int(rev.get("strategy_index")) == alt_idx:
-                                review = rev
-                                break
-                        except Exception:
-                            continue
-                    score = _safe_float(review.get("score"), 0.0) if isinstance(review, dict) else 0.0
-                    selectable = bool(review.get("selectable", score >= 3.0)) if isinstance(review, dict) else False
-                    exec_check = _validate_selected_strategy_executability(
-                        alt,
-                        review=review if isinstance(review, dict) else None,
-                        compute_constraints=compute_constraints,
-                    )
-                    if selectable and bool(exec_check.get("ok")) and score > best_alt_score:
-                        best_alt = alt
-                        best_alt_score = score
-                        best_alt_review = review
-
-                if isinstance(best_alt, dict):
-                    clean_alt = {k: v for k, v in best_alt.items() if not str(k).startswith("_")}
-                    alt_title = str(clean_alt.get("title") or "alternative_strategy")
-                    reselection_reason = str(best_alt_review.get("reasoning") or "") if isinstance(best_alt_review, dict) else ""
-                    current_history.append(
-                        f"DOMAIN_EXPERT_RESELECTION: switched to '{alt_title}' after blocking failure."
-                    )
-                    result.update(
-                        {
-                            "feedback_history": current_history[-20:],
-                            "selected_strategy": clean_alt,
-                            "selection_reason": (
-                                f"Reselected after blocking retry failure. {reselection_reason}".strip()
-                                if reselection_reason
-                                else "Reselected after blocking retry failure."
-                            ),
-                            "strategy_reselected": True,
-                            "domain_expert_reselection": {
-                                "status": "reselected",
-                                "previous_strategy_index": selected_index,
-                                "new_strategy_title": alt_title,
-                                "score": best_alt_score,
-                                "reviews_count": len([r for r in reselection_reviews if isinstance(r, dict)]),
-                            },
-                            "domain_expert_reviews": [r for r in reselection_reviews if isinstance(r, dict)],
-                        }
-                    )
-                    route_reason = f"{route_reason}|domain_expert_reselected"
-                else:
-                    current_history.append("DOMAIN_EXPERT_RESELECTION: no viable alternative selected; keeping current strategy.")
-                    route_reason = f"{route_reason}|no_viable_alternative"
-            else:
-                route_reason = f"{route_reason}|no_alternative_strategies"
-        elif can_reselect:
-            route_reason = f"{route_reason}|insufficient_strategy_options"
-    except Exception as reselection_err:
-        current_history.append(f"DOMAIN_EXPERT_RESELECTION_WARNING: {reselection_err}")
-        route_reason = f"reselection_exception:{type(reselection_err).__name__}"
+    # Single-strategy mode: no alternative strategies to reselect from.
+    # The retry handler keeps the current strategy and retries with feedback.
+    route_reason = "single_strategy_retry"
 
     route = "replan" if bool(result.get("strategy_reselected")) else "engineer"
     current_history.append(f"RETRY_ROUTE_DECISION: {route} (reason={route_reason})")
@@ -31070,7 +30671,6 @@ workflow = StateGraph(AgentState)
 
 workflow.add_node("steward", run_steward)
 workflow.add_node("strategist", run_strategist)
-workflow.add_node("domain_expert", run_domain_expert) # Add Node
 workflow.add_node("execution_planner", run_execution_planner)
 
 workflow.add_node("data_engineer", run_data_engineer)
@@ -31107,8 +30707,7 @@ workflow.add_conditional_edges(
         "failed": "translator",
     }
 )
-workflow.add_edge("strategist", "domain_expert") # Rewire
-workflow.add_edge("domain_expert", "execution_planner")
+workflow.add_edge("strategist", "execution_planner")
 workflow.add_conditional_edges(
     "execution_planner",
     check_execution_planner_success,
