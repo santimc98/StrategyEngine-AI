@@ -58,7 +58,9 @@ from src.utils.contract_schema_registry import (
 )
 from src.utils.contract_response_schema import (
     EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS,
+    EXECUTION_CONTRACT_V5_CANONICAL_REQUIRED_KEYS,
     EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS,
+    V5_AGENT_SECTION_KEYS,
 )
 from src.utils.problem_capabilities import (
     infer_problem_capabilities,
@@ -98,141 +100,198 @@ COMPILER_OPERATIONAL_SCHEMA_EXAMPLES_TEXT = """
 These are reference examples showing expected shapes and conventions for contract fields.
 Use them as structural guidance, not as templates to fill blindly. Derive actual values from context.
 
---- STRUCTURAL FIELDS ---
+CONTRACT VERSION 5.0 — HIERARCHICAL STRUCTURE
 
-- contract_version: "4.1"
+The contract is organized by agent hierarchy: shared context + per-agent sections.
+Each downstream agent receives: shared + its own section (merged automatically).
+This means: put fields needed by 2+ agents in "shared", and agent-exclusive fields in the agent's section.
 
-- scope: one of "cleaning_only" | "ml_only" | "full_pipeline"
-  cleaning_only = this run cleans/prepares data only (even if a future target exists)
-  ml_only = this run trains/evaluates on pre-cleaned data
-  full_pipeline = this run both cleans and trains/evaluates in one pass
+FULL EXAMPLE (full_pipeline with model_training=true):
 
-- output_dialect: {"sep": ",", "decimal": ".", "encoding": "utf-8"}
-
---- COLUMN STRUCTURE ---
-
-- canonical_columns: ["id", "feature_a", "feature_b", "target", "created_at"]
-
-- column_roles: {
-    "pre_decision": ["feature_a", "feature_b"],
-    "decision": [],
-    "outcome": ["target"],
-    "post_decision_audit_only": ["created_at"],
-    "identifiers": ["id"],
-    "split": ["__split"],
-    "auxiliary_train_only": ["event"]
+{
+  "contract_version": "5.0",
+  "shared": {
+    "scope": "full_pipeline",
+    "strategy_title": "Binary classification with gradient boosting",
+    "business_objective": "Predict customer churn with high recall",
+    "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
+    "canonical_columns": ["id", "feature_a", "feature_b", "target", "created_at"],
+    "column_roles": {
+      "pre_decision": ["feature_a", "feature_b"],
+      "decision": [],
+      "outcome": ["target"],
+      "post_decision_audit_only": ["created_at"],
+      "unknown": [],
+      "identifiers": ["id"],
+      "time_columns": []
+    },
+    "allowed_feature_sets": {
+      "segmentation_features": [],
+      "model_features": ["feature_a", "feature_b"],
+      "forbidden_features": [],
+      "audit_only_features": ["created_at"]
+    },
+    "task_semantics": {
+      "problem_family": "binary_classification",
+      "objective_type": "binary_classification",
+      "primary_target": "target",
+      "target_columns": ["target"],
+      "prediction_unit": "customer"
+    },
+    "active_workstreams": {"cleaning": true, "feature_engineering": true, "model_training": true},
+    "model_features": ["feature_a", "feature_b"],
+    "column_dtype_targets": {
+      "id": {"target_dtype": "int64", "nullable": false, "role": "identifiers"},
+      "feature_a": {"target_dtype": "float64", "nullable": true, "role": "pre_decision"},
+      "target": {"target_dtype": "int64", "nullable": false, "role": "outcome"}
+    },
+    "iteration_policy": {"max_iterations": 6, "metric_improvement_max": 4, "runtime_fix_max": 3, "compliance_bootstrap_max": 2}
+  },
+  "data_engineer": {
+    "required_outputs": [
+      {"intent": "cleaned_dataset", "path": "artifacts/clean/dataset_cleaned.csv", "required": true, "kind": "dataset"},
+      {"intent": "cleaning_manifest", "path": "artifacts/clean/cleaning_manifest.json", "required": true, "kind": "manifest"},
+      {"intent": "eda_plots", "path": "static/plots/*.png", "required": false, "kind": "visualization"}
+    ],
+    "cleaning_gates": [
+      {"name": "verify_no_leakage", "severity": "HARD", "params": {"forbidden_columns": ["created_at"]}},
+      {"name": "preferred_null_rate", "severity": "SOFT", "params": {"max_null_pct": 0.05}}
+    ],
+    "runbook": {
+      "objectives": ["Clean and prepare dataset for ML training"],
+      "constraints": ["Preserve all model_features and identifiers", "Do not drop outcome column"]
+    },
+    "artifact_requirements": {
+      "cleaned_dataset": {
+        "output_path": "artifacts/clean/dataset_cleaned.csv",
+        "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+        "required_columns": ["id", "feature_a", "feature_b", "target"]
+      }
+    }
+  },
+  "ml_engineer": {
+    "required_outputs": [
+      {"intent": "cv_metrics", "path": "artifacts/ml/cv_metrics.json", "required": true, "kind": "metrics"},
+      {"intent": "predictions", "path": "artifacts/ml/predictions.csv", "required": true, "kind": "predictions"},
+      {"intent": "model_plots", "path": "static/plots/*.png", "required": false, "kind": "visualization"}
+    ],
+    "qa_gates": [
+      {"name": "metric_above_baseline", "severity": "HARD", "params": {"metric": "roc_auc", "min_value": 0.5}},
+      {"name": "no_target_leakage", "severity": "HARD", "params": {}}
+    ],
+    "reviewer_gates": [
+      {"name": "no_test_leakage", "severity": "HARD", "params": {}},
+      {"name": "reproducible_seed", "severity": "SOFT", "params": {}}
+    ],
+    "runbook": {
+      "objectives": ["Train competitive gradient boosting model optimizing for the primary metric"],
+      "constraints": ["Use cross-validation for evaluation", "No data leakage"]
+    },
+    "evaluation_spec": {
+      "objective_type": "binary_classification",
+      "primary_target": "target",
+      "primary_metric": "log_loss",
+      "metric_definition_rule": "Binary cross-entropy averaged across all samples using predicted probabilities.",
+      "label_columns": ["target"]
+    },
+    "validation_requirements": {
+      "method": "cross_validation",
+      "primary_metric": "log_loss",
+      "metrics_to_report": ["log_loss", "roc_auc", "accuracy"],
+      "params": {"n_splits": 5, "stratify": true}
+    },
+    "optimization_policy": {
+      "enabled": true, "max_rounds": 4, "quick_eval_folds": 3, "full_eval_folds": 5,
+      "min_delta": 0.001, "patience": 2,
+      "allow_model_switch": false, "allow_ensemble": false, "allow_hpo": true,
+      "allow_feature_engineering": true, "allow_calibration": false
+    },
+    "artifact_requirements": {
+      "model_path": "artifacts/ml/model.pkl"
+    }
+  },
+  "cleaning_reviewer": {
+    "focus_areas": ["column preservation", "dtype consistency"]
+  },
+  "qa_reviewer": {
+    "review_subject": "ml_engineer",
+    "artifacts_to_verify": ["artifacts/ml/cv_metrics.json", "artifacts/ml/predictions.csv"]
+  },
+  "business_translator": {
+    "reporting_policy": {"audience": "executive", "format": "pdf"},
+    "visual_requirements": {"include_feature_importance": true, "include_metric_summary": true}
   }
-  Role definitions:
-  - outcome: ONLY target variable(s) the model predicts. Not ordinary features.
-  - pre_decision: ALL model input features available before prediction.
-  - decision: decision/action outputs from model/policy (often empty at contract time).
-  - identifiers: entity keys for joins/traceability (non-predictive).
-  - post_decision_audit_only: columns for post-hoc analysis only.
-  - split: train/test partition column.
-  - auxiliary_train_only: columns available only in train, excluded from modeling to prevent leakage.
+}
 
-- allowed_feature_sets: [
-    {"family": "PREDICTIVE_FEATURES", "description": "All numeric features excluding identifiers, split, targets, and auxiliary."},
-    {"family": "TARGET_HORIZONS", "description": "The target horizon columns."},
-    {"family": "AUXILIARY_TRAIN_ONLY", "description": "Contextual columns excluded from modeling."}
-  ]
+--- FIELD REFERENCE ---
 
-- model_features: ["feature_a", "feature_b"]
-  Must list the explicit column names the ML engineer should use as model inputs.
+SHARED section (fields needed by 2+ agents):
+  scope: "cleaning_only" | "ml_only" | "full_pipeline"
+  strategy_title, business_objective: from semantic_core
+  output_dialect: {"sep", "decimal", "encoding"}
+  canonical_columns: all column names in the dataset
+  column_roles: pre_decision, decision, outcome, post_decision_audit_only, unknown, identifiers, time_columns
+    - outcome: ONLY target variable(s). Not ordinary features.
+    - pre_decision: ALL model input features available before prediction.
+    - decision: model/policy outputs (often empty at contract time).
+  allowed_feature_sets: segmentation_features, model_features, forbidden_features, audit_only_features
+  model_features: explicit column names the ML engineer should use as model inputs
+  task_semantics: problem_family, objective_type, primary_target, target_columns, prediction_unit
+  active_workstreams: cleaning, feature_engineering, model_training (booleans)
+  column_dtype_targets: {col_name: {"target_dtype": str, "nullable": bool, "role": str}}
+    IMPORTANT: Each entry MUST use key "target_dtype" (not "type" or "dtype").
+    Include ALL canonical_columns when dataset has <=80 columns.
+  iteration_policy: {max_iterations, metric_improvement_max, runtime_fix_max, compliance_bootstrap_max}
+  future_ml_handoff: (when model_training=false but future target defined)
 
-- column_dtype_targets: {
-    "id": {"target_dtype": "int64", "nullable": false, "role": "identifiers", "source": "observed_dtype_hints"},
-    "feature_a": {"target_dtype": "float64", "nullable": true, "role": "pre_decision", "source": "observed_dtype_hints"},
-    "target": {"target_dtype": "float64", "nullable": true, "role": "outcome", "source": "observed_dtype_hints"}
-  }
-  IMPORTANT: Each entry MUST use key "target_dtype" (not "type" or "dtype").
-  Include ALL canonical_columns when dataset has <=80 columns. Derive dtypes from data_profile observed types.
+DATA_ENGINEER section:
+  required_outputs: array of {intent, path, required, kind} — DE-specific deliverables
+  cleaning_gates: array of gate objects for data quality
+  runbook: objectives + constraints for cleaning task
+  artifact_requirements: cleaned_dataset paths, required_columns, transforms
+    CRITICAL: required_columns must NOT include "decision" role columns.
+    Include output_manifest_path for downstream provenance chain.
+  outlier_policy: (optional) {"enabled", "target_columns", "methods"}
+  constraints: (optional) additional execution constraints
 
---- ARTIFACT STRUCTURE ---
+ML_ENGINEER section:
+  required_outputs: array of {intent, path, required, kind} — ML-specific deliverables
+    When model_training=true, a metrics JSON artifact MUST appear.
+  qa_gates: quality gate objects for ML outputs
+  reviewer_gates: code review gate objects
+  runbook: objectives + constraints for ML task
+  evaluation_spec: {objective_type, primary_target, primary_metric, metric_definition_rule, label_columns}
+  validation_requirements: {method, primary_metric, metrics_to_report, params}
+    primary_metric MUST equal evaluation_spec.primary_metric.
+  optimization_policy: {enabled, max_rounds, quick_eval_folds, full_eval_folds, min_delta, patience, allow_*}
+  artifact_requirements: model output paths
+  plot_spec, visual_requirements, decisioning_requirements: (optional)
 
-- required_outputs (structured form, preferred):
-  [{"intent": "cleaned_dataset", "path": "artifacts/clean/dataset_cleaned.csv", "required": true, "owner": "data_engineer", "kind": "dataset"},
-   {"intent": "cv_metrics", "path": "artifacts/ml/cv_metrics.json", "required": true, "owner": "ml_engineer", "kind": "metrics"}]
-  Every path MUST point to a specific file, not a directory.
-  When model_training=true, a metrics JSON artifact MUST appear (the system reads it to track metric across iterations).
+CLEANING_REVIEWER section:
+  Inherits cleaning_gates and full context from data_engineer section automatically.
+  Only add overrides or focus directives specific to the review process.
 
-- artifact_requirements.cleaned_dataset: {
-    "output_path": "artifacts/clean/dataset_cleaned.csv",
-    "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
-    "required_columns": ["id", "feature_a", "feature_b", "target"],
-    "optional_passthrough_columns": ["raw_event_ts"],
-    "column_transformations": {"drop_columns": ["debug_col"], "scale_columns": []}
-  }
-  CRITICAL: required_columns must NOT include "decision" role columns. Decision columns are MODEL OUTPUTS that do not exist in raw data.
-  optional_passthrough_columns: use for columns needed during processing but not guaranteed in final output.
+QA_REVIEWER section:
+  Inherits qa_gates and full context from ml_engineer section automatically.
+  review_subject: which agent's work to review (typically "ml_engineer")
+  artifacts_to_verify: list of artifact paths to check
 
-- artifact_requirements.enriched_dataset (when separate model-ready handoff artifact exists): {
-    "output_path": "artifacts/clean/dataset_enriched.csv",
-    "required_columns": ["feature_a", "feature_b", "target"]
-  }
+BUSINESS_TRANSLATOR section:
+  reporting_policy, plot_spec, visual_requirements, decisioning_requirements, evidence_inventory
 
---- GATE STRUCTURE ---
+--- GATE CONVENTIONS ---
 
-- gate objects (cleaning_gates / qa_gates / reviewer_gates):
-  [{"name": "verify_no_leakage", "severity": "HARD", "action_type": "check", "params": {"forbidden_columns": ["event"]}},
-   {"name": "parse_dates", "severity": "HARD", "action_type": "parse", "params": {"target_columns": ["created_at"]}},
-   {"name": "preferred_null_rate", "severity": "SOFT", "action_type": "check", "params": {"max_null_pct": 0.05}}]
-  Preferred shape: {"name": str, "severity": "HARD"|"SOFT", "params": object}
-  Optional extensions: action_type (drop|parse|coerce|impute|standardize|derive|check), column_phase, final_state, condition, evidence_required, action_if_fail.
+Gate preferred shape: {"name": str, "severity": "HARD"|"SOFT", "params": object}
+Optional extensions: action_type, column_phase, final_state, condition, evidence_required, action_if_fail.
+HARD: failure means corrupt, unsafe, or silently wrong output.
+SOFT: quality degraded but output remains usable.
 
---- POLICY STRUCTURE ---
+--- VISUALIZATION PLANNING ---
 
-- iteration_policy: {"max_iterations": 6, "metric_improvement_max": 4, "runtime_fix_max": 3, "compliance_bootstrap_max": 2}
-  Typical: max_iterations=6 for full_pipeline, 3 for cleaning_only.
-
-- optimization_policy (full example for model_training=true): {
-    "primary_objective": "minimize log_loss",
-    "constraints": ["no data leakage", "submission format compliance"],
-    "fallback_chain": ["tune hyperparameters", "try alternative model family", "simplify features"],
-    "enabled": true, "max_rounds": 4, "quick_eval_folds": 3, "full_eval_folds": 5,
-    "min_delta": 0.001, "patience": 2,
-    "allow_model_switch": false, "allow_ensemble": false, "allow_hpo": true,
-    "allow_feature_engineering": true, "allow_calibration": false
-  }
-
-- optimization_policy (minimal, for cleaning_only): {
-    "primary_objective": "data quality",
-    "constraints": ["preserve all required columns"],
-    "fallback_chain": ["relax optional quality thresholds"]
-  }
-
---- ML-SPECIFIC SECTIONS (only when model_training=true) ---
-
-- evaluation_spec: {
-    "objective_type": "binary_classification",
-    "primary_target": "target",
-    "primary_metric": "log_loss",
-    "metric_definition_rule": "Binary cross-entropy averaged across all samples, using predicted probabilities.",
-    "label_columns": ["target"]
-  }
-  metric_definition_rule must be precise and implementable.
-  Derive from task_semantics, column_roles.outcome, and business objective.
-
-- validation_requirements: {
-    "method": "cross_validation",
-    "primary_metric": "log_loss",
-    "metrics_to_report": ["log_loss", "roc_auc", "accuracy"],
-    "params": {"n_splits": 5, "n_repeats": 2, "stratify": true}
-  }
-  primary_metric MUST equal evaluation_spec.primary_metric.
-
---- OPTIONAL SECTIONS ---
-
-- future_ml_handoff (when model_training=false but future target defined): {
-    "enabled": true, "primary_target": "target", "target_columns": ["target"],
-    "readiness_goal": "dataset ready for later ML", "notes": "training deferred to a later run"
-  }
-
-- agent_interfaces (optional thin deltas only, do NOT duplicate top-level contract):
-  agent_interfaces.data_engineer: {"focus": ["traceability_artifacts"]}
-  agent_interfaces.ml_engineer: {"handoff_notes": "Use top-level model_features as authoritative handoff inputs."}
-
-- outlier_policy: {"enabled": true, "apply_stage": "data_engineer", "target_columns": ["feature_a"], "methods": {"iqr": {"factor": 1.5}}}
+Data Engineer plots (in data_engineer.runbook): EDA, missing values, distributions, correlations.
+ML Engineer plots (in ml_engineer.runbook): feature importance, CV performance, learning curves, confusion matrices.
+Each agent saves plots as PNG files in static/plots/ with descriptive names.
+Add "static/plots/*.png" to the agent's required_outputs with required=false.
 """.strip()
 
 _EXECUTION_CONTRACT_TOOL_NAME = "emit_execution_contract"
@@ -277,6 +336,36 @@ _EXECUTION_CONTRACT_PATCH_SCHEMA: Dict[str, Any] = {
         },
     },
 }
+
+
+def _read_openai_raw_response_body(raw_response: Any) -> str:
+    if raw_response is None:
+        return ""
+    text_attr = getattr(raw_response, "text", None)
+    try:
+        if callable(text_attr):
+            raw = text_attr()
+        else:
+            raw = text_attr
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+    except Exception:
+        pass
+    http_response = getattr(raw_response, "http_response", None)
+    if http_response is not None:
+        try:
+            raw = getattr(http_response, "text", None)
+            if callable(raw):
+                raw = raw()
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if isinstance(raw, str) and raw.strip():
+                return raw
+        except Exception:
+            pass
+    return ""
 
 
 class _OpenRouterAdapter:
@@ -403,106 +492,86 @@ MINIMAL_CONTRACT_COMPILER_PROMPT = """
 You are a Senior Execution Contract Compiler for a multi-agent business intelligence system.
 
 MISSION
-Compile SEMANTIC_CORE_AUTHORITY_JSON into ONE executable JSON contract. Your job is compilation, not reinterpretation. Build the smallest executable contract that preserves the semantic core and gives downstream agents exactly what they need.
+Compile SEMANTIC_CORE_AUTHORITY_JSON into ONE executable JSON contract using the V5.0 HIERARCHICAL FORMAT. Your job is compilation, not reinterpretation. Build the smallest executable contract that preserves the semantic core and gives each downstream agent exactly what it needs — organized by agent hierarchy.
 
 SOURCE OF TRUTH
 1. SEMANTIC_CORE_AUTHORITY_JSON is authoritative. Do not override it with SUPPORT_CONTEXT.
 2. SUPPORT_CONTEXT improves compilation quality but never overrides semantic decisions.
 3. Do not widen scope, renegotiate intent, or re-decide whether model_training is active.
 
+V5.0 HIERARCHICAL STRUCTURE
+The contract has a "shared" section plus one section per agent: data_engineer, ml_engineer, cleaning_reviewer, qa_reviewer, business_translator.
+
+HIERARCHY PRINCIPLE: If a field is needed by 2+ agents, place it in "shared". If it is exclusive to one agent's execution, place it in that agent's section. Each agent's view is built automatically by merging shared + its section.
+
+The cleaning_reviewer inherits the data_engineer context (cleaning_gates, artifact_requirements, etc.) automatically. The qa_reviewer inherits the ml_engineer context (qa_gates, evaluation_spec, etc.) automatically. You do NOT need to duplicate those fields — only add review-specific directives in the reviewer sections.
+
 FIVE CORE PRINCIPLES
 1. Evidence-grounded: Every field must be supported by evidence from semantic_core or support_context. Do not invent columns, paths, or artifacts.
 2. Semantic closure: If you declare a concept anywhere, close its dependencies everywhere. model_features must appear in cleaned_dataset.required_columns. Evaluation metric must match in evaluation_spec and validation_requirements. HARD gate columns must be covered by required_columns or optional_passthrough_columns.
-3. Downstream-executable: Each downstream agent must be able to execute its task from its contract view alone. The contract is the single source of truth for execution.
+3. Downstream-executable: Each downstream agent must be able to execute its task from its contract section alone (plus shared). The contract is the single source of truth for execution.
 4. No invention: Do not reference columns not in column_inventory, do not create training sections when model_training=false, do not invent artifacts beyond what the semantic core implies.
-5. Minimal: The shortest valid contract that satisfies principles 1-4. No filler sections, no duplicated truth in agent_interfaces, no padding with defaults when context provides specifics.
+5. Minimal: The shortest valid contract that satisfies principles 1-4. No filler sections, no padding with defaults when context provides specifics.
 
-WHAT TO PRESERVE VERBATIM FROM SEMANTIC_CORE
-scope, active_workstreams, future_ml_handoff, task_semantics, column_roles, allowed_feature_sets, model_features, strategy_title, business_objective, output_dialect.
-Preserve required_outputs semantically: if semantic_core has paths, keep them; if it has conceptual labels, materialize them as artifact objects with path + intent.
+WHAT GOES IN "shared" (preserved verbatim from SEMANTIC_CORE where available)
+scope, active_workstreams, future_ml_handoff, task_semantics, column_roles, allowed_feature_sets, model_features, strategy_title, business_objective, output_dialect, canonical_columns, column_dtype_targets, iteration_policy.
+These are the shared context fields that multiple agents need.
 
-WHAT YOU COMPILE (the minimal operational layer)
-Your main job is materializing the execution layer that semantic_core does not provide:
-- artifact_requirements (cleaned_dataset, enriched_dataset when applicable)
-- column_dtype_targets (derive from observed dtypes in data profile, not from defaults)
-- iteration_policy (scope-appropriate iteration budgets)
-- executable gate objects (compile gate intent from semantic_core into structured gates)
-- evaluation_spec + validation_requirements (ONLY when model_training=true)
-- optimization_policy operational fields (ONLY when model_training=true)
-- agent_interfaces (ONLY when a thin additive hint is genuinely needed beyond top-level contract)
+WHAT YOU COMPILE PER AGENT (the operational layer)
+For each agent section, materialize the execution fields that semantic_core does not directly provide:
+
+data_engineer: required_outputs (DE deliverables), cleaning_gates, runbook, artifact_requirements (cleaned_dataset with output_manifest_path), constraints, outlier_policy.
+ml_engineer: required_outputs (ML deliverables), qa_gates, reviewer_gates, runbook, evaluation_spec, validation_requirements, optimization_policy, artifact_requirements, plot_spec, visual_requirements, decisioning_requirements.
+cleaning_reviewer: focus_areas or severity_overrides only if needed (inherits DE context automatically).
+qa_reviewer: review_subject, artifacts_to_verify (inherits ML context automatically).
+business_translator: reporting_policy, visual_requirements, decisioning_requirements.
 
 ARTIFACT REQUIREMENTS — MANDATORY FIELDS
 When scope includes cleaning (cleaning_only or full_pipeline):
-- artifact_requirements.cleaned_dataset MUST include output_manifest_path (e.g., "artifacts/clean/cleaning_manifest.json"). The manifest is read by downstream reviewers and QA to verify cleaning provenance.
-- required_outputs MUST include a cleaning_manifest artifact with intent "cleaning_manifest" pointing to the same path.
+- data_engineer.artifact_requirements.cleaned_dataset MUST include output_manifest_path (e.g., "artifacts/clean/cleaning_manifest.json"). The manifest is read by downstream reviewers and QA to verify cleaning provenance.
+- data_engineer.required_outputs MUST include a cleaning_manifest artifact with intent "cleaning_manifest" pointing to the same path.
 Omitting the manifest path causes downstream validation failures because the system cannot resolve the cleaning provenance chain.
-
-DOWNSTREAM CONSUMERS — who reads what and why
-Understanding who consumes each section prevents orphan fields and ensures closure:
-
-Data Engineer reads: scope, active_workstreams, task_semantics, canonical_columns, column_roles, allowed_feature_sets, model_features, required_outputs, cleaning_gates, data_engineer_runbook, column_dtype_targets, artifact_requirements (cleaned_dataset paths + required_columns + transforms), output_dialect, constraints.
-=> The DE must know what to clean, what columns to preserve, what gates to satisfy, and where to write outputs.
-
-ML Engineer reads: scope, active_workstreams, task_semantics, canonical_columns, column_roles, model_features, required_outputs, qa_gates, reviewer_gates, ml_engineer_runbook, evaluation_spec, validation_requirements, column_dtype_targets, artifact_requirements, decisioning_requirements.
-=> The ML engineer must know what to predict, how to validate, what features to use, and what artifacts to produce.
-
-Cleaning Reviewer reads: scope, task_semantics, strategy_title, business_objective, canonical_columns, model_features, required_outputs, cleaning_gates, column_roles, allowed_feature_sets, artifact_requirements.
-=> The reviewer must verify the DE's work against the contract's cleaning intent.
-
-QA Reviewer reads: scope, task_semantics, qa_gates, artifact_requirements, model_features, allowed_feature_sets, column_roles, canonical_columns, decisioning_requirements.
-=> The QA reviewer must verify ML outputs against gates and schema expectations.
 
 VISUALIZATION PLANNING
 Reason about what diagnostic visualizations would best represent the results of THIS specific strategy and assign them to the right agent:
 
-Data Engineer visualizations (EDA / data quality):
+Data Engineer visualizations (EDA / data quality — in data_engineer.runbook):
 - Only when scope includes cleaning or feature engineering.
-- Examples: missing value heatmaps, distribution plots before/after cleaning, correlation matrices, outlier analysis, feature distributions.
-- Add to data_engineer_runbook: describe what EDA plots to generate and save to static/plots/.
+- Examples: missing value heatmaps, distribution plots, correlation matrices, outlier analysis.
 
-ML Engineer visualizations (model results):
+ML Engineer visualizations (model results — in ml_engineer.runbook):
 - Only when model_training=true.
-- Examples: feature importance, CV fold performance, learning curves, prediction distributions, residual plots, confusion matrices, ROC/PR curves.
-- Add to ml_engineer_runbook: describe what model diagnostic plots to generate and save to static/plots/.
+- Examples: feature importance, CV fold performance, learning curves, confusion matrices, ROC/PR curves.
 
-Adapt to the problem type:
-- Regression: residuals, predicted vs actual, feature importance.
-- Classification: confusion matrix, ROC curve, feature importance, probability distribution.
-- Time series: forecast vs actual, temporal residuals, trend decomposition.
-- Anomaly detection: anomaly score distribution, flagged vs normal comparison.
-- Cleaning-only: EDA before/after, missing data overview, distribution changes.
-
-Each agent should save plots as PNG files in static/plots/ with descriptive names.
-Add "static/plots/*.png" to required_outputs so the translator can reference them.
+Adapt to the problem type (regression, classification, time series, anomaly detection, cleaning-only).
+Each agent saves plots as PNG in static/plots/. Add "static/plots/*.png" to the agent's required_outputs with required=false.
 
 COMPILATION REASONING
 Before emitting JSON, reason through:
-1. What did semantic_core already decide? Preserve it.
-2. What operational fields does this run need? Materialize only those.
+1. What did semantic_core already decide? Preserve it in "shared".
+2. What does each agent need exclusively? Place it in that agent's section.
 3. Are all dependencies closed? Every model_feature in cleaned_dataset.required_columns? Every HARD gate column covered? Every metric consistent across sections?
 4. Is anything invented? Remove it. Is anything redundant? Remove it.
 
 RUNBOOK PRINCIPLES
 Runbooks state OBJECTIVES and CONSTRAINTS, not implementation recipes.
 - BAD: "Apply median imputation to all features." GOOD: "Handle missing values appropriately per column distribution."
-- BAD: "Use RepeatedStratifiedKFold(n_splits=5, n_repeats=2)." GOOD: "Use repeated stratified CV with sufficient folds for stable estimates."
-- BAD: "Use LightGBM with learning_rate=0.05, num_leaves=31" (copied from strategy). GOOD: "Train a competitive gradient boosting model, optimizing hyperparameters for the primary metric."
-Hard constraints (leakage prevention, output format, required columns) MUST be explicit. Soft preferences disguised as requirements reduce the agent's ability to reason.
+- BAD: "Use LightGBM with learning_rate=0.05" (copied from strategy). GOOD: "Train a competitive gradient boosting model, optimizing hyperparameters for the primary metric."
 CRITICAL: Strategy techniques in semantic_core are advisory hypotheses. Do NOT transcribe them as prescriptive steps. Abstract into objectives and let the downstream agent reason about implementation.
 
 GATE PRINCIPLES
 - HARD: failure means corrupt, unsafe, or silently wrong output.
 - SOFT: quality degraded but output remains usable.
 - Each gate must address a distinct, plausible risk grounded in the data. 5 well-reasoned gates beat 15 templated ones.
-- Preferred shape: {"name": str, "severity": "HARD"|"SOFT", "params": object}. See OPERATIONAL SCHEMA EXAMPLES for extensions.
+- Place cleaning_gates in data_engineer section, qa_gates and reviewer_gates in ml_engineer section.
 
 SCOPE-CONDITIONAL LOGIC
-- When model_training=false: do not invent evaluation_spec, validation_requirements, or training sections. Compile a handoff-ready cleaning/feature-prep contract.
-- When model_training=true: evaluation_spec, validation_requirements, ml_engineer_runbook, and optimization_policy operational fields are required. A metrics JSON artifact must appear in required_outputs.
-- agent_interfaces: optional thin deltas only. Never duplicate top-level truth. Never introduce semantics absent from the top-level contract.
+- When model_training=false: do not invent evaluation_spec, validation_requirements, or training sections in ml_engineer. Compile a handoff-ready cleaning/feature-prep contract.
+- When model_training=true: ml_engineer MUST include evaluation_spec, validation_requirements, runbook, and optimization_policy. A metrics JSON artifact must appear in ml_engineer.required_outputs.
 
 OUTPUT
 - Return ONLY valid JSON. No markdown, no code fences, no reasoning traces.
+- The JSON must have these top-level keys: contract_version ("5.0"), shared, data_engineer, ml_engineer, cleaning_reviewer, qa_reviewer, business_translator.
 - Populate every required section with grounded content. Never return empty placeholders.
 - Refer to OPERATIONAL SCHEMA EXAMPLES below for field shapes and conventions.
 """
@@ -546,36 +615,6 @@ Return format:
     }
   ]
 }
-
-
-def _read_openai_raw_response_body(raw_response: Any) -> str:
-    if raw_response is None:
-        return ""
-    text_attr = getattr(raw_response, "text", None)
-    try:
-        if callable(text_attr):
-            raw = text_attr()
-        else:
-            raw = text_attr
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
-        if isinstance(raw, str) and raw.strip():
-            return raw
-    except Exception:
-        pass
-    http_response = getattr(raw_response, "http_response", None)
-    if http_response is not None:
-        try:
-            raw = getattr(http_response, "text", None)
-            if callable(raw):
-                raw = raw()
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="replace")
-            if isinstance(raw, str) and raw.strip():
-                return raw
-        except Exception:
-            pass
-    return ""
 
 
 def _coerce_provider_text(value: Any, depth: int = 0) -> str:
@@ -1318,9 +1357,17 @@ def _build_transport_validation(payload: Any) -> Dict[str, Any]:
             "summary": {"error_count": 1, "warning_count": 0, "phase": "transport"},
         }
 
-    core_keys = tuple(
-        key for key in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS if key != "contract_version"
-    )
+    # Detect v5 hierarchical contract vs v4 flat contract
+    _is_v5 = str(payload.get("contract_version", "")).startswith("5") or "shared" in payload
+    if _is_v5:
+        core_keys = tuple(
+            key for key in (EXECUTION_CONTRACT_V5_CANONICAL_REQUIRED_KEYS + list(V5_AGENT_SECTION_KEYS))
+            if key != "contract_version"
+        )
+    else:
+        core_keys = tuple(
+            key for key in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS if key != "contract_version"
+        )
     present_keys = [key for key in core_keys if key in payload]
     meaningful_keys = [key for key in present_keys if _is_meaningful_contract_value(payload.get(key))]
 
@@ -1719,6 +1766,10 @@ def _build_semantic_guard_validation(
             "issues": [],
             "summary": {"error_count": 0, "warning_count": 0, "phase": "semantic_guard"},
         }
+    # V5 hierarchical: flatten so the guard logic (which reads top-level keys) works unchanged.
+    if isinstance(compiled_contract, dict) and str(compiled_contract.get("contract_version", "")).startswith("5"):
+        from src.utils.contract_accessors import flatten_v5_contract
+        compiled_contract = flatten_v5_contract(compiled_contract)
     if not isinstance(compiled_contract, dict) or not compiled_contract:
         issues.append(
             {
@@ -8488,17 +8539,6 @@ class ExecutionPlannerAgent:
                         "expected_kind": "predictions|submission", "expected_owner": "ml_engineer",
                     })
 
-            # INV-4: Kaggle/competition requires submission
-            if _detect_submission_requirement():
-                if not any(isinstance(d, dict) and d.get("required") and d.get("kind") == "submission"
-                           and d.get("owner") == "ml_engineer" for d in deliverables):
-                    missing.append({
-                        "invariant": "competition_requires_submission",
-                        "severity": "error",
-                        "message": "Competition/Kaggle objective requires at least one required deliverable with kind='submission' and owner='ml_engineer'.",
-                        "expected_kind": "submission", "expected_owner": "ml_engineer",
-                    })
-
             return missing
 
         def _pattern_name(name: str) -> str:
@@ -9235,7 +9275,7 @@ class ExecutionPlannerAgent:
             previous_parse_feedback: str | None,
             original_inputs_text: str | None,
         ) -> str:
-            required_top_level = list(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)
+            required_top_level = list(EXECUTION_CONTRACT_V5_CANONICAL_REQUIRED_KEYS) + list(V5_AGENT_SECTION_KEYS)
             validation_feedback = _compact_validation_feedback(previous_validation)
             parse_feedback = (previous_parse_feedback or "").strip() or "No parse diagnostics available."
             previous_payload = (
@@ -9256,21 +9296,22 @@ class ExecutionPlannerAgent:
                 head=15000,
                 tail=5000,
             )
-            _required_keys_csv = ", ".join(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)
+            _required_keys_csv = ", ".join(required_top_level)
             return (
                 "Repair the previous execution contract by returning the COMPLETE corrected contract.\n"
                 "Return ONLY valid JSON (no markdown, no comments, no code fences).\n"
+                'Use V5.0 hierarchical structure: contract_version "5.0", shared, data_engineer, ml_engineer, cleaning_reviewer, qa_reviewer, business_translator.\n'
                 "Include ALL sections from the previous contract that were valid, plus fix the issues listed below.\n"
                 "Every key listed here MUST be present: " + _required_keys_csv + ".\n"
                 "Do NOT return a patch — return the full contract with fixes applied.\n"
                 "Schema registry examples:\n"
                 + CONTRACT_SCHEMA_EXAMPLES_TEXT
                 + "\n"
-                "scope MUST be one of: cleaning_only, ml_only, full_pipeline, and it must be compatible with active_workstreams.\n"
-                "If the run is data cleaning / feature preparation for a future ML run, set active_workstreams.model_training=false and prefer scope=cleaning_only.\n"
+                "scope MUST be inside shared and be one of: cleaning_only, ml_only, full_pipeline.\n"
+                "If the run is data cleaning / feature preparation for a future ML run, set shared.active_workstreams.model_training=false and prefer scope=cleaning_only.\n"
                 "Do not invent columns outside column_inventory.\n"
                 "Use downstream_consumer_interface + evidence_policy from ORIGINAL INPUTS.\n"
-                "column_dtype_targets values MUST use key target_dtype (never key type).\n"
+                "shared.column_dtype_targets values MUST use key target_dtype (never key type).\n"
                 "Example: {\"age\": {\"target_dtype\": \"float64\", \"nullable\": false}}.\n"
                 "Do not remove required business intent; fix only structural/semantic contract errors.\n"
                 "Preserve business objective, dataset context, and selected strategy from ORIGINAL INPUTS.\n"
@@ -9966,24 +10007,27 @@ domain_expert_critique:
             + semantic_checklist
         )
 
-        _required_keys_csv = ", ".join(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)
+        _v5_top_level_keys = ", ".join(EXECUTION_CONTRACT_V5_CANONICAL_REQUIRED_KEYS + list(V5_AGENT_SECTION_KEYS))
         _closing_checklist = (
-            "\n\nBEFORE YOU RETURN — self-check your JSON against this contract completeness checklist.\n"
-            f"Every key listed here MUST be a top-level key in your output: {_required_keys_csv}.\n"
-            "If any key is missing, add it now.  Omitting a required section will fail validation.\n"
-            "For sections where you lack explicit input evidence, reason from the business objective, "
-            "task_semantics, and column_roles to derive sensible defaults — a senior planner always "
-            "produces a complete contract, never a partial one.\n"
+            "\n\nBEFORE YOU RETURN — self-check your JSON against this V5.0 contract completeness checklist.\n"
+            f"These MUST be top-level keys in your output: {_v5_top_level_keys}.\n"
+            'contract_version MUST be "5.0".\n'
+            "If any top-level section is missing, add it now. Omitting a required section will fail validation.\n"
+            "V5.0 hierarchy self-check:\n"
+            "- shared: contains scope, strategy_title, business_objective, output_dialect, canonical_columns, "
+            "column_roles, allowed_feature_sets, task_semantics, active_workstreams, model_features, "
+            "column_dtype_targets, iteration_policy. If any is missing, add it.\n"
+            "- data_engineer: contains required_outputs (DE deliverables), cleaning_gates, runbook, artifact_requirements.\n"
+            "- ml_engineer: contains required_outputs (ML deliverables), qa_gates, reviewer_gates, runbook. "
+            "When model_training=true: also evaluation_spec, validation_requirements, optimization_policy.\n"
+            "- cleaning_reviewer, qa_reviewer, business_translator: present even if minimal.\n"
             "Semantic closure self-check:\n"
-            "- If targets are declared, evaluation_spec must name the primary target and label columns.\n"
-            "- If a metric appears anywhere in strategy/objective/gates/runbooks, it must appear in both evaluation_spec.primary_metric and validation_requirements.primary_metric.\n"
-            "- If a validation protocol is implied anywhere, validation_requirements must close it explicitly.\n"
-            "- If model_features / allowed_feature_sets / column_roles imply ML input columns, artifact_requirements.enriched_dataset.required_columns must cover them for any future-ML handoff dataset.\n"
-            "- If anchor columns exist (outcome, identifiers, split, time, decision), column_dtype_targets must include explicit entries for those anchors.\n"
-            "- Prefer a compact contract: do not duplicate top-level sections inside agent_interfaces.\n"
-            "- Only emit agent_interfaces blocks when additive consumer-specific hints are genuinely useful.\n"
-            "- translator/results_advisor blocks are optional and should remain lightweight if included.\n"
-            "- Do not create any failure_explainer block."
+            "- If targets are declared, ml_engineer.evaluation_spec must name the primary target and label columns.\n"
+            "- If a metric appears anywhere, it must match in ml_engineer.evaluation_spec.primary_metric and ml_engineer.validation_requirements.primary_metric.\n"
+            "- If model_features imply ML input columns, data_engineer.artifact_requirements.cleaned_dataset.required_columns must cover them.\n"
+            "- If anchor columns exist (outcome, identifiers, split, time), shared.column_dtype_targets must include entries for those anchors.\n"
+            "- Do not create agent_interfaces — the v5 hierarchy replaces it.\n"
+            "- Do not create any failure_explainer section."
         )
 
         full_prompt = (
@@ -10586,7 +10630,8 @@ domain_expert_critique:
                 repair_suffix = (
                     "\n\n--- REPAIR FEEDBACK FROM PREVIOUS ATTEMPT ---\n"
                     "Your previous contract was rejected. Fix the issues below and return the COMPLETE corrected contract.\n"
-                    f"Every required key MUST be present: {', '.join(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)}.\n"
+                    f"Every required top-level key MUST be present: {', '.join(EXECUTION_CONTRACT_V5_CANONICAL_REQUIRED_KEYS + list(V5_AGENT_SECTION_KEYS))}.\n"
+                    'contract_version MUST be "5.0". Use V5.0 hierarchical structure (shared + per-agent sections).\n'
                 )
                 if targeted_actions.strip():
                     repair_suffix += f"\nTargeted fixes:\n{targeted_actions}\n"

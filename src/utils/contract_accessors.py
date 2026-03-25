@@ -20,6 +20,101 @@ from src.utils.contract_validator import is_probably_path
 
 
 # ============================================================================
+# V5 helpers – hierarchical contract field resolution
+# ============================================================================
+
+def _is_v5(contract: Dict[str, Any]) -> bool:
+    """Return True if contract uses v5.0 hierarchical structure."""
+    return isinstance(contract, dict) and str(contract.get("contract_version", "")).startswith("5")
+
+
+def _v5_get(contract: Dict[str, Any], field: str, *agent_sections: str) -> Any:
+    """Resolve a field from v5 hierarchical contract.
+
+    Checks agent sections in order, then falls back to shared.
+    """
+    for section_key in agent_sections:
+        section = contract.get(section_key)
+        if isinstance(section, dict) and field in section:
+            return section[field]
+    shared = contract.get("shared")
+    if isinstance(shared, dict) and field in shared:
+        return shared[field]
+    return None
+
+
+_V5_AGENT_SECTIONS = ("data_engineer", "ml_engineer", "cleaning_reviewer", "qa_reviewer", "business_translator")
+
+
+def flatten_v5_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a v5 hierarchical contract into a v4-compatible flat dict.
+
+    Merges shared + all agent sections into top-level keys.  Agent-specific
+    keys like ``runbook`` are prefixed with the agent name to avoid collisions
+    (e.g., ``data_engineer.runbook`` becomes ``data_engineer_runbook``).
+
+    The ``required_outputs`` lists are merged into a single flat list with
+    ``owner`` set on each item.
+
+    If the contract is not v5, returns it unchanged.
+    """
+    if not isinstance(contract, dict) or not _is_v5(contract):
+        return contract
+
+    flat: Dict[str, Any] = {}
+
+    # Shared fields become top-level
+    shared = contract.get("shared")
+    if isinstance(shared, dict):
+        flat.update(shared)
+
+    # Use "4.1" so downstream code (resolve_contract_active_workstreams, etc.)
+    # reads from flat top-level keys instead of looking for shared/agent sections.
+    flat["contract_version"] = "4.1"
+
+    # Merge agent sections
+    merged_required_outputs: List[Any] = []
+    for agent_key in _V5_AGENT_SECTIONS:
+        section = contract.get(agent_key)
+        if not isinstance(section, dict):
+            continue
+        for field, value in section.items():
+            if field == "required_outputs":
+                # Merge required_outputs with owner tag
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            tagged = dict(item)
+                            tagged.setdefault("owner", agent_key)
+                            merged_required_outputs.append(tagged)
+                        elif isinstance(item, str):
+                            merged_required_outputs.append(item)
+            elif field == "runbook":
+                # Prefix with agent name to avoid collisions
+                flat[f"{agent_key}_runbook"] = value
+            elif field == "artifact_requirements":
+                # Merge into top-level artifact_requirements
+                existing_ar = flat.get("artifact_requirements")
+                if not isinstance(existing_ar, dict):
+                    existing_ar = {}
+                if isinstance(value, dict):
+                    existing_ar.update(value)
+                flat["artifact_requirements"] = existing_ar
+            else:
+                # Other fields go directly to top level
+                # Later agent sections may override earlier ones (ml > de)
+                flat[field] = value
+
+    if merged_required_outputs:
+        flat["required_outputs"] = merged_required_outputs
+
+    # Preserve the original v5 structure for v5-aware code
+    flat["_v5_original"] = contract
+
+    return flat
+
+
+# ============================================================================
 # V4.1 CONTRACT GUARD – Enforcement of legacy field removal
 # ============================================================================
 
@@ -274,10 +369,10 @@ def get_column_roles(contract: Dict[str, Any]) -> Dict[str, List[str]]:
     """
     if not isinstance(contract, dict):
         return {}
-    roles_raw = contract.get("column_roles")
+    roles_raw = _v5_get(contract, "column_roles") if _is_v5(contract) else contract.get("column_roles")
     if not roles_raw:
         return {}
-    
+
     # Format A: dict role -> list[str]
     if isinstance(roles_raw, dict):
         first_val = next(iter(roles_raw.values()), None) if roles_raw else None
@@ -423,7 +518,7 @@ def get_task_semantics(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(contract, dict):
         return {}
-    task_semantics = contract.get("task_semantics")
+    task_semantics = _v5_get(contract, "task_semantics") if _is_v5(contract) else contract.get("task_semantics")
     if not isinstance(task_semantics, dict):
         return {}
     return task_semantics
@@ -530,6 +625,16 @@ def get_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(contract, dict):
         return {"required_files": [], "required_plots": []}
+    # V5: merge artifact_requirements from data_engineer + ml_engineer sections
+    if _is_v5(contract):
+        merged: Dict[str, Any] = {}
+        for section_key in ("data_engineer", "ml_engineer"):
+            section = contract.get(section_key)
+            if isinstance(section, dict):
+                ar = section.get("artifact_requirements")
+                if isinstance(ar, dict):
+                    merged.update(ar)
+        return merged if merged else {"required_files": [], "required_plots": []}
     artifacts = contract.get("artifact_requirements")
     if not isinstance(artifacts, dict):
         return {"required_files": [], "required_plots": []}
@@ -743,12 +848,14 @@ def filter_gate_list_for_phase(raw_gates: Any, phase: Any, *, actor: str = "") -
 def get_qa_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Return the list of QA gate specifications.
-    
+
     Returns:
         List of QA gate objects.
     """
     if not isinstance(contract, dict):
         return []
+    if _is_v5(contract):
+        return _normalize_gate_list(_v5_get(contract, "qa_gates", "ml_engineer"))
     return _normalize_gate_list(contract.get("qa_gates"))
 
 
@@ -767,18 +874,22 @@ def get_cleaning_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     if not isinstance(contract, dict):
         return []
+    if _is_v5(contract):
+        return _normalize_gate_list(_v5_get(contract, "cleaning_gates", "data_engineer"))
     return _normalize_gate_list(contract.get("cleaning_gates"))
 
 
 def get_reviewer_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Return the list of reviewer gate specifications.
-    
+
     Returns:
         List of reviewer gate objects.
     """
     if not isinstance(contract, dict):
         return []
+    if _is_v5(contract):
+        return _normalize_gate_list(_v5_get(contract, "reviewer_gates", "ml_engineer"))
     return _normalize_gate_list(contract.get("reviewer_gates"))
 
 
@@ -797,6 +908,9 @@ def get_data_engineer_runbook(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(contract, dict):
         return {}
+    if _is_v5(contract):
+        runbook = _v5_get(contract, "runbook", "data_engineer")
+        return runbook if isinstance(runbook, dict) else {}
     runbook = contract.get("data_engineer_runbook")
     if not isinstance(runbook, dict):
         return {}
@@ -806,12 +920,15 @@ def get_data_engineer_runbook(contract: Dict[str, Any]) -> Dict[str, Any]:
 def get_ml_engineer_runbook(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     Return the ml_engineer_runbook section.
-    
+
     Returns:
         Dictionary containing ML engineer instructions.
     """
     if not isinstance(contract, dict):
         return {}
+    if _is_v5(contract):
+        runbook = _v5_get(contract, "runbook", "ml_engineer")
+        return runbook if isinstance(runbook, dict) else {}
     runbook = contract.get("ml_engineer_runbook")
     if not isinstance(runbook, dict):
         return {}
@@ -845,6 +962,9 @@ def get_outlier_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(contract, dict):
         return {}
+    if _is_v5(contract):
+        policy = _v5_get(contract, "outlier_policy", "data_engineer")
+        return policy if isinstance(policy, dict) else {}
     policy = contract.get("outlier_policy")
     if not isinstance(policy, dict):
         return {}
@@ -854,12 +974,15 @@ def get_outlier_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
 def get_validation_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     Return validation_requirements section.
-    
+
     Returns:
         Dictionary with validation specifications.
     """
     if not isinstance(contract, dict):
         return {}
+    if _is_v5(contract):
+        validation = _v5_get(contract, "validation_requirements", "ml_engineer")
+        return validation if isinstance(validation, dict) else {}
     validation = contract.get("validation_requirements")
     if not isinstance(validation, dict):
         return {}
@@ -869,12 +992,15 @@ def get_validation_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
 def get_optimization_specification(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
     Return optimization_specification section.
-    
+
     Returns:
         Dictionary with optimization specifications.
     """
     if not isinstance(contract, dict):
         return {}
+    if _is_v5(contract):
+        opt = _v5_get(contract, "optimization_specification", "ml_engineer")
+        return opt if isinstance(opt, dict) else {}
     opt = contract.get("optimization_specification")
     if not isinstance(opt, dict):
         return {}
@@ -1197,15 +1323,47 @@ def get_required_outputs_by_owner(contract: Dict[str, Any], owner: str) -> List[
 
     Supports both List[str] (legacy) and List[dict] formats for required_outputs.
     When items lack an explicit 'owner' field, uses _infer_owner_from_path as fallback.
+    Items explicitly marked ``"required": false`` are excluded — they are optional
+    artifacts and must not be enforced as mandatory outputs in view projections.
+
+    V5.0 contracts: reads required_outputs directly from the agent's section.
     """
     if not isinstance(contract, dict):
         return []
+
+    # V5: required_outputs is per-agent, no owner inference needed
+    if _is_v5(contract):
+        _owner_to_section = {
+            "data_engineer": "data_engineer",
+            "ml_engineer": "ml_engineer",
+            "qa_engineer": "qa_reviewer",
+        }
+        section_key = _owner_to_section.get(owner, owner)
+        section = contract.get(section_key)
+        raw = section.get("required_outputs") if isinstance(section, dict) else None
+        if not isinstance(raw, list) or not raw:
+            return []
+        result: List[str] = []
+        for item in raw:
+            if isinstance(item, dict):
+                if item.get("required") is False:
+                    continue
+                path = item.get("path") or ""
+                if path:
+                    result.append(path)
+            elif isinstance(item, str) and item.strip():
+                result.append(item)
+        return result
+
     raw = contract.get("required_outputs")
     if not isinstance(raw, list) or not raw:
         return []
     result: List[str] = []
     for item in raw:
         if isinstance(item, dict):
+            # Skip items explicitly marked as optional
+            if item.get("required") is False:
+                continue
             path = item.get("path") or ""
             item_owner = item.get("owner") or _infer_owner_from_path(path)
             if item_owner == owner:

@@ -2894,6 +2894,36 @@ def _project_plot_payload(contract_full: Dict[str, Any]) -> Tuple[Dict[str, Any]
     return visual_requirements, plot_spec if isinstance(plot_spec, dict) else None
 
 
+def _build_views_v5(contract: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Build agent views for v5.0 hierarchical contracts via trivial merge.
+
+    View formulas:
+      de_view            = shared + data_engineer
+      ml_view            = shared + ml_engineer
+      cleaning_view      = shared + data_engineer + cleaning_reviewer
+      qa_view            = shared + ml_engineer   + qa_reviewer
+      reviewer_view      = shared + ml_engineer
+      translator_view    = shared + business_translator
+      results_advisor_view = shared
+    """
+    shared = contract.get("shared") or {}
+    de = contract.get("data_engineer") or {}
+    ml = contract.get("ml_engineer") or {}
+    cr = contract.get("cleaning_reviewer") or {}
+    qa = contract.get("qa_reviewer") or {}
+    bt = contract.get("business_translator") or {}
+
+    return {
+        "de_view": {**shared, **de, "role": "data_engineer"},
+        "ml_view": {**shared, **ml, "role": "ml_engineer"},
+        "cleaning_view": {**shared, **de, **cr, "role": "cleaning_reviewer"},
+        "qa_view": {**shared, **ml, **qa, "role": "qa_reviewer"},
+        "reviewer_view": {**shared, **ml, "role": "reviewer"},
+        "translator_view": {**shared, **bt, "role": "translator"},
+        "results_advisor_view": {**shared, "role": "results_advisor"},
+    }
+
+
 def build_contract_views_projection(
     contract_full: Dict[str, Any] | None,
     artifact_index: Any,
@@ -2904,10 +2934,20 @@ def build_contract_views_projection(
     """
     Build agent views as pure projection from validated execution contract.
 
-    Prefer explicit contract.agent_interfaces blocks when present. Legacy
-    field-to-view projection remains only as backward-compatible fallback.
+    V5.0 contracts use trivial merge (shared + agent section).
+    V4.x contracts fall through to legacy field-to-view projection.
     """
     contract_full = contract_full if isinstance(contract_full, dict) else {}
+
+    # ── V5 dispatch: hierarchical merge ──────────────────────────────
+    # If the contract was flattened, use the original v5 hierarchy for views.
+    v5_original = contract_full.get("_v5_original") if isinstance(contract_full, dict) else None
+    if isinstance(v5_original, dict) and str(v5_original.get("contract_version", "")).startswith("5"):
+        return _build_views_v5(v5_original)
+    if str(contract_full.get("contract_version", "")).startswith("5") and "shared" in contract_full:
+        return _build_views_v5(contract_full)
+
+    # ── V4.x legacy path ────────────────────────────────────────────
     artifact_index = artifact_index if isinstance(artifact_index, list) else []
     contract_min = contract_full
     return {

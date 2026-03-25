@@ -129,6 +129,7 @@ from src.utils.contract_accessors import (
     get_decision_columns,
     filter_gate_list_for_phase,
     normalize_artifact_path,
+    flatten_v5_contract,
 )
 from src.utils.contract_validator import (
     normalize_contract_scope,
@@ -5532,6 +5533,42 @@ def _validate_projected_views_for_execution(
     errors: List[str] = []
     contract = contract if isinstance(contract, dict) else {}
 
+    # ── V5 union validation: the union of all view fields must contain
+    # every field declared in any contract section.  This is the only
+    # structural check needed because v5 views are direct merges.
+    # Detect v5: either direct v5 contract or flattened (has _v5_original)
+    _v5_source = None
+    if str(contract.get("contract_version", "")).startswith("5") and "shared" in contract:
+        _v5_source = contract
+    elif isinstance(contract.get("_v5_original"), dict):
+        _v5_source = contract["_v5_original"]
+    if _v5_source is not None:
+        from src.utils.contract_response_schema import V5_AGENT_SECTION_KEYS
+
+        # Collect all fields declared across contract sections
+        all_contract_fields: set = set()
+        for section_key in ["shared"] + list(V5_AGENT_SECTION_KEYS):
+            section = _v5_source.get(section_key)
+            if isinstance(section, dict):
+                all_contract_fields.update(section.keys())
+
+        # Collect all fields present across all views
+        all_view_fields: set = set()
+        expected_view_keys = ("de_view", "ml_view", "cleaning_view", "qa_view", "reviewer_view", "translator_view", "results_advisor_view")
+        for view_key in expected_view_keys:
+            v = views.get(view_key) if isinstance(views, dict) else None
+            if not isinstance(v, dict) or not v:
+                errors.append(f"{view_key}_missing")
+            else:
+                all_view_fields.update(v.keys())
+
+        # Every contract field must appear in at least one view
+        missing = all_contract_fields - all_view_fields
+        if missing:
+            errors.append(f"v5_view_union_missing_fields:{','.join(sorted(missing))}")
+
+        return errors
+
     def _normalize_artifact_path_set(values: Any) -> set[str]:
         return {path.lower() for path in _normalize_output_path_list(values)}
 
@@ -5855,11 +5892,20 @@ def _build_contract_views(
         "results_advisor_view": results_advisor_view,
     }
     view_errors = _validate_projected_views_for_execution(contract, views)
-    projection_reports = build_contract_view_projection_reports(contract, views, contract_min=contract_min)
-    projection_report_errors = list_view_projection_report_errors(projection_reports)
-    for error in projection_report_errors:
-        if error not in view_errors:
-            view_errors.append(error)
+    # V5 contracts: skip legacy projection report bindings — they check v4-specific
+    # field names that don't exist in v5 views (e.g. output_path, data_engineer_runbook).
+    # The union validation in _validate_projected_views_for_execution is sufficient.
+    _is_v5 = isinstance(contract.get("_v5_original"), dict) or (
+        str(contract.get("contract_version", "")).startswith("5") and "shared" in contract
+    )
+    if _is_v5:
+        projection_reports: Dict[str, Any] = {}
+    else:
+        projection_reports = build_contract_view_projection_reports(contract, views, contract_min=contract_min)
+        projection_report_errors = list_view_projection_report_errors(projection_reports)
+        for error in projection_report_errors:
+            if error not in view_errors:
+                view_errors.append(error)
     artifact_obligations_context = build_data_engineer_artifact_obligations(contract)
     column_resolution_context_path = _persist_column_resolution_context(
         views,
@@ -16187,6 +16233,11 @@ def _resolve_de_output_artifacts(state: Dict[str, Any]) -> tuple[str, str, List[
             or ""
         )
     )
+    # V5 views store paths inside artifact_requirements, not as top-level keys.
+    if not output_path:
+        output_path = _normalize_output_path(get_clean_dataset_output_path(de_view))
+    if not manifest_path:
+        manifest_path = _normalize_output_path(get_clean_manifest_path(de_view))
 
     required_artifacts: List[str] = []
 
@@ -17182,78 +17233,118 @@ def run_execution_planner(state: AgentState) -> AgentState:
     column_manifest = state.get("column_manifest")
     if not isinstance(column_manifest, dict) or not column_manifest:
         column_manifest = _load_json_safe("data/column_manifest.json") or {}
-    try:
-        # Prepare output_dialect from state (csv dialect detected by steward)
-        output_dialect = {
-            "sep": csv_sep,
-            "decimal": csv_decimal,
-            "encoding": csv_encoding
-        }
+    # Prepare output_dialect from state (csv dialect detected by steward)
+    output_dialect = {
+        "sep": csv_sep,
+        "decimal": csv_decimal,
+        "encoding": csv_encoding
+    }
 
-        # Prepare env_constraints (conservative default)
-        env_constraints = {"forbid_inplace_column_creation": True}
+    # Prepare env_constraints (conservative default)
+    env_constraints = {"forbid_inplace_column_creation": True}
 
-        domain_expert_critique = state.get("selection_reason", "")
+    domain_expert_critique = state.get("selection_reason", "")
+
+    # ── Planner retry loop ─────────────────────────────────────────────
+    # The compiler's internal repair loop catches structural issues, but
+    # the semantic guard (which runs post-compiler) can still reject the
+    # contract.  We retry the full planner (semantic core + compiler) up
+    # to _PLANNER_GRAPH_MAX_RETRIES times before falling through to
+    # fail-closed.
+    #
+    # V5 contracts have much simpler validation (no rigid schema, no
+    # legacy view checks) so a single attempt is sufficient — the
+    # compiler's own repair loop handles any issues.  Multiple graph-level
+    # retries for v5 would waste API calls on redundant semantic+compile
+    # cycles.  We keep 1 retry (total 2) as a safety net for transient
+    # transport failures.
+    _PLANNER_GRAPH_MAX_RETRIES = 2
+    planner_contract_accepted = False
+    for _planner_try in range(1, _PLANNER_GRAPH_MAX_RETRIES + 1):
         try:
             execution_planner.last_contract_diagnostics = None
         except Exception:
             pass
+        try:
+            contract = execution_planner.generate_contract(
+                strategy=strategy,
+                data_summary=data_summary_for_planner,
+                business_objective=business_objective,
+                column_inventory=column_inventory,
+                column_sets=column_sets if isinstance(column_sets, dict) else {},
+                column_manifest=column_manifest if isinstance(column_manifest, dict) else {},
+                output_dialect=output_dialect,
+                env_constraints=env_constraints,
+                domain_expert_critique=domain_expert_critique,
+                data_profile=planner_data_profile,
+                run_id=run_id,
+            )
+        except Exception as e:
+            print(f"Warning: execution planner attempt {_planner_try} failed ({e})")
+            contract = {}
+        if not isinstance(contract, dict):
+            contract = {}
+        planner_contract_diagnostics = getattr(execution_planner, "last_contract_diagnostics", None)
+        if not isinstance(planner_contract_diagnostics, dict):
+            planner_contract_diagnostics = {}
+        if not planner_contract_diagnostics:
+            planner_contract_diagnostics = {
+                "schema_version": 1,
+                "where": "execution_planner:graph_fallback",
+                "llm_success": False,
+                "validation": {
+                    "status": "error",
+                    "accepted": False,
+                    "issues": [
+                        {
+                            "severity": "error",
+                            "rule": "planner_no_contract",
+                            "message": "Planner did not produce diagnostics/contract payload.",
+                        }
+                    ],
+                    "summary": {"error_count": 1, "warning_count": 0},
+                },
+                "summary": {"status": "error", "issue_count": 1, "accepted": False},
+            }
+        validation_payload = planner_contract_diagnostics.get("validation")
+        planner_contract_accepted = False
+        if isinstance(validation_payload, dict):
+            accepted_flag = validation_payload.get("accepted")
+            validation_status = str(validation_payload.get("status") or "").lower()
+            if isinstance(accepted_flag, bool):
+                planner_contract_accepted = bool(accepted_flag and validation_status != "error")
+        summary_payload = planner_contract_diagnostics.get("summary")
+        if isinstance(summary_payload, dict):
+            summary_accepted = summary_payload.get("accepted")
+            if isinstance(summary_accepted, bool):
+                if isinstance(validation_payload, dict):
+                    planner_contract_accepted = planner_contract_accepted and summary_accepted
+                else:
+                    planner_contract_accepted = summary_accepted
 
-        contract = execution_planner.generate_contract(
-            strategy=strategy,
-            data_summary=data_summary_for_planner,
-            business_objective=business_objective,
-            column_inventory=column_inventory,
-            column_sets=column_sets if isinstance(column_sets, dict) else {},
-            column_manifest=column_manifest if isinstance(column_manifest, dict) else {},
-            output_dialect=output_dialect,
-            env_constraints=env_constraints,
-            domain_expert_critique=domain_expert_critique,
-            data_profile=planner_data_profile,
-            run_id=run_id,
-        )
-    except Exception as e:
-        print(f"Warning: execution planner failed ({e}); fail-closed contract path.")
-        contract = {}
-    if not isinstance(contract, dict):
-        contract = {}
-    planner_contract_diagnostics = getattr(execution_planner, "last_contract_diagnostics", None)
-    if not isinstance(planner_contract_diagnostics, dict):
-        planner_contract_diagnostics = {}
-    if not planner_contract_diagnostics:
-        planner_contract_diagnostics = {
-            "schema_version": 1,
-            "where": "execution_planner:graph_fallback",
-            "llm_success": False,
-            "validation": {
-                "status": "error",
-                "accepted": False,
-                "issues": [
-                    {
-                        "severity": "error",
-                        "rule": "planner_no_contract",
-                        "message": "Planner did not produce diagnostics/contract payload.",
-                    }
-                ],
-                "summary": {"error_count": 1, "warning_count": 0},
-            },
-            "summary": {"status": "error", "issue_count": 1, "accepted": False},
-        }
-    validation_payload = planner_contract_diagnostics.get("validation")
-    planner_contract_accepted = False
-    if isinstance(validation_payload, dict):
-        accepted_flag = validation_payload.get("accepted")
-        validation_status = str(validation_payload.get("status") or "").lower()
-        if isinstance(accepted_flag, bool):
-            planner_contract_accepted = bool(accepted_flag and validation_status != "error")
-    summary_payload = planner_contract_diagnostics.get("summary")
-    if isinstance(summary_payload, dict):
-        summary_accepted = summary_payload.get("accepted")
-        if isinstance(summary_accepted, bool):
+        if planner_contract_accepted:
+            if _planner_try > 1:
+                print(f"SUCCESS: Execution Planner contract accepted on graph retry {_planner_try}")
+            break
+        if _planner_try < _PLANNER_GRAPH_MAX_RETRIES:
+            _diag_issues = []
             if isinstance(validation_payload, dict):
-                planner_contract_accepted = planner_contract_accepted and summary_accepted
-            else:
-                planner_contract_accepted = summary_accepted
+                _diag_issues = validation_payload.get("issues", [])
+            _error_rules = [
+                str(iss.get("rule", ""))
+                for iss in _diag_issues
+                if isinstance(iss, dict) and str(iss.get("severity", "")).lower() == "error"
+            ]
+            print(
+                f"PLANNER_RETRY: Contract rejected on attempt {_planner_try} "
+                f"(errors: {_error_rules}); retrying full planner..."
+            )
+    # V5 contracts: flatten to v4-compatible flat dict so all downstream
+    # code (which reads contract.get("evaluation_spec"), etc.) works unchanged.
+    # The original v5 hierarchy is preserved in contract["_v5_original"].
+    if isinstance(contract, dict):
+        contract = flatten_v5_contract(contract)
+
     strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
     objective_type = None
     if isinstance(strategy_spec, dict):
@@ -17405,7 +17496,13 @@ def run_execution_planner(state: AgentState) -> AgentState:
     view_projection_errors = [
         str(err) for err in (view_payload.get("contract_views_projection_errors") or []) if err
     ]
-    if not view_projection_ok:
+    # V5 contracts: views are trivial merges from contract sections — structural
+    # failure is impossible by construction.  Treat view errors as advisory only
+    # and never abort the pipeline over them.
+    _is_v5_contract = isinstance(contract.get("_v5_original"), dict) or (
+        str(contract.get("contract_version", "")).startswith("5") and "shared" in contract
+    )
+    if not view_projection_ok and not _is_v5_contract:
         error_message = (
             "Execution planner produced a contract that cannot generate executable agent views "
             f"(fail-closed): {view_projection_errors}"
@@ -17445,6 +17542,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
             "contract_views_projection_ok": False,
             "contract_views_projection_errors": view_projection_errors,
         }
+    elif not view_projection_ok and _is_v5_contract:
+        print(f"ADVISORY: V5 view projection errors (non-blocking): {view_projection_errors}")
     if view_payload.get("contract_views"):
         try:
             de_len = len(json.dumps(view_payload["contract_views"].get("de_view", {}), ensure_ascii=True))
@@ -17911,6 +18010,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
         or de_view.get("manifest_path")
         or ""
     ).strip()
+    # V5 views store paths inside artifact_requirements, not as top-level keys.
+    # Fall back to accessors which know all resolution paths.
+    if not de_output_path:
+        de_output_path = get_clean_dataset_output_path(de_view)
+    if not de_manifest_path:
+        de_manifest_path = get_clean_manifest_path(de_view)
     de_outlier_report_path = _resolve_de_outlier_report_path(
         {"de_view": de_view, "contract_views": state.get("contract_views") or {}}
     )

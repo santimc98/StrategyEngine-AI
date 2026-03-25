@@ -524,3 +524,64 @@ EXECUTION_CONTRACT_TRANSPORT_SCHEMA["required"] = list(EXECUTION_CONTRACT_CANONI
 
 EXECUTION_SEMANTIC_CORE_TRANSPORT_SCHEMA: Dict[str, Any] = copy.deepcopy(EXECUTION_SEMANTIC_CORE_SCHEMA)
 EXECUTION_SEMANTIC_CORE_TRANSPORT_SCHEMA["required"] = list(EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS)
+
+
+# ── V5 Hierarchical Contract Schema ──────────────────────────────────
+#
+# V5 organises the contract by agent hierarchy:
+#   { "shared": {...}, "data_engineer": {...}, "ml_engineer": {...}, ... }
+#
+# View generation becomes a trivial merge instead of 800+ lines of
+# resolvers/bindings:
+#   de_view  = shared + data_engineer
+#   ml_view  = shared + ml_engineer
+#   cleaning_view = shared + data_engineer + cleaning_reviewer
+#   qa_view  = shared + ml_engineer + qa_reviewer
+#   reviewer_view = shared + ml_engineer
+#   translator_view = shared + business_translator
+#   results_advisor_view = shared
+# ─────────────────────────────────────────────────────────────────────
+
+_V5_SHARED_REQUIRED_KEYS: List[str] = [
+    "scope",
+    "strategy_title",
+    "business_objective",
+    "output_dialect",
+    "canonical_columns",
+    "column_roles",
+    "allowed_feature_sets",
+    "task_semantics",
+    "active_workstreams",
+    "model_features",
+    "column_dtype_targets",
+    "iteration_policy",
+]
+
+EXECUTION_CONTRACT_V5_CANONICAL_REQUIRED_KEYS: List[str] = [
+    "contract_version",
+    "shared",
+    "data_engineer",
+    "ml_engineer",
+]
+
+
+# ── V5 View merge formulas ──────────────────────────────────────────
+# Documented here for reference; implemented in contract_views.py.
+#
+#   de_view            = shared + data_engineer
+#   ml_view            = shared + ml_engineer
+#   cleaning_view      = shared + data_engineer + cleaning_reviewer
+#   qa_view            = shared + ml_engineer   + qa_reviewer
+#   reviewer_view      = shared + ml_engineer
+#   translator_view    = shared + business_translator
+#   results_advisor_view = shared
+# ─────────────────────────────────────────────────────────────────────
+
+# Agent section keys recognized by v5 dispatch logic.
+V5_AGENT_SECTION_KEYS: List[str] = [
+    "data_engineer",
+    "ml_engineer",
+    "cleaning_reviewer",
+    "qa_reviewer",
+    "business_translator",
+]

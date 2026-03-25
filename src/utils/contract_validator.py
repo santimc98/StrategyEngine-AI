@@ -2567,19 +2567,25 @@ def resolve_contract_active_workstreams(contract: Any) -> Dict[str, Any]:
     future modeling run" without being forced into ML training semantics.
     """
     payload = contract if isinstance(contract, dict) else {}
-    declared = payload.get("active_workstreams")
+    # V5 hierarchical contracts store shared fields under "shared"
+    _shared = payload.get("shared") if isinstance(payload.get("shared"), dict) else {}
+    _is_v5 = str(payload.get("contract_version", "")).startswith("5")
+    _ctx = _shared if _is_v5 else payload
+    declared = _ctx.get("active_workstreams")
     objective_text = " ".join(
         str(value or "")
         for value in (
-            payload.get("business_objective"),
-            payload.get("strategy_title"),
-            ((payload.get("task_semantics") or {}).get("objective_type") if isinstance(payload.get("task_semantics"), dict) else ""),
-            ((payload.get("task_semantics") or {}).get("problem_family") if isinstance(payload.get("task_semantics"), dict) else ""),
+            _ctx.get("business_objective"),
+            _ctx.get("strategy_title"),
+            ((_ctx.get("task_semantics") or {}).get("objective_type") if isinstance(_ctx.get("task_semantics"), dict) else ""),
+            ((_ctx.get("task_semantics") or {}).get("problem_family") if isinstance(_ctx.get("task_semantics"), dict) else ""),
         )
         if str(value or "").strip()
     )
-    scope = normalize_contract_scope(payload.get("scope"))
-    artifact_requirements = payload.get("artifact_requirements") if isinstance(payload.get("artifact_requirements"), dict) else {}
+    scope = normalize_contract_scope(_ctx.get("scope"))
+    _de_section = payload.get("data_engineer") if isinstance(payload.get("data_engineer"), dict) else {}
+    artifact_requirements = (_de_section.get("artifact_requirements") if _is_v5 else payload.get("artifact_requirements"))
+    artifact_requirements = artifact_requirements if isinstance(artifact_requirements, dict) else {}
     clean_dataset = {}
     if isinstance(artifact_requirements, dict):
         candidate = artifact_requirements.get("cleaned_dataset")
@@ -3485,6 +3491,143 @@ def _has_multi_target_signal(*values: Any) -> bool:
     return False
 
 
+def _validate_contract_v5(
+    contract: Dict[str, Any],
+    column_inventory: List[str] | None = None,
+) -> Dict[str, Any]:
+    """Native V5 validation — direct checks on hierarchical structure.
+
+    No flatten, no legacy rules.  Only validates what the orchestrator and
+    downstream agents actually need to function.
+    """
+    issues: List[Dict[str, Any]] = []
+
+    shared = contract.get("shared")
+    if not isinstance(shared, dict) or not shared:
+        issues.append(_strict_issue(
+            "v5.shared_missing", "error",
+            "V5 contract must have a non-empty 'shared' section.", None,
+        ))
+        return {
+            "status": "error", "accepted": False, "issues": issues,
+            "summary": {"error_count": 1, "warning_count": 0},
+        }
+
+    # ── shared essential keys ───────────────────────────────────────
+    for key in ("scope", "canonical_columns", "column_roles", "task_semantics",
+                "active_workstreams", "business_objective"):
+        val = shared.get(key)
+        if val is None or val == "" or val == [] or val == {}:
+            issues.append(_strict_issue(
+                f"v5.shared_{key}_missing", "warning",
+                f"shared.{key} is missing or empty.", None,
+            ))
+
+    # scope value check
+    scope = str(shared.get("scope") or "").strip().lower()
+    if scope and scope not in ("cleaning_only", "ml_only", "full_pipeline"):
+        # Normalize common aliases silently — only warn on truly unknown
+        _scope_aliases = {
+            "clean_only": "cleaning_only", "cleaning": "cleaning_only",
+            "ml": "ml_only", "full": "full_pipeline", "pipeline": "full_pipeline",
+        }
+        if scope not in _scope_aliases:
+            issues.append(_strict_issue(
+                "v5.shared_scope_unknown", "warning",
+                f"shared.scope '{scope}' is not a recognized value.", scope,
+            ))
+
+    # canonical_columns vs column_inventory
+    canonical = shared.get("canonical_columns")
+    if isinstance(canonical, list) and isinstance(column_inventory, list) and column_inventory:
+        inv_lower = {str(c).strip().lower() for c in column_inventory if c}
+        phantom = [c for c in canonical if isinstance(c, str) and c.strip().lower() not in inv_lower]
+        if phantom and len(phantom) > len(canonical) * 0.5:
+            issues.append(_strict_issue(
+                "v5.canonical_columns_phantom", "warning",
+                f"{len(phantom)}/{len(canonical)} canonical columns not found in column_inventory.",
+                phantom[:15],
+            ))
+
+    # ── agent sections ──────────────────────────────────────────────
+    _workstreams = shared.get("active_workstreams") if isinstance(shared.get("active_workstreams"), dict) else {}
+    _cleaning_active = _boolish(_workstreams.get("cleaning") or _workstreams.get("data_cleaning"))
+    _ml_active = _boolish(_workstreams.get("model_training") or _workstreams.get("training"))
+
+    de = contract.get("data_engineer")
+    if _cleaning_active and (not isinstance(de, dict) or not de):
+        issues.append(_strict_issue(
+            "v5.data_engineer_missing", "warning",
+            "data_engineer section missing while cleaning is active.", None,
+        ))
+    elif isinstance(de, dict):
+        if not isinstance(de.get("required_outputs"), list) or not de.get("required_outputs"):
+            issues.append(_strict_issue(
+                "v5.de_required_outputs_empty", "warning",
+                "data_engineer.required_outputs is missing or empty.", None,
+            ))
+        if not _runbook_present(de.get("runbook")):
+            issues.append(_strict_issue(
+                "v5.de_runbook_missing", "warning",
+                "data_engineer.runbook is missing or empty.", None,
+            ))
+
+    ml = contract.get("ml_engineer")
+    if _ml_active and (not isinstance(ml, dict) or not ml):
+        issues.append(_strict_issue(
+            "v5.ml_engineer_missing", "warning",
+            "ml_engineer section missing while model_training is active.", None,
+        ))
+    elif isinstance(ml, dict):
+        if not isinstance(ml.get("required_outputs"), list) or not ml.get("required_outputs"):
+            issues.append(_strict_issue(
+                "v5.ml_required_outputs_empty", "warning",
+                "ml_engineer.required_outputs is missing or empty.", None,
+            ))
+        if not _runbook_present(ml.get("runbook")):
+            issues.append(_strict_issue(
+                "v5.ml_runbook_missing", "warning",
+                "ml_engineer.runbook is missing or empty.", None,
+            ))
+
+    # ── required_outputs duplicate paths (merged across agents) ─────
+    all_output_paths: List[str] = []
+    for section_key in ("data_engineer", "ml_engineer"):
+        section = contract.get(section_key)
+        if isinstance(section, dict):
+            for item in (section.get("required_outputs") or []):
+                path = None
+                if isinstance(item, dict):
+                    path = item.get("path")
+                elif isinstance(item, str):
+                    path = item
+                if isinstance(path, str) and path.strip():
+                    all_output_paths.append(path.strip())
+    seen_paths: set = set()
+    dup_paths: List[str] = []
+    for p in all_output_paths:
+        if p.lower() in seen_paths:
+            if p not in dup_paths:
+                dup_paths.append(p)
+        seen_paths.add(p.lower())
+    if dup_paths:
+        issues.append(_strict_issue(
+            "contract.required_outputs_duplicates", "warning",
+            "required_outputs contains duplicate artifact paths.", dup_paths,
+        ))
+
+    # ── Summary ─────────────────────────────────────────────────────
+    status = _status_from_issues(issues)
+    error_count = sum(1 for i in issues if str(i.get("severity", "")).lower() in {"error", "fail"})
+    warning_count = sum(1 for i in issues if str(i.get("severity", "")).lower() == "warning")
+    return {
+        "status": status,
+        "accepted": status != "error",
+        "issues": issues,
+        "summary": {"error_count": error_count, "warning_count": warning_count, "scope": scope},
+    }
+
+
 def validate_contract_minimal_readonly(
     contract: Dict[str, Any],
     column_inventory: List[str] | None = None,
@@ -3522,6 +3665,10 @@ def validate_contract_minimal_readonly(
             "issues": issues,
             "summary": {"error_count": 1, "warning_count": 0},
         }
+
+    # V5 hierarchical: validate natively on the hierarchy — no flatten, no legacy rules.
+    if str(contract.get("contract_version", "")).startswith("5") and "shared" in contract:
+        return _validate_contract_v5(contract, column_inventory=column_inventory)
 
     steward_semantics = steward_semantics if isinstance(steward_semantics, dict) else {}
 
@@ -4514,12 +4661,19 @@ def validate_contract_minimal_readonly(
 
     # Contract-to-view executability checks (fail-closed): if the contract is accepted,
     # projected runtime views must be executable without additional deterministic repairs.
+    #
+    # V5 contracts: views are trivial merges from the hierarchical contract, so they
+    # are structurally guaranteed. Skip the legacy view-field checks — the v5 schema
+    # validation already ensures all required agent sections exist.
+    _skip_legacy_view_checks = isinstance(contract.get("_v5_original"), dict) or (
+        str(contract.get("contract_version", "")).startswith("5") and "shared" in contract
+    )
     try:
         from src.utils.contract_views import build_contract_views_projection
 
         projected_views = build_contract_views_projection(contract, artifact_index=[])
 
-        if requires_cleaning:
+        if requires_cleaning and not _skip_legacy_view_checks:
             de_view = projected_views.get("de_view") if isinstance(projected_views, dict) else None
             if not isinstance(de_view, dict) or not de_view:
                 issues.append(
@@ -4586,7 +4740,7 @@ def validate_contract_minimal_readonly(
                         )
                     )
 
-        if requires_ml:
+        if requires_ml and not _skip_legacy_view_checks:
             ml_view = projected_views.get("ml_view") if isinstance(projected_views, dict) else None
             reviewer_view = projected_views.get("reviewer_view") if isinstance(projected_views, dict) else None
             qa_view = projected_views.get("qa_view") if isinstance(projected_views, dict) else None
