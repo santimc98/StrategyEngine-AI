@@ -2086,12 +2086,28 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
     _VERDICT_LABELS = {"APPROVED": "Aprobado", "NEEDS_IMPROVEMENT": "Necesita Mejoras"}
     _GATE_LABELS = {"PASSED": "Superado", "FAILED": "No Superado"}
 
-    mc1, mc2, mc3, mc4 = st.columns(4)
+    # Estimate API cost from budget counters
+    _counters = result.get('budget_counters', {})
+    if not isinstance(_counters, dict):
+        _counters = {}
+    _total_api_calls = sum(
+        int(_counters.get(k, 0))
+        for k in ("de_calls", "ml_calls", "reviewer_calls", "qa_calls", "execution_calls")
+    )
+    # Fixed agents that always run once: steward, strategist, planner, translator
+    _fixed_calls = 4
+    _total_llm_calls = _total_api_calls + _fixed_calls
+    # Rough cost estimate: ~$0.05 per LLM call average (mix of cheap/expensive models)
+    _est_cost = _total_llm_calls * 0.05
+    _cost_str = f"~${_est_cost:.2f}"
+    _cost_color = "var(--success)" if _est_cost < 1.5 else "var(--warning)" if _est_cost < 3.0 else "var(--danger)"
+
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
     with mc1:
         st.markdown(f"""
         <div class="card fade-in" style="text-align:center;">
             <div class="card-header">Estrategia</div>
-            <div style="font-size:1rem; font-weight:700; color:var(--text-primary);">{strat_title}</div>
+            <div style="font-size:0.95rem; font-weight:700; color:var(--text-primary);">{strat_title}</div>
         </div>
         """, unsafe_allow_html=True)
     with mc2:
@@ -2117,14 +2133,23 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         st.markdown(f"""
         <div class="card fade-in" style="text-align:center;">
             <div class="card-header">Control de Calidad</div>
-            <div style="font-size:1rem; font-weight:700; color:var(--text-primary);">{gate_label}</div>
+            <div style="font-size:0.95rem; font-weight:700; color:var(--text-primary);">{gate_label}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with mc5:
+        st.markdown(f"""
+        <div class="card fade-in" style="text-align:center;">
+            <div class="card-header">Coste Estimado</div>
+            <div style="font-size:1.1rem; font-weight:700; color:{_cost_color};">{_cost_str}</div>
+            <div style="font-size:0.7rem; color:var(--text-secondary);">{_total_llm_calls} llamadas API</div>
         </div>
         """, unsafe_allow_html=True)
 
     # Tabs
-    tab1, tab2, tab_de, tab3, tab4 = st.tabs([
+    tab1, tab2, tab_plan, tab_de, tab3, tab4 = st.tabs([
         "Auditor\u00eda de Datos",
         "Estrategia",
+        "Plan de Ejecuci\u00f3n",
         "Ingenier\u00eda de Datos",
         "Modelo ML",
         "Informe Ejecutivo"
@@ -2164,7 +2189,62 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
             """, unsafe_allow_html=True)
 
 
-    # --- Tab 3: Data Engineering ---
+    # --- Tab: Execution Plan ---
+    with tab_plan:
+        st.markdown("#### Plan de Ejecuci\u00f3n")
+        contract = result.get('execution_contract', {})
+        if isinstance(contract, dict) and contract:
+            # Summary cards
+            _plan_cols = st.columns(4)
+            with _plan_cols[0]:
+                _pt = contract.get('problem_type', 'N/A')
+                st.markdown(f'<div class="card fade-in" style="text-align:center;">'
+                            f'<div class="card-header">Tipo de Problema</div>'
+                            f'<div style="font-size:0.95rem;font-weight:700;">{_pt}</div>'
+                            f'</div>', unsafe_allow_html=True)
+            with _plan_cols[1]:
+                _eval = contract.get('evaluation_spec', {}) if isinstance(contract.get('evaluation_spec'), dict) else {}
+                _pm = _eval.get('primary_metric', contract.get('primary_metric', 'N/A'))
+                st.markdown(f'<div class="card fade-in" style="text-align:center;">'
+                            f'<div class="card-header">M\u00e9trica Principal</div>'
+                            f'<div style="font-size:0.95rem;font-weight:700;">{_pm}</div>'
+                            f'</div>', unsafe_allow_html=True)
+            with _plan_cols[2]:
+                _deps = contract.get('required_dependencies', [])
+                _deps_str = ', '.join(_deps[:6]) if isinstance(_deps, list) and _deps else 'Est\u00e1ndar'
+                st.markdown(f'<div class="card fade-in" style="text-align:center;">'
+                            f'<div class="card-header">Dependencias</div>'
+                            f'<div style="font-size:0.85rem;">{_deps_str}</div>'
+                            f'</div>', unsafe_allow_html=True)
+            with _plan_cols[3]:
+                _vis = contract.get('artifact_requirements', {})
+                _vis = _vis.get('visual_requirements', {}) if isinstance(_vis, dict) else {}
+                _vis_items = _vis.get('items', []) if isinstance(_vis, dict) else []
+                _vis_count = len(_vis_items) if isinstance(_vis_items, list) else 0
+                st.markdown(f'<div class="card fade-in" style="text-align:center;">'
+                            f'<div class="card-header">Visualizaciones</div>'
+                            f'<div style="font-size:0.95rem;font-weight:700;">{_vis_count} plots</div>'
+                            f'</div>', unsafe_allow_html=True)
+
+            # Runbook
+            _runbook = contract.get('runbook', '')
+            if _runbook:
+                with st.expander("Runbook de ejecuci\u00f3n", expanded=True):
+                    st.markdown(_runbook)
+
+            # Artifact requirements
+            _art_req = contract.get('artifact_requirements', {})
+            if isinstance(_art_req, dict) and _art_req:
+                with st.expander("Requisitos de artefactos"):
+                    st.json(_art_req)
+
+            # Full contract JSON (collapsed)
+            with st.expander("Contrato completo (JSON)"):
+                st.json(contract)
+        else:
+            st.info("No se gener\u00f3 un plan de ejecuci\u00f3n para esta run.")
+
+    # --- Tab: Data Engineering ---
     with tab_de:
         st.markdown("#### Ingenier\u00eda de Datos")
 
