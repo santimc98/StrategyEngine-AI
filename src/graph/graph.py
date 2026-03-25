@@ -30382,6 +30382,24 @@ def run_translator(state: AgentState) -> AgentState:
         print(f"WARNING: Failed to build run narrative: {_narrative_err}")
         report_state["run_narrative"] = None
 
+    # Generate report visuals (charts + CSV previews) before translator call
+    try:
+        from src.utils.report_visuals import generate_report_visuals
+        work_dir_abs = os.path.abspath(state.get("work_dir") or ".")
+        visuals_result = generate_report_visuals(work_dir_abs)
+        visuals_plots = visuals_result.get("plots") or []
+        csv_previews = visuals_result.get("csv_previews") or {}
+        if visuals_plots:
+            report_plots = list(report_plots or []) + visuals_plots
+            report_state["plots_local"] = report_plots
+        if csv_previews:
+            preview_block = "\n".join(
+                f"### Preview: {name}\n{html}" for name, html in csv_previews.items()
+            )
+            report_state["csv_previews"] = preview_block
+    except Exception as vis_err:
+        print(f"WARNING: Report visuals generation failed: {vis_err}")
+
     report_state["has_partial_visuals"] = bool(report_plots) and error_flag
     report_has_partial = report_state["has_partial_visuals"]
     try:
