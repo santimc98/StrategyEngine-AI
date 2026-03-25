@@ -1609,7 +1609,7 @@ if not st.session_state.get("analysis_complete"):
         <div class="feature-card fade-in">
             <div class="feature-icon">&#127919;</div>
             <div class="feature-title">Estrategia IA</div>
-            <div class="feature-desc">Generaci&oacute;n y evaluaci&oacute;n de m&uacute;ltiples estrategias con deliberaci&oacute;n experta.</div>
+            <div class="feature-desc">Razonamiento estrat&eacute;gico senior para dise&ntilde;ar el mejor enfoque para tus datos.</div>
         </div>
         """, unsafe_allow_html=True)
     with col_f3:
@@ -1729,12 +1729,13 @@ def _fmt_elapsed(seconds: float) -> str:
 
 # Progress weight per step (cumulative %)
 _STEP_PROGRESS = {
-    "steward": 12,
+    "steward": 10,
     "strategist": 22,
-    "domain_expert": 34,
+    "execution_planner": 32,
     "data_engineer": 48,
     "engineer": 60,       # first ML iteration start
-    "evaluate_results": 82,
+    "evaluate_results": 78,
+    "review_board": 82,
     "translator": 94,
     "generate_pdf": 100,
 }
@@ -1742,11 +1743,12 @@ _STEP_PROGRESS = {
 # Friendly stage names for the progress header
 _STAGE_NAMES = {
     "steward": "Auditando datos",
-    "strategist": "Generando estrategias",
-    "domain_expert": "Deliberaci\u00f3n experta",
+    "strategist": "Generando estrategia",
+    "execution_planner": "Planificando ejecución",
     "data_engineer": "Procesando datos",
     "engineer": "Entrenando modelo ML",
     "evaluate_results": "Evaluando resultados",
+    "review_board": "Revisando calidad",
     "translator": "Generando informe",
     None: "Completado",
 }
@@ -2152,7 +2154,6 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
             st.json(strategies)
 
         selected = result.get('selected_strategy', {})
-        reviews = result.get('domain_expert_reviews', [])
 
         if selected:
             st.markdown(f"""
@@ -2162,15 +2163,6 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
             </div>
             """, unsafe_allow_html=True)
 
-        if reviews:
-            st.markdown("#### Deliberaci\u00f3n del Experto")
-            for rev in reviews:
-                score = rev.get('score', 'N/A')
-                badge_cls = "badge-success" if isinstance(score, (int, float)) and score >= 7 else "badge-warning"
-                with st.expander(f"{rev.get('title')} \u2014 Puntuaci\u00f3n: {score}/10"):
-                    st.write(f"**Razonamiento:** {rev.get('reasoning')}")
-                    st.write(f"**Riesgos:** {rev.get('risks')}")
-                    st.write(f"**Recomendaci\u00f3n:** {rev.get('recommendation')}")
 
     # --- Tab 3: Data Engineering ---
     with tab_de:
@@ -2235,12 +2227,48 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         st.markdown("#### Informe Ejecutivo")
         final_report = result.get('final_report', '')
         if final_report:
-            st.markdown(final_report)
+            # Render report with inline images: split on ![alt](path) and
+            # render each image via st.image() so they appear inline.
+            import re as _re
+            _img_pattern = _re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+            _report_run_id = st.session_state.get("viewing_run_id") or result.get("run_id")
+            _last_end = 0
+            for _m in _img_pattern.finditer(final_report):
+                # Render markdown text before this image
+                _text_before = final_report[_last_end:_m.start()].strip()
+                if _text_before:
+                    st.markdown(_text_before)
+                # Resolve image path from run dir or cwd
+                _img_alt = _m.group(1)
+                _img_rel = _m.group(2)
+                _img_resolved = None
+                if _report_run_id:
+                    _candidate = os.path.join("runs", str(_report_run_id), "work", _img_rel)
+                    if os.path.isfile(_candidate):
+                        _img_resolved = _candidate
+                if not _img_resolved and os.path.isfile(_img_rel):
+                    _img_resolved = _img_rel
+                if _img_resolved:
+                    st.image(_img_resolved, caption=_img_alt or None, use_container_width=True)
+                _last_end = _m.end()
+            # Render remaining text after last image (or full report if no images)
+            _remainder = final_report[_last_end:].strip()
+            if _remainder:
+                st.markdown(_remainder)
         else:
             st.info("No se gener\u00f3 un informe ejecutivo para esta ejecuci\u00f3n.")
 
-        # Plot gallery
-        plots = glob.glob("static/plots/*.png")
+        # Plot gallery — resolve from run directory first, fallback to cwd
+        _plot_run_id = st.session_state.get("viewing_run_id") or result.get("run_id")
+        _plot_roots = []
+        if _plot_run_id:
+            _plot_roots.append(os.path.join("runs", str(_plot_run_id), "work", "static", "plots"))
+        _plot_roots.append("static/plots")
+        plots = []
+        for _pr in _plot_roots:
+            plots = glob.glob(os.path.join(_pr, "*.png"))
+            if plots:
+                break
         if plots:
             st.markdown("#### Gr\u00e1ficos y Visualizaciones")
             cols = st.columns(min(len(plots), 3))
