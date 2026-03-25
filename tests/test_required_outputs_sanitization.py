@@ -1,5 +1,5 @@
 from src.utils.contract_validator import normalize_artifact_requirements
-from src.utils.contract_v41 import get_required_outputs
+from src.utils.contract_accessors import get_required_outputs
 from src.utils.output_contract import check_required_outputs
 
 

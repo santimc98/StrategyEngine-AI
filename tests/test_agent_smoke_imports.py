@@ -204,9 +204,9 @@ class TestCoreUtilImports:
     """Verify critical utility modules import without errors."""
 
     def test_import_contract_views(self):
-        from src.utils.contract_views import build_de_view, build_ml_view
-        assert build_de_view is not None
-        assert build_ml_view is not None
+        from src.utils.contract_views import build_contract_views_projection, trim_to_budget
+        assert build_contract_views_projection is not None
+        assert trim_to_budget is not None
 
     def test_import_contract_validator(self):
         from src.utils.contract_validator import validate_contract

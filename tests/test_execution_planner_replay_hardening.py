@@ -3,7 +3,6 @@ from pathlib import Path
 
 from src.agents.execution_planner import _build_semantic_guard_validation, _repair_common_json_damage
 from src.utils.contract_validator import validate_contract_minimal_readonly
-from src.utils.contract_views import build_contract_views_projection
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -92,64 +91,3 @@ def test_replay_97929fa9_validator_accepts_zero_optimization_rounds_for_disabled
     assert "contract.optimization_policy_value" not in rules
 
 
-def test_replay_6f2993d7_views_preserve_top_level_required_outputs_and_cleaning_gates():
-    contract_raw = _load_run_json("6f2993d7", "contract_raw.json")
-
-    projected = build_contract_views_projection(contract_raw, artifact_index=[])
-    de_view = projected.get("de_view") or {}
-    cleaning_view = projected.get("cleaning_view") or {}
-
-    top_required_outputs = contract_raw.get("required_outputs") or []
-    top_cleaning_gates = contract_raw.get("cleaning_gates") or []
-    de_required_outputs = de_view.get("required_outputs") or []
-    cleaning_gates = cleaning_view.get("cleaning_gates") or []
-
-    assert len(de_required_outputs) == len(top_required_outputs)
-    assert len(cleaning_gates) == len(top_cleaning_gates)
-
-    def _extract_paths(items: list) -> set[str]:
-        paths: set[str] = set()
-        for item in items:
-            if isinstance(item, dict) and isinstance(item.get("path"), str):
-                paths.add(item["path"])
-            elif isinstance(item, str):
-                paths.add(item)
-        return paths
-
-    top_paths = _extract_paths(top_required_outputs)
-    de_paths = _extract_paths(de_required_outputs)
-    assert de_paths == top_paths
-
-    top_gate_names = {
-        item.get("name")
-        for item in top_cleaning_gates
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
-    cleaning_gate_names = {
-        item.get("name")
-        for item in cleaning_gates
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
-    assert cleaning_gate_names == top_gate_names
-
-
-def test_replay_ccc6cbf5_de_view_preserves_declared_optional_passthrough_columns():
-    contract_raw = _load_run_json("ccc6cbf5", "contract_raw.json")
-
-    projected = build_contract_views_projection(contract_raw, artifact_index=[])
-    de_view = projected.get("de_view") or {}
-    artifact_reqs = (contract_raw.get("artifact_requirements") or {}).get("clean_dataset") or {}
-    expected_optional = artifact_reqs.get("optional_passthrough_columns") or []
-
-    assert de_view.get("optional_passthrough_columns") == expected_optional
-
-
-def test_replay_6c9b6bd5_ml_view_preserves_declared_model_features():
-    contract_raw = json.loads(
-        (_REPO_ROOT / "runs" / "6c9b6bd5" / "work" / "data" / "execution_contract_raw.json").read_text(encoding="utf-8")
-    )
-
-    projected = build_contract_views_projection(contract_raw, artifact_index=[])
-    ml_view = projected.get("ml_view") or {}
-
-    assert ml_view.get("model_features") == contract_raw.get("model_features")

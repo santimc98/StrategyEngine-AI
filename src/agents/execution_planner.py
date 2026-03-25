@@ -1400,113 +1400,6 @@ def _build_transport_validation(payload: Any) -> Dict[str, Any]:
     }
 
 
-def _looks_like_legacy_execution_payload(payload: Any) -> bool:
-    if not isinstance(payload, dict) or not payload:
-        return False
-    candidate = payload.get("contract") if isinstance(payload.get("contract"), dict) else payload
-    if not isinstance(candidate, dict) or not candidate:
-        return False
-    legacy_keys = {
-        "feature_engineering_plan",
-        "feature_engineering_tasks",
-        "artifact_requirements",
-        "evaluation_spec",
-        "objective_analysis",
-        "validation_requirements",
-        "preprocessing_requirements",
-        "leakage_execution_plan",
-        "data_analysis",
-        "iteration_policy",
-        "ml_engineer_runbook",
-        "data_engineer_runbook",
-        "column_roles",
-        "required_outputs",
-        "qa_gates",
-        "reviewer_gates",
-    }
-    return any(key in candidate for key in legacy_keys)
-
-
-def _payload_needs_required_key_lift(payload: Any, required_keys: List[str]) -> bool:
-    if not isinstance(payload, dict) or not _looks_like_legacy_execution_payload(payload):
-        return False
-    candidate = payload.get("contract") if isinstance(payload.get("contract"), dict) else payload
-    if not isinstance(candidate, dict):
-        return False
-    canonical_marker_keys = (
-        "scope",
-        "active_workstreams",
-        "task_semantics",
-        "allowed_feature_sets",
-        "column_roles",
-    )
-    canonical_marker_count = sum(
-        1 for key in canonical_marker_keys if _is_meaningful_contract_value(candidate.get(key))
-    )
-    if canonical_marker_count >= 4 and _is_meaningful_contract_value(candidate.get("contract_version")):
-        return False
-    return any(not _is_meaningful_contract_value(candidate.get(key)) for key in required_keys)
-
-
-def _merge_contract_scaffold_with_payload(scaffold: Any, payload: Any) -> Any:
-    if isinstance(scaffold, dict) and isinstance(payload, dict):
-        merged = copy.deepcopy(scaffold)
-        for key, payload_value in payload.items():
-            if key in merged:
-                merged[key] = _merge_contract_scaffold_with_payload(merged.get(key), payload_value)
-                continue
-            merged[key] = copy.deepcopy(payload_value)
-        return merged
-    if isinstance(scaffold, list) and isinstance(payload, list):
-        return copy.deepcopy(payload) if _is_meaningful_contract_value(payload) else copy.deepcopy(scaffold)
-    return copy.deepcopy(payload) if _is_meaningful_contract_value(payload) else copy.deepcopy(scaffold)
-
-
-def _normalize_legacy_execution_payload(
-    payload: Dict[str, Any] | None,
-    *,
-    strategy: Dict[str, Any] | None,
-    column_inventory: List[str] | None,
-    relevant_columns: List[str] | None,
-    data_profile: Dict[str, Any] | None,
-    business_objective_hint: str = "",
-    base_contract: Dict[str, Any] | None = None,
-) -> Dict[str, Any] | None:
-    candidate = payload.get("contract") if isinstance(payload, dict) and isinstance(payload.get("contract"), dict) else payload
-    if not isinstance(candidate, dict) or not candidate or not _looks_like_legacy_execution_payload(candidate):
-        return None
-
-    scaffold = copy.deepcopy(base_contract) if isinstance(base_contract, dict) and base_contract else None
-    if not isinstance(scaffold, dict) or not scaffold:
-        scaffold = build_contract_min(
-            candidate,
-            strategy,
-            column_inventory,
-            relevant_columns,
-            target_candidates=None,
-            data_profile=data_profile,
-            business_objective_hint=business_objective_hint,
-        )
-    if not isinstance(scaffold, dict) or not scaffold:
-        return None
-
-    merged = _merge_contract_scaffold_with_payload(scaffold, candidate)
-    merged = _sync_execution_contract_outputs(merged, scaffold)
-    merged = _apply_planner_structural_support(merged)
-
-    allowed_sets = merged.get("allowed_feature_sets")
-    if not isinstance(merged.get("model_features"), list):
-        merged["model_features"] = []
-    if not merged.get("model_features") and isinstance(allowed_sets, dict):
-        model_features_raw = allowed_sets.get("model_features")
-        if isinstance(model_features_raw, list):
-            merged["model_features"] = [str(col).strip() for col in model_features_raw if str(col).strip()]
-
-    contract_version = merged.get("contract_version")
-    if contract_version is None:
-        merged["contract_version"] = CONTRACT_VERSION_V41
-
-    return merged
 
 
 def _synthesize_semantic_core_from_contract_candidate(contract_candidate: Dict[str, Any] | None) -> Dict[str, Any] | None:
@@ -2444,87 +2337,6 @@ def _align_decisioning_requirements_with_schema(
     new_output["required_columns"] = updated
     aligned["output"] = new_output
     return aligned
-
-
-def _sync_execution_contract_outputs(contract: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(contract, dict) or not isinstance(contract_min, dict):
-        return contract
-
-    def _extract_output_path(item: Any) -> str:
-        if isinstance(item, str):
-            return item
-        if isinstance(item, dict):
-            for key in ("path", "output", "artifact"):
-                value = item.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value
-        return ""
-
-    required_outputs = contract.get("required_outputs")
-    required_outputs_list = (
-        [path for path in (_extract_output_path(item) for item in required_outputs) if path]
-        if isinstance(required_outputs, list)
-        else []
-    )
-    has_conceptual = any(item and not is_probably_path(item) for item in required_outputs_list)
-
-    min_required_outputs = contract_min.get("required_outputs")
-    min_required_outputs_list = (
-        [path for path in (_extract_output_path(item) for item in min_required_outputs) if path and is_probably_path(path)]
-        if isinstance(min_required_outputs, list)
-        else []
-    )
-
-    if has_conceptual and min_required_outputs_list:
-        contract["required_outputs"] = min_required_outputs_list
-    elif not required_outputs_list and min_required_outputs_list:
-        contract["required_outputs"] = min_required_outputs_list
-
-    contract_artifacts = contract.get("artifact_requirements")
-    if not isinstance(contract_artifacts, dict):
-        contract_artifacts = {}
-    min_artifacts = contract_min.get("artifact_requirements")
-    if not isinstance(min_artifacts, dict):
-        min_artifacts = {}
-
-    min_required_files = _extract_required_paths(min_artifacts)
-    contract_required_files = _extract_required_paths(contract_artifacts)
-    if min_required_files:
-        merged_files: List[Dict[str, Any]] = []
-        seen = {path.lower() for path in contract_required_files if path}
-        for path in contract_required_files:
-            merged_files.append({"path": path, "description": ""})
-        for path in min_required_files:
-            key = path.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            merged_files.append({"path": path, "description": ""})
-        if merged_files:
-            contract_artifacts["required_files"] = merged_files
-            contract["artifact_requirements"] = contract_artifacts
-
-    contract_scored_schema = contract_artifacts.get("scored_rows_schema")
-    min_scored_schema = min_artifacts.get("scored_rows_schema")
-    merged_scored_schema = _merge_scored_rows_schema(contract_scored_schema, min_scored_schema)
-    if merged_scored_schema:
-        contract_artifacts["scored_rows_schema"] = merged_scored_schema
-        contract["artifact_requirements"] = contract_artifacts
-
-    merged_outputs: List[str] = []
-    seen_outputs: set[str] = set()
-    for item in (contract.get("required_outputs") or []) + min_required_files:
-        path = _extract_output_path(item)
-        if not path or not is_probably_path(path):
-            continue
-        if path in seen_outputs:
-            continue
-        seen_outputs.add(path)
-        merged_outputs.append(path)
-    if merged_outputs:
-        contract["required_outputs"] = merged_outputs
-
-    return contract
 
 
 def _repair_deliverable_invariants(contract: Dict[str, Any], errors: List[Dict[str, Any]] | None) -> Dict[str, Any]:
@@ -10056,7 +9868,6 @@ domain_expert_critique:
         contract: Dict[str, Any] | None = None
         llm_success = False
         semantic_success = False
-        legacy_contract_seed_for_compile: Dict[str, Any] | None = None
         best_candidate: Dict[str, Any] | None = None
         best_canonical_candidate: Dict[str, Any] | None = None
         best_validation: Dict[str, Any] | None = None
@@ -10150,56 +9961,17 @@ domain_expert_critique:
                 if parsed_payload is not None and not isinstance(parsed_payload, dict):
                     parse_error = ValueError("Parsed semantic_core JSON is not an object")
                 elif not _transport_validation_accepted(semantic_validation):
-                    lifted_legacy_contract = None
-                    if _payload_needs_required_key_lift(
-                        parsed_payload,
-                        EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS,
-                    ):
-                        lifted_legacy_contract = _normalize_legacy_execution_payload(
-                            parsed_payload,
-                            strategy=strategy,
-                            column_inventory=column_inventory,
-                            relevant_columns=relevant_columns,
-                            data_profile=data_profile,
-                            business_objective_hint=business_objective or "",
-                        )
-                    if isinstance(lifted_legacy_contract, dict) and lifted_legacy_contract:
-                        synthetic_semantic_core = _synthesize_semantic_core_from_contract_candidate(
-                            lifted_legacy_contract
-                        )
-                        if isinstance(synthetic_semantic_core, dict) and synthetic_semantic_core:
-                            parsed_semantic = synthetic_semantic_core
-                            semantic_validation = {
-                                "status": "ok",
-                                "accepted": True,
-                                "issues": [
-                                    {
-                                        "severity": "warning",
-                                        "rule": "semantic_core.legacy_payload_lift",
-                                        "message": "Legacy/partial planner payload was lifted into a synthetic semantic_core for one-shot compatibility.",
-                                    }
-                                ],
-                                "summary": {"error_count": 0, "warning_count": 1, "phase": "semantic_transport"},
-                            }
-                            last_semantic_transport_validation = semantic_validation
-                            legacy_contract_seed_for_compile = copy.deepcopy(lifted_legacy_contract)
-                            parse_error = None
-                        else:
-                            parsed_semantic = None
-                    else:
-                        parsed_semantic = None
-                    if parsed_semantic is None:
-                        transport_issue = None
-                        issues = semantic_validation.get("issues")
-                        if isinstance(issues, list):
-                            for issue in issues:
-                                if isinstance(issue, dict) and issue.get("rule"):
-                                    transport_issue = str(issue.get("rule"))
-                                    break
-                        parse_error = ValueError(
-                            f"Semantic core invalid: {transport_issue or 'missing_or_trivial_semantic_core'}"
-                        )
-                        parsed_semantic = None
+                    transport_issue = None
+                    issues = semantic_validation.get("issues")
+                    if isinstance(issues, list):
+                        for issue in issues:
+                            if isinstance(issue, dict) and issue.get("rule"):
+                                transport_issue = str(issue.get("rule"))
+                                break
+                    parse_error = ValueError(
+                        f"Semantic core invalid: {transport_issue or 'missing_or_trivial_semantic_core'}"
+                    )
+                    parsed_semantic = None
 
                 planner_diag.append(
                     {
@@ -10368,65 +10140,20 @@ domain_expert_critique:
                         elif parsed is None and parse_error is None:
                             parse_error = ValueError("Parsed planner payload is missing a contract object")
                         elif not _transport_validation_accepted(transport_validation_result):
-                            lifted_candidate = None
-                            if _payload_needs_required_key_lift(
-                                parsed_payload,
-                                [key for key in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS if key != "contract_version"],
-                            ):
-                                lifted_candidate = _normalize_legacy_execution_payload(
-                                    parsed_payload,
-                                    strategy=strategy,
-                                    column_inventory=column_inventory,
-                                    relevant_columns=relevant_columns,
-                                    data_profile=data_profile,
-                                    business_objective_hint=business_objective or "",
-                                    base_contract=legacy_contract_seed_for_compile,
-                                )
-                            if isinstance(lifted_candidate, dict) and lifted_candidate:
-                                parsed = lifted_candidate
-                                transport_validation_result = {
-                                    "status": "ok",
-                                    "accepted": True,
-                                    "issues": [
-                                        {
-                                            "severity": "warning",
-                                            "rule": "contract.legacy_payload_lift",
-                                            "message": "Legacy/partial compiler payload was lifted into a canonical contract candidate before validation.",
-                                        }
-                                    ],
-                                    "summary": {"error_count": 0, "warning_count": 1, "phase": "transport"},
-                                }
-                                parse_error = None
-                            else:
-                                transport_issue = None
-                                issues = transport_validation_result.get("issues")
-                                if isinstance(issues, list):
-                                    for issue in issues:
-                                        if isinstance(issue, dict) and issue.get("rule"):
-                                            transport_issue = str(issue.get("rule"))
-                                            break
-                                parse_error = ValueError(
-                                    f"Transport payload invalid: {transport_issue or 'empty_or_trivial_contract'}"
-                                )
-                                parsed = None
+                            transport_issue = None
+                            issues = transport_validation_result.get("issues")
+                            if isinstance(issues, list):
+                                for issue in issues:
+                                    if isinstance(issue, dict) and issue.get("rule"):
+                                        transport_issue = str(issue.get("rule"))
+                                        break
+                            parse_error = ValueError(
+                                f"Transport payload invalid: {transport_issue or 'empty_or_trivial_contract'}"
+                            )
+                            parsed = None
 
                     quality_error_message = None
                     if parsed is not None and isinstance(parsed, dict):
-                        if _payload_needs_required_key_lift(
-                            parsed,
-                            [key for key in EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS if key != "contract_version"],
-                        ):
-                            lifted_candidate = _normalize_legacy_execution_payload(
-                                parsed,
-                                strategy=strategy,
-                                column_inventory=column_inventory,
-                                relevant_columns=relevant_columns,
-                                data_profile=data_profile,
-                                business_objective_hint=business_objective or "",
-                                base_contract=legacy_contract_seed_for_compile,
-                            )
-                            if isinstance(lifted_candidate, dict) and lifted_candidate:
-                                parsed = lifted_candidate
                         round_has_candidate = True
                         planner_contract_canonical = copy.deepcopy(parsed)
                         candidate_for_validation = copy.deepcopy(parsed)

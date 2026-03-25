@@ -15,7 +15,7 @@ from src.utils.contract_validator import (
     _is_supervised_contract,
     _extract_role_from_value,
 )
-from src.utils.contract_v41 import get_outcome_columns
+from src.utils.contract_accessors import get_outcome_columns
 
 
 class TestExtractRoleFromValue:

@@ -1,29 +1,7 @@
-"""Execution Planner canonical contract transport schemas."""
+"""Execution Planner contract schemas."""
 
 from typing import Any, Dict, List
 import copy
-
-
-_AGENT_INTERFACE_BLOCK_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "minProperties": 1,
-    "additionalProperties": True,
-}
-
-
-_AGENT_INTERFACES_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "data_engineer": copy.deepcopy(_AGENT_INTERFACE_BLOCK_SCHEMA),
-        "ml_engineer": copy.deepcopy(_AGENT_INTERFACE_BLOCK_SCHEMA),
-        "cleaning_reviewer": copy.deepcopy(_AGENT_INTERFACE_BLOCK_SCHEMA),
-        "qa_reviewer": copy.deepcopy(_AGENT_INTERFACE_BLOCK_SCHEMA),
-        "reviewer": copy.deepcopy(_AGENT_INTERFACE_BLOCK_SCHEMA),
-        "translator": copy.deepcopy(_AGENT_INTERFACE_BLOCK_SCHEMA),
-        "results_advisor": copy.deepcopy(_AGENT_INTERFACE_BLOCK_SCHEMA),
-    },
-    "additionalProperties": True,
-}
 
 
 _REQUIRED_OUTPUT_ITEM_SCHEMA: Dict[str, Any] = {
@@ -52,96 +30,6 @@ _REQUIRED_OUTPUTS_SCHEMA: Dict[str, Any] = {
     "type": "array",
     "items": copy.deepcopy(_REQUIRED_OUTPUT_ITEM_SCHEMA),
     "minItems": 1,
-}
-
-
-EXECUTION_CONTRACT_V41_MIN_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "required": [
-        "contract_version",
-        "scope",
-        "strategy_title",
-        "business_objective",
-        "output_dialect",
-        "canonical_columns",
-        "column_roles",
-        "allowed_feature_sets",
-        "artifact_requirements",
-        "required_outputs",
-        "iteration_policy",
-    ],
-    "properties": {
-        "contract_version": {"type": "string"},
-        "scope": {
-            "type": "string",
-            "enum": ["cleaning_only", "ml_only", "full_pipeline"],
-        },
-        "strategy_title": {"type": "string"},
-        "business_objective": {"type": "string"},
-        "output_dialect": {
-            "type": "object",
-            "required": ["sep", "decimal", "encoding"],
-            "properties": {
-                "sep": {"type": "string"},
-                "decimal": {"type": "string"},
-                "encoding": {"type": "string"},
-            },
-            "additionalProperties": False,
-        },
-        "canonical_columns": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "required_outputs": copy.deepcopy(_REQUIRED_OUTPUTS_SCHEMA),
-        "column_roles": {
-            "type": "object",
-            "required": [
-                "pre_decision",
-                "decision",
-                "outcome",
-                "post_decision_audit_only",
-                "unknown",
-                "identifiers",
-                "time_columns",
-            ],
-            "properties": {
-                "pre_decision": {"type": "array", "items": {"type": "string"}},
-                "decision": {"type": "array", "items": {"type": "string"}},
-                "outcome": {"type": "array", "items": {"type": "string"}},
-                "post_decision_audit_only": {"type": "array", "items": {"type": "string"}},
-                "unknown": {"type": "array", "items": {"type": "string"}},
-                "identifiers": {"type": "array", "items": {"type": "string"}},
-                "time_columns": {"type": "array", "items": {"type": "string"}},
-            },
-            "additionalProperties": False,
-        },
-        "allowed_feature_sets": {
-            "type": "object",
-            "required": [
-                "segmentation_features",
-                "model_features",
-                "forbidden_features",
-                "audit_only_features",
-            ],
-            "properties": {
-                "segmentation_features": {"type": "array", "items": {"type": "string"}},
-                "model_features": {"type": "array", "items": {"type": "string"}},
-                "forbidden_features": {"type": "array", "items": {"type": "string"}},
-                "audit_only_features": {"type": "array", "items": {"type": "string"}},
-            },
-            "additionalProperties": False,
-        },
-        "artifact_requirements": {
-            "type": "object",
-            "additionalProperties": True,
-        },
-        "iteration_policy": {
-            "type": "object",
-            "additionalProperties": True,
-        },
-        "agent_interfaces": copy.deepcopy(_AGENT_INTERFACES_SCHEMA),
-    },
-    "additionalProperties": True,
 }
 
 
@@ -177,17 +65,8 @@ OPTIMIZATION_POLICY_MIN_SCHEMA: Dict[str, Any] = {
 }
 
 
-EXECUTION_CONTRACT_V42_MIN_SCHEMA: Dict[str, Any] = copy.deepcopy(EXECUTION_CONTRACT_V41_MIN_SCHEMA)
-EXECUTION_CONTRACT_V42_MIN_SCHEMA["properties"] = dict(EXECUTION_CONTRACT_V42_MIN_SCHEMA.get("properties") or {})
-EXECUTION_CONTRACT_V42_MIN_SCHEMA["properties"]["contract_version"] = {
-    "type": "string",
-    "enum": ["4.1", "4.2"],
-}
-EXECUTION_CONTRACT_V42_MIN_SCHEMA["properties"]["optimization_policy"] = copy.deepcopy(
-    OPTIMIZATION_POLICY_MIN_SCHEMA
-)
-
-
+# V4 canonical required keys — kept for backward compat in execution_planner
+# validation scoring (non-v5 path).
 EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS: List[str] = [
     "contract_version",
     "scope",
@@ -274,42 +153,6 @@ _GATE_LIST_SCHEMA: Dict[str, Any] = {
             copy.deepcopy(_GATE_OBJECT_SCHEMA),
         ]
     },
-}
-
-
-_COLUMN_DTYPE_TARGETS_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "minProperties": 1,
-    "additionalProperties": {
-        "type": "object",
-        "properties": {
-            "target_dtype": {"type": "string"},
-            "nullable": {"type": "boolean"},
-            "role": {"type": "string"},
-            "source": {"type": "string"},
-        },
-        "required": ["target_dtype"],
-        "additionalProperties": True,
-    },
-}
-
-
-_ITERATION_POLICY_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "minProperties": 1,
-    "required": [
-        "max_iterations",
-        "metric_improvement_max",
-        "runtime_fix_max",
-        "compliance_bootstrap_max",
-    ],
-    "properties": {
-        "max_iterations": {"type": "integer", "minimum": 1},
-        "metric_improvement_max": {"type": "integer", "minimum": 0},
-        "runtime_fix_max": {"type": "integer", "minimum": 0},
-        "compliance_bootstrap_max": {"type": "integer", "minimum": 0},
-    },
-    "additionalProperties": True,
 }
 
 
@@ -424,104 +267,6 @@ EXECUTION_SEMANTIC_CORE_SCHEMA: Dict[str, Any] = {
 }
 
 
-EXECUTION_CONTRACT_CANONICAL_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "required": list(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS),
-    "properties": {
-        "contract_version": {"type": "string", "enum": ["4.1", "4.2"]},
-        "scope": {"type": "string", "enum": ["cleaning_only", "ml_only", "full_pipeline"]},
-        "strategy_title": {"type": "string", "minLength": 1},
-        "business_objective": {"type": "string", "minLength": 1},
-        "output_dialect": {
-            "type": "object",
-            "required": ["sep", "decimal", "encoding"],
-            "properties": {
-                "sep": {"type": "string"},
-                "decimal": {"type": "string"},
-                "encoding": {"type": "string"},
-            },
-            "additionalProperties": True,
-        },
-        "canonical_columns": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-        "required_outputs": copy.deepcopy(_REQUIRED_OUTPUTS_SCHEMA),
-        "column_roles": {
-            "type": "object",
-            "required": [
-                "pre_decision",
-                "decision",
-                "outcome",
-                "post_decision_audit_only",
-                "unknown",
-                "identifiers",
-                "time_columns",
-            ],
-            "properties": {
-                "pre_decision": {"type": "array", "items": {"type": "string"}},
-                "decision": {"type": "array", "items": {"type": "string"}},
-                "outcome": {"type": "array", "items": {"type": "string"}},
-                "post_decision_audit_only": {"type": "array", "items": {"type": "string"}},
-                "unknown": {"type": "array", "items": {"type": "string"}},
-                "identifiers": {"type": "array", "items": {"type": "string"}},
-                "time_columns": {"type": "array", "items": {"type": "string"}},
-            },
-            "additionalProperties": True,
-        },
-        "allowed_feature_sets": {
-            "type": "object",
-            "required": [
-                "segmentation_features",
-                "model_features",
-                "forbidden_features",
-                "audit_only_features",
-            ],
-            "properties": {
-                "segmentation_features": {"type": "array", "items": {"type": "string"}},
-                "model_features": {"type": "array", "items": {"type": "string"}},
-                "forbidden_features": {"type": "array", "items": {"type": "string"}},
-                "audit_only_features": {"type": "array", "items": {"type": "string"}},
-            },
-            "additionalProperties": True,
-        },
-        "task_semantics": {
-            "type": "object",
-            "required": ["problem_family", "objective_type"],
-            "properties": {
-                "problem_family": {"type": "string"},
-                "objective_type": {"type": "string"},
-                "primary_target": {"type": "string"},
-                "target_columns": {"type": "array", "items": {"type": "string"}},
-                "prediction_unit": {"type": "string"},
-                "output_schema": {"type": "object", "additionalProperties": True},
-            },
-            "additionalProperties": True,
-        },
-        "active_workstreams": _ACTIVE_WORKSTREAMS_SCHEMA,
-        "future_ml_handoff": _FUTURE_ML_HANDOFF_SCHEMA,
-        "artifact_requirements": {"type": "object", "minProperties": 1, "additionalProperties": True},
-        "model_features": {"type": "array", "items": {"type": "string"}},
-        "column_dtype_targets": _COLUMN_DTYPE_TARGETS_SCHEMA,
-        "cleaning_gates": _GATE_LIST_SCHEMA,
-        "qa_gates": _GATE_LIST_SCHEMA,
-        "reviewer_gates": _GATE_LIST_SCHEMA,
-        "validation_requirements": {"type": "object", "additionalProperties": True},
-        "data_engineer_runbook": _RUNBOOK_SCHEMA,
-        "ml_engineer_runbook": _RUNBOOK_SCHEMA,
-        "evaluation_spec": {"type": "object", "additionalProperties": True},
-        "iteration_policy": copy.deepcopy(_ITERATION_POLICY_SCHEMA),
-        "optimization_policy": copy.deepcopy(OPTIMIZATION_POLICY_MIN_SCHEMA),
-        "agent_interfaces": copy.deepcopy(_AGENT_INTERFACES_SCHEMA),
-    },
-    "additionalProperties": True,
-}
-
-
-EXECUTION_CONTRACT_TRANSPORT_SCHEMA: Dict[str, Any] = copy.deepcopy(EXECUTION_CONTRACT_CANONICAL_SCHEMA)
-# Transport schema must require the same keys as the canonical schema.
-# When the schema marks keys as optional, LLMs deprioritize them regardless
-# of prompt instructions — the tool schema has higher weight than text.
-EXECUTION_CONTRACT_TRANSPORT_SCHEMA["required"] = list(EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS)
-
-
 EXECUTION_SEMANTIC_CORE_TRANSPORT_SCHEMA: Dict[str, Any] = copy.deepcopy(EXECUTION_SEMANTIC_CORE_SCHEMA)
 EXECUTION_SEMANTIC_CORE_TRANSPORT_SCHEMA["required"] = list(EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS)
 
@@ -531,8 +276,7 @@ EXECUTION_SEMANTIC_CORE_TRANSPORT_SCHEMA["required"] = list(EXECUTION_SEMANTIC_C
 # V5 organises the contract by agent hierarchy:
 #   { "shared": {...}, "data_engineer": {...}, "ml_engineer": {...}, ... }
 #
-# View generation becomes a trivial merge instead of 800+ lines of
-# resolvers/bindings:
+# View generation becomes a trivial merge:
 #   de_view  = shared + data_engineer
 #   ml_view  = shared + ml_engineer
 #   cleaning_view = shared + data_engineer + cleaning_reviewer
@@ -564,18 +308,6 @@ EXECUTION_CONTRACT_V5_CANONICAL_REQUIRED_KEYS: List[str] = [
     "ml_engineer",
 ]
 
-
-# ── V5 View merge formulas ──────────────────────────────────────────
-# Documented here for reference; implemented in contract_views.py.
-#
-#   de_view            = shared + data_engineer
-#   ml_view            = shared + ml_engineer
-#   cleaning_view      = shared + data_engineer + cleaning_reviewer
-#   qa_view            = shared + ml_engineer   + qa_reviewer
-#   reviewer_view      = shared + ml_engineer
-#   translator_view    = shared + business_translator
-#   results_advisor_view = shared
-# ─────────────────────────────────────────────────────────────────────
 
 # Agent section keys recognized by v5 dispatch logic.
 V5_AGENT_SECTION_KEYS: List[str] = [

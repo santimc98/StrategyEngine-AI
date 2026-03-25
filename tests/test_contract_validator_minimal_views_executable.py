@@ -153,26 +153,6 @@ def test_validate_contract_minimal_readonly_accepts_cleaning_feature_prep_withou
     assert "contract.ml_engineer_runbook" not in rules
 
 
-def test_validate_contract_minimal_readonly_rejects_missing_de_manifest_path():
-    contract = _base_full_pipeline_contract()
-    clean_dataset = contract["artifact_requirements"]["clean_dataset"]
-    clean_dataset.pop("output_manifest_path", None)
-    contract["required_outputs"] = [
-        path for path in contract.get("required_outputs", []) if "manifest" not in str(path).lower()
-    ]
-    contract["artifact_requirements"]["required_files"] = [
-        item
-        for item in contract["artifact_requirements"].get("required_files", [])
-        if "manifest" not in str(item.get("path", "")).lower()
-    ]
-
-    result = validate_contract_minimal_readonly(contract)
-
-    assert result.get("accepted") is False
-    rules = {str(issue.get("rule")) for issue in result.get("issues", []) if isinstance(issue, dict)}
-    assert "contract.de_view_manifest_path" in rules
-
-
 def test_validate_contract_minimal_readonly_rejects_unknown_ml_objective():
     contract = _base_full_pipeline_contract()
     contract.pop("objective_analysis", None)

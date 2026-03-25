@@ -1,6 +1,5 @@
 from src.agents.execution_planner import build_execution_plan
 from src.agents.results_advisor import ResultsAdvisorAgent
-from src.utils.contract_views import _resolve_objective_type
 from src.utils.problem_capabilities import (
     infer_problem_capabilities,
     metric_family_for_metric,
@@ -51,25 +50,6 @@ def test_build_execution_plan_adds_survival_outputs():
     assert plan["objective_type"] == "survival_analysis"
     assert "predictions" in output_types
     assert "calibration" in output_types
-
-
-def test_contract_views_resolve_objective_type_uses_capabilities():
-    contract_full = {
-        "business_objective": "Model survival risk over time",
-        "evaluation_spec": {"objective_type": "predictive"},
-        "validation_requirements": {"primary_metric": "concordance_index"},
-        "required_outputs": ["data/metrics.json", "data/scored_rows.csv"],
-    }
-
-    objective_type = _resolve_objective_type({}, contract_full, contract_full["required_outputs"])
-
-    assert objective_type == "survival_analysis"
-
-
-def test_contract_views_output_only_fallback_uses_capability_family():
-    objective_type = _resolve_objective_type({}, {}, ["data/cluster_assignments.csv"])
-
-    assert objective_type == "clustering"
 
 
 def test_results_advisor_metric_priority_supports_survival():

@@ -5,13 +5,7 @@ import sys
 from typing import Any, Dict, List
 
 from src.utils.contract_views import (
-    build_de_view,
-    build_ml_view,
-    build_cleaning_view,
-    build_qa_view,
-    build_reviewer_view,
-    build_translator_view,
-    build_results_advisor_view,
+    build_contract_views_projection,
     persist_views,
 )
 
@@ -24,15 +18,6 @@ def _load_json(path: str) -> Any:
             return json.load(f)
     except Exception:
         return None
-
-
-def _artifact_index_from_required_outputs(required_outputs: List[str]) -> List[Dict[str, Any]]:
-    entries = []
-    for path in required_outputs or []:
-        if not path:
-            continue
-        entries.append({"path": path, "artifact_type": "artifact"})
-    return entries
 
 
 def main() -> int:
@@ -50,34 +35,12 @@ def main() -> int:
         return 1
 
     contract_full = _load_json(args.contract_full) if args.contract_full else _load_json("data/execution_contract.json") or {}
-    contract_min = {}
-    artifact_index = _load_json(args.artifact_index) if args.artifact_index else _load_json("data/produced_artifact_index.json")
-    if not isinstance(artifact_index, list):
-        required_outputs = contract_full.get("required_outputs") if isinstance(contract_full, dict) else []
-        if not isinstance(required_outputs, list):
-            required_outputs = []
-        artifact_index = _artifact_index_from_required_outputs(required_outputs)
 
     if not contract_full:
         print("dry_views error: missing execution_contract. Provide --contract_full or data/execution_contract.json.")
         return 2
 
-    de_view = build_de_view(contract_full, {}, artifact_index)
-    ml_view = build_ml_view(contract_full, {}, artifact_index)
-    cleaning_view = build_cleaning_view(contract_full, {}, artifact_index)
-    qa_view = build_qa_view(contract_full, {}, artifact_index)
-    reviewer_view = build_reviewer_view(contract_full, {}, artifact_index)
-    translator_view = build_translator_view(contract_full, {}, artifact_index)
-    results_advisor_view = build_results_advisor_view(contract_full, {}, artifact_index)
-    views = {
-        "de_view": de_view,
-        "ml_view": ml_view,
-        "cleaning_view": cleaning_view,
-        "qa_view": qa_view,
-        "reviewer_view": reviewer_view,
-        "translator_view": translator_view,
-        "results_advisor_view": results_advisor_view,
-    }
+    views = build_contract_views_projection(contract_full)
     persisted = persist_views(
         views,
         base_dir=args.output_dir,

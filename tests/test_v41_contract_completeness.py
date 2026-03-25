@@ -1,6 +1,6 @@
 
 import pytest
-from src.utils.contract_v41 import strip_legacy_keys, assert_no_legacy_keys, LEGACY_KEYS
+from src.utils.contract_accessors import strip_legacy_keys, assert_no_legacy_keys, LEGACY_KEYS
 
 def test_legacy_keys_definitions():
     """Ensure newly banned keys are in LEGACY_KEYS."""

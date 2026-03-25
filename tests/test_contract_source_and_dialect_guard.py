@@ -11,7 +11,7 @@ import json
 
 from src.agents.execution_planner import ExecutionPlannerAgent
 from src.graph.graph import _resolve_required_input_columns, dialect_guard_violations, _filter_input_contract
-from src.utils.contract_v41 import get_canonical_columns, get_derived_column_names
+from src.utils.contract_accessors import get_canonical_columns, get_derived_column_names
 
 
 def test_execution_planner_marks_missing_column_as_derived_with_inventory():
