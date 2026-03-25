@@ -921,6 +921,17 @@ section[data-testid="stSidebar"] .stButton > button:hover {
     color: #a6e3a1;
     font-weight: 600;
 }
+.sidebar-run-objective {
+    font-size: 0.66rem;
+    color: #7d8590;
+    margin-top: 0.2rem;
+    line-height: 1.3;
+    font-style: italic;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
 
 /* ---------- Footer ---------- */
 .footer {
@@ -1469,9 +1480,15 @@ with st.sidebar:
             _sr_metric = ""
             if _sr["metric_value"]:
                 _sr_metric = f'<span class="sidebar-run-metric">{_sr["metric_name"]}: {_sr["metric_value"]}</span>'
+            _sr_objective = _sr.get("business_objective") or ""
+            _sr_objective_html = ""
+            if _sr_objective:
+                _sr_obj_escaped = _sr_objective.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                _sr_objective_html = f'<div class="sidebar-run-objective">{_sr_obj_escaped}</div>'
             st.markdown(
                 f'<div class="sidebar-run-item">'
                 f'<div class="sidebar-run-title">{_sr_icon} {_sr_title}</div>'
+                f'{_sr_objective_html}'
                 f'<div class="sidebar-run-meta">'
                 f'<span>{_sr["run_id"]}</span>'
                 f'<span>{_sr.get("started_str") or ""}</span>'
@@ -1480,17 +1497,28 @@ with st.sidebar:
                 f'</div></div>',
                 unsafe_allow_html=True,
             )
+            _sr_btn_cols = st.columns([1, 1] if _sr["status"] == "complete" else [1])
             if _sr["status"] == "complete":
-                if st.button("Ver", key=f"view_run_{_sr['run_id']}", use_container_width=True):
-                    _loaded = _load_run_result(_sr["run_id"])
-                    if _loaded:
-                        st.session_state["analysis_result"] = _loaded
-                        st.session_state["analysis_complete"] = True
-                        st.session_state["viewing_run_id"] = _sr["run_id"]
-                        st.session_state.pop("pdf_binary", None)
+                with _sr_btn_cols[0]:
+                    if st.button("Ver", key=f"view_run_{_sr['run_id']}", use_container_width=True):
+                        _loaded = _load_run_result(_sr["run_id"])
+                        if _loaded:
+                            st.session_state["analysis_result"] = _loaded
+                            st.session_state["analysis_complete"] = True
+                            st.session_state["viewing_run_id"] = _sr["run_id"]
+                            st.session_state.pop("pdf_binary", None)
+                            st.rerun()
+                        else:
+                            st.error("No se pudieron cargar los resultados.")
+            _reuse_col = _sr_btn_cols[-1] if _sr["status"] == "complete" else _sr_btn_cols[0]
+            if _sr_objective:
+                with _reuse_col:
+                    if st.button("Reutilizar", key=f"reuse_run_{_sr['run_id']}", use_container_width=True):
+                        st.session_state["main_business_objective"] = _sr_objective
+                        st.session_state.pop("analysis_complete", None)
+                        st.session_state.pop("analysis_result", None)
+                        st.session_state.pop("viewing_run_id", None)
                         st.rerun()
-                    else:
-                        st.error("No se pudieron cargar los resultados.")
 
 # ---------------------------------------------------------------------------
 # Session State init

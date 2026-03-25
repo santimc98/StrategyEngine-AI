@@ -77,6 +77,12 @@ def _extract_run_summary(run_id: str, run_dir: str) -> Optional[Dict[str, Any]]:
             h, m = divmod(m, 60)
             elapsed = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
+    # Load original business objective from worker input
+    worker_input = _load_json_safe(os.path.join(run_dir, "worker_input.json"))
+    business_objective = ""
+    if isinstance(worker_input, dict):
+        business_objective = str(worker_input.get("business_objective", "") or "")
+
     return {
         "run_id": run_id,
         "status": run_status,
@@ -88,6 +94,7 @@ def _extract_run_summary(run_id: str, run_dir: str) -> Optional[Dict[str, Any]]:
         "metric_value": metric_value,
         "iterations": iteration_count,
         "verdict": review_verdict,
+        "business_objective": business_objective,
     }
 
 
