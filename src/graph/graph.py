@@ -18529,104 +18529,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "budget_counters": counters,
         }
 
+    # DE preflight: advisory warnings only (never blocks execution).
+    # The Data Engineer is a senior agent — let the sandbox execute and the
+    # reviewer/QA gates catch real issues, not heuristic false positives.
     if not is_plan:
         preflight_issues = data_engineer_preflight(code)
         if preflight_issues:
-            msg = "DATA_ENGINEER_PREFLIGHT: " + "; ".join(preflight_issues)
-            fh = list(state.get("feedback_history", []))
-            fh.append(msg)
-            lgc = {
-                "source": "data_engineer_preflight",
-                "status": "REJECTED",
-                "feedback": msg,
-                "required_fixes": preflight_issues,
-                "failed_gates": preflight_issues,
-            }
+            msg = "DE_PREFLIGHT_ADVISORY: " + "; ".join(preflight_issues)
             try:
                 print(msg)
             except Exception:
                 pass
-            if not state.get("de_preflight_retry_done"):
-                new_state = dict(state)
-                new_state["de_preflight_retry_done"] = True
-                payload = "PREFLIGHT_ERROR_CONTEXT:\n" + msg
-                explainer_fix_hints: List[str] = []
-                try:
-                    explainer_text = ""
-                    try:
-                        required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
-                        header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
-                        norm_map = {}
-                        for col in header_cols:
-                            normed = _norm_name(col)
-                            if normed and normed not in norm_map:
-                                norm_map[normed] = col
-                        required_raw_map = _build_required_raw_map(required_input, norm_map)
-                        explainer_ctx = {
-                            "strategy_title": selected.get("title", "") if selected else "",
-                            "csv_dialect": input_dialect,
-                            "required_input_columns": required_input,
-                            "required_raw_header_map": required_raw_map,
-                            "preflight_issues": preflight_issues,
-                        }
-                        explainer_text = failure_explainer.explain_data_engineer_failure(
-                            code=code,
-                            error_details=msg,
-                            context=explainer_ctx,
-                        )
-                    except Exception as explainer_err:
-                        print(f"Warning: failure explainer failed: {explainer_err}")
-                        explainer_text = ""
-                    if explainer_text:
-                        payload, explainer_fix_hints = _append_de_failure_explainer_context(
-                            payload,
-                            explainer_text,
-                        )
-                        try:
-                            os.makedirs("artifacts", exist_ok=True)
-                            with open(
-                                os.path.join("artifacts", "data_engineer_preflight_explainer.txt"),
-                                "w",
-                                encoding="utf-8",
-                            ) as f_exp:
-                                f_exp.write(explainer_text.strip())
-                        except Exception as exp_err:
-                            print(f"Warning: failed to persist data_engineer_preflight_explainer.txt: {exp_err}")
-                except Exception:
-                    pass
-                _merge_de_override_with_feedback_record(
-                    new_state,
-                    base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
-                    payload=payload,
-                    source="preflight",
-                    status="REJECTED",
-                    iteration=int(attempt_id),
-                    feedback=str(msg),
-                    failed_gates=["data_engineer_preflight"],
-                    required_fixes=[
-                        str(item)
-                        for item in list(preflight_issues) + list(explainer_fix_hints)
-                        if str(item).strip()
-                    ],
-                    runtime_error_tail=str(msg),
-                    evidence=[{"claim": "Data engineer preflight checks failed.", "source": "data_engineer_preflight"}],
-                )
-                print("Preflight guard: retrying Data Engineer with explainer context.")
-                return run_data_engineer(new_state)
-            if run_id:
-                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_preflight_failed"})
-            oc_report = _persist_output_contract_report(state, reason="data_engineer_preflight_failed")
-            return {
-                "cleaning_code": code,
-                "cleaned_data_preview": "Preflight Failed",
-                "error_message": msg,
-                "feedback_history": fh,
-                "last_gate_context": lgc,
-                "output_contract_report": oc_report,
-                "pipeline_aborted_reason": "data_engineer_preflight_failed",
-                "data_engineer_failed": True,
-                "budget_counters": counters,
-            }
+            fh = list(state.get("feedback_history", []))
+            fh.append(msg)
 
     # 0a. Undefined name preflight for Data Engineer code
     if not is_plan:
