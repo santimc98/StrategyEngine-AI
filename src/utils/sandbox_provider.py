@@ -223,6 +223,7 @@ class _RemoteSandboxClient:
         *,
         payload: Optional[Dict[str, Any]] = None,
         query: Optional[Dict[str, Any]] = None,
+        timeout_override: Optional[float] = None,
     ) -> Dict[str, Any]:
         if query:
             query_string = urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
@@ -235,8 +236,9 @@ class _RemoteSandboxClient:
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(url, data=body, method=method.upper(), headers=self._headers)
+        effective_timeout = timeout_override if timeout_override is not None else self._timeout
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout, context=self._context) as response:
+            with urllib.request.urlopen(request, timeout=effective_timeout, context=self._context) as response:
                 raw = response.read()
         except Exception as exc:
             raise RemoteSandboxHTTPError(f"Remote sandbox request failed: {exc}") from exc
@@ -300,6 +302,12 @@ class _RemoteSandboxClient:
             raise RemoteSandboxHTTPError("Remote sandbox returned invalid base64 content") from exc
 
     def run_command(self, cmd: str, timeout: Optional[int] = None) -> CommandResult:
+        # HTTP timeout must exceed the command timeout so the connection stays
+        # alive while the gateway executes the script.  Add a 60-second buffer
+        # for network / serialization overhead.
+        http_timeout: Optional[float] = None
+        if timeout is not None:
+            http_timeout = float(timeout) + 60.0
         data = self._request_json(
             "POST",
             f"/sessions/{self.session_id}/commands/run",
@@ -307,6 +315,7 @@ class _RemoteSandboxClient:
                 "cmd": cmd,
                 "timeout": timeout,
             },
+            timeout_override=http_timeout,
         )
         exit_code = int(data.get("exit_code", 1) or 0)
         stdout = str(data.get("stdout") or "")

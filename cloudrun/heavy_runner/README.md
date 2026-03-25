@@ -10,7 +10,7 @@ Cloud Run Job that executes ML scripts with high memory (32GB RAM) for large dat
 │                                                                   │
 │  Dataset < 50MB, < 50k rows  │  Dataset >= 50MB or >= 50k rows  │
 │              ↓                │                ↓                  │
-│         E2B Sandbox           │         Cloud Run Job             │
+│       Local Sandbox           │         Cloud Run Job             │
 │         (8GB RAM)             │          (32GB RAM)               │
 └─────────────────────────────────────────────────────────────────┘
 ```

@@ -1,8 +1,8 @@
 """
 Tests for the manifest/artifact roundtrip flow during ML code execution.
 
-NOTE: The original E2B Sandbox execution path has been replaced by the
-Heavy Runner (Cloud Run / Local Runner) architecture. These tests verify
+NOTE: Code execution uses the Heavy Runner (Cloud Run / Local Runner)
+architecture via the sandbox gateway abstraction. These tests verify
 the heavy runner request construction and contract handling.
 """
 import os

@@ -12,7 +12,7 @@ def _profile(n_rows: int, n_cols: int, dtype: str = "float64"):
     }
 
 
-def test_backend_selection_prefers_e2b_when_memory_is_safe():
+def test_backend_selection_prefers_sandbox_when_memory_is_safe():
     state = {
         "dataset_scale_hints": {
             "file_mb": 15.0,
@@ -26,7 +26,7 @@ def test_backend_selection_prefers_e2b_when_memory_is_safe():
     use_heavy, reason = graph_mod._should_use_heavy_runner(state, data_profile, ml_plan)
 
     assert use_heavy is False
-    assert reason == "e2b_memory_safe"
+    assert reason == "sandbox_memory_safe"
     decision = state.get("backend_memory_estimate") or {}
     assert decision.get("estimate", {}).get("estimated_peak_gb") is not None
 
@@ -45,13 +45,13 @@ def test_backend_selection_uses_heavy_when_memory_exceeds_safe_budget():
     use_heavy, reason = graph_mod._should_use_heavy_runner(state, data_profile, ml_plan)
 
     assert use_heavy is True
-    assert reason == "est_memory_exceeds_e2b_safe"
+    assert reason == "est_memory_exceeds_sandbox_safe"
     decision = state.get("backend_memory_estimate") or {}
     estimate = decision.get("estimate") or {}
     assert (estimate.get("estimated_peak_gb") or 0) > (decision.get("safe_budget_gb") or 0)
 
 
-def test_backend_selection_promotes_to_heavy_after_e2b_memory_failure():
+def test_backend_selection_promotes_to_heavy_after_sandbox_memory_failure():
     state = {
         "e2b_memory_failure_detected": True,
     }
@@ -61,7 +61,7 @@ def test_backend_selection_promotes_to_heavy_after_e2b_memory_failure():
     use_heavy, reason = graph_mod._should_use_heavy_runner(state, data_profile, ml_plan)
 
     assert use_heavy is True
-    assert reason == "e2b_memory_failure_fallback"
+    assert reason == "sandbox_memory_failure_fallback"
 
 
 def test_backend_selection_uses_heavy_for_large_dataset_with_uncertain_estimate():
@@ -69,9 +69,7 @@ def test_backend_selection_uses_heavy_for_large_dataset_with_uncertain_estimate(
         "dataset_scale_hints": {
             "file_mb": 120.0,
             "est_rows": 1_400_000,
-            # Emulates stale hints without explicit cols.
         },
-        # Runtime knows columns from inventory even when profile is sampled/truncated.
         "column_inventory": [f"c{i}" for i in range(60)],
     }
     data_profile = {
@@ -90,7 +88,7 @@ def test_backend_selection_uses_heavy_for_large_dataset_with_uncertain_estimate(
     use_heavy, reason = graph_mod._should_use_heavy_runner(state, data_profile, ml_plan)
 
     assert use_heavy is True
-    assert reason in {"large_dataset_uncertain_memory_estimate", "est_memory_exceeds_e2b_safe"}
+    assert reason in {"large_dataset_uncertain_memory_estimate", "est_memory_exceeds_sandbox_safe"}
     decision = state.get("backend_memory_estimate") or {}
     estimate = decision.get("estimate") or {}
     assert (estimate.get("n_rows") or 0) >= 1_400_000
@@ -118,7 +116,6 @@ def test_de_backend_selection_uses_total_header_columns_signal():
         "dataset_scale_hints": {
             "file_mb": 278.0,
             "est_rows": 1_498_232,
-            # intentionally missing "cols" to emulate stale/incomplete hint payload
         }
     }
     use_heavy, reason = graph_mod._should_use_heavy_runner_for_data_engineer(
@@ -127,16 +124,16 @@ def test_de_backend_selection_uses_total_header_columns_signal():
         total_cols_count=60,
     )
     assert use_heavy is True
-    assert reason in {"de_est_memory_exceeds_e2b_safe", "de_memory_uncertain_guard"}
+    assert reason in {"de_est_memory_exceeds_sandbox_safe", "de_memory_uncertain_guard"}
     decision = state.get("de_backend_memory_estimate") or {}
     assert decision.get("n_cols") == 60
 
 
-def test_de_heavy_failure_does_not_fallback_to_e2b_in_same_cycle():
-    assert graph_mod._should_run_e2b_after_de_heavy_result(None) is True
-    assert graph_mod._should_run_e2b_after_de_heavy_result({"unavailable": True}) is True
-    assert graph_mod._should_run_e2b_after_de_heavy_result({"ok": True, "unavailable": False}) is False
-    assert graph_mod._should_run_e2b_after_de_heavy_result({"ok": False, "unavailable": False}) is False
+def test_de_heavy_failure_does_not_fallback_to_sandbox_in_same_cycle():
+    assert graph_mod._should_run_sandbox_after_de_heavy_result(None) is True
+    assert graph_mod._should_run_sandbox_after_de_heavy_result({"unavailable": True}) is True
+    assert graph_mod._should_run_sandbox_after_de_heavy_result({"ok": True, "unavailable": False}) is False
+    assert graph_mod._should_run_sandbox_after_de_heavy_result({"ok": False, "unavailable": False}) is False
 
 
 def test_detect_de_heavy_runner_protocol_mismatch_from_ml_missing_outputs():
@@ -180,7 +177,7 @@ def test_ml_backend_selection_forces_cloudrun_when_contract_requires_heavy_deps(
     }
     with patch.object(graph_mod, "_get_execution_runtime_mode", return_value="cloudrun"), \
          patch.object(graph_mod, "_get_heavy_runner_config", return_value={"job": "j"}), \
-         patch.object(graph_mod, "_should_use_heavy_runner", return_value=(False, "e2b_memory_safe")):
+         patch.object(graph_mod, "_should_use_heavy_runner", return_value=(False, "sandbox_memory_safe")):
         decision = graph_mod._resolve_ml_backend_selection(state)
 
     assert decision.get("use_heavy") is True
@@ -189,7 +186,7 @@ def test_ml_backend_selection_forces_cloudrun_when_contract_requires_heavy_deps(
     assert decision.get("heavy_deps_required") is True
 
 
-def test_ml_backend_selection_heavy_deps_without_cloudrun_stays_e2b():
+def test_ml_backend_selection_heavy_deps_without_cloudrun_stays_sandbox():
     state = {
         "execution_contract": {"required_dependencies": ["torch"]},
     }
@@ -211,7 +208,7 @@ def test_ml_backend_selection_forces_cloudrun_when_script_imports_heavy_libs():
     }
     with patch.object(graph_mod, "_get_execution_runtime_mode", return_value="cloudrun"), \
          patch.object(graph_mod, "_get_heavy_runner_config", return_value={"job": "j"}), \
-         patch.object(graph_mod, "_should_use_heavy_runner", return_value=(False, "e2b_memory_safe")):
+         patch.object(graph_mod, "_should_use_heavy_runner", return_value=(False, "sandbox_memory_safe")):
         decision = graph_mod._resolve_ml_backend_selection(state)
 
     assert decision.get("use_heavy") is True

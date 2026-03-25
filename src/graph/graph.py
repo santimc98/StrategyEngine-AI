@@ -15680,7 +15680,7 @@ def _build_backend_memory_decision(
     if state.get("sandbox_memory_failure_detected") or state.get("e2b_memory_failure_detected"):
         return {
             "use_heavy": True,
-            "reason": "e2b_memory_failure_fallback",
+            "reason": "sandbox_memory_failure_fallback",
             "safe_budget_gb": safe_budget_gb,
             "sandbox_limit_gb": sandbox_limit_gb,
             "estimate": estimate,
@@ -15712,14 +15712,14 @@ def _build_backend_memory_decision(
         if peak_gb <= safe_budget_gb:
             return {
                 "use_heavy": False,
-                "reason": "e2b_memory_safe",
+                "reason": "sandbox_memory_safe",
                 "safe_budget_gb": safe_budget_gb,
                 "sandbox_limit_gb": sandbox_limit_gb,
                 "estimate": estimate,
             }
         return {
             "use_heavy": True,
-            "reason": "est_memory_exceeds_e2b_safe",
+            "reason": "est_memory_exceeds_sandbox_safe",
             "safe_budget_gb": safe_budget_gb,
             "sandbox_limit_gb": sandbox_limit_gb,
             "estimate": estimate,
@@ -15735,7 +15735,7 @@ def _build_backend_memory_decision(
         }
     return {
         "use_heavy": False,
-        "reason": "e2b_default",
+        "reason": "sandbox_default",
         "safe_budget_gb": safe_budget_gb,
         "sandbox_limit_gb": sandbox_limit_gb,
         "estimate": estimate,
@@ -16037,7 +16037,7 @@ def _build_de_backend_memory_decision(
     if state.get("de_sandbox_memory_failure_detected") or state.get("de_e2b_memory_failure_detected"):
         return {
             "use_heavy": True,
-            "reason": "e2b_memory_failure_fallback",
+            "reason": "sandbox_memory_failure_fallback",
             "safe_budget_gb": safe_budget_gb,
             "sandbox_limit_gb": sandbox_limit_gb,
             "estimated_peak_gb": estimated_peak_gb,
@@ -16051,7 +16051,7 @@ def _build_de_backend_memory_decision(
         if estimated_peak_gb <= safe_budget_gb:
             return {
                 "use_heavy": False,
-                "reason": "e2b_memory_safe",
+                "reason": "sandbox_memory_safe",
                 "safe_budget_gb": safe_budget_gb,
                 "sandbox_limit_gb": sandbox_limit_gb,
                 "estimated_peak_gb": estimated_peak_gb,
@@ -16062,7 +16062,7 @@ def _build_de_backend_memory_decision(
             }
         return {
             "use_heavy": True,
-            "reason": "de_est_memory_exceeds_e2b_safe",
+            "reason": "de_est_memory_exceeds_sandbox_safe",
             "safe_budget_gb": safe_budget_gb,
             "sandbox_limit_gb": sandbox_limit_gb,
             "estimated_peak_gb": estimated_peak_gb,
@@ -16098,7 +16098,7 @@ def _build_de_backend_memory_decision(
         }
     return {
         "use_heavy": False,
-        "reason": "de_e2b_default",
+        "reason": "de_sandbox_default",
         "safe_budget_gb": safe_budget_gb,
         "sandbox_limit_gb": sandbox_limit_gb,
         "estimated_peak_gb": None,
@@ -16177,12 +16177,12 @@ def _detect_de_heavy_runner_protocol_mismatch(
     return bool(cleaned_success_logged or expected_output_seen)
 
 
-def _should_run_e2b_after_de_heavy_result(de_heavy_result: Dict[str, Any] | None) -> bool:
+def _should_run_sandbox_after_de_heavy_result(de_heavy_result: Dict[str, Any] | None) -> bool:
     """
     Backward-compatible alias for the DE fallback policy.
 
     Policy:
-    - No heavy result: run E2B/local sandbox.
+    - No heavy result: run local sandbox.
     - Heavy runner unavailable: run fallback sandbox.
     - Heavy runner attempted (ok or failed): do not run sandbox in same cycle.
     """
@@ -16369,6 +16369,9 @@ def _execute_data_engineer_via_heavy_runner(
         download_map[rel_path] = rel_path
     for rel_path in optional_download_artifacts:
         download_map.setdefault(rel_path, rel_path)
+    # Ensure DE plots and plot_summaries are downloaded (Cloud Run catch-all
+    # already covers this via gsutil glob, but local_runner needs explicit map).
+    download_map.setdefault("static/plots/plot_summaries.json", "static/plots/plot_summaries.json")
     support_files: List[Dict[str, str]] = []
     for rel_path in [
         "data/required_columns.json",
@@ -23062,7 +23065,7 @@ def execute_code(state: AgentState) -> AgentState:
                             print(f"Warning: failed to download required output {remote_path}")
 
                 # Download optional plot insights if present using centralized helper
-                for rel_path in ["data/plot_insights.json"]:
+                for rel_path in ["data/plot_insights.json", "static/plots/plot_summaries.json"]:
                     if rel_path.startswith("/"):
                         remote_path = rel_path
                     else:
