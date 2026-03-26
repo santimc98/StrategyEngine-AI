@@ -94,14 +94,10 @@ def _extract_target_columns(contract: Dict[str, Any]) -> List[str]:
     return _unique_strings(targets)
 
 
-def _extract_required_outputs(contract: Dict[str, Any]) -> List[str]:
-    required = _as_list(contract.get("required_outputs"))
-    if required:
-        return _unique_strings(required)
-    artifact_reqs = _as_dict(contract.get("artifact_requirements"))
-    files = _as_list(artifact_reqs.get("required_files"))
+def _normalize_output_entries(entries: List[Any]) -> List[str]:
+    """Extract path strings from a list that may contain dicts or plain strings."""
     normalized: List[str] = []
-    for entry in files:
+    for entry in entries:
         if not entry:
             continue
         if isinstance(entry, dict):
@@ -110,7 +106,16 @@ def _extract_required_outputs(contract: Dict[str, Any]) -> List[str]:
                 normalized.append(str(path))
             continue
         normalized.append(str(entry))
-    return _unique_strings(normalized)
+    return normalized
+
+
+def _extract_required_outputs(contract: Dict[str, Any]) -> List[str]:
+    required = _as_list(contract.get("required_outputs"))
+    if required:
+        return _unique_strings(_normalize_output_entries(required))
+    artifact_reqs = _as_dict(contract.get("artifact_requirements"))
+    files = _as_list(artifact_reqs.get("required_files"))
+    return _unique_strings(_normalize_output_entries(files))
 
 
 def _extract_contract_columns(contract: Dict[str, Any], max_cols: int = 40) -> Dict[str, Any]:

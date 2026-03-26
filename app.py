@@ -2088,9 +2088,21 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
                 unsafe_allow_html=True,
             )
 
-    # Success Banner
-    verdict = result.get('review_verdict', 'APPROVED')
-    if verdict == "NEEDS_IMPROVEMENT":
+    # Success Banner — use board's authoritative verdict when available
+    _board_pld = result.get("review_board_verdict")
+    verdict = (
+        (_board_pld.get("final_review_verdict") if isinstance(_board_pld, dict) else None)
+        or result.get("review_verdict")
+        or "APPROVED"
+    )
+    if verdict in ("REJECTED", "FAIL", "CRASH"):
+        st.markdown("""
+        <div class="result-banner error fade-in">
+            <div class="result-banner-icon">&#10060;</div>
+            <div class="result-banner-text">An&aacute;lisis finalizado con rechazo del revisor</div>
+        </div>
+        """, unsafe_allow_html=True)
+    elif verdict == "NEEDS_IMPROVEMENT":
         st.markdown("""
         <div class="result-banner error fade-in">
             <div class="result-banner-icon">&#9888;&#65039;</div>
@@ -2111,7 +2123,11 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
     strat_title = selected_strat.get('title', 'N/A') if isinstance(selected_strat, dict) else 'N/A'
 
     # Map verdict and gate labels to Spanish
-    _VERDICT_LABELS = {"APPROVED": "Aprobado", "NEEDS_IMPROVEMENT": "Necesita Mejoras"}
+    _VERDICT_LABELS = {
+        "APPROVED": "Aprobado", "APPROVE_WITH_WARNINGS": "Aprobado con Avisos",
+        "NEEDS_IMPROVEMENT": "Necesita Mejoras", "REJECTED": "Rechazado",
+        "FAIL": "Fallido", "CRASH": "Error Cr\u00edtico",
+    }
     _GATE_LABELS = {"PASSED": "Superado", "FAILED": "No Superado"}
 
     # Estimate API cost from budget counters
@@ -2146,9 +2162,13 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         </div>
         """, unsafe_allow_html=True)
     with mc3:
-        rv = result.get('review_verdict', 'N/A')
+        rv = (
+            (_board_pld.get("final_review_verdict") if isinstance(_board_pld, dict) else None)
+            or result.get("review_verdict")
+            or "N/A"
+        )
         rv_label = _VERDICT_LABELS.get(rv, rv)
-        badge_cls = "badge-success" if rv == "APPROVED" else "badge-warning"
+        badge_cls = "badge-success" if rv in ("APPROVED", "APPROVE_WITH_WARNINGS") else "badge-warning"
         st.markdown(f"""
         <div class="card fade-in" style="text-align:center;">
             <div class="card-header">Veredicto</div>
