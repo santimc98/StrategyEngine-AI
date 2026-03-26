@@ -620,18 +620,12 @@ def _load_run_timeline_tail(run_id: Optional[str], max_events: int = 12) -> List
     return []
 
 def render_table_text(headers: List[str], rows: List[List[str]], max_rows: int = 8, max_cell_len: int = 28) -> str:
-    """
-    Render a professional ASCII table suitable for PDF monospaced fonts.
+    """Render a markdown pipe table that converts cleanly to HTML/PDF.
 
-    Uses a clean grid format inspired by tabulate's "simple" style:
-    +------------+------------+------------+
-    | Header 1   | Header 2   | Header 3   |
-    +============+============+============+
-    | Value 1    | Value 2    | Value 3    |
-    +------------+------------+------------+
-
-    This looks professional in executive reports while avoiding markdown tables
-    that break PDF generators.
+    Output example:
+    | Header 1 | Header 2 | Header 3 |
+    |----------|----------|----------|
+    | Value 1  | Value 2  | Value 3  |
     """
     if not headers or not rows:
         return "(No data available)"
@@ -644,47 +638,20 @@ def render_table_text(headers: List[str], rows: List[List[str]], max_rows: int =
     if not safe_rows:
         return "(No data available)"
 
-    # Calculate column widths
-    widths = []
-    for idx, header in enumerate(headers):
-        header_text = _truncate_cell(header, max_cell_len)
-        col_width = len(header_text)
-        for row in safe_rows:
-            if idx < len(row):
-                col_width = max(col_width, len(row[idx]))
-        widths.append(min(col_width + 2, max_cell_len))  # Add padding
+    def _md_row(cells: List[str]) -> str:
+        escaped = [c.replace("|", "\\|") for c in cells]
+        return "| " + " | ".join(escaped) + " |"
 
-    # Build grid lines
-    def _build_separator(char: str = "-", corner: str = "+") -> str:
-        parts = [corner]
-        for width in widths:
-            parts.append(char * (width + 2))
-            parts.append(corner)
-        return "".join(parts)
-
-    def _build_row(cells: List[str]) -> str:
-        parts = ["|"]
-        for idx, width in enumerate(widths):
-            cell = cells[idx] if idx < len(cells) else ""
-            cell_text = _truncate_cell(cell, max_cell_len)
-            parts.append(f" {cell_text.ljust(width)} ")
-            parts.append("|")
-        return "".join(parts)
-
-    # Assemble table
     lines = []
-    lines.append(_build_separator("-", "+"))
-    lines.append(_build_row([_truncate_cell(h, max_cell_len) for h in headers]))
-    lines.append(_build_separator("=", "+"))  # Double line under header
-
+    lines.append(_md_row([_truncate_cell(h, max_cell_len) for h in headers]))
+    lines.append("|" + "|".join("---" for _ in headers) + "|")
     for row in safe_rows:
-        lines.append(_build_row(row))
+        # Pad row to match header length
+        padded = row + [""] * max(0, len(headers) - len(row))
+        lines.append(_md_row(padded[:len(headers)]))
 
-    lines.append(_build_separator("-", "+"))
-
-    # Add row count footer if truncated
     if len(rows) > max_rows:
-        lines.append(f"  ... ({len(rows) - max_rows} more rows)")
+        lines.append(f"*... ({len(rows) - max_rows} more rows)*")
 
     return "\n".join(lines)
 
@@ -1082,11 +1049,11 @@ def _canonical_evidence_section(evidence_paths: List[str], llm_items: Optional[L
     else:
         items = _build_evidence_items(evidence_paths)
 
-    evidence_lines = ["evidence:"]
+    evidence_lines: List[str] = []
     for item in items:
         claim = _sanitize_evidence_value(item.get("claim", ""))
         source = _sanitize_evidence_value(item.get("source", "missing")) or "missing"
-        evidence_lines.append(f'{{claim: "{claim}", source: "{source}"}}')
+        evidence_lines.append(f"- **{claim}** — `{source}`")
     dedup_paths: List[str] = []
     for path in (evidence_paths or []):
         clean = _sanitize_evidence_value(path)
@@ -1094,8 +1061,8 @@ def _canonical_evidence_section(evidence_paths: List[str], llm_items: Optional[L
             dedup_paths.append(clean)
         if len(dedup_paths) >= 8:
             break
-    path_lines = [f"- {path}" for path in dedup_paths] or ["- missing"]
-    return "\n".join(evidence_lines + ["", "Artifacts:"] + path_lines)
+    path_lines = [f"- `{path}`" for path in dedup_paths] or ["- missing"]
+    return "\n".join(evidence_lines + ["", "**Artifacts:**", ""] + path_lines)
 
 
 def _ensure_evidence_section(report: str, evidence_paths: List[str]) -> str:
@@ -1272,9 +1239,19 @@ def _validate_report_structure(content: str, expected_language: str) -> List[str
         issues.append("report_too_short")
     if length > 30000:
         issues.append("report_too_long")
-    decision_header = re.search(r"(?im)^\s*##\s+(Executive Decision|Decisi[oó]n Ejecutiva)\s*$", content)
-    evidence_header = re.search(r"(?im)^\s*##\s+Evidencia\s+[Uu]sada\s*$", content)
-    risk_header = re.search(r"(?im)^\s*##\s+(Risks|Riesgos)(\s*&?\s*(Limitations|Limitaciones))?\s*$", content)
+    # Flexible header matching — accept natural variations the LLM may produce
+    decision_header = re.search(
+        r"(?im)^\s*##\s+.{0,10}(Decisi[oó]n|Decision|Veredicto|Verdict).{0,30}$",
+        content,
+    )
+    evidence_header = re.search(
+        r"(?im)^\s*##\s+.{0,10}(Evidencia|Evidence).{0,30}$",
+        content,
+    )
+    risk_header = re.search(
+        r"(?im)^\s*##\s+.{0,10}(Riesgo|Risk|Limitaci|Limitation).{0,30}$",
+        content,
+    )
     if not decision_header:
         issues.append("missing_decision_section")
     if not evidence_header:
@@ -1412,62 +1389,6 @@ def _build_repair_prompt(
     )
 
 
-def _generate_deterministic_fallback_report(
-    *,
-    target_language_code: str,
-    executive_decision_label: str,
-    business_objective: str,
-    strategy_title: str,
-    error_message: str,
-    facts_context: List[Dict[str, Any]],
-    evidence_paths: List[str],
-) -> str:
-    is_es = target_language_code == "es"
-    title = "# Reporte Ejecutivo (Fallback Determinístico)" if is_es else "# Executive Report (Deterministic Fallback)"
-    objective_title = "## Objetivo y enfoque" if is_es else "## Objective and approach"
-    decision_title = "## Decisión Ejecutiva" if is_es else "## Executive Decision"
-    risks_title = "## Riesgos" if is_es else "## Risks"
-    actions_title = "## Próximas acciones" if is_es else "## Next actions"
-    warning_note = (
-        "Este reporte se generó de forma determinística por un fallo de traducción del LLM."
-        if is_es else
-        "This report was generated deterministically due to an LLM translation failure."
-    )
-    lines: List[str] = [
-        title,
-        "",
-        decision_title,
-        f"- {executive_decision_label}",
-        "",
-        objective_title,
-        f"- {business_objective or 'N/A'}",
-        f"- Strategy: {strategy_title or 'N/A'}",
-        "",
-        "## Evidence & Metrics",
-    ]
-    if facts_context:
-        for fact in facts_context[:6]:
-            lines.append(
-                f"- {fact.get('metric', 'metric')}: {fact.get('value', 'N/A')} (source: {fact.get('source', 'missing')})"
-            )
-    else:
-        lines.append("- No metric facts available in artifacts.")
-    lines.extend([
-        "",
-        risks_title,
-        f"- {warning_note}",
-        f"- Error: {error_message}",
-        "",
-        actions_title,
-        "- Review artifacts directly and regenerate the executive report.",
-        "- Validate metric integrity before making a production decision.",
-    ])
-    lines.append("")
-    lines.append("## Evidencia Usada")
-    lines.append("")
-    lines.append(_canonical_evidence_section(evidence_paths))
-    return "\n".join(lines) + "\n"
-
 
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     if not text:
@@ -1525,6 +1446,109 @@ def _validate_outline_payload(payload: Dict[str, Any]) -> List[str]:
     return issues
 
 
+def _build_embeddable_artifacts_catalog(
+    *,
+    plots: List[str],
+    plot_summaries: Optional[List[Dict[str, Any]]],
+    cleaned_sample_table_text: str,
+    scored_sample_table_text: str,
+    kpi_snapshot_table_html: str,
+    artifact_inventory_table_html: str,
+    artifact_compliance_table_html: str,
+) -> str:
+    """Build a unified catalog of all artifacts the translator can embed inline.
+
+    Each entry tells the LLM: what the artifact is, what it shows, and exactly
+    how to embed it.  The translator then reasons about WHERE in the narrative
+    each artifact best supports a claim.
+    """
+    entries: List[str] = []
+
+    # ── Plot summaries keyed by filename for O(1) lookup ──
+    summary_by_file: Dict[str, Dict[str, Any]] = {}
+    if isinstance(plot_summaries, list):
+        for item in plot_summaries:
+            if isinstance(item, dict):
+                fname = os.path.basename(str(item.get("filename") or item.get("path") or ""))
+                if fname:
+                    summary_by_file[fname] = item
+
+    # ── Charts ──
+    if plots:
+        for p in plots:
+            fname = os.path.basename(p)
+            name_stem = fname.rsplit(".", 1)[0].replace("_", " ").title()
+            summary = summary_by_file.get(fname, {})
+            title = summary.get("title") or name_stem
+            facts = summary.get("key_facts") or summary.get("facts") or ""
+            if isinstance(facts, list):
+                facts = "; ".join(str(f) for f in facts[:4])
+            desc = f"  description: {title}"
+            if facts:
+                desc += f"\n  key_facts: {facts}"
+            entries.append(
+                f"- type: chart\n"
+                f"  embed: ![{title}]({p})\n"
+                f"{desc}\n"
+                f"  guidance: Place near the finding this chart illustrates. "
+                f"Follow with 2-3 sentences interpreting what it reveals."
+            )
+
+    # ── CSV data previews ──
+    if cleaned_sample_table_text and cleaned_sample_table_text != "No data available.":
+        entries.append(
+            f"- type: data_preview\n"
+            f"  name: Cleaned dataset sample (first 5 rows)\n"
+            f"  embed: paste the table below directly into the report markdown\n"
+            f"  content:\n{cleaned_sample_table_text}\n"
+            f"  guidance: Use when discussing data quality, cleaning results, "
+            f"or explaining the structure of the input data."
+        )
+
+    if scored_sample_table_text and scored_sample_table_text != "No data available.":
+        entries.append(
+            f"- type: data_preview\n"
+            f"  name: Model predictions sample (first 5 rows)\n"
+            f"  embed: paste the table below directly into the report markdown\n"
+            f"  content:\n{scored_sample_table_text}\n"
+            f"  guidance: Use when discussing prediction quality, model outputs, "
+            f"or demonstrating what the submission looks like."
+        )
+
+    # ── Pre-rendered HTML tables ──
+    if kpi_snapshot_table_html and len(kpi_snapshot_table_html) > 30:
+        entries.append(
+            f"- type: html_table\n"
+            f"  name: KPI Snapshot\n"
+            f"  embed: paste the HTML directly (it renders in PDF)\n"
+            f"  guidance: Use in the executive decision or key findings section "
+            f"to give a quick metric overview."
+        )
+
+    if artifact_inventory_table_html and len(artifact_inventory_table_html) > 30:
+        entries.append(
+            f"- type: html_table\n"
+            f"  name: Artifact Inventory\n"
+            f"  embed: paste the HTML directly\n"
+            f"  guidance: Use in the evidence trail or as an appendix to show "
+            f"what was produced and its status."
+        )
+
+    if artifact_compliance_table_html and len(artifact_compliance_table_html) > 30:
+        entries.append(
+            f"- type: html_table\n"
+            f"  name: Output Compliance\n"
+            f"  embed: paste the HTML directly\n"
+            f"  guidance: Use when discussing whether the pipeline met its "
+            f"contractual obligations."
+        )
+
+    if not entries:
+        return "No embeddable artifacts available for this run."
+
+    return "\n\n".join(entries)
+
+
 def _build_outline_prompt(
     *,
     target_language_code: str,
@@ -1545,8 +1569,12 @@ The final decision label must be: $executive_decision_label
 
 Reasoning workflow:
 1. Decide what an executive needs to know first.
-2. Group the evidence into a small number of sections that explain decision, evidence, risks, and next actions.
-3. Use only supported claims; if evidence is weak, surface that uncertainty in the outline.
+2. Design a narrative that flows naturally: decision → evidence → risks → actions.
+3. For each section, decide which artifacts (charts, data previews, tables) should
+   be embedded inline to support the claims. Charts and data previews should NOT be
+   grouped in a separate "Visual Analysis" section — they belong next to the finding
+   they illustrate.
+4. Use only supported claims; if evidence is weak, surface that uncertainty.
 
 FACTS_BLOCK:
 $facts_block_json
@@ -1568,7 +1596,8 @@ Return JSON with this schema:
       "id": "short_section_identifier",
       "heading": "...",
       "bullets": ["...", "..."],
-      "evidence_refs": ["artifact/path.json", "..."]
+      "evidence_refs": ["artifact/path.json", "..."],
+      "inline_artifacts": ["static/plots/feature_importance.png", "..."]
     }
   ],
   "evidence_summary": [
@@ -2471,43 +2500,50 @@ Slot Coverage: $slot_coverage_context
 === APPENDIX (lower priority — use only if needed for depth) ===
 $context_appendix_json
 
+=== EMBEDDABLE ARTIFACTS ===
+The following artifacts are available for inline embedding in your report.
+Place each artifact where it best supports the narrative — do NOT group all
+visuals in a single section. Each chart, data preview, or table should appear
+immediately after the claim or finding it illustrates.
+
+$embeddable_artifacts_catalog
+
+Embedding rules:
+- Charts: copy the ![title](path) syntax exactly as shown above. Follow each
+  embedded chart with 2-3 sentences interpreting what it reveals and why it
+  matters for the business decision.
+- Data previews (CSV samples): paste the provided text table directly into
+  the markdown. Introduce it with context (e.g. "A sample of the cleaned
+  dataset shows the structure:" or "The model predictions for the first
+  rows:").
+- HTML tables (KPI, inventory, compliance): paste the HTML directly — it
+  renders correctly in the PDF.
+- Not every artifact must be used. Select and place only those that
+  strengthen the narrative. Skip artifacts that add no decision value.
+
 === OUTPUT FORMAT ===
-Markdown. No markdown pipe tables — use provided HTML tables where available.
+Markdown. The report should read as a continuous executive narrative — not
+a data dump, not a wall of tables, not charts grouped in a separate annex.
 
-For FULL_PIPELINE or ML_ONLY scope, the report must contain at minimum:
-  1) Decision and rationale (## Decisión Ejecutiva)
-  2) What happened and key findings (## Hallazgos Clave)
-  3) Visual analysis with charts (## Análisis Visual)
-  4) Risks and limitations (## Riesgos)
-  5) Recommended next actions (## Próximas Acciones)
-  6) Evidence trail (## Evidencia Usada)
+The structure and section order are yours to determine based on what matters
+most for this specific run. Think like a senior consultant presenting to the
+C-suite: lead with the decision, support it with evidence, surface risks,
+and close with actionable next steps.
 
-For CLEANING_ONLY scope, adapt the report structure:
-  1) Data quality assessment (## Evaluación de Calidad de Datos)
-  2) Cleaning operations performed (## Operaciones de Limpieza)
-  3) Visual analysis with charts (## Análisis Visual)
-  4) Validation results and gate compliance (## Resultados de Validación)
-  5) Risks and data limitations (## Riesgos y Limitaciones)
-  6) Recommendations for data usage (## Recomendaciones)
-  7) Evidence trail (## Evidencia Usada)
+Required elements (structure is flexible):
+- Executive decision with clear rationale (always first)
+- Key findings connected to business impact, with supporting charts and
+  data previews embedded inline where they strengthen the argument
+- Risks and limitations
+- Recommended next actions (specific, not generic)
+- Evidence trail (## Evidencia Usada) — always the FINAL section
 
-CHARTS AND VISUALS:
-The Data Engineer and ML Engineer generate diagnostic plots as part of their execution.
-These plots are saved in the static/plots/ directory and listed in plots_local context.
-
-If plot_summaries is present in the appendix, it contains factual data for each plot
-(filename, title, and key facts computed by the agent that generated it). Use these
-facts to write a substantive interpretation for each chart:
-- Embed the plot: ![title](static/plots/filename.png)
-- Below each plot, write 2-3 sentences explaining what the chart reveals and why it
-  matters for the business decision. Ground your interpretation in the facts provided.
-
-If plot_summaries is NOT present but plots exist in plots_local, embed them with
-a brief description based on the filename.
-If no plots were generated, omit the "Análisis Visual" section entirely.
+Do NOT create a separate "Visual Analysis" or "Análisis Visual" section.
+Charts and data previews belong inline, woven into the narrative next to
+the finding they illustrate.
 
 If the Outline Plan is non-empty, use it as a starting skeleton but adapt
-freely to improve clarity.
+freely to improve clarity and narrative flow.
 """)
 
         execution_results = state.get("execution_output", "No execution results available.")
@@ -2521,6 +2557,16 @@ $execution_results
 The final section must be "## Evidencia Usada" with entries:
   {claim: "...", source: "artifact_path -> key"}
 """
+
+        embeddable_catalog = _build_embeddable_artifacts_catalog(
+            plots=plots,
+            plot_summaries=state.get("plot_summaries") if isinstance(state.get("plot_summaries"), list) else None,
+            cleaned_sample_table_text=cleaned_sample_table_text,
+            scored_sample_table_text=scored_sample_table_text,
+            kpi_snapshot_table_html=kpi_snapshot_table_html,
+            artifact_inventory_table_html=artifact_inventory_table_html,
+            artifact_compliance_table_html=artifact_compliance_table_html,
+        )
 
         prompt_values = {
             "senior_translation_protocol": SENIOR_TRANSLATION_PROTOCOL,
@@ -2552,6 +2598,7 @@ The final section must be "## Evidencia Usada" with entries:
             "recommendations_table_text": recommendations_table_text,
             "context_appendix_json": json.dumps(context_appendix, ensure_ascii=False),
             "pipeline_scope_section": pipeline_scope_section,
+            "embeddable_artifacts_catalog": embeddable_catalog,
         }
 
         two_pass_enabled = str(os.getenv("TRANSLATOR_TWO_PASS_ENABLED", "1")).strip().lower() not in {
@@ -2651,6 +2698,13 @@ The final section must be "## Evidencia Usada" with entries:
                 "decision_issue": [],
             }
 
+            # ── Repair loop: up to MAX_REPAIR_ATTEMPTS, keep best attempt ──
+            max_repair_attempts = int(os.getenv("TRANSLATOR_MAX_REPAIR_ATTEMPTS", "3"))
+            repair_history: List[Dict[str, Any]] = []
+            best_content = content
+            best_score = 0
+            best_validation = validation
+
             if not is_echo_response:
                 validation = _validate_report(
                     content=content,
@@ -2661,115 +2715,70 @@ The final section must be "## Evidencia Usada" with entries:
                     expected_language=target_language_code,
                     decision_discrepancy=decision_discrepancy,
                 )
-                if validation.get("has_critical"):
-                    repair_prompt = _build_repair_prompt(
-                        report=content,
-                        validation=validation,
-                        expected_decision=executive_decision_label,
-                        evidence_paths=evidence_paths,
-                        target_language_code=target_language_code,
-                    )
-                    repaired = self._call_llm(repair_prompt)
-                    repaired = _sanitize_report_text(repaired)
-                    repaired = _ensure_evidence_section(repaired, evidence_paths)
-                    repaired = sanitize_text(repaired)
-                    repair_validation = _validate_report(
-                        content=repaired,
-                        expected_decision=executive_decision_label,
-                        facts_context=facts_context if isinstance(facts_context, list) else [],
-                        metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
-                        plots=plots,
-                        expected_language=target_language_code,
-                        decision_discrepancy=decision_discrepancy,
-                    )
-                    if repair_validation.get("has_critical"):
-                        content = _generate_deterministic_fallback_report(
-                            target_language_code=target_language_code,
-                            executive_decision_label=executive_decision_label,
-                            business_objective=business_objective,
-                            strategy_title=strategy_title,
-                            error_message=", ".join(repair_validation.get("critical_issues", [])),
-                            facts_context=facts_context if isinstance(facts_context, list) else [],
+                best_score = _score_report_quality(validation)
+                best_content = content
+                best_validation = validation
+                repair_history.append({
+                    "attempt": 0,
+                    "score": best_score,
+                    "issues": validation.get("critical_issues", []) + validation.get("structure_issues", []),
+                })
+
+                for repair_attempt in range(max_repair_attempts):
+                    if not validation.get("has_critical") and best_score >= int(os.getenv("TRANSLATOR_MIN_QUALITY_SCORE", "60")):
+                        break  # Report is good enough
+                    try:
+                        all_issues = validation.get("critical_issues", []) + validation.get("structure_issues", [])
+                        if not validation.get("has_critical"):
+                            # Quality is low but no critical — add hint
+                            all_issues = list(all_issues) + ["low_quality_score"]
+                        repair_prompt = _build_repair_prompt(
+                            report=content,
+                            validation={**validation, "critical_issues": all_issues, "has_critical": True},
+                            expected_decision=executive_decision_label,
                             evidence_paths=evidence_paths,
+                            target_language_code=target_language_code,
                         )
-                        validation = repair_validation
-                    else:
-                        content = repaired
-                        validation = repair_validation
+                        repaired = self._call_llm(repair_prompt)
+                        repaired = _sanitize_report_text(repaired)
+                        repaired = _ensure_evidence_section(repaired, evidence_paths)
+                        repaired = sanitize_text(repaired)
+                        repair_validation = _validate_report(
+                            content=repaired,
+                            expected_decision=executive_decision_label,
+                            facts_context=facts_context if isinstance(facts_context, list) else [],
+                            metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
+                            plots=plots,
+                            expected_language=target_language_code,
+                            decision_discrepancy=decision_discrepancy,
+                        )
+                        repair_score = _score_report_quality(repair_validation)
+                        repair_history.append({
+                            "attempt": repair_attempt + 1,
+                            "score": repair_score,
+                            "issues": repair_validation.get("critical_issues", []) + repair_validation.get("structure_issues", []),
+                        })
+                        # Always keep the best version seen so far
+                        if repair_score >= best_score:
+                            best_content = repaired
+                            best_score = repair_score
+                            best_validation = repair_validation
+                        # Feed the best version back into the next repair iteration
+                        content = best_content
+                        validation = best_validation
+                    except Exception as repair_exc:
+                        repair_history.append({
+                            "attempt": repair_attempt + 1,
+                            "score": best_score,
+                            "error": str(repair_exc),
+                        })
+                        break
 
-            quality_score = 100 if is_echo_response else _score_report_quality(validation)
+            # Use the best version produced across all attempts
+            content = best_content
+            validation = best_validation
+            quality_score = best_score if not is_echo_response else 100
             quality_threshold = int(os.getenv("TRANSLATOR_MIN_QUALITY_SCORE", "60"))
-            quality_retry_applied = False
-            quality_retry_error = None
-            quality_fallback_triggered = False
-
-            if not is_echo_response and quality_score < quality_threshold:
-                quality_retry_applied = True
-                retry_validation = dict(validation)
-                critical = retry_validation.get("critical_issues", [])
-                if "low_quality_score" not in critical:
-                    critical = list(critical) + ["low_quality_score"]
-                    retry_validation["critical_issues"] = critical
-                retry_validation["has_critical"] = True
-                try:
-                    quality_repair_prompt = _build_repair_prompt(
-                        report=content,
-                        validation=retry_validation,
-                        expected_decision=executive_decision_label,
-                        evidence_paths=evidence_paths,
-                        target_language_code=target_language_code,
-                    )
-                    quality_candidate = self._call_llm(quality_repair_prompt)
-                    quality_candidate = _sanitize_report_text(quality_candidate)
-                    quality_candidate = _ensure_evidence_section(quality_candidate, evidence_paths)
-                    quality_candidate = sanitize_text(quality_candidate)
-                    quality_candidate_validation = _validate_report(
-                        content=quality_candidate,
-                        expected_decision=executive_decision_label,
-                        facts_context=facts_context if isinstance(facts_context, list) else [],
-                        metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
-                        plots=plots,
-                        expected_language=target_language_code,
-                        decision_discrepancy=decision_discrepancy,
-                    )
-                    quality_candidate_score = _score_report_quality(quality_candidate_validation)
-                    if quality_candidate_score >= quality_score:
-                        content = quality_candidate
-                        validation = quality_candidate_validation
-                        quality_score = quality_candidate_score
-                except Exception as quality_exc:
-                    quality_retry_error = str(quality_exc)
-
-            low_score_fallback_enabled = str(os.getenv("TRANSLATOR_LOW_SCORE_FALLBACK", "1")).strip().lower() not in {
-                "0",
-                "off",
-                "false",
-                "no",
-            }
-            if (
-                not is_echo_response
-                and quality_score < quality_threshold
-                and low_score_fallback_enabled
-            ):
-                quality_fallback_triggered = True
-                content = _generate_deterministic_fallback_report(
-                    target_language_code=target_language_code,
-                    executive_decision_label=executive_decision_label,
-                    business_objective=business_objective,
-                    strategy_title=strategy_title,
-                    error_message=f"report_quality_below_threshold:{quality_score}<{quality_threshold}",
-                    facts_context=facts_context if isinstance(facts_context, list) else [],
-                    evidence_paths=evidence_paths,
-                )
-                validation = {
-                    "has_critical": True,
-                    "critical_issues": ["low_quality_score"],
-                    "unverified_metrics": validation.get("unverified_metrics", []),
-                    "structure_issues": validation.get("structure_issues", []),
-                    "invalid_plots": validation.get("invalid_plots", []),
-                    "decision_issue": validation.get("decision_issue", []),
-                }
-                quality_score = 0
 
             if not is_echo_response and validation.get("unverified_metrics") and not validation.get("has_critical"):
                 warning_lines = "\n".join(f"- {item}" for item in validation.get("unverified_metrics", [])[:6])
@@ -2806,9 +2815,11 @@ The final section must be "## Evidencia Usada" with entries:
                         "outline_generated": bool(outline_payload),
                     },
                     "quality_threshold": quality_threshold,
-                    "quality_retry_applied": quality_retry_applied,
-                    "quality_retry_error": quality_retry_error,
-                    "quality_fallback_triggered": quality_fallback_triggered,
+                    "repair_loop": {
+                        "max_attempts": max_repair_attempts,
+                        "history": repair_history,
+                        "total_attempts": len(repair_history),
+                    },
                     "quality_score": quality_score,
                     "validation": validation,
                     "decision_discrepancy": decision_discrepancy,
@@ -2817,15 +2828,18 @@ The final section must be "## Evidencia Usada" with entries:
             self.last_response = content
             return content
         except Exception as e:
-            fallback = _generate_deterministic_fallback_report(
-                target_language_code=target_language_code,
-                executive_decision_label=executive_decision_label,
-                business_objective=business_objective,
-                strategy_title=strategy_title,
-                error_message=str(e),
-                facts_context=facts_context if isinstance(facts_context, list) else [],
-                evidence_paths=evidence_paths,
+            # Even on exception, return best effort — never a deterministic stub
+            error_report = (
+                f"# Executive Report\n\n"
+                f"## Decisión Ejecutiva\n\n"
+                f"**{executive_decision_label}**\n\n"
+                f"Report generation encountered an error: {e}\n\n"
+                f"## Riesgos\n\n"
+                f"- Report could not be fully generated due to: {e}\n"
+                f"- Review artifacts directly for complete analysis.\n\n"
+                f"## Evidencia Usada\n\n"
             )
+            error_report += _canonical_evidence_section(evidence_paths)
             _persist_quality_audit(
                 {
                     "prompt_estimated_tokens": est_tokens,
@@ -2842,7 +2856,7 @@ The final section must be "## Evidencia Usada" with entries:
                     "exception": str(e),
                 }
             )
-            self.last_response = fallback
-            return fallback
+            self.last_response = error_report
+            return error_report
 
 
