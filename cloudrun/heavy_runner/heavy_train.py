@@ -16,6 +16,7 @@ Environment Variables:
     OUTPUT_URI: GCS URI prefix for outputs
 """
 import ast
+import glob as _glob_mod
 import importlib.util
 import json
 import os
@@ -488,17 +489,27 @@ def _check_required_outputs(work_dir: str, required: List[str]) -> Tuple[List[st
     """
     Check which required outputs exist.
 
+    Supports glob patterns (e.g. ``static/plots/*.png``).  When a pattern
+    contains ``*``, ``?``, or ``[`` it is resolved via :func:`glob.glob`;
+    at least one match is required for it to count as present.
+
     Returns:
         Tuple of (present, missing) lists
     """
     present = []
     missing = []
+    _GLOB_CHARS = {"*", "?", "["}
     for rel_path in required:
         rel_norm = _normalize_rel_path(rel_path)
         if not rel_norm:
             continue
         full_path = os.path.join(work_dir, rel_norm)
-        if os.path.exists(full_path):
+        if any(c in rel_norm for c in _GLOB_CHARS):
+            if _glob_mod.glob(full_path):
+                present.append(rel_norm)
+            else:
+                missing.append(rel_norm)
+        elif os.path.exists(full_path):
             present.append(rel_norm)
         else:
             missing.append(rel_norm)
