@@ -1049,11 +1049,11 @@ def _canonical_evidence_section(evidence_paths: List[str], llm_items: Optional[L
     else:
         items = _build_evidence_items(evidence_paths)
 
-    evidence_lines: List[str] = []
+    evidence_lines: List[str] = ["evidence:"]
     for item in items:
         claim = _sanitize_evidence_value(item.get("claim", ""))
         source = _sanitize_evidence_value(item.get("source", "missing")) or "missing"
-        evidence_lines.append(f"- **{claim}** — `{source}`")
+        evidence_lines.append(f'{{claim: "{claim}", source: "{source}"}}')
     dedup_paths: List[str] = []
     for path in (evidence_paths or []):
         clean = _sanitize_evidence_value(path)
@@ -1061,7 +1061,7 @@ def _canonical_evidence_section(evidence_paths: List[str], llm_items: Optional[L
             dedup_paths.append(clean)
         if len(dedup_paths) >= 8:
             break
-    path_lines = [f"- `{path}`" for path in dedup_paths] or ["- missing"]
+    path_lines = [f"- {path}" for path in dedup_paths] or ["- missing"]
     return "\n".join(evidence_lines + ["", "**Artifacts:**", ""] + path_lines)
 
 
@@ -1920,42 +1920,6 @@ class BusinessTranslatorAgent:
         # Keep insertion order
         required_outputs = [p for idx, p in enumerate(required_outputs) if p and p not in required_outputs[:idx]]
 
-        def _summarize_integrity():
-            issues = integrity_audit.get("issues", []) if isinstance(integrity_audit, dict) else []
-            severity_counts = {}
-            for i in issues:
-                sev = str(i.get("severity", "unknown"))
-                severity_counts[sev] = severity_counts.get(sev, 0) + 1
-            top = issues[:3]
-            return f"Issues by severity: {severity_counts}; Top3: {top}"
-
-        def _summarize_contract():
-            """V4.1: Summarize contract using V4.1 keys only, no legacy keys."""
-            if not contract:
-                return "No execution contract."
-            return {
-                "strategy_title": contract.get("strategy_title"),
-                "business_objective": contract.get("business_objective"),
-                "required_outputs": contract.get("required_outputs", []),
-                "canonical_columns_count": len(contract.get("canonical_columns", []) or []),
-                "derived_columns_count": len(contract.get("derived_columns", []) or []),
-                "validation_requirements": contract.get("validation_requirements", {}),
-                "qa_gates": contract.get("qa_gates", []),
-                "cleaning_gates": contract.get("cleaning_gates", []),
-                "reviewer_gates": contract.get("reviewer_gates", []),
-                "business_alignment": contract.get("business_alignment", {}),
-                "iteration_policy": contract.get("iteration_policy", {}),
-                "decisioning_requirements": contract.get("decisioning_requirements", {}),
-                "reporting_policy": contract.get("reporting_policy", {}),
-            }
-
-        def _summarize_output_contract():
-            if not output_contract_report:
-                return "No output contract report."
-            miss = output_contract_report.get("missing", [])
-            present = output_contract_report.get("present", [])
-            return f"Outputs present={len(present)} missing={len(miss)}"
-
         def _summarize_steward():
             if not steward_summary:
                 return "No steward summary."
@@ -2076,14 +2040,6 @@ class BusinessTranslatorAgent:
                 }
             return str(gate_context)[:1200]
 
-        def _summarize_review_feedback():
-            feedback = state.get("review_feedback") or state.get("execution_feedback") or ""
-            if isinstance(feedback, dict):
-                return feedback
-            if isinstance(feedback, str):
-                return feedback[:2000]
-            return str(feedback)[:2000]
-
         def _summarize_data_adequacy():
             if not data_adequacy_report:
                 return "No data adequacy report."
@@ -2107,15 +2063,6 @@ class BusinessTranslatorAgent:
                 "summary": alignment_check_report.get("summary"),
                 "requirements": alignment_check_report.get("requirements", []),
             }
-
-        def _summarize_case_alignment():
-            if not case_alignment_report:
-                return "No case alignment report."
-            status = case_alignment_report.get("status")
-            failures = case_alignment_report.get("failures", [])
-            metrics = case_alignment_report.get("metrics", {})
-            thresholds = case_alignment_report.get("thresholds", {})
-            return f"Status={status}; Failures={failures}; KeyMetrics={metrics}"
 
         def _case_alignment_business_status():
             if not case_alignment_report:
@@ -2160,14 +2107,8 @@ class BusinessTranslatorAgent:
                 "recommendation": "Priorizar reducciÃ³n de violaciones entre casos antes de considerar producciÃ³n.",
             }
 
-        contract_context = _summarize_contract()
-        integrity_context = _summarize_integrity()
-        output_contract_context = _summarize_output_contract()
-        case_alignment_context = _summarize_case_alignment()
-        case_alignment_business_status = _case_alignment_business_status()
         alignment_check_context = _summarize_alignment_check()
         gate_context = _summarize_gate_context()
-        review_feedback_context = _summarize_review_feedback()
         steward_context = _summarize_steward()
         cleaning_context = _summarize_cleaning()
         weights_context = _summarize_weights()
