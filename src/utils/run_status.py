@@ -30,14 +30,27 @@ def _final_state_path(run_id: str) -> str:
 
 
 def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
-    """Write JSON atomically: write to temp file then replace."""
+    """Write JSON atomically: write to temp file then replace.
+
+    On Windows, os.replace can fail with PermissionError when another
+    process (e.g. Streamlit polling) holds the target file open.  We
+    retry a few times with a short sleep to ride out the lock.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     dir_name = os.path.dirname(path)
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp_path, path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, path)
+                return
+            except PermissionError:
+                if attempt < 4:
+                    time.sleep(0.1 * (attempt + 1))
+                else:
+                    raise
     except Exception:
         try:
             os.unlink(tmp_path)
