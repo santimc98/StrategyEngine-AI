@@ -277,6 +277,152 @@ class TestStrategistNormalization:
         assert "FEATURE ENGINEERING REASONING" not in prompt
         assert '"feature_engineering_strategy"' not in prompt
 
+    @patch.dict("os.environ", {"STRATEGIST_STRATEGY_COUNT": "3"})
+    def test_generate_prompt_aligns_strategy_goal_with_requested_count(self):
+        payload = {
+            "strategies": [
+                {
+                    "title": "Strategy A",
+                    "objective_type": "predictive",
+                    "objective_reasoning": "Reason A.",
+                    "success_metric": "roc_auc",
+                    "scope_recommendation": "ml_only",
+                    "scope_reasoning": "Model-only run.",
+                    "recommended_evaluation_metrics": ["roc_auc"],
+                    "validation_strategy": "stratified_cv",
+                    "validation_rationale": "Balanced classes.",
+                    "analysis_type": "Churn Prediction",
+                    "hypothesis": "A",
+                    "required_columns": ["target", "feature_a"],
+                    "feature_families": [],
+                    "techniques": ["gradient_boosting"],
+                    "feasibility_analysis": {
+                        "statistical_power": "adequate",
+                        "signal_quality": "moderate",
+                        "compute_value_tradeoff": "acceptable",
+                    },
+                    "recommended_artifacts": [],
+                    "fallback_chain": ["logistic_regression"],
+                    "expected_lift": "small",
+                    "estimated_difficulty": "Medium",
+                    "reasoning": "Reason A",
+                },
+                {
+                    "title": "Strategy B",
+                    "objective_type": "predictive",
+                    "objective_reasoning": "Reason B.",
+                    "success_metric": "f1",
+                    "scope_recommendation": "ml_only",
+                    "scope_reasoning": "Model-only run.",
+                    "recommended_evaluation_metrics": ["f1"],
+                    "validation_strategy": "stratified_cv",
+                    "validation_rationale": "Balanced classes.",
+                    "analysis_type": "Churn Prediction",
+                    "hypothesis": "B",
+                    "required_columns": ["target", "feature_a"],
+                    "feature_families": [],
+                    "techniques": ["logistic_regression"],
+                    "feasibility_analysis": {
+                        "statistical_power": "adequate",
+                        "signal_quality": "moderate",
+                        "compute_value_tradeoff": "acceptable",
+                    },
+                    "recommended_artifacts": [],
+                    "fallback_chain": ["naive_bayes"],
+                    "expected_lift": "small",
+                    "estimated_difficulty": "Low",
+                    "reasoning": "Reason B",
+                },
+                {
+                    "title": "Strategy C",
+                    "objective_type": "predictive",
+                    "objective_reasoning": "Reason C.",
+                    "success_metric": "precision_at_k",
+                    "scope_recommendation": "ml_only",
+                    "scope_reasoning": "Model-only run.",
+                    "recommended_evaluation_metrics": ["precision_at_k"],
+                    "validation_strategy": "stratified_cv",
+                    "validation_rationale": "Balanced classes.",
+                    "analysis_type": "Churn Prediction",
+                    "hypothesis": "C",
+                    "required_columns": ["target", "feature_a"],
+                    "feature_families": [],
+                    "techniques": ["random_forest"],
+                    "feasibility_analysis": {
+                        "statistical_power": "adequate",
+                        "signal_quality": "moderate",
+                        "compute_value_tradeoff": "acceptable",
+                    },
+                    "recommended_artifacts": [],
+                    "fallback_chain": ["extra_trees"],
+                    "expected_lift": "small",
+                    "estimated_difficulty": "Medium",
+                    "reasoning": "Reason C",
+                },
+            ]
+        }
+        self.agent.model.generate_content = MagicMock(return_value=_mock_llm_response(payload))
+        self.agent.generate_strategies(
+            data_summary="summary",
+            user_request="predict churn",
+            column_inventory=["target", "feature_a"],
+        )
+        prompt = self.agent.last_prompt or ""
+        assert "craft 3 materially distinct executable strategies" in prompt
+        assert "craft ONE optimal strategy" not in prompt
+
+    def test_generate_strategies_restores_max_tokens_after_truncation_retry(self):
+        original_max_tokens = self.agent._max_tokens
+        payload = {
+            "strategies": [
+                {
+                    "title": "Retry Strategy",
+                    "objective_type": "predictive",
+                    "objective_reasoning": "Retry test.",
+                    "success_metric": "roc_auc",
+                    "scope_recommendation": "ml_only",
+                    "scope_reasoning": "Model-only run.",
+                    "recommended_evaluation_metrics": ["roc_auc"],
+                    "validation_strategy": "stratified_cv",
+                    "validation_rationale": "Balanced classes.",
+                    "analysis_type": "Churn Prediction",
+                    "hypothesis": "Retry",
+                    "required_columns": ["target", "feature_a"],
+                    "feature_families": [],
+                    "techniques": ["gradient_boosting"],
+                    "feasibility_analysis": {
+                        "statistical_power": "adequate",
+                        "signal_quality": "moderate",
+                        "compute_value_tradeoff": "acceptable",
+                    },
+                    "recommended_artifacts": [],
+                    "fallback_chain": ["logistic_regression"],
+                    "expected_lift": "small",
+                    "estimated_difficulty": "Medium",
+                    "reasoning": "Retry reasoning",
+                }
+            ]
+        }
+
+        observed_max_tokens = []
+
+        def fake_call_model(_prompt, *, temperature, context_tag):
+            observed_max_tokens.append(self.agent._max_tokens)
+            self.agent._last_finish_reason = "length" if len(observed_max_tokens) == 1 else "stop"
+            return json.dumps(payload)
+
+        with patch.object(self.agent, "_call_model", side_effect=fake_call_model):
+            output = self.agent.generate_strategies(
+                data_summary="summary",
+                user_request="predict churn",
+                column_inventory=["target", "feature_a"],
+            )
+
+        assert output["strategies"][0]["title"] == "Retry Strategy"
+        assert observed_max_tokens[0] == original_max_tokens
+        assert observed_max_tokens[1] == min(original_max_tokens * 2, 32768)
+        assert self.agent._max_tokens == original_max_tokens
+
 
 class TestGraphStrategistIntegration:
     

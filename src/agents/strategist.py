@@ -1875,6 +1875,11 @@ $payload_json
             )
         else:
             strategy_count_guidance = "Generate 3 distinct strategies."
+        strategy_goal = (
+            "craft ONE optimal strategy"
+            if strategy_count == 1
+            else f"craft {strategy_count} materially distinct executable strategies"
+        )
         compute_constraints_payload = (
             compute_constraints
             if isinstance(compute_constraints, dict)
@@ -1886,7 +1891,7 @@ $payload_json
         )
 
         SYSTEM_PROMPT_TEMPLATE = """
-        You are a Chief Data Strategist inside a multi-agent system. Your goal is to craft ONE optimal strategy
+        You are a Chief Data Strategist inside a multi-agent system. Your goal is to $strategy_goal
         that downstream AI engineers can execute successfully.
 
         === SENIOR STRATEGY PROTOCOL ===
@@ -2177,6 +2182,7 @@ $payload_json
         
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
+            strategy_goal=strategy_goal,
             data_summary=data_summary,
             authorized_column_inventory=inventory_payload,
             column_sets=json.dumps(column_sets_payload, ensure_ascii=False),
@@ -2193,6 +2199,7 @@ $payload_json
         self.last_prompt = system_prompt
         
         try:
+            original_max_tokens = self._max_tokens
             # --- Truncation-aware generation with retry ---
             _max_generation_attempts = 2
             content = None
@@ -2214,6 +2221,7 @@ $payload_json
                     self._max_tokens = min(self._max_tokens * 2, 32768)
                     continue
                 break
+            self._max_tokens = original_max_tokens
             self.last_response = content
             cleaned_content = self._clean_json(content)
             parsed, json_repair_meta = self._parse_with_json_repair(
@@ -2271,6 +2279,7 @@ $payload_json
             return payload
 
         except Exception as e:
+            self._max_tokens = original_max_tokens
             print(f"Strategist Error: {e}")
             # Fallback simple strategy
             fallback = {"strategies": [{
