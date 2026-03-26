@@ -1,7 +1,6 @@
 import sys
 import os
 import shutil
-import subprocess
 import re
 import json
 import copy
@@ -19,11 +18,9 @@ import importlib
 import importlib.util
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import TypedDict, Dict, Any, List, Literal, Optional, Tuple
+from typing import TypedDict, Dict, Any, List, Optional, Tuple
 from langgraph.graph import StateGraph, END
 from src.utils.sandbox_provider import get_sandbox_class
-from dotenv import load_dotenv
-import base64
 import pandas as pd
 
 # Add src to path to allow imports if running from root
@@ -59,7 +56,7 @@ from src.agents.business_translator import BusinessTranslatorAgent
 from src.agents.data_engineer import DataEngineerAgent
 from src.agents.cleaning_reviewer import CleaningReviewerAgent
 from src.agents.reviewer import ReviewerAgent
-from src.agents.qa_reviewer import QAReviewerAgent, collect_static_qa_facts, run_static_qa_checks # New QA Gate
+from src.agents.qa_reviewer import QAReviewerAgent, collect_static_qa_facts, run_static_qa_checks
 from src.agents.review_board import ReviewBoardAgent
 from src.agents.execution_planner import (
     ExecutionPlannerAgent,
@@ -80,8 +77,6 @@ from src.utils.leakage_sanity_audit import run_unsupervised_numeric_relation_aud
 from src.utils.cleaning_validation import (
     normalize_manifest,
     sample_raw_columns,
-    detect_destructive_conversions,
-    format_issue_report,
 )
 from src.utils.cleaning_guards import (
     detect_identifier_scientific_notation,
@@ -106,11 +101,9 @@ from src.utils.sandbox_deps import (
 )
 from src.utils.problem_capabilities import infer_problem_capabilities
 from src.utils.case_alignment import build_case_alignment_report
-# REMOVED: from src.utils.contract_validation import ensure_role_runbooks  # V4.1 cutover
 from src.utils.data_engineer_preflight import data_engineer_preflight
 from src.utils.contract_accessors import (
     get_clean_dataset_output_path,
-    get_cleaning_gates,
     get_clean_manifest_path,
     get_canonical_columns,
     get_artifact_requirements,
@@ -126,13 +119,11 @@ from src.utils.contract_accessors import (
     get_qa_gates_for_phase,
     get_reviewer_gates,
     get_reviewer_gates_for_phase,
-    get_decision_columns,
     filter_gate_list_for_phase,
     normalize_artifact_path,
     flatten_v5_contract,
 )
 from src.utils.contract_validator import (
-    normalize_contract_scope,
     resolve_contract_active_workstreams,
     derive_contract_scope_from_workstreams,
     get_default_optimization_policy,
@@ -156,7 +147,6 @@ from src.utils.run_bundle import (
     copy_run_artifacts,
     copy_run_contracts,
     copy_run_reports,
-    write_run_manifest,
     get_run_dir,
 )
 from src.utils.run_storage import (
@@ -169,11 +159,6 @@ from src.utils.run_storage import (
 from src.utils.review_status import normalize_status as normalize_review_status
 from src.utils.run_workspace import enter_run_workspace, exit_run_workspace
 from src.utils.path_resolution import _resolve_csv_path_with_base, _add_workspace_metadata
-from src.utils.artifact_resolver import (
-    load_json_scoped,
-    exists_scoped,
-    get_artifact_from_state_or_scoped,
-)
 from src.utils.dataset_memory import (
     fingerprint_dataset,
     load_dataset_memory,
@@ -195,8 +180,7 @@ from src.utils.data_adequacy import (
     _calc_lift,
     _metric_higher_is_better,
 )
-from src.utils.code_extract import extract_code_block, is_syntax_valid
-from src.utils.visuals import generate_fallback_plots
+from src.utils.code_extract import extract_code_block
 from src.utils.recommendations_preview import build_recommendations_preview
 from src.utils.label_enrichment import enrich_outputs
 from src.utils.ml_validation import validate_model_metrics_consistency, validate_metrics_ci_consistency
@@ -223,10 +207,8 @@ from src.utils.sandbox_paths import (
     canonical_abs,
 )
 from src.utils.sandbox_resilience import (
-    run_code_with_optional_timeout,
     run_python_file_with_optional_timeout,
     run_cmd_with_retry,
-    safe_download_file,
     safe_download_bytes,
     is_transient_sandbox_error,
     create_sandbox_with_retry,
@@ -5497,31 +5479,6 @@ def _maybe_set_contract_min_policy(contract_min: Dict[str, Any] | None, policy: 
     compact = _compact_reporting_policy(policy)
     if compact:
         contract_min["reporting_policy"] = compact
-
-
-def _is_artifact_path_like(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    path = value.strip().replace("\\", "/")
-    if not path:
-        return False
-    # Avoid logical labels and enforce file-like path shape.
-    if "/" not in path:
-        return False
-    base = os.path.basename(path)
-    if "." not in base:
-        return False
-    return True
-
-
-def _has_nonempty_runbook_payload(value: Any) -> bool:
-    if isinstance(value, dict):
-        return bool(value)
-    if isinstance(value, list):
-        return bool(value)
-    if isinstance(value, str):
-        return bool(value.strip())
-    return False
 
 
 def _validate_projected_views_for_execution(
@@ -26910,23 +26867,6 @@ def _should_run_metric_improvement_round(state: Dict[str, Any], contract: Dict[s
     return _metric_improvement_skip_reason(state, contract) is None
 
 
-def _flatten_numeric_metrics_for_improvement(payload: Any, prefix: str = "") -> List[Tuple[str, float]]:
-    items: List[Tuple[str, float]] = []
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            next_key = f"{prefix}.{key}" if prefix else str(key)
-            if isinstance(value, (int, float)):
-                items.append((next_key, float(value)))
-            elif isinstance(value, dict):
-                items.extend(_flatten_numeric_metrics_for_improvement(value, next_key))
-            elif isinstance(value, list) and value:
-                nums = [float(v) for v in value if isinstance(v, (int, float))]
-                if nums and len(nums) == len(value):
-                    mean_val = sum(nums) / len(nums)
-                    items.append((f"{next_key}_mean", mean_val))
-    return items
-
-
 def _extract_primary_metric(metrics_json: Dict[str, Any], metric_name: str) -> Optional[float]:
     value = metric_eval_extract_primary_metric(metrics_json, metric_name)
     if value is not None:
@@ -30558,10 +30498,10 @@ workflow.add_node("execution_planner", run_execution_planner)
 workflow.add_node("data_engineer", run_data_engineer)
 workflow.add_node("engineer", run_engineer)
 workflow.add_node("reviewer", run_reviewer)
-workflow.add_node("qa_reviewer", run_qa_reviewer) # QA Node
+workflow.add_node("qa_reviewer", run_qa_reviewer)
 workflow.add_node("final_runtime_fix", finalize_runtime_failure)
 workflow.add_node("execute_code", execute_code)
-workflow.add_node("evaluate_results", run_result_evaluator) # New Node
+workflow.add_node("evaluate_results", run_result_evaluator)
 workflow.add_node("review_board", run_review_board)
 workflow.add_node("bootstrap_opt_round", run_bootstrap_opt_round)
 workflow.add_node("plan_opt_hypothesis", run_plan_opt_hypothesis)
@@ -30569,12 +30509,12 @@ workflow.add_node("run_quick_eval", run_quick_eval)
 workflow.add_node("run_full_eval", run_full_eval)
 workflow.add_node("select_incumbent", run_select_incumbent)
 workflow.add_node("finalize_opt_loop", run_finalize_opt_loop)
-# Legacy compatibility nodes (kept for tests/backward routes)
+# Compatibility nodes kept for historical/resume paths and tests.
 workflow.add_node("bootstrap_improvement_round", run_metric_improvement_bootstrap)
 workflow.add_node("finalize_improvement_round", run_metric_improvement_finalize)
 workflow.add_node("retry_handler", retry_handler)
 workflow.add_node("retry_sandbox", retry_sandbox_execution)
-workflow.add_node("prepare_runtime_fix", prepare_runtime_fix) # New Node
+workflow.add_node("prepare_runtime_fix", prepare_runtime_fix)
 
 workflow.add_node("translator", run_translator)
 workflow.add_node("generate_pdf", generate_pdf_artifact)
@@ -30599,9 +30539,6 @@ workflow.add_conditional_edges(
     }
 )
 
-# workflow.add_edge("data_engineer", "engineer") -> Replaced by Conditional Edge
-# workflow.add_edge("engineer", "reviewer") -> Replaced by Conditional Edge
-
 workflow.add_conditional_edges(
     "engineer",
     check_engineer_success,
@@ -30613,7 +30550,7 @@ workflow.add_conditional_edges(
     }
 )
 
-# Conditional Edge for Data Engineer Failure
+# Data Engineer routing
 workflow.add_conditional_edges(
     "data_engineer",
     check_data_success,
@@ -30639,7 +30576,7 @@ workflow.add_conditional_edges(
 # Nodes remain registered for optional future use.
 """
 
-# New Flow: Execution -> Loop
+# Execution and evaluation loop
 workflow.add_conditional_edges(
     "execute_code",
     check_execution_status,
@@ -30658,7 +30595,7 @@ workflow.add_edge("retry_sandbox", "execute_code")
 
 workflow.add_edge("evaluate_results", "review_board")
 
-# Conditional Edge for Review Board Decision
+# Review board routing
 workflow.add_conditional_edges(
     "review_board",
     check_review_board_opt_route,
@@ -30680,7 +30617,7 @@ workflow.add_conditional_edges(
     }
 )
 
-# Legacy compatibility routes (reachable from historical branches).
+# Compatibility routes for historical/resume paths.
 workflow.add_conditional_edges(
     "bootstrap_improvement_round",
     check_metric_improvement_bootstrap_route,
