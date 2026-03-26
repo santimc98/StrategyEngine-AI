@@ -4,7 +4,7 @@ import os
 import csv
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -36,7 +36,7 @@ _RANDOM_RATIO = 0.2          # 20% from random middle (if file supports it)
 _FILE_SIZE_THRESHOLD_MB = 10 # Only sample if file > this size
 
 
-def _compute_sample_sizes(file_size_mb: float, total_rows_estimate: int = None) -> Dict[str, int]:
+def _compute_sample_sizes(file_size_mb: float) -> Dict[str, int]:
     """
     Compute context-aware sample sizes based on file size.
 
@@ -215,7 +215,7 @@ def _count_csv_rows(file_path: str, encoding: str) -> int:
 class StewardAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Steward Agent via OpenRouter.
+        Initializes the Steward Agent via the configured text provider.
         """
         self.provider = "openrouter"
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
@@ -240,6 +240,27 @@ class StewardAgent:
             raise ValueError("OPENROUTER_API_KEY or GOOGLE_API_KEY is required.")
         self.last_prompt = None
         self.last_response = None
+
+    def _run_text_prompt(self, prompt: str) -> Tuple[str, Any, Any]:
+        self.last_prompt = prompt
+        if self.provider == "gemini" and hasattr(self.client, "generate_content"):
+            response = self.client.generate_content(prompt)
+            text = str(getattr(response, "text", "") or "").strip()
+            finish_reason = getattr(response, "finish_reason", None)
+        else:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            choices = getattr(response, "choices", None) or []
+            choice = choices[0] if choices else None
+            message = getattr(choice, "message", None)
+            text = getattr(message, "content", "") or ""
+            text = str(text).strip()
+            finish_reason = getattr(choice, "finish_reason", None) if choice is not None else None
+        self.last_response = text
+        return text, response, finish_reason
 
     def analyze_data(self, data_path: str, business_objective: str = "") -> Dict[str, Any]:
         """
@@ -300,7 +321,7 @@ class StewardAgent:
             df = scrubber.scrub_dataframe(df)
 
             # 5. Smart Profiling (V3)
-            profile = self._smart_profile(df, business_objective)
+            profile = self._smart_profile(df)
             shape = df.shape
             dataset_profile = build_dataset_profile(
                 df=df,
@@ -387,24 +408,12 @@ class StewardAgent:
                 business_objective=business_objective,
                 metadata_str=metadata_str
             )
-            self.last_prompt = system_prompt
 
-            if self.provider == "gemini" and hasattr(self.client, "generate_content"):
-                response = self.client.generate_content(system_prompt)
-                summary = str(getattr(response, "text", "") or "").strip()
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": system_prompt}],
-                    temperature=0.2,
-                )
-                summary = (response.choices[0].message.content or "").strip()
-            self.last_response = summary
+            summary, response, finish_reason = self._run_text_prompt(system_prompt)
 
             # Diagnostic logging for empty responses (best-effort, no PII)
             try:
                 text_len = len(summary)
-                finish_reason = getattr(response.choices[0], "finish_reason", None) if response.choices else None
                 print(f"STEWARD_LLM_DIAG: text_len={text_len} finish_reason={finish_reason}")
                 error_classification = None
                 if text_len == 0:
@@ -420,7 +429,7 @@ class StewardAgent:
                     "response_text_len": text_len,
                     "prompt_text_len": len(system_prompt),
                     "finish_reason": str(finish_reason),
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "error_classification": error_classification,
                 }
                 try:
@@ -534,14 +543,7 @@ $raw_output
         current_prompt = prompt
         last_text = ""
         for attempt in range(max(1, int(max_attempts))):
-            self.last_prompt = current_prompt
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": current_prompt}],
-                temperature=0.2,
-            )
-            text = (response.choices[0].message.content or "").strip()
-            self.last_response = text
+            text, _response, _finish_reason = self._run_text_prompt(current_prompt)
             last_text = text
             parsed = self._parse_json_response(text)
             has_required = bool(parsed) and all(key in parsed for key in required_keys)
@@ -572,7 +574,7 @@ $raw_output
         SYSTEM_PROMPT_TEMPLATE = """
 You are the Senior Data Steward.
 
-TASK: Propose semantic hypotheses for modeling and request only the extra evidence you need.
+TASK: Analyze the dataset and business objective to propose semantic hypotheses for modeling. Decide which column is the most likely prediction target, and request the specific evidence you need to confirm your hypotheses.
 
 Business objective:
 $business_objective
@@ -588,14 +590,27 @@ $data_atlas_summary
 Sample rows (head/tail/random):
 $sample_rows
 
-RULES:
-- Choose exactly one primary_target (string). Always decide, even if uncertain.
-- split_candidates and id_candidates are optional lists (use [] if none).
-- evidence_requests is REQUIRED. It must be a list (max 12 items) where each item is:
-  {"kind":"missingness"|"uniques"|"column_profile","column":"<exact_column_name>", "max_unique": <int optional for uniques>}
-- evidence_requests must request only columns present in inventory/atlas.
-- notes: 2-6 bullets explaining why (objective + column names). Do NOT invent metrics.
-- Output JSON only. No markdown, no extra text.
+YOUR REASONING TASK:
+1. Read the business objective carefully. What is the user trying to predict, classify, or optimize?
+2. Examine the column names, types, and sample values. Which column best represents the outcome the user cares about?
+3. Consider ambiguity: if multiple columns could be the target, pick the one most aligned with the stated objective and explain your reasoning in notes.
+4. Identify columns that look like row identifiers (IDs, UUIDs, keys) and columns that could define train/test splits.
+5. Decide what additional evidence you need to confirm your hypotheses (missingness patterns, unique value counts, column distributions).
+
+OUTPUT FORMAT (JSON only, no markdown):
+{
+  "primary_target": "<your best candidate column name>",
+  "split_candidates": ["<columns that may define train/test partitions, or [] if none>"],
+  "id_candidates": ["<columns that look like row identifiers, or [] if none>"],
+  "evidence_requests": [
+    {"kind": "missingness"|"uniques"|"column_profile", "column": "<exact_column_name>", "max_unique": <int, optional for uniques>}
+  ],
+  "notes": ["2-6 bullets explaining your reasoning: why this target, what uncertainties remain, what the evidence will clarify"]
+}
+
+CONSTRAINTS:
+- evidence_requests: max 12 items, only columns present in inventory/atlas.
+- Do NOT invent metrics or statistics you haven't seen. State what you observe and what you need to verify.
 
 $retry_note
 """
@@ -684,15 +699,18 @@ OUTPUT REQUIREMENTS (JSON ONLY):
   }
 }
 
-RULES:
-- Use the primary_target exactly as provided; do not change it.
-- If 0 < target_null_frac_exact < 1, set:
-  training_rows_rule: "rows where <target> is not missing"
-  scoring_rows_rule_primary: "all rows"
-  scoring_rows_rule_secondary: "rows where <target> is missing"
-- If no partial labels, training_rows_rule: "use all rows" and scoring_rows_rule_primary: "all rows".
-- column_sets: do NOT enumerate full column lists. Use selectors above and only list explicit_columns.
-- Use directed evidence_bundle as source-of-truth evidence. If it conflicts with sample rows, prioritize evidence_bundle.
+YOUR REASONING TASK:
+1. You already chose the primary_target in pass1. Keep it as provided — do not change it.
+2. Examine the measured target missingness. What fraction of labels is missing? What does this mean for training?
+   - If a significant portion of labels is missing, reason about whether those rows should be excluded from training, used for scoring, or treated differently.
+   - If all labels are present, all rows can be used for training.
+   - Express your reasoning in the rationale field.
+3. Examine the split candidates and their unique values. Do any columns define a natural train/test partition?
+4. Use the evidence_bundle as your source of truth. If it conflicts with sample rows, trust the evidence_bundle.
+5. Design column_sets using compact selectors (prefix_numeric_range, regex, all_numeric_except, all_columns_except) — do NOT enumerate full column lists.
+
+CONSTRAINTS:
+- primary_target must match the value provided above exactly.
 - Output JSON only. No markdown, no extra text.
 """
         prompt = render_prompt(
@@ -775,7 +793,7 @@ RULES:
         
         return '.'
 
-    def _smart_profile(self, df: pd.DataFrame, objective: str) -> Dict[str, str]:
+    def _smart_profile(self, df: pd.DataFrame) -> Dict[str, str]:
         """
         Generates intelligent profile: High Card checks, Constant check, Target Detection.
         """
@@ -784,8 +802,6 @@ RULES:
         ambiguities = ""
         glossary = ""
         remaining_columns_summary = ""
-        ids = []
-        dates = []
 
         # Preserve original order; avoid heuristic target suggestions.
         all_cols = df.columns.tolist()
@@ -925,8 +941,6 @@ RULES:
             "ambiguities": ambiguities or "None detected.",
             "glossary": glossary or "None.",
             "remaining_columns_summary": remaining_columns_summary,
-            "ids": ids,
-            "dates": dates,
             "examples": examples
         }
 
@@ -1708,7 +1722,7 @@ def build_data_profile(
         "feature_target_associations": feature_target_associations,
         "multicollinearity_pairs_high": multicollinearity_pairs,
         "compute_hints": compute_hints,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     return profile
 
