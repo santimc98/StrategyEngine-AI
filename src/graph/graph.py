@@ -16312,7 +16312,18 @@ def _execute_data_engineer_via_heavy_runner(
     downloaded = heavy_result.get("downloaded") or {}
     missing = list(heavy_result.get("missing_artifacts") or [])
     status_ok = str(heavy_result.get("status") or "").lower() == "success"
-    required_ok = all(path in downloaded for path in required_artifacts)
+    _GLOB_CHARS = {"*", "?", "["}
+    _downloaded_set = set(downloaded) if isinstance(downloaded, dict) else set(downloaded)
+
+    def _artifact_present(path: str) -> bool:
+        if path in _downloaded_set:
+            return True
+        if any(c in path for c in _GLOB_CHARS):
+            import fnmatch
+            return any(fnmatch.fnmatch(d, path) for d in _downloaded_set)
+        return False
+
+    required_ok = all(_artifact_present(path) for path in required_artifacts)
     outlier_report_downloaded = bool(optional_outlier_report and optional_outlier_report in downloaded)
     protocol_mismatch = False
     protocol_mismatch_hint = ""
