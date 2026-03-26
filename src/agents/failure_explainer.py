@@ -44,11 +44,13 @@ class FailureExplainerAgent:
         )
         return (response.choices[0].message.content or "").strip()
 
-    def explain_data_engineer_failure(
+    def _explain_failure(
         self,
         code: str,
         error_details: str,
-        context: Dict[str, Any] | None = None,
+        context: Dict[str, Any] | None,
+        *,
+        prompt_prefix: str,
     ) -> str:
         if not code or not error_details:
             return ""
@@ -59,26 +61,13 @@ class FailureExplainerAgent:
         code_snippet = self._truncate(code, 6000)
         error_snippet = self._truncate(error_details, 4000)
         context_snippet = self._truncate(str(ctx), 2000)
-
         prompt = (
-            "You are a senior debugging assistant. "
-            "Given the generated Python cleaning code, the traceback/error, and context, "
-            "explain why the failure happened and how to fix it. "
-            "Return concise plain text (3-6 short lines). "
-            "Use this format with short lines: "
-            "WHERE: <location or step>, WHY: <root cause>, FIX: <specific change>. "
-            "Prioritize the earliest root cause, not just the final exception. "
-            "Be concrete about the coding invariant that was violated (shape/length mismatch, "
-            "missing columns, incorrect file path, stale artifacts, wrong import, etc.). "
-            "If uncertain, propose a minimal diagnostic check to confirm the cause. "
-            "Do NOT include code. Do NOT restate the full traceback.\n\n"
-            + "CODE:\n"
+            prompt_prefix
+            + "\n\nCODE:\n"
             + code_snippet
-            + "\n\n"
-            + "ERROR:\n"
+            + "\n\nERROR:\n"
             + error_snippet
-            + "\n\n"
-            + "CONTEXT:\n"
+            + "\n\nCONTEXT:\n"
             + context_snippet
             + "\n"
         )
@@ -89,6 +78,31 @@ class FailureExplainerAgent:
             return self._fallback(error_details)
 
         return (content or "").strip()
+
+    def explain_data_engineer_failure(
+        self,
+        code: str,
+        error_details: str,
+        context: Dict[str, Any] | None = None,
+    ) -> str:
+        return self._explain_failure(
+            code,
+            error_details,
+            context,
+            prompt_prefix=(
+                "You are a senior debugging assistant. "
+                "Given the generated Python cleaning code, the traceback/error, and context, "
+                "explain why the failure happened and how to fix it. "
+                "Return concise plain text (3-6 short lines). "
+                "Use this format with short lines: "
+                "WHERE: <location or step>, WHY: <root cause>, FIX: <specific change>. "
+                "Prioritize the earliest root cause, not just the final exception. "
+                "Be concrete about the coding invariant that was violated (shape/length mismatch, "
+                "missing columns, incorrect file path, stale artifacts, wrong import, etc.). "
+                "If uncertain, propose a minimal diagnostic check to confirm the cause. "
+                "Do NOT include code. Do NOT restate the full traceback."
+            ),
+        )
 
     def explain_ml_failure(
         self,
@@ -96,46 +110,25 @@ class FailureExplainerAgent:
         error_details: str,
         context: Dict[str, Any] | None = None,
     ) -> str:
-        if not code or not error_details:
-            return ""
-        if not self._client:
-            return self._fallback(error_details)
-
-        ctx = context or {}
-        code_snippet = self._truncate(code, 6000)
-        error_snippet = self._truncate(error_details, 4000)
-        context_snippet = self._truncate(str(ctx), 2000)
-
-        prompt = (
-            "You are a senior ML debugging assistant. "
-            "Given the generated ML Python code, the runtime error output, and context, "
-            "explain why the failure happened and how to fix it. "
-            "Return concise plain text (3-6 short lines). "
-            "Use this format with short lines: "
-            "WHERE: <location or step>, WHY: <root cause>, FIX: <specific change>. "
-            "Prioritize the earliest root cause, not just the final exception. "
-            "Name the violated invariant (mismatched shapes/lengths, pipeline refit side effects, "
-            "missing column, wrong import, wrong file path, or derived field not created). "
-            "If multiple errors appear, address the first causal one. "
-            "If uncertain, propose a minimal diagnostic check to confirm the cause. "
-            "Do NOT include code. Do NOT restate the full traceback.\n\n"
-            + "CODE:\n"
-            + code_snippet
-            + "\n\n"
-            + "ERROR:\n"
-            + error_snippet
-            + "\n\n"
-            + "CONTEXT:\n"
-            + context_snippet
-            + "\n"
+        return self._explain_failure(
+            code,
+            error_details,
+            context,
+            prompt_prefix=(
+                "You are a senior ML debugging assistant. "
+                "Given the generated ML Python code, the runtime error output, and context, "
+                "explain why the failure happened and how to fix it. "
+                "Return concise plain text (3-6 short lines). "
+                "Use this format with short lines: "
+                "WHERE: <location or step>, WHY: <root cause>, FIX: <specific change>. "
+                "Prioritize the earliest root cause, not just the final exception. "
+                "Name the violated invariant (mismatched shapes/lengths, pipeline refit side effects, "
+                "missing column, wrong import, wrong file path, or derived field not created). "
+                "If multiple errors appear, address the first causal one. "
+                "If uncertain, propose a minimal diagnostic check to confirm the cause. "
+                "Do NOT include code. Do NOT restate the full traceback."
+            ),
         )
-
-        try:
-            content = call_with_retries(lambda: self._call_llm(prompt), max_retries=2)
-        except Exception:
-            return self._fallback(error_details)
-
-        return (content or "").strip()
 
     def _fallback(self, error_details: str) -> str:
         if not error_details:
