@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
-from openai import OpenAI
 
 from src.utils.code_extract import extract_code_block
 from src.utils.cleaning_contract_semantics import resolve_required_columns_for_cleaning
