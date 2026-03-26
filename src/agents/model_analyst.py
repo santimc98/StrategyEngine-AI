@@ -18,30 +18,6 @@ from src.utils.llm_fallback import call_chat_with_fallback, extract_response_tex
 load_dotenv()
 
 
-def _coerce_llm_response_text(response: Any) -> str:
-    """Extract text from Gemini or OpenAI-compatible response objects."""
-    if isinstance(response, str):
-        return response
-    text = getattr(response, "text", None)
-    if isinstance(text, str) and text.strip():
-        return text
-    candidates = getattr(response, "candidates", None)
-    if isinstance(candidates, list):
-        for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            parts = getattr(content, "parts", None)
-            if not isinstance(parts, list):
-                continue
-            chunks: List[str] = []
-            for part in parts:
-                part_text = getattr(part, "text", None)
-                if isinstance(part_text, str) and part_text.strip():
-                    chunks.append(part_text.strip())
-            if chunks:
-                return "\n".join(chunks)
-    return str(response or "")
-
-
 _ACTION_FAMILIES_STR = ", ".join(ACTION_FAMILIES)
 
 _MAX_SCRIPT_CHARS = 12000
@@ -768,34 +744,6 @@ class ModelAnalystAgent:
             except (ValueError, TypeError):
                 action["priority"] = 3
         return True
-
-    def _merge_llm_and_deterministic(
-        self, llm: Dict[str, Any], det: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        llm_actions = llm.get("improvement_actions") or []
-        det_actions = det.get("improvement_actions") or []
-
-        llm_families = {str(a.get("action_family")) for a in llm_actions if isinstance(a, dict)}
-        llm_techniques = {str(a.get("technique")).lower() for a in llm_actions if isinstance(a, dict)}
-
-        merged = list(llm_actions)
-        for da in det_actions:
-            if not isinstance(da, dict):
-                continue
-            da_family = str(da.get("action_family"))
-            da_technique = str(da.get("technique")).lower()
-            if da_family not in llm_families or da_technique not in llm_techniques:
-                merged.append(da)
-
-        merged.sort(key=lambda x: int(x.get("priority", 5)) if isinstance(x.get("priority"), int) else 5)
-
-        result = dict(llm)
-        result["improvement_actions"] = merged[:6]
-        result["total_expected_delta"] = round(
-            sum(a.get("expected_delta", 0) for a in result["improvement_actions"] if isinstance(a.get("expected_delta"), (int, float))),
-            4,
-        )
-        return result
 
     def _finalize_blueprint(self, blueprint: Dict[str, Any], context: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Apply compute-budget guardrails and finalize the blueprint.
