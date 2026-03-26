@@ -73,3 +73,7 @@ reports/
 
 # Encrypted API keys store (never commit)
 data/api_keys.enc
+
+# Generated presentations
+*.pptx
+~$*
