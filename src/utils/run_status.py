@@ -112,17 +112,33 @@ def append_log(run_id: str, agent: str, message: str, level: str = "info") -> No
 
 def write_final_state(run_id: str, state: Dict[str, Any]) -> None:
     """Serialize the final graph state for the results dashboard."""
-    # Only keep JSON-serializable fields that the UI needs
+    # Only keep JSON-serializable fields that the UI needs.
+    # P3 fix: expanded whitelist — previous version lost observability fields
+    # that the dashboard and governance summary depend on.
     keys_to_keep = [
-        "review_verdict", "iteration_count", "current_iteration",
-        "selected_strategy", "gate_status", "data_summary",
-        "strategies", "selection_reason", "domain_expert_reviews",
+        # Core identification
+        "run_id", "business_objective", "csv_path",
+        # Review & governance
+        "review_verdict", "last_successful_review_verdict",
+        "review_board_verdict", "gate_status",
+        "budget_counters", "iteration_count", "current_iteration",
+        # Strategy
+        "selected_strategy", "strategies", "selection_reason",
+        "data_summary", "domain_expert_reviews",
+        # Execution contract
+        "execution_contract",
+        # Data Engineer
         "cleaning_code", "cleaned_data_preview",
+        # ML Engineer
         "generated_code", "last_generated_code",
         "execution_output", "last_successful_execution_output",
-        "execution_contract",
+        # Report & artifacts
         "final_report", "pdf_path", "output_contract_report",
-        "execution_feedback", "run_id",
+        "execution_feedback", "artifact_paths",
+        "work_dir", "work_dir_abs",
+        # Pipeline status
+        "data_engineer_failed", "pipeline_aborted_reason",
+        "ml_improvement_kept", "stop_reason",
     ]
     serializable = {}
     for k in keys_to_keep:

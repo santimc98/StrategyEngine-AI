@@ -29527,7 +29527,10 @@ def _sync_review_board_verdict_after_metric_round(
     force_finalize_reason = str(controller.get("force_finalize_reason") or selection.get("force_finalize_reason") or "")
 
     payload = dict(board_payload)
-    final_verdict = normalize_review_status(state.get("review_verdict") or payload.get("final_review_verdict"))
+    # P1 fix: board's explicit verdict is authoritative.
+    # state["review_verdict"] may contain the *baseline* verdict restored during
+    # metric-round rollback (L28968), which would shadow the board's real ruling.
+    final_verdict = normalize_review_status(payload.get("final_review_verdict") or state.get("review_verdict"))
     summary_line = (
         "METRIC_IMPROVEMENT_FINAL: "
         + f"kept={kept or 'unknown'} "

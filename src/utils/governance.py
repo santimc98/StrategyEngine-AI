@@ -425,8 +425,22 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     alignment_check = _safe_load_json("data/alignment_check.json")
     integrity = _safe_load_json("data/integrity_audit_report.json")
 
-    # Status from state (for backward compatibility)
-    status = state.get("last_successful_review_verdict") or state.get("review_verdict") or "UNKNOWN"
+    # Status: prefer the review board's final verdict (authoritative after metric
+    # improvement rounds), then fall back to state-level verdicts.
+    _board_payload = state.get("review_board_verdict")
+    if not isinstance(_board_payload, dict):
+        _board_payload = _safe_load_json("data/review_board_verdict.json")
+    _board_verdict = (
+        _board_payload.get("final_review_verdict")
+        if isinstance(_board_payload, dict)
+        else None
+    )
+    status = (
+        _board_verdict
+        or state.get("review_verdict")
+        or state.get("last_successful_review_verdict")
+        or "UNKNOWN"
+    )
 
     # Collect failed_gates from multiple sources (legacy logic preserved)
     failed_gates: List[str] = []

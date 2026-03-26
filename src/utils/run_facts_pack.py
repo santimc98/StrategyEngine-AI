@@ -1,14 +1,29 @@
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 from src.utils.contract_accessors import get_outcome_columns
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
     return value if isinstance(value, dict) else {}
 
 
 def _as_list(value: Any) -> List[Any]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
     return value if isinstance(value, list) else []
 
 
@@ -32,8 +47,18 @@ def _extract_contract(state: Dict[str, Any]) -> Dict[str, Any]:
         snap_contract = snapshot.get("execution_contract")
         if isinstance(snap_contract, dict) and snap_contract:
             return snap_contract
-    contract = state.get("execution_contract") or {}
-    return contract if isinstance(contract, dict) else {}
+    contract = _as_dict(state.get("execution_contract"))
+    if contract:
+        return contract
+    # Fallback: contract may only exist on disk (not in state dict)
+    try:
+        with open(os.path.join("data", "execution_contract.json"), "r", encoding="utf-8") as f:
+            disk_contract = json.load(f)
+        if isinstance(disk_contract, dict) and disk_contract:
+            return disk_contract
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {}
 
 
 def _extract_objective_type(contract: Dict[str, Any], state: Dict[str, Any]) -> Optional[str]:
