@@ -1,5 +1,4 @@
 import json
-import re
 from typing import Any, Dict, List
 
 from src.utils.reviewer_llm import init_reviewer_llm
@@ -294,6 +293,7 @@ class ReviewBoardAgent:
         return packet
 
     def _clean_json(self, text: str) -> str:
-        text = re.sub(r"```json", "", text)
-        text = re.sub(r"```", "", text)
-        return text.strip()
+        cleaned = str(text or "")
+        cleaned = cleaned.replace("```json", "")
+        cleaned = cleaned.replace("```", "")
+        return cleaned.strip()
