@@ -2174,7 +2174,8 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         """, unsafe_allow_html=True)
 
     # Tabs
-    tab1, tab2, tab_plan, tab_de, tab3, tab4 = st.tabs([
+    tab_init, tab1, tab2, tab_plan, tab_de, tab3, tab4 = st.tabs([
+        "Estado Inicial",
         "Auditor\u00eda de Datos",
         "Estrategia",
         "Plan de Ejecuci\u00f3n",
@@ -2182,6 +2183,51 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         "Modelo ML",
         "Informe Ejecutivo"
     ])
+
+    # --- Tab 0: Initial State ---
+    with tab_init:
+        st.markdown("#### Objetivo de Negocio")
+        _biz_obj = result.get("business_objective", "")
+        if _biz_obj:
+            st.markdown(f'<div class="card fade-in" style="white-space:pre-wrap;">{_biz_obj}</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.info("No se registr\u00f3 un objetivo de negocio para esta ejecuci\u00f3n.")
+
+        st.markdown("#### Vista Previa del Dataset")
+        _csv_path = result.get("csv_path", "")
+        if _csv_path and os.path.isfile(_csv_path):
+            try:
+                _init_df = pd.read_csv(_csv_path, nrows=10)
+                _init_shape = pd.read_csv(_csv_path, nrows=0)
+                # Show dataset dimensions
+                import csv as _csv_mod
+                _total_rows = sum(1 for _ in open(_csv_path, encoding="utf-8", errors="ignore")) - 1
+                _total_cols = len(_init_shape.columns)
+                _dim_cols = st.columns(3)
+                with _dim_cols[0]:
+                    st.markdown(f'<div class="card fade-in" style="text-align:center;">'
+                                f'<div class="card-header">Filas</div>'
+                                f'<div class="card-value">{_total_rows:,}</div>'
+                                f'</div>', unsafe_allow_html=True)
+                with _dim_cols[1]:
+                    st.markdown(f'<div class="card fade-in" style="text-align:center;">'
+                                f'<div class="card-header">Columnas</div>'
+                                f'<div class="card-value">{_total_cols}</div>'
+                                f'</div>', unsafe_allow_html=True)
+                with _dim_cols[2]:
+                    _fname = os.path.basename(_csv_path)
+                    st.markdown(f'<div class="card fade-in" style="text-align:center;">'
+                                f'<div class="card-header">Archivo</div>'
+                                f'<div style="font-size:0.85rem;font-weight:700;">{_fname}</div>'
+                                f'</div>', unsafe_allow_html=True)
+                st.dataframe(_init_df, use_container_width=True)
+            except Exception as _csv_err:
+                st.warning(f"No se pudo cargar el CSV: {_csv_err}")
+        elif _csv_path:
+            st.warning(f"El archivo CSV ya no est\u00e1 disponible en: {_csv_path}")
+        else:
+            st.info("No se registr\u00f3 la ruta del dataset para esta ejecuci\u00f3n.")
 
     # --- Tab 1: Data Audit ---
     with tab1:

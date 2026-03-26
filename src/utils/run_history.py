@@ -124,6 +124,16 @@ def list_runs(runs_dir: str = _RUNS_DIR, limit: int = 20) -> List[Dict[str, Any]
 
 
 def load_run_result(run_id: str, runs_dir: str = _RUNS_DIR) -> Optional[Dict[str, Any]]:
-    """Load the full final state of a specific run."""
+    """Load the full final state of a specific run, enriched with worker input."""
     run_dir = os.path.join(runs_dir, run_id)
-    return _load_json_safe(os.path.join(run_dir, "worker_final_state.json"))
+    state = _load_json_safe(os.path.join(run_dir, "worker_final_state.json"))
+    if state is None:
+        return None
+    # Enrich with business_objective and csv_path from worker_input if missing
+    worker_input = _load_json_safe(os.path.join(run_dir, "worker_input.json"))
+    if isinstance(worker_input, dict):
+        if not state.get("business_objective"):
+            state["business_objective"] = worker_input.get("business_objective", "")
+        if not state.get("csv_path"):
+            state["csv_path"] = worker_input.get("csv_path", "")
+    return state

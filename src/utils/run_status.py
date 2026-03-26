@@ -191,9 +191,23 @@ def read_final_state(run_id: str) -> Optional[Dict[str, Any]]:
     path = _final_state_path(run_id)
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+    # Enrich with business_objective and csv_path from worker_input
+    try:
+        run_dir = os.path.join(RUNS_DIR, run_id)
+        wi_path = os.path.join(run_dir, "worker_input.json")
+        with open(wi_path, "r", encoding="utf-8") as f:
+            worker_input = json.load(f)
+        if isinstance(worker_input, dict):
+            if not state.get("business_objective"):
+                state["business_objective"] = worker_input.get("business_objective", "")
+            if not state.get("csv_path"):
+                state["csv_path"] = worker_input.get("csv_path", "")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return state
 
 
 def get_active_run_id() -> Optional[str]:
