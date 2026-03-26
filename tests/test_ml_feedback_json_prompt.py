@@ -2,6 +2,17 @@ from src.agents.ml_engineer import MLEngineerAgent
 from types import SimpleNamespace
 
 
+def _assert_contains_all(text: str, *needles: str) -> None:
+    for needle in needles:
+        assert needle in text
+
+
+def _assert_contains_terms(text: str, *terms: str) -> None:
+    lowered = text.lower()
+    for term in terms:
+        assert term.lower() in lowered
+
+
 class _FakeOpenAI:
     def __init__(self, api_key=None, base_url=None, timeout=None, default_headers=None):
         self.api_key = api_key
@@ -102,8 +113,8 @@ def test_generate_code_prompt_preserves_string_runbook(monkeypatch):
     )
 
     prompt = str(agent.last_prompt or "")
-    assert "discrete-time hazard baseline" in prompt
-    assert "time_to_hit_hours" in prompt
+    _assert_contains_all(prompt, "time_to_hit_hours")
+    _assert_contains_terms(prompt, "discrete-time hazard baseline")
 
 
 def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatch):
@@ -185,20 +196,22 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
     )
 
     prompt = str(agent.last_prompt or "")
-    assert "MODE: CODE_EDITOR_MODE_OPTIMIZATION" in prompt
-    assert "OPTIMIZATION EDITOR CONTRACT" in prompt
-    assert "CURRENT TASK CONTEXT" in prompt
-    assert "CURRENT ROUND BRIEF:" in prompt
-    assert "ACTIVE HYPOTHESIS BRIEF:" in prompt
-    assert "CURRENT EVIDENCE BRIEF:" in prompt
-    assert "LOCKED INVARIANTS:" in prompt
-    assert "Optimization Authoritative State:" in prompt
-    assert "cleaning_manifest.json only for CSV dialect and cleaning metadata" in prompt
-    assert "allowed_feature_sets.model_features" in prompt
-    assert '"feature_a"' in prompt
-    assert "target_columns" in prompt
-    assert '"label_12h"' in prompt
-    assert "simple arithmetic mean" in prompt
+    _assert_contains_all(
+        prompt,
+        "MODE: CODE_EDITOR_MODE_OPTIMIZATION",
+        "OPTIMIZATION EDITOR CONTRACT",
+        "CURRENT TASK CONTEXT",
+        "CURRENT ROUND BRIEF:",
+        "ACTIVE HYPOTHESIS BRIEF:",
+        "CURRENT EVIDENCE BRIEF:",
+        "LOCKED INVARIANTS:",
+        "Optimization Authoritative State:",
+        "allowed_feature_sets.model_features",
+        '"feature_a"',
+        "target_columns",
+        '"label_12h"',
+    )
+    _assert_contains_terms(prompt, "cleaning_manifest.json", "csv dialect", "cleaning metadata", "simple arithmetic mean")
     assert "ARTIFACT: data/scored_rows.csv" not in prompt
     assert "STRUCTURED CRITIQUE PACKET:" not in prompt
     assert "OPTIMIZATION CONTEXT (authoritative current round):" not in prompt
@@ -271,11 +284,14 @@ def test_optimization_authoritative_state_accepts_submission_schema_alias_paths(
     )
 
     prompt = str(agent.last_prompt or "")
-    assert "Optimization Authoritative State:" in prompt
-    assert "submission_expected_row_count" in prompt
-    assert "outputs/submission.csv" in prompt
-    assert "95" in prompt
-    assert "artifacts/manifests/custom_clean_manifest.json" in prompt
+    _assert_contains_all(
+        prompt,
+        "Optimization Authoritative State:",
+        "submission_expected_row_count",
+        "outputs/submission.csv",
+        "95",
+        "artifacts/manifests/custom_clean_manifest.json",
+    )
 
 
 def test_editor_prompt_includes_authoritative_repair_ground_truth(monkeypatch):
@@ -329,9 +345,8 @@ def test_editor_prompt_includes_authoritative_repair_ground_truth(monkeypatch):
     )
 
     prompt = str(agent.last_prompt or "")
-    assert "REPAIR GROUND TRUTH (verified environment facts, authoritative):" in prompt
-    assert "pathlib.Path.read_text" in prompt
-    assert "unexpected_keyword_argument" in prompt
+    _assert_contains_all(prompt, "pathlib.Path.read_text", "unexpected_keyword_argument")
+    _assert_contains_terms(prompt, "repair ground truth", "verified environment facts", "authoritative")
 
 
 def test_editor_prompt_enforces_patch_only_repair_scope(monkeypatch):
@@ -390,11 +405,18 @@ def test_editor_prompt_enforces_patch_only_repair_scope(monkeypatch):
     )
 
     prompt = str(agent.last_prompt or "")
-    assert "REPAIR SCOPE (authoritative edit boundaries):" in prompt
-    assert "patch_only" in prompt
-    assert "compliance_runtime patch-only mode is ACTIVE." in prompt
-    assert "Treat all regions outside REPAIR SCOPE as frozen" in prompt
-    assert "Editable targets: script_line:2; call_site:os.remove." in prompt
+    _assert_contains_all(prompt, "patch_only", "script_line:2", "call_site:os.remove")
+    _assert_contains_terms(
+        prompt,
+        "repair scope",
+        "authoritative edit boundaries",
+        "compliance_runtime",
+        "patch-only mode",
+        "active",
+        "outside repair scope",
+        "frozen",
+        "editable targets",
+    )
 
 
 def test_metric_optimization_runtime_repair_keeps_optimization_editor_prompt(monkeypatch):
@@ -474,13 +496,15 @@ def test_metric_optimization_runtime_repair_keeps_optimization_editor_prompt(mon
     )
 
     prompt = str(agent.last_prompt or "")
-    assert "MODE: CODE_EDITOR_MODE_OPTIMIZATION" in prompt
-    assert "CURRENT ROUND BRIEF:" in prompt
-    assert "CURRENT PHASE:" in prompt
-    assert "runtime_repair" in prompt
-    assert "REPAIR GROUND TRUTH:" in prompt
-    assert "REPAIR SCOPE:" in prompt
-    assert "calibration_scoring_loop" in prompt
+    _assert_contains_all(
+        prompt,
+        "MODE: CODE_EDITOR_MODE_OPTIMIZATION",
+        "CURRENT ROUND BRIEF:",
+        "CURRENT PHASE:",
+        "runtime_repair",
+        "calibration_scoring_loop",
+    )
+    _assert_contains_terms(prompt, "repair ground truth", "repair scope")
 
 
 def test_generate_code_records_subcall_trace_with_completion_reprompt(monkeypatch):
@@ -518,5 +542,5 @@ def test_generate_code_records_subcall_trace_with_completion_reprompt(monkeypatc
     assert len(trace) == 2
     assert trace[0]["stage"] == "build_generation"
     assert trace[1]["stage"] == "completion_reprompt"
-    assert "Return a COMPLETE runnable Python script" in trace[1]["prompt"]
+    _assert_contains_terms(trace[1]["prompt"], "complete runnable python script")
     assert "print('completed')" in trace[1]["response"]

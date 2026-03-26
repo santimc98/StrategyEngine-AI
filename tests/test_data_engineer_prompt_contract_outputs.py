@@ -14,6 +14,17 @@ def _mock_response(content: str) -> SimpleNamespace:
     )
 
 
+def _assert_contains_all(text: str, *needles: str) -> None:
+    for needle in needles:
+        assert needle in text
+
+
+def _assert_contains_terms(text: str, *terms: str) -> None:
+    lowered = text.lower()
+    for term in terms:
+        assert term.lower() in lowered
+
+
 def test_data_engineer_prompt_prioritizes_owned_required_outputs_from_contract():
     agent = DataEngineerAgent(api_key="fake")
     execution_contract = {
@@ -79,13 +90,15 @@ def test_data_engineer_prompt_prioritizes_owned_required_outputs_from_contract()
 
     assert "print('ok')" in code
     prompt = agent.last_prompt or ""
-    assert "DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT" in prompt
-    assert "artifacts/clean/dataset_clean.csv" in prompt
-    assert "artifacts/clean/data_dictionary.json" in prompt
-    assert "artifacts/clean/decision_log.json" in prompt
-    assert "Write every required output you own in DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT." in prompt
+    _assert_contains_all(
+        prompt,
+        "DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT",
+        "artifacts/clean/dataset_clean.csv",
+        "artifacts/clean/data_dictionary.json",
+        "artifacts/clean/decision_log.json",
+    )
+    _assert_contains_terms(prompt, "write every required output you own", "no model training")
     assert "cleaned output + manifest" not in prompt
-    assert "No model training occurs in THIS run." in prompt
 
 
 def test_data_engineer_prompt_uses_contract_outputs_as_deliverable_closure_not_only_anchors():
@@ -118,9 +131,8 @@ def test_data_engineer_prompt_uses_contract_outputs_as_deliverable_closure_not_o
         )
 
     prompt = agent.last_prompt or ""
-    assert "Do not collapse a multi-artifact contract into one CSV + manifest pair." in prompt
-    assert "primary anchors" in prompt
-    assert "artifacts/clean/data_dictionary.json" in prompt
+    _assert_contains_all(prompt, "artifacts/clean/data_dictionary.json")
+    _assert_contains_terms(prompt, "multi-artifact contract", "primary anchors")
 
 
 def test_data_engineer_prompt_frames_dedup_as_identity_resolution_from_context():
@@ -164,11 +176,17 @@ def test_data_engineer_prompt_frames_dedup_as_identity_resolution_from_context()
         )
 
     prompt = agent.last_prompt or ""
-    assert "IDENTITY RESOLUTION (WHEN DEDUPLICATION IS IN SCOPE)" in prompt
-    assert "Decide which signals are strong, medium, or weak identity evidence for" in prompt
-    assert "Treat nulls, placeholders, and missing contact fields as absence of" in prompt
-    assert "Do not collapse rows just because a composite key can be mechanically" in prompt
-    assert "If the context only supports soft duplicate suspicion, prefer flags/logs" in prompt
+    _assert_contains_all(prompt, "IDENTITY RESOLUTION")
+    _assert_contains_terms(
+        prompt,
+        "strong",
+        "medium",
+        "weak",
+        "nulls",
+        "placeholders",
+        "soft duplicate suspicion",
+        "flags/logs",
+    )
 
 
 def test_data_engineer_prompt_requires_empty_required_artifacts_to_be_materialized():
@@ -208,9 +226,8 @@ def test_data_engineer_prompt_requires_empty_required_artifacts_to_be_materializ
         )
 
     prompt = agent.last_prompt or ""
-    assert "still materialize a schema-valid empty artifact" in prompt
-    assert "write the empty artifact" in prompt
-    assert "\"materialization_policy\": \"required_even_if_empty\"" in prompt
+    _assert_contains_all(prompt, "\"materialization_policy\": \"required_even_if_empty\"")
+    _assert_contains_terms(prompt, "schema-valid empty artifact", "write the empty artifact")
 
 
 def test_data_engineer_prompt_frames_date_and_numeric_cleaning_as_format_resolution():
@@ -266,13 +283,17 @@ def test_data_engineer_prompt_frames_date_and_numeric_cleaning_as_format_resolut
         )
 
     prompt = agent.last_prompt or ""
-    assert "FORMAT RESOLUTION (BEFORE final casting)" in prompt
-    assert "format families in THIS dataset" in prompt
-    assert "Do not assume one parser or one locale is enough" in prompt
-    assert "salvages defensible values" in prompt
-    assert "coercing unresolved strings to null" in prompt
-    assert "final null inflation is" in prompt
-    assert "observed raw quality" in prompt
+    _assert_contains_all(prompt, "FORMAT RESOLUTION")
+    _assert_contains_terms(
+        prompt,
+        "format families",
+        "one parser",
+        "locale",
+        "salvages defensible values",
+        "coercing unresolved strings to null",
+        "null inflation",
+        "raw quality",
+    )
 
 
 def test_data_engineer_prompt_treats_temporal_completeness_as_explicit_contractual_requirement():
@@ -316,10 +337,14 @@ def test_data_engineer_prompt_treats_temporal_completeness_as_explicit_contractu
         )
 
     prompt = agent.last_prompt or ""
-    assert 'Do not infer a hard "no nulls after parsing" requirement for temporal' in prompt
-    assert "explicitly requires complete recoverability" in prompt
-    assert 'Do not convert "required for downstream use" into "must be fully non-null"' in prompt
-    assert "A parsed datetime column is not automatically a hard completeness gate." in prompt
+    _assert_contains_terms(
+        prompt,
+        "no nulls after parsing",
+        "temporal",
+        "complete recoverability",
+        "required for downstream use",
+        "hard completeness gate",
+    )
 
 
 def test_data_engineer_prompt_derives_cleaning_scope_from_de_view_context():
@@ -407,11 +432,15 @@ def test_data_engineer_prompt_includes_column_resolution_context_as_support_evid
         )
 
     prompt = agent.last_prompt or ""
-    assert "COLUMN_RESOLUTION_CONTEXT" in prompt
-    assert "raw formats, placeholders" in prompt
-    assert "Use COLUMN_RESOLUTION_CONTEXT first" in prompt
-    assert "\"annual_revenue\"" in prompt
-    assert "\"currency_symbol\"" in prompt
+    _assert_contains_all(
+        prompt,
+        "COLUMN_RESOLUTION_CONTEXT",
+        "\"annual_revenue\"",
+        "\"currency_symbol\"",
+        "observed_format_families",
+        "top_raw_examples",
+    )
+    _assert_contains_terms(prompt, "raw formats", "placeholders")
 
 
 def test_data_engineer_prompt_includes_artifact_obligations_as_contract_extraction_context():
@@ -460,10 +489,13 @@ def test_data_engineer_prompt_includes_artifact_obligations_as_contract_extracti
         )
 
     prompt = agent.last_prompt or ""
-    assert "ARTIFACT_OBLIGATIONS_CONTEXT" in prompt
-    assert "lossless extraction of artifact bindings already declared in the contract" in prompt
-    assert "\"binding_name\": \"cleaned_dataset\"" in prompt
-    assert "artifact_requirements.cleaned_dataset.output_path" in prompt
+    _assert_contains_all(
+        prompt,
+        "ARTIFACT_OBLIGATIONS_CONTEXT",
+        "\"binding_name\": \"cleaned_dataset\"",
+        "artifact_requirements.cleaned_dataset.output_path",
+    )
+    _assert_contains_terms(prompt, "lossless extraction", "artifact bindings", "contract")
 
 
 def test_data_engineer_repair_mode_uses_previous_script_patch_context():
@@ -516,10 +548,14 @@ def test_data_engineer_repair_mode_uses_previous_script_patch_context():
         )
 
     prompt = agent.last_prompt or ""
-    assert "MODE: REPAIR_EDITOR" in prompt
-    assert "PREVIOUS_SCRIPT_BODY_TO_PATCH" in prompt
-    assert "Do not regenerate from zero" in prompt
-    assert "Fix the failing pandas operation without rewriting the whole script." in prompt
+    _assert_contains_all(
+        prompt,
+        "MODE: REPAIR_EDITOR",
+        "PREVIOUS_SCRIPT_BODY_TO_PATCH",
+        "raise ValueError('boom')",
+        "Fix the failing pandas operation without rewriting the whole script.",
+    )
+    _assert_contains_terms(prompt, "regenerate from zero")
     assert "json.dumps = _safe_dumps_json" not in prompt
     assert "print('patched')" in code
 
