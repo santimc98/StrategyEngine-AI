@@ -107,6 +107,7 @@ def write_final_state(run_id: str, state: Dict[str, Any]) -> None:
         "cleaning_code", "cleaned_data_preview",
         "generated_code", "last_generated_code",
         "execution_output", "last_successful_execution_output",
+        "execution_contract",
         "final_report", "pdf_path", "output_contract_report",
         "execution_feedback", "run_id",
     ]
