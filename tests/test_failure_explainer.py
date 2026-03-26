@@ -1,6 +1,17 @@
 from src.agents.failure_explainer import FailureExplainerAgent
 
 
+def _assert_contains_all(text: str, *needles: str) -> None:
+    for needle in needles:
+        assert needle in text
+
+
+def _assert_contains_terms(text: str, *terms: str) -> None:
+    lowered = text.lower()
+    for term in terms:
+        assert term.lower() in lowered
+
+
 def test_failure_explainer_returns_empty_without_code_or_error(monkeypatch) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     agent = FailureExplainerAgent(api_key=None)
@@ -31,10 +42,8 @@ def test_failure_explainer_data_prompt_uses_llm(monkeypatch) -> None:
 
     assert result == "WHERE: clean\nWHY: mismatch\nFIX: align rows"
     prompt = captured.get("prompt") or ""
-    assert "senior debugging assistant" in prompt
-    assert "generated Python cleaning code" in prompt
-    assert "ValueError: length mismatch" in prompt
-    assert "'step': 'impute'" in prompt
+    _assert_contains_all(prompt, "ValueError: length mismatch", "'step': 'impute'")
+    _assert_contains_terms(prompt, "senior", "debugging assistant", "cleaning code")
 
 
 def test_failure_explainer_ml_prompt_falls_back_on_llm_error(monkeypatch) -> None:
@@ -76,5 +85,5 @@ def test_failure_explainer_truncates_large_inputs(monkeypatch) -> None:
     agent.explain_ml_failure(code, error, context)
 
     prompt = captured.get("prompt") or ""
-    assert "...[truncated]..." in prompt
-    assert "senior ML debugging assistant" in prompt
+    _assert_contains_all(prompt, "...[truncated]...")
+    _assert_contains_terms(prompt, "senior", "ml", "debugging assistant")

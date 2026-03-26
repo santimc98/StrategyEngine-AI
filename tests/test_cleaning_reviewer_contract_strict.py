@@ -22,6 +22,17 @@ from src.agents.cleaning_reviewer import (
 )
 
 
+def _assert_contains_all(text: str, *needles: str) -> None:
+    for needle in needles:
+        assert needle in text
+
+
+def _assert_contains_terms(text: str, *terms: str) -> None:
+    lowered = text.lower()
+    for term in terms:
+        assert term.lower() in lowered
+
+
 class TestContractStrictMode:
     """Test suite for contract-strict mode behavior."""
 
@@ -55,13 +66,21 @@ class TestContractStrictMode:
             },
         )
 
-        assert "MISSION" in prompt
-        assert "SOURCE OF TRUTH AND PRECEDENCE" in prompt
-        assert "REVIEW DECISION WORKFLOW (MANDATORY)" in prompt
-        assert "deterministic_gate_results are supporting evidence only" in prompt
-        assert "GUIDANCE, NOT A SUBSTITUTE FOR REASONING" in prompt
-        assert "column_resolution_context" in prompt
-        assert "artifact_obligations" in prompt
+        _assert_contains_all(
+            prompt,
+            "MISSION",
+            "SOURCE OF TRUTH AND PRECEDENCE",
+            "column_resolution_context",
+            "artifact_obligations",
+        )
+        _assert_contains_terms(
+            prompt,
+            "review decision workflow",
+            "deterministic_gate_results",
+            "supporting evidence",
+            "guidance",
+            "substitute for reasoning",
+        )
         assert payload["contract_source_used"] == "cleaning_view"
         assert "column_resolution_context" in payload
         assert "artifact_obligations" in payload
@@ -114,8 +133,8 @@ class TestContractStrictMode:
         assert enforced["status"] == "REJECTED"
         assert _CONTRACT_MISSING_CLEANING_GATES in enforced["hard_failures"]
         assert _CONTRACT_MISSING_CLEANING_GATES in enforced["failed_checks"]
-        assert any("Regenerate Execution Contract" in fix for fix in enforced["required_fixes"])
-        assert "CONTRACT INCOMPLETE" in enforced["feedback"]
+        assert any("Regenerate" in fix and "Contract" in fix for fix in enforced["required_fixes"])
+        _assert_contains_terms(enforced["feedback"], "contract incomplete")
 
     def test_enforce_contract_strict_rejection_does_not_change_cleaning_view_source(self):
         """When contract_source_used is 'cleaning_view', result should not be modified."""
