@@ -5,7 +5,6 @@ import json
 import copy
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
-from openai import OpenAI
 from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 from src.utils.ml_plan_validation import validate_ml_plan_constraints
@@ -13,33 +12,6 @@ from src.utils.reviewer_response_schema import build_qa_response_schema
 from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
 
 load_dotenv()
-
-def _coerce_llm_response_text(response: Any) -> str:
-    if isinstance(response, str):
-        return response
-    text = getattr(response, "text", None)
-    if isinstance(text, str) and text.strip():
-        return text
-    candidates = getattr(response, "candidates", None)
-    if isinstance(candidates, list):
-        for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            parts = getattr(content, "parts", None)
-            if not isinstance(parts, list):
-                continue
-            chunks: List[str] = []
-            for part in parts:
-                part_text = getattr(part, "text", None)
-                if isinstance(part_text, str) and part_text.strip():
-                    chunks.append(part_text.strip())
-            if chunks:
-                return "\n".join(chunks)
-    return str(response or "")
-
-
-def _parse_json_payload(text: str) -> Dict[str, Any]:
-    parsed, _ = parse_json_object_with_repair(text or "", actor="qa_reviewer")
-    return parsed
 
 
 def _parse_json_payload_with_trace(text: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
