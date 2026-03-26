@@ -192,7 +192,7 @@ def main(run_id: str) -> None:
                 active_step = "strategist"
                 current_progress = _STEP_PROGRESS["steward"]
                 append_log(run_id, "Data Steward", "Auditoria de calidad completada.", "ok")
-                append_log(run_id, "Strategist", "Generando 3 estrategias de alto impacto...", "info")
+                append_log(run_id, "Strategist", "Diseñando la estrategia óptima para el objetivo de negocio...", "info")
 
             elif "strategist" in event:
                 completed_steps.add("strategist")
