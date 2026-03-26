@@ -26563,7 +26563,7 @@ def _build_results_advisor_feedback_for_improvement(
 
 def _collect_hard_gate_names(contract: Dict[str, Any] | None) -> set[str]:
     """Return lowercase names of gates with HARD severity from the contract."""
-    hard: Set[str] = set()
+    hard: set[str] = set()
     if not isinstance(contract, dict):
         return hard
     for gate in (get_qa_gates(contract) or []):
