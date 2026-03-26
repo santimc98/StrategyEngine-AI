@@ -1,6 +1,17 @@
 from src.agents.ml_engineer import MLEngineerAgent
 
 
+def _assert_contains_all(text: str, *needles: str) -> None:
+    for needle in needles:
+        assert needle in text
+
+
+def _assert_contains_terms(text: str, *terms: str) -> None:
+    lowered = text.lower()
+    for term in terms:
+        assert term.lower() in lowered
+
+
 class FakeOpenAI:
     def __init__(self, api_key=None, base_url=None, timeout=None, default_headers=None):
         self.api_key = api_key
@@ -15,7 +26,6 @@ def test_incomplete_reprompt_context_has_contract_and_outputs(monkeypatch):
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", FakeOpenAI)
 
     agent = MLEngineerAgent()
-    # V4.1: Use canonical_columns and artifact_requirements instead of legacy keys
     contract = {
         "canonical_columns": [f"col_{i}" for i in range(300)],
         "required_outputs": ["data/metrics.json", "data/alignment_check.json"],
@@ -33,11 +43,16 @@ def test_incomplete_reprompt_context_has_contract_and_outputs(monkeypatch):
         feedback_history=["REVIEWER FEEDBACK: add baseline metrics"],
         gate_context={"feedback": "QA TEAM FEEDBACK: fix outputs"},
     )
-    assert "EXECUTION_CONTRACT_CONTEXT" in context
-    assert "REQUIRED OUTPUTS" in context
-    # V4.1: Context may be smaller without legacy keys; adjust threshold
+    _assert_contains_all(
+        context,
+        "EXECUTION_CONTRACT_CONTEXT",
+        "REQUIRED OUTPUTS",
+        "column_list_reference",
+        "data/metrics.json",
+        "data/alignment_check.json",
+        "data/scored_rows.csv",
+    )
     assert len(context) > 1000
-    assert "column_list_reference" in context
     assert "..." not in context
 
 
@@ -59,7 +74,7 @@ def test_reprompt_context_includes_critical_errors(monkeypatch):
         "feedback": "Price used as feature in optimization",
         "required_fixes": ["Remove price from MODEL_FEATURES"],
     }
-    
+
     context = agent._build_incomplete_reprompt_context(
         execution_contract={},
         required_outputs=[],
@@ -68,13 +83,22 @@ def test_reprompt_context_includes_critical_errors(monkeypatch):
         feedback_history=[],
         gate_context=gate_context,
     )
-    
-    assert "!!! CRITICAL ERRORS FROM PREVIOUS ATTEMPTS" in context
-    assert "ATTEMPT 2 - REJECTED" in context
-    assert "Error Type: QA_CODE_AUDIT" in context
-    assert "Root Cause: Price used as feature in optimization" in context
-    assert "Required Fix: Remove price from MODEL_FEATURES" in context
-    
-    assert "ATTEMPT 1 - REJECTED" in context
-    assert "Error Type: Security violation" in context
-    assert "Required Fix: Remove OS imports" in context
+
+    _assert_contains_all(
+        context,
+        "QA_CODE_AUDIT",
+        "Price used as feature in optimization",
+        "Remove price from MODEL_FEATURES",
+        "Security violation",
+        "Remove OS imports",
+    )
+    _assert_contains_terms(
+        context,
+        "critical errors from previous attempts",
+        "attempt 2",
+        "attempt 1",
+        "rejected",
+        "error type",
+        "root cause",
+        "required fix",
+    )

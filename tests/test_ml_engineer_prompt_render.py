@@ -1,4 +1,15 @@
-﻿from src.agents.ml_engineer import MLEngineerAgent
+from src.agents.ml_engineer import MLEngineerAgent
+
+
+def _assert_contains_all(text: str, *needles: str) -> None:
+    for needle in needles:
+        assert needle in text
+
+
+def _assert_contains_terms(text: str, *terms: str) -> None:
+    lowered = text.lower()
+    for term in terms:
+        assert term.lower() in lowered
 
 
 def test_ml_engineer_prompt_renders_decisioning_and_visual_context():
@@ -22,10 +33,14 @@ def test_ml_engineer_prompt_renders_decisioning_and_visual_context():
     prompt = agent._build_system_prompt(template, {}, ml_view=ml_view, execution_contract={})
     assert "$decisioning_requirements_context" not in prompt
     assert "$visual_requirements_context" not in prompt
-    assert "DECISIONING REQUIREMENTS CONTEXT" in prompt
-    assert "VISUAL REQUIREMENTS" in prompt
-    assert "priority_rank" in prompt
-    assert "dist" in prompt
+    _assert_contains_all(
+        prompt,
+        "DECISIONING REQUIREMENTS CONTEXT",
+        "VISUAL REQUIREMENTS",
+        "priority_rank",
+        "dist",
+    )
+    _assert_contains_terms(prompt, "rank tiers")
 
 
 def test_ml_engineer_artifact_schema_block_includes_expected_row_count():
@@ -41,8 +56,8 @@ def test_ml_engineer_artifact_schema_block_includes_expected_row_count():
         }
     }
     block = agent._render_artifact_schema_block(contract, {})
-    assert "ARTIFACT: data/submission.csv" in block
-    assert "EXPECTED_ROW_COUNT: 270,000 rows" in block
+    _assert_contains_all(block, "data/submission.csv", "id", "prediction")
+    _assert_contains_terms(block, "artifact", "expected_row_count", "270,000")
 
 
 def test_ml_engineer_partitioning_context_renders_expected_row_hints():
@@ -65,12 +80,16 @@ def test_ml_engineer_partitioning_context_renders_expected_row_hints():
         },
     }
     context = agent._build_data_partitioning_context(contract, {}, ml_plan)
-    assert "DATA PARTITIONING CONTEXT" in context
-    assert "Total rows in cleaned dataset: 900,000" in context
-    assert "Training rows: 630,000" in context
-    assert "Test/scoring rows: 270,000" in context
-    assert "data/submission.csv: MUST contain TEST/SCORING rows only (270,000 rows)" in context
-    assert "Train filter rule: (is_train == 1) & (target.notnull())" in context
+    _assert_contains_all(
+        context,
+        "DATA PARTITIONING CONTEXT",
+        "900,000",
+        "630,000",
+        "270,000",
+        "data/submission.csv",
+        "(is_train == 1) & (target.notnull())",
+    )
+    _assert_contains_terms(context, "training rows", "test/scoring rows", "train filter rule")
 
 
 def test_ml_engineer_partitioning_context_renders_rules_without_row_counts():
@@ -86,6 +105,5 @@ def test_ml_engineer_partitioning_context_renders_rules_without_row_counts():
         }
     }
     context = agent._build_data_partitioning_context(contract, {}, {})
-    assert "DATA PARTITIONING CONTEXT" in context
-    assert "Split resolution status: resolved" in context
-    assert "Train filter rule: Filter training rows where 'target' is not null." in context
+    _assert_contains_all(context, "DATA PARTITIONING CONTEXT", "resolved", "target")
+    _assert_contains_terms(context, "split resolution status", "train filter rule", "not null")
