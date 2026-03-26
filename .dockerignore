@@ -1,0 +1,58 @@
+# Virtual environments
+.venv/
+venv/
+
+# Git
+.git/
+.gitignore
+
+# Claude Code
+.claude/
+
+# Runtime artifacts (generated at runtime, not needed in image)
+runs/
+artifacts/
+logs/
+work/
+data/api_keys.enc
+catboost_info/
+
+# Development files
+scripts/
+notebooks/
+bulletproof_tests/
+tools/
+diffs/
+diffs_updates/
+claude_plans/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Docs / notes
+*.md
+!README.md
+
+# Kaggle
+kaggle_submission/
+
+# Cloud Run runner (separate image)
+cloudrun/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Misc
+*.pptx
+*.zip
+*.patch
+.env
+.env.*
+!.env.example

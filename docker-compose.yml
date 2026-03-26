@@ -1,0 +1,13 @@
+services:
+  app:
+    build: .
+    container_name: strategyengine-ai
+    ports:
+      - "8501:8501"
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+    volumes:
+      # Persist runs and data across restarts
+      - ./runs:/app/runs
+      - ./data:/app/data
+    restart: unless-stopped
