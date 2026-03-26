@@ -6,22 +6,6 @@ import os
 from typing import Any, Dict, List, Optional
 
 
-# Shared helper for decisioning requirements extraction
-def _get_decisioning_requirements(contract_full: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any]:
-    for source in (contract_min, contract_full):
-        if not isinstance(source, dict):
-            continue
-        decisioning = source.get("decisioning_requirements")
-        if isinstance(decisioning, dict) and decisioning:
-            return {
-                "enabled": bool(decisioning.get("enabled")),
-                "required": bool(decisioning.get("required")),
-                "output": decisioning.get("output", {}),
-                "policy_notes": decisioning.get("policy_notes", ""),
-            }
-    return {"enabled": False, "required": False, "output": {}, "policy_notes": ""}
-
-
 # ── Budget trimming (used by ml_engineer.py) ────────────────────────
 
 _PRESERVE_KEYS = {

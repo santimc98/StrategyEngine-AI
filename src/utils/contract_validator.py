@@ -2983,20 +2983,6 @@ def _gate_targets_removed(gate: Dict[str, Any]) -> bool:
     return _infer_gate_action_type(gate) == "drop"
 
 
-def _collect_gate_column_refs(gates: Any, hard_only: bool = True) -> List[str]:
-    if not isinstance(gates, list):
-        return []
-    refs: List[str] = []
-    for gate in gates:
-        if not isinstance(gate, dict):
-            continue
-        severity = str(gate.get("severity") or "HARD").strip().upper()
-        if hard_only and severity != "HARD":
-            continue
-        refs.extend(_extract_columns_from_value(gate))
-    return list(dict.fromkeys([ref for ref in refs if isinstance(ref, str) and ref.strip()]))
-
-
 def _collect_gate_column_refs_by_mode(
     gates: Any,
     *,
