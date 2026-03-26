@@ -19,7 +19,7 @@ _SAFE_VARIABLE_NAMES = {
 def get_agent_files():
     files = []
     for f in os.listdir(AGENTS_DIR):
-        if f.endswith(".py") and f not in ["__init__.py", "steward.py"]:
+        if f.endswith(".py") and f != "__init__.py":
             files.append(os.path.join(AGENTS_DIR, f))
     return files
 
