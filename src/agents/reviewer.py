@@ -1,11 +1,9 @@
 import os
 import json
-import re
 import ast
 import copy
 from typing import Dict, Any, List
 from dotenv import load_dotenv
-from openai import OpenAI
 from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 from src.utils.sandbox_paths import CANONICAL_CLEANED_REL, CANONICAL_MANIFEST_REL
