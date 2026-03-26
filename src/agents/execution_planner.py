@@ -4,7 +4,6 @@ import ast
 import copy
 import math
 from typing import Dict, Any, List, Optional, Tuple, Callable
-from string import Template
 import re
 import difflib
 
@@ -15,7 +14,6 @@ from src.utils.contract_validation import (
     DEFAULT_ML_ENGINEER_RUNBOOK,
 )
 from src.utils.contract_accessors import (
-    get_canonical_columns,
     get_clean_dataset_output_path,
     get_dataset_artifact_binding,
     get_declared_artifact_path_by_intent,
@@ -24,7 +22,6 @@ from src.utils.contract_accessors import (
     get_cleaning_gates,
     get_column_roles,
     get_declared_artifact_path,
-    get_derived_column_names,
     normalize_artifact_path,
     get_qa_gates,
     get_required_outputs,
@@ -46,7 +43,6 @@ from src.utils.contract_validator import (
     resolve_contract_active_workstreams,
     derive_contract_scope_from_workstreams,
     is_probably_path,
-    is_file_path,
     _normalize_selector_entry,
     get_default_optimization_policy,
     normalize_optimization_policy,
@@ -865,20 +861,6 @@ PHASED_CONTRACT_COMPILATION_PROTOCOL_V1 = {
 }
 
 
-def _normalize_text(*values: Any) -> str:
-    tokens: List[str] = []
-    for raw in values:
-        if raw is None:
-            continue
-        if isinstance(raw, str):
-            text = raw
-        else:
-            text = json.dumps(raw, ensure_ascii=False)
-        cleaned = re.sub(r"[^0-9a-zA-ZÁÉÍÓÚáéíóúüÜñÑ]+", " ", text.lower())
-        tokens.extend(cleaned.split())
-    return " ".join(token for token in tokens if token)
-
-
 def _extract_required_paths(artifact_requirements: Dict[str, Any]) -> List[str]:
     if not isinstance(artifact_requirements, dict):
         return []
@@ -1212,26 +1194,6 @@ def _apply_planner_structural_support(contract: Dict[str, Any] | None) -> Dict[s
     return supported
 
 
-def _append_unique_columns(bucket: List[str], values: Any) -> None:
-    if isinstance(values, str):
-        values = [values]
-    if not isinstance(values, list):
-        return
-    seen = {str(item).strip().lower() for item in bucket if str(item).strip()}
-    for value in values:
-        text = str(value or "").strip()
-        if not text:
-            continue
-        lowered = text.lower()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        bucket.append(text)
-
-
-
-
-
 def _infer_primary_metric_from_canonical(
     contract: Dict[str, Any],
     evaluation_spec: Dict[str, Any],
@@ -1400,48 +1362,6 @@ def _build_transport_validation(payload: Any) -> Dict[str, Any]:
     }
 
 
-
-
-def _synthesize_semantic_core_from_contract_candidate(contract_candidate: Dict[str, Any] | None) -> Dict[str, Any] | None:
-    if not isinstance(contract_candidate, dict) or not contract_candidate:
-        return None
-    candidate = _apply_planner_structural_support(copy.deepcopy(contract_candidate))
-    if not isinstance(candidate, dict) or not candidate:
-        return None
-
-    allowed_sets = candidate.get("allowed_feature_sets") if isinstance(candidate.get("allowed_feature_sets"), dict) else {}
-    model_features = candidate.get("model_features")
-    if (not isinstance(model_features, list) or not model_features) and isinstance(allowed_sets.get("model_features"), list):
-        model_features = [str(col).strip() for col in allowed_sets.get("model_features") if str(col).strip()]
-
-    defaults: Dict[str, Any] = {
-        "scope": str(candidate.get("scope") or "cleaning_only"),
-        "strategy_title": str(candidate.get("strategy_title") or "Execution Plan"),
-        "business_objective": str(candidate.get("business_objective") or ""),
-        "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
-        "canonical_columns": [],
-        "required_outputs": [],
-        "column_roles": {},
-        "allowed_feature_sets": {},
-        "task_semantics": {},
-        "active_workstreams": {},
-        "model_features": model_features if isinstance(model_features, list) else [],
-        "cleaning_gates": [],
-        "qa_gates": [],
-        "reviewer_gates": [],
-        "data_engineer_runbook": {},
-        "optimization_policy": normalize_optimization_policy(candidate.get("optimization_policy")),
-    }
-
-    semantic_core: Dict[str, Any] = {}
-    for key in EXECUTION_SEMANTIC_CORE_REQUIRED_KEYS:
-        value = copy.deepcopy(candidate.get(key))
-        if key == "model_features":
-            value = copy.deepcopy(model_features) if isinstance(model_features, list) else value
-        if not _is_meaningful_contract_value(value):
-            value = copy.deepcopy(defaults.get(key))
-        semantic_core[key] = value
-    return semantic_core
 
 
 def _build_semantic_core_transport_validation(payload: Any) -> Dict[str, Any]:
