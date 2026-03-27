@@ -16438,6 +16438,8 @@ def _resolve_de_output_artifacts(state: Dict[str, Any]) -> tuple[str, str, List[
 
     def _append_artifact(candidate: Any) -> None:
         if isinstance(candidate, dict):
+            if candidate.get("required") is False:
+                return
             candidate = (
                 candidate.get("path")
                 or candidate.get("output_path")
@@ -16462,6 +16464,28 @@ def _resolve_de_output_artifacts(state: Dict[str, Any]) -> tuple[str, str, List[
         required_artifacts.append(manifest_path)
     required_artifacts = list(dict.fromkeys(required_artifacts))
     return output_path, manifest_path, required_artifacts
+
+
+def _resolve_de_optional_output_artifacts(state: Dict[str, Any]) -> List[str]:
+    de_view = state.get("de_view") or (state.get("contract_views") or {}).get("de_view")
+    if not isinstance(de_view, dict):
+        return []
+    optional_artifacts: List[str] = []
+    for candidate in de_view.get("required_outputs") or []:
+        if not isinstance(candidate, dict) or candidate.get("required") is not False:
+            continue
+        path = (
+            candidate.get("path")
+            or candidate.get("output_path")
+            or candidate.get("output")
+            or candidate.get("file")
+            or candidate.get("filename")
+            or ""
+        )
+        normalized = _normalize_output_path(str(path or ""))
+        if normalized:
+            optional_artifacts.append(normalized)
+    return list(dict.fromkeys(optional_artifacts))
 
 
 def _resolve_de_outlier_report_path(state: Dict[str, Any]) -> str:
@@ -16572,8 +16596,12 @@ def _execute_data_engineer_via_heavy_runner(
 ) -> Dict[str, Any]:
     runtime_mode = _get_execution_runtime_mode(state)
     _, _, required_artifacts = _resolve_de_output_artifacts(state)
+    optional_view_artifacts = _resolve_de_optional_output_artifacts(state)
     optional_outlier_report = _resolve_de_outlier_report_path(state)
     optional_download_artifacts: List[str] = []
+    for rel_path in optional_view_artifacts:
+        if rel_path and rel_path not in required_artifacts:
+            optional_download_artifacts.append(rel_path)
     if optional_outlier_report and optional_outlier_report not in required_artifacts:
         optional_download_artifacts.append(optional_outlier_report)
     if not required_artifacts:

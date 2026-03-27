@@ -4,6 +4,7 @@ import os
 
 from src.graph.graph import (
     _resolve_de_output_artifacts,
+    _resolve_de_optional_output_artifacts,
     _persist_artifact_obligations_context,
     _persist_runner_artifact_index,
 )
@@ -44,6 +45,28 @@ def test_resolve_de_output_artifacts_covers_all_owned_contract_outputs():
         "artifacts/reports/transformation_log.json",
         "artifacts/clean/cleaning_manifest.json",
     ]
+
+
+def test_resolve_de_output_artifacts_excludes_optional_view_outputs_from_required_list():
+    state = {
+        "de_view": {
+            "output_path": "artifacts/clean/dataset_cleaned.csv",
+            "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+            "required_outputs": [
+                {"path": "artifacts/clean/dataset_cleaned.csv", "required": True},
+                {"path": "artifacts/clean/cleaning_manifest.json", "required": True},
+                {"path": "static/plots/*.png", "required": False},
+            ],
+        }
+    }
+
+    output_path, manifest_path, required_artifacts = _resolve_de_output_artifacts(state)
+    optional_artifacts = _resolve_de_optional_output_artifacts(state)
+
+    assert output_path == "artifacts/clean/dataset_cleaned.csv"
+    assert manifest_path == "artifacts/clean/cleaning_manifest.json"
+    assert "static/plots/*.png" not in required_artifacts
+    assert optional_artifacts == ["static/plots/*.png"]
 
 
 def test_replay_c946b64d_resolve_de_output_artifacts_covers_all_owned_outputs_from_contract_and_view():
