@@ -1408,3 +1408,52 @@ def test_resolve_metrics_report_for_facts_prefers_current_round_artifact_index_o
     assert str(resolved.get("source") or "").endswith(
         "sandbox/current/output/artifacts/reports/evaluation_summary.json"
     )
+
+
+def test_resolve_metrics_report_for_facts_ignores_stale_candidate_snapshot_from_prior_attempt(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path("artifacts/ml").mkdir(parents=True, exist_ok=True)
+
+    Path("artifacts/ml/cv_metrics.json").write_text(
+        json.dumps(
+            {
+                "primary_metric_name": "normalized_gini",
+                "primary_metric_value": 0.28138552527699523,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = {
+        "ml_improvement_round_active": True,
+        "ml_improvement_current_round_id": 2,
+        "execution_attempt": 4,
+        "execution_contract": {
+            "artifact_requirements": {
+                "required_files": [{"path": "artifacts/ml/cv_metrics.json"}],
+            },
+            "required_outputs": ["artifacts/ml/cv_metrics.json"],
+        },
+        "metrics_report": {
+            "primary_metric_name": "normalized_gini",
+            "primary_metric_value": 0.2798233900087834,
+        },
+        "metrics_artifact_snapshot": {
+            "role": "candidate",
+            "attempt_id": 2,
+            "round_id": 2,
+            "path": "artifacts/ml/cv_metrics.json",
+            "metrics_payload": {
+                "primary_metric_name": "normalized_gini",
+                "primary_metric_value": 0.2798233900087834,
+            },
+        },
+    }
+
+    resolved = graph_mod._resolve_metrics_report_for_facts(state)
+
+    assert resolved.get("primary_metric_value") == pytest.approx(0.28138552527699523, abs=1e-12)
+    assert str(resolved.get("source") or "").endswith("artifacts/ml/cv_metrics.json")

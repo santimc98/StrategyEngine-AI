@@ -961,13 +961,14 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     metric_round_active = bool(state.get("ml_improvement_round_active"))
     state_metrics = state.get("metrics_report")
     state_metrics_snapshot = state.get("metrics_artifact_snapshot")
+    snapshot_is_fresh = _metrics_snapshot_matches_active_attempt(state, state_metrics_snapshot)
     snapshot_role = (
         str(state_metrics_snapshot.get("role") or "").strip().lower()
         if isinstance(state_metrics_snapshot, dict)
         else ""
     )
     if isinstance(state_metrics, dict) and state_metrics and (
-        (not metric_round_active) or snapshot_role == "candidate"
+        (not metric_round_active) or (snapshot_role == "candidate" and snapshot_is_fresh)
     ):
         candidates.append((state_metrics, "state.metrics_report"))
 
@@ -984,7 +985,12 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
                 or "state.metrics_artifact_snapshot"
             ).strip()
             candidates.append((snapshot_payload, snapshot_source))
-    elif metric_round_active and isinstance(state_metrics_snapshot, dict) and snapshot_role == "candidate":
+    elif (
+        metric_round_active
+        and isinstance(state_metrics_snapshot, dict)
+        and snapshot_role == "candidate"
+        and snapshot_is_fresh
+    ):
         snapshot_payload = (
             state_metrics_snapshot.get("metrics_payload")
             if isinstance(state_metrics_snapshot.get("metrics_payload"), dict)
@@ -1431,6 +1437,28 @@ def _resolve_metrics_snapshot_from_state(
                 if str(snapshot.get("role") or "").strip().lower() == role:
                     return copy.deepcopy(snapshot)
     return copy.deepcopy(candidates[0])
+
+
+def _metrics_snapshot_matches_active_attempt(
+    state: Dict[str, Any] | None,
+    snapshot: Dict[str, Any] | None,
+) -> bool:
+    state = state if isinstance(state, dict) else {}
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    if not snapshot or not bool(state.get("ml_improvement_round_active")):
+        return True
+
+    current_attempt = _coerce_nonnegative_int(state.get("execution_attempt"), default=0)
+    snapshot_attempt = _coerce_nonnegative_int(snapshot.get("attempt_id"), default=0)
+    if current_attempt > 0 and snapshot_attempt > 0 and snapshot_attempt != current_attempt:
+        return False
+
+    current_round = _coerce_nonnegative_int(state.get("ml_improvement_current_round_id"), default=0)
+    snapshot_round = _coerce_nonnegative_int(snapshot.get("round_id"), default=0)
+    if current_round > 0 and snapshot_round > 0 and snapshot_round != current_round:
+        return False
+
+    return True
 
 
 def _metric_loop_controller(loop_state: Dict[str, Any] | None) -> Dict[str, Any]:
