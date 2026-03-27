@@ -11,6 +11,21 @@ import ast
 from typing import List, Tuple
 
 
+_CSV_DIALECT_HELPER_NAME = "_strip_csv_dialect_kwargs"
+_CSV_DIALECT_HELPER_SOURCE = f"""
+def {_CSV_DIALECT_HELPER_NAME}(kwargs):
+    if kwargs is None:
+        return {{}}
+    if not hasattr(kwargs, "items"):
+        return kwargs
+    return {{
+        key: value
+        for key, value in kwargs.items()
+        if str(key) not in {{"sep", "delimiter", "decimal", "encoding"}}
+    }}
+""".strip()
+
+
 def patch_read_csv_dialect(
     code: str,
     csv_sep: str,
@@ -25,10 +40,10 @@ def patch_read_csv_dialect(
     1. Parses code as AST
     2. Finds the target read_csv call (one reading expected_path, or first one)
     3. For that call:
-       - If sep/decimal/encoding is missing (and no **kwargs), adds it
-       - If sep/decimal/encoding is a literal with wrong value, replaces it
+       - If sep/decimal/encoding is missing, adds it
+       - If sep/decimal/encoding (or delimiter alias) is a literal with wrong value, replaces it
        - Does NOT touch non-literal values (variables/expressions)
-       - Does NOT try to modify **kwargs content
+       - If **kwargs is present, strips dialect keys from it and pins explicit dialect params
 
     Args:
         code: Python source code to patch
@@ -78,12 +93,6 @@ def patch_read_csv_dialect(
     if target_call is None:
         target_call = calls[0]
 
-    # Check for **kwargs (keyword with arg=None)
-    has_kwargs = any(kw.arg is None for kw in target_call.keywords)
-
-    # Build keyword map
-    kw_map = {kw.arg: kw for kw in target_call.keywords if kw.arg is not None}
-
     # Expected parameters
     expected = {
         "sep": csv_sep,
@@ -92,6 +101,7 @@ def patch_read_csv_dialect(
     }
 
     changed = False
+    helper_needed = False
 
     def _normalize_encoding(value: str) -> str:
         return str(value).strip().lower().replace("_", "-")
@@ -105,44 +115,129 @@ def patch_read_csv_dialect(
             return act in {"utf-8", "utf8", "utf-8-sig", "utf8-sig"}
         return exp == act
 
-    for param, expected_value in expected.items():
-        if param not in kw_map:
-            # Parameter missing
-            if has_kwargs:
-                # **kwargs might supply it, don't add
+    def _is_helper_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == _CSV_DIALECT_HELPER_NAME
+            and len(node.args) == 1
+        )
+
+    def _helper_already_defined(module_tree: ast.Module) -> bool:
+        for stmt in getattr(module_tree, "body", []):
+            if isinstance(stmt, ast.FunctionDef) and stmt.name == _CSV_DIALECT_HELPER_NAME:
+                return True
+        return False
+
+    named_keywords = [kw for kw in target_call.keywords if kw.arg is not None]
+    star_keywords = [kw for kw in target_call.keywords if kw.arg is None]
+    has_kwargs = bool(star_keywords)
+
+    if has_kwargs:
+        sanitized_any = False
+        for kw in star_keywords:
+            if _is_helper_call(kw.value):
                 continue
-            # Add the parameter
-            new_kw = ast.keyword(arg=param, value=ast.Constant(value=expected_value))
-            target_call.keywords.append(new_kw)
-            patch_notes.append(f"Added {param}={repr(expected_value)}")
+            kw.value = ast.Call(
+                func=ast.Name(id=_CSV_DIALECT_HELPER_NAME, ctx=ast.Load()),
+                args=[kw.value],
+                keywords=[],
+            )
+            sanitized_any = True
+        if sanitized_any:
+            patch_notes.append("Sanitized **kwargs to strip sep/delimiter/decimal/encoding before pd.read_csv")
             changed = True
-        else:
-            # Parameter exists, check if it's a literal mismatch
-            kw = kw_map[param]
+            helper_needed = True
+
+        named_without_alias = [kw for kw in named_keywords if kw.arg != "delimiter"]
+        kw_map = {kw.arg: kw for kw in named_without_alias if kw.arg is not None}
+        delimiter_kw = next((kw for kw in named_keywords if kw.arg == "delimiter"), None)
+        if delimiter_kw is not None:
+            patch_notes.append("Normalized delimiter alias to explicit sep= for pd.read_csv")
+            changed = True
+
+        for param, expected_value in expected.items():
+            kw = kw_map.get(param)
+            if kw is None:
+                named_without_alias.append(
+                    ast.keyword(arg=param, value=ast.Constant(value=expected_value))
+                )
+                patch_notes.append(f"Added {param}={repr(expected_value)}")
+                changed = True
+            else:
+                literal_matches = (
+                    isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)
+                    and (
+                        _encoding_matches(expected_value, kw.value.value)
+                        if param == "encoding"
+                        else kw.value.value == expected_value
+                    )
+                )
+                if not literal_matches:
+                    kw.value = ast.Constant(value=expected_value)
+                    patch_notes.append(f"Pinned {param}={repr(expected_value)} ahead of **kwargs")
+                    changed = True
+
+        target_call.keywords = named_without_alias + star_keywords
+    else:
+        kw_map = {kw.arg: kw for kw in named_keywords if kw.arg is not None}
+        delimiter_kw = kw_map.get("delimiter")
+
+        for param, expected_value in expected.items():
+            alias_kw = delimiter_kw if param == "sep" else None
+            kw = kw_map.get(param) or alias_kw
+            if kw is None:
+                target_call.keywords.append(
+                    ast.keyword(arg=param, value=ast.Constant(value=expected_value))
+                )
+                patch_notes.append(f"Added {param}={repr(expected_value)}")
+                changed = True
+                continue
+
             val_node = kw.value
             if isinstance(val_node, ast.Constant) and isinstance(val_node.value, str):
                 actual_value = val_node.value
-                if param == "encoding":
-                    if not _encoding_matches(expected_value, actual_value):
-                        kw.value = ast.Constant(value=expected_value)
-                        patch_notes.append(
-                            f"Replaced {param}={repr(actual_value)} with {repr(expected_value)}"
-                        )
-                        changed = True
-                else:
-                    if actual_value != expected_value:
-                        kw.value = ast.Constant(value=expected_value)
-                        patch_notes.append(
-                            f"Replaced {param}={repr(actual_value)} with {repr(expected_value)}"
-                        )
-                        changed = True
-            # Non-literal values (variables/expressions) are left untouched
+                matches = (
+                    _encoding_matches(expected_value, actual_value)
+                    if param == "encoding"
+                    else actual_value == expected_value
+                )
+                if not matches:
+                    kw.value = ast.Constant(value=expected_value)
+                    label = "delimiter" if kw.arg == "delimiter" else param
+                    patch_notes.append(
+                        f"Replaced {label}={repr(actual_value)} with {repr(expected_value)}"
+                    )
+                    changed = True
 
     if not changed:
         return code, patch_notes or ["No changes needed"], False
 
+    if helper_needed and not _helper_already_defined(tree):
+        helper_def = ast.parse(_CSV_DIALECT_HELPER_SOURCE).body[0]
+        insert_at = 0
+        body = list(tree.body or [])
+        if body:
+            first = body[0]
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(getattr(first, "value", None), ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                insert_at = 1
+            while insert_at < len(body):
+                stmt = body[insert_at]
+                if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                    insert_at += 1
+                    continue
+                break
+        tree.body.insert(insert_at, helper_def)
+        changed = True
+
     # Re-serialize the AST
     try:
+        ast.fix_missing_locations(tree)
         patched_code = ast.unparse(tree)
     except Exception as e:
         return code, [f"AST unparse error: {e}"], False

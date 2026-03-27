@@ -5,8 +5,16 @@ These tests verify the AST-based autopatcher for pd.read_csv dialect parameters.
 No network/LLM dependencies.
 """
 
+import os
+
 import pytest
 from src.utils.dialect_code_patch import patch_read_csv_dialect, has_kwargs_in_read_csv
+
+
+os.environ.setdefault("DEEPSEEK_API_KEY", "dummy")
+os.environ.setdefault("GOOGLE_API_KEY", "dummy")
+os.environ.setdefault("SANDBOX_PROVIDER", "local")
+os.environ.setdefault("OPENROUTER_API_KEY", "dummy-openrouter")
 
 
 class TestPatchReadCsvDialect:
@@ -62,17 +70,20 @@ class TestPatchReadCsvDialect:
 
         assert changed is False
 
-    def test_does_not_add_when_kwargs_present(self):
-        """Test that missing params are NOT added when **kwargs is present."""
+    def test_sanitizes_kwargs_and_pins_explicit_dialect(self):
+        """Test that **kwargs is sanitized and explicit dialect is pinned."""
         code = "import pandas as pd\ndialect = {'sep': ','}\ndf = pd.read_csv('data/raw.csv', **dialect)"
 
         patched, notes, changed = patch_read_csv_dialect(
             code, csv_sep=",", csv_decimal=".", csv_encoding="utf-8"
         )
 
-        # Should not add params because **kwargs might supply them
-        assert changed is False
-        assert patched == code
+        assert changed is True
+        assert "_strip_csv_dialect_kwargs" in patched
+        assert "sep=','" in patched or 'sep=","' in patched
+        assert "decimal='.'" in patched or 'decimal="."' in patched
+        assert "encoding='utf-8'" in patched or 'encoding="utf-8"' in patched
+        assert any("Sanitized **kwargs" in note for note in notes)
 
     def test_replaces_incorrect_literal_with_kwargs(self):
         """Test that incorrect literals are replaced even with **kwargs present."""
@@ -84,7 +95,7 @@ class TestPatchReadCsvDialect:
 
         # sep literal is wrong, should be replaced
         assert changed is True
-        assert any("Replaced sep" in note for note in notes)
+        assert any("Pinned sep" in note or "Replaced sep" in note for note in notes)
 
     def test_handles_parse_error(self):
         """Test that parse errors are handled gracefully."""
@@ -235,3 +246,15 @@ class TestDialectGuardWithKwargs:
 
         # All 3 params missing
         assert len(violations) == 3
+
+    def test_delimiter_alias_is_accepted_when_matching(self):
+        """Test that delimiter alias counts as a matching separator."""
+        from src.graph.graph import dialect_guard_violations
+
+        code = "import pandas as pd\ndf = pd.read_csv('data/raw.csv', delimiter=';', decimal=',', encoding='utf-8')"
+
+        violations = dialect_guard_violations(
+            code, csv_sep=";", csv_decimal=",", csv_encoding="utf-8"
+        )
+
+        assert violations == []

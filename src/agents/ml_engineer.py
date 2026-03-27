@@ -100,6 +100,33 @@ UNIVERSAL_PROLOGUE_END = "# ML_ENGINEER_UNIVERSAL_PROLOGUE_END"
 
 
 class MLEngineerAgent:
+    @staticmethod
+    def _default_editor_model_name(primary_model_name: str) -> str:
+        primary = str(primary_model_name or "").strip()
+        if not primary:
+            return ""
+        # Keep GPT-5.4 as the stronger baseline generator, but move iterative
+        # repair/editor passes to the cheaper mini variant by default.
+        if primary == "openai/gpt-5.4":
+            return "openai/gpt-5.4-mini"
+        return primary
+
+    def resolve_editor_model_name(
+        self,
+        *,
+        primary_model: str | None = None,
+        editor_model_override: str | None = None,
+    ) -> str:
+        primary = str(primary_model or self.model_name or "").strip()
+        explicit = str(
+            editor_model_override
+            if editor_model_override is not None
+            else (os.getenv("OPENROUTER_ML_EDITOR_MODEL") or "")
+        ).strip()
+        if explicit:
+            return explicit
+        return self._default_editor_model_name(primary)
+
     def __init__(self, api_key: str = None):
         """
         Initializes the ML Engineer Agent with OpenRouter only.
@@ -155,16 +182,11 @@ class MLEngineerAgent:
             self.model_name = "moonshotai/kimi-k2.5"
         if not self.fallback_model_name:
             self.fallback_model_name = "minimax/minimax-m2.5"
-        # Keep editor mode on the same primary model as base generation so
-        # optimization/repair quality follows the run's configured main model.
         _editor_raw = (os.getenv("OPENROUTER_ML_EDITOR_MODEL") or "").strip()
-        if _editor_raw and _editor_raw != self.model_name:
-            self.logger.warning(
-                "OPENROUTER_ML_EDITOR_MODEL=%s ignored; editor follows primary model=%s",
-                _editor_raw,
-                self.model_name,
-            )
-        self.editor_model_name = self.model_name
+        self.editor_model_name = self.resolve_editor_model_name(
+            primary_model=self.model_name,
+            editor_model_override=_editor_raw,
+        )
         self.logger.info(
             "ML_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s editor=%s",
             self.model_name,
@@ -2990,6 +3012,16 @@ class MLEngineerAgent:
             + f"sep = {sep_literal}\n"
             + f"decimal = {decimal_literal}\n"
             + f"encoding = {encoding_literal}\n\n"
+            + "def _strip_csv_dialect_kwargs(kwargs):\n"
+            + "    if kwargs is None:\n"
+            + "        return {}\n"
+            + "    if not hasattr(kwargs, 'items'):\n"
+            + "        return kwargs\n"
+            + "    return {\n"
+            + "        key: value\n"
+            + "        for key, value in kwargs.items()\n"
+            + "        if str(key) not in {'sep', 'delimiter', 'decimal', 'encoding'}\n"
+            + "    }\n\n"
             + "def json_default(obj):\n"
             + "    if isinstance(obj, np.bool_):\n"
             + "        return bool(obj)\n"
@@ -3154,43 +3186,57 @@ class MLEngineerAgent:
         except SyntaxError:
             return code
 
-        has_sep = False
-        has_decimal = False
-        has_encoding = False
-        has_load_dialect = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                if node.id == "sep":
-                    has_sep = True
-                elif node.id == "decimal":
-                    has_decimal = True
-                elif node.id == "encoding":
-                    has_encoding = True
-            if isinstance(node, ast.Call):
-                name = self._call_name(node)
-                if name.endswith("load_dialect"):
-                    has_load_dialect = True
-        if not has_load_dialect and not (has_sep and has_decimal and has_encoding):
-            return code
+        def _is_pd_read_csv(node: ast.Call) -> bool:
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "read_csv":
+                return isinstance(node.func.value, ast.Name) and node.func.value.id == "pd"
+            return isinstance(node.func, ast.Name) and node.func.id == "read_csv"
 
-        class _ToCsvDialectFixer(ast.NodeTransformer):
+        def _is_to_csv(node: ast.Call) -> bool:
+            return isinstance(node.func, ast.Attribute) and node.func.attr == "to_csv"
+
+        def _is_strip_helper_call(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_strip_csv_dialect_kwargs"
+                and len(node.args) == 1
+            )
+
+        class _CsvDialectFixer(ast.NodeTransformer):
             def visit_Call(self, node: ast.Call) -> ast.AST:
                 self.generic_visit(node)
-                if not isinstance(node.func, ast.Attribute) or node.func.attr != "to_csv":
+                if not (_is_pd_read_csv(node) or _is_to_csv(node)):
                     return node
-                if any(kw.arg is None for kw in node.keywords):
-                    return node
-                existing = {kw.arg for kw in node.keywords if kw.arg}
-                if "sep" not in existing:
-                    node.keywords.append(ast.keyword(arg="sep", value=ast.Name(id="sep", ctx=ast.Load())))
-                if "decimal" not in existing:
-                    node.keywords.append(ast.keyword(arg="decimal", value=ast.Name(id="decimal", ctx=ast.Load())))
-                if "encoding" not in existing:
-                    node.keywords.append(ast.keyword(arg="encoding", value=ast.Name(id="encoding", ctx=ast.Load())))
+
+                named_keywords = [kw for kw in node.keywords if kw.arg is not None]
+                star_keywords = [kw for kw in node.keywords if kw.arg is None]
+
+                if _is_pd_read_csv(node):
+                    named_keywords = [kw for kw in named_keywords if kw.arg != "delimiter"]
+
+                for kw in star_keywords:
+                    if _is_strip_helper_call(kw.value):
+                        continue
+                    kw.value = ast.Call(
+                        func=ast.Name(id="_strip_csv_dialect_kwargs", ctx=ast.Load()),
+                        args=[kw.value],
+                        keywords=[],
+                    )
+
+                kw_map = {kw.arg: kw for kw in named_keywords if kw.arg}
+                for param in ("sep", "decimal", "encoding"):
+                    expected_name = ast.Name(id=param, ctx=ast.Load())
+                    existing = kw_map.get(param)
+                    if existing is None:
+                        named_keywords.append(ast.keyword(arg=param, value=expected_name))
+                    else:
+                        existing.value = expected_name
+
+                node.keywords = named_keywords + star_keywords
                 return node
 
         try:
-            fixed_tree = _ToCsvDialectFixer().visit(tree)
+            fixed_tree = _CsvDialectFixer().visit(tree)
             ast.fix_missing_locations(fixed_tree)
             return ast.unparse(fixed_tree)
         except Exception:
@@ -5237,7 +5283,13 @@ class MLEngineerAgent:
                 completed = self._clean_code(completed)
                 if is_syntax_valid(completed):
                     code = completed
-
+            if not code.strip().startswith("# Error:"):
+                code = self._apply_universal_script_guards(
+                    code,
+                    csv_sep=csv_sep,
+                    csv_decimal=csv_decimal,
+                    csv_encoding=csv_encoding,
+                )
             return code
 
         except Exception as e:

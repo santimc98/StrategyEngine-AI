@@ -93,3 +93,48 @@ def write_metrics():
     assert decimal_value == ","
     assert encoding_value == "latin-1"
     assert has_default_kw is True
+
+
+def test_universal_guards_pin_csv_dialect_even_with_kwargs():
+    agent = MLEngineerAgent.__new__(MLEngineerAgent)
+    raw_code = """
+import pandas as pd
+
+def run():
+    read_kwargs = {"sep": ",", "quotechar": '"'}
+    df = pd.read_csv("data/cleaned_data.csv", **read_kwargs)
+    df.to_csv("data/out.csv", **read_kwargs)
+""".strip()
+
+    patched = agent._apply_universal_script_guards(
+        raw_code,
+        csv_sep=";",
+        csv_decimal=",",
+        csv_encoding="utf-8",
+    )
+
+    assert "_strip_csv_dialect_kwargs" in patched
+    tree = ast.parse(patched)
+    read_seen = False
+    write_seen = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "read_csv":
+            read_seen = True
+        elif isinstance(func, ast.Attribute) and func.attr == "to_csv":
+            write_seen = True
+        else:
+            continue
+        keyword_names = [kw.arg for kw in node.keywords if kw.arg is not None]
+        assert "sep" in keyword_names
+        assert "decimal" in keyword_names
+        assert "encoding" in keyword_names
+        star_kwargs = [kw for kw in node.keywords if kw.arg is None]
+        assert len(star_kwargs) == 1
+        assert isinstance(star_kwargs[0].value, ast.Call)
+        assert isinstance(star_kwargs[0].value.func, ast.Name)
+        assert star_kwargs[0].value.func.id == "_strip_csv_dialect_kwargs"
+    assert read_seen is True
+    assert write_seen is True

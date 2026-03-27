@@ -13,6 +13,7 @@ def test_ml_engineer_forces_openrouter_provider(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setenv("OPENROUTER_ML_PRIMARY_MODEL", "moonshotai/kimi-k2.5")
     monkeypatch.setenv("OPENROUTER_ML_FALLBACK_MODEL", "minimax/minimax-m2.5")
+    monkeypatch.delenv("OPENROUTER_ML_EDITOR_MODEL", raising=False)
     monkeypatch.delenv("ZAI_API_KEY", raising=False)
     monkeypatch.delenv("GLM_API_KEY", raising=False)
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", FakeOpenAI)
@@ -26,7 +27,20 @@ def test_ml_engineer_forces_openrouter_provider(monkeypatch):
     assert agent.editor_model_name == "moonshotai/kimi-k2.5"
 
 
-def test_ml_engineer_editor_model_follows_primary(monkeypatch):
+def test_ml_engineer_editor_model_defaults_to_gpt54_mini(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setenv("OPENROUTER_ML_PRIMARY_MODEL", "openai/gpt-5.4")
+    monkeypatch.setenv("OPENROUTER_ML_FALLBACK_MODEL", "minimax/minimax-m2.5")
+    monkeypatch.delenv("OPENROUTER_ML_EDITOR_MODEL", raising=False)
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", FakeOpenAI)
+
+    agent = MLEngineerAgent()
+
+    assert agent.model_name == "openai/gpt-5.4"
+    assert agent.editor_model_name == "openai/gpt-5.4-mini"
+
+
+def test_ml_engineer_editor_model_honors_explicit_override(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setenv("OPENROUTER_ML_PRIMARY_MODEL", "openai/gpt-5.4")
     monkeypatch.setenv("OPENROUTER_ML_FALLBACK_MODEL", "minimax/minimax-m2.5")
@@ -36,4 +50,4 @@ def test_ml_engineer_editor_model_follows_primary(monkeypatch):
     agent = MLEngineerAgent()
 
     assert agent.model_name == "openai/gpt-5.4"
-    assert agent.editor_model_name == "openai/gpt-5.4"
+    assert agent.editor_model_name == "minimax/minimax-m2.5"
