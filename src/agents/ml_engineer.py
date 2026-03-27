@@ -4359,7 +4359,7 @@ class MLEngineerAgent:
                     "Use a simple arithmetic mean unless the contract explicitly provides weights."
                 )
             ml_view_payload = {
-                "required_outputs": required_deliverables[:12],
+                "required_outputs": copy.deepcopy(deliverables[:12]),
                 "evaluation_spec": {
                     "problem_type": evaluation_lock.get("problem_type"),
                     "objective_type": evaluation_lock.get("objective_type"),
@@ -4442,27 +4442,24 @@ class MLEngineerAgent:
         )
         canonical_columns_source = canonical_columns_hint
         required_columns_payload: Any = []
-        artifact_reqs = execution_contract_input.get("artifact_requirements")
-        if isinstance(artifact_reqs, dict):
-            clean_cfg = artifact_reqs.get("clean_dataset")
-            if isinstance(clean_cfg, dict):
+
+        def _extract_clean_artifact_required_columns(source: Any) -> List[str]:
+            if not isinstance(source, dict):
+                return []
+            for key in ("cleaned_dataset", "clean_dataset"):
+                clean_cfg = source.get(key)
+                if not isinstance(clean_cfg, dict):
+                    continue
                 required_candidate = clean_cfg.get("required_columns")
                 if isinstance(required_candidate, list) and required_candidate:
-                    required_columns_payload = required_candidate
+                    return required_candidate
+            return []
+
+        artifact_reqs = execution_contract_input.get("artifact_requirements")
+        required_columns_payload = _extract_clean_artifact_required_columns(artifact_reqs)
         if not required_columns_payload:
             view_artifacts = ml_view.get("artifact_requirements")
-            if isinstance(view_artifacts, dict):
-                clean_cfg = view_artifacts.get("clean_dataset")
-                if isinstance(clean_cfg, dict):
-                    required_candidate = clean_cfg.get("required_columns")
-                    if isinstance(required_candidate, list) and required_candidate:
-                        required_columns_payload = required_candidate
-        if not required_columns_payload:
-            strategy_required = strategy.get("required_columns", [])
-            if isinstance(strategy_required, list) and strategy_required:
-                required_columns_payload = strategy_required
-        if not required_columns_payload:
-            required_columns_payload = canonical_columns_source
+            required_columns_payload = _extract_clean_artifact_required_columns(view_artifacts)
         if isinstance(required_columns_payload, list) and len(required_columns_payload) > 80:
             required_columns_payload = summarize_long_list(required_columns_payload)
             required_columns_payload["note"] = COLUMN_LIST_POINTER
@@ -4483,6 +4480,17 @@ class MLEngineerAgent:
                 allowed_model_features = allowed_feature_sets_source.get("model_features")
                 if isinstance(allowed_model_features, list) and allowed_model_features:
                     model_input_candidates_payload = allowed_model_features
+        if not model_input_candidates_payload:
+            column_roles_source = ml_view.get("column_roles")
+            if not isinstance(column_roles_source, dict):
+                column_roles_source = (
+                    execution_contract_input.get("column_roles")
+                    if isinstance(execution_contract_input.get("column_roles"), dict)
+                    else {}
+                )
+            pre_decision_columns = column_roles_source.get("pre_decision") if isinstance(column_roles_source, dict) else None
+            if isinstance(pre_decision_columns, list) and pre_decision_columns:
+                model_input_candidates_payload = pre_decision_columns
         if not model_input_candidates_payload:
             strategy_required = strategy.get("required_columns", [])
             if isinstance(strategy_required, list) and strategy_required:
@@ -4603,17 +4611,25 @@ class MLEngineerAgent:
             strategy_techniques_compact=_strategy_techniques_compact,
             strategy_fallback_chain=_strategy_fallback_chain,
             optional_context_block=_optional_context_block,
-            model_input_candidates=self._serialize_json_for_prompt(
-                model_input_candidates_payload,
-                max_chars=5000,
-                max_str_len=400,
-                max_list_items=120,
+            model_input_candidates=(
+                "[]"
+                if model_input_candidates_payload == []
+                else self._serialize_json_for_prompt(
+                    model_input_candidates_payload,
+                    max_chars=5000,
+                    max_str_len=400,
+                    max_list_items=120,
+                )
             ),
-            artifact_required_columns=self._serialize_json_for_prompt(
-                required_columns_payload,
-                max_chars=5000,
-                max_str_len=400,
-                max_list_items=120,
+            artifact_required_columns=(
+                "[]"
+                if required_columns_payload == []
+                else self._serialize_json_for_prompt(
+                    required_columns_payload,
+                    max_chars=5000,
+                    max_str_len=400,
+                    max_list_items=120,
+                )
             ),
             deliverables_json=deliverables_json,
             canonical_columns=self._serialize_json_for_prompt(

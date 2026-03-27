@@ -169,6 +169,48 @@ def test_build_prompt_preserves_optional_required_output_flags(monkeypatch):
     _assert_contains_terms(prompt, '"intent":"model_plots"')
 
 
+def test_build_prompt_does_not_invent_artifact_required_columns_from_canonical(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={"title": "Column Policy Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        execution_contract={
+            "canonical_columns": ["target", "identifier", "outcome_flag"],
+            "column_roles": {
+                "pre_decision": ["feature_a", "feature_b"],
+                "outcome": ["outcome_flag"],
+                "identifiers": ["identifier"],
+            },
+            "required_outputs": ["artifacts/ml/cv_metrics.json"],
+        },
+        ml_view={
+            "canonical_columns": ["target", "identifier", "outcome_flag"],
+            "column_roles": {
+                "pre_decision": ["feature_a", "feature_b"],
+                "outcome": ["outcome_flag"],
+                "identifiers": ["identifier"],
+            },
+            "required_outputs": ["artifacts/ml/cv_metrics.json"],
+        },
+    )
+
+    prompt = str(agent.last_prompt or "")
+    _assert_contains_all(prompt, 'Model Input Candidates: ["feature_a","feature_b"]', "Artifact-required Clean Columns: []")
+    assert 'Artifact-required Clean Columns: ["target","identifier","outcome_flag"]' not in prompt
+
+
 def test_generate_code_prompt_preserves_string_runbook(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
