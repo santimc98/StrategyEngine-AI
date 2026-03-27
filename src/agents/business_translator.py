@@ -2,6 +2,8 @@ import os
 import re
 import html
 import csv
+import glob
+import copy
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
@@ -74,6 +76,17 @@ def _safe_load_json(path: str):
             return json.load(f)
     except Exception:
         return None
+
+
+def _load_authoritative_metrics_payload() -> Dict[str, Any]:
+    for candidate in (
+        "artifacts/ml/cv_metrics.json",
+        "data/metrics.json",
+    ):
+        payload = _safe_load_json(candidate)
+        if isinstance(payload, dict) and payload:
+            return payload
+    return {}
 
 def _normalize_artifact_index(entries):
     normalized = []
@@ -426,9 +439,20 @@ def _build_report_artifact_manifest(
     items: List[Dict[str, Any]] = []
     for path in sorted(candidate_paths):
         present = os.path.exists(path)
+        matched_paths: List[str] = []
+        if not present and glob.has_magic(path):
+            try:
+                matched_paths = [
+                    _normalize_path(match_path)
+                    for match_path in glob.glob(path)
+                    if _normalize_path(match_path)
+                ]
+            except Exception:
+                matched_paths = []
+            present = bool(matched_paths)
         required = path in required_set
         if path in missing_set:
-            status = "missing_required"
+            status = "ok" if present else "missing_required"
         elif required and present:
             status = "ok"
         elif required and not present:
@@ -458,6 +482,7 @@ def _build_report_artifact_manifest(
                 "updated_at_utc": stat_mtime,
                 "row_count": profile.get("row_count"),
                 "column_count": profile.get("column_count"),
+                "matched_paths": matched_paths[:8],
             }
         )
 
@@ -840,6 +865,298 @@ def _coerce_float(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _metric_key_score(metric_key: str, metric_name: str) -> int:
+    key = str(metric_key or "").strip().lower()
+    metric = str(metric_name or "").strip().lower()
+    if not key or not metric:
+        return -1
+    if "std_" in key or key.endswith(".std") or ".std_" in key:
+        return -1
+    if key == f"mean_{metric}" or key.endswith(f".mean_{metric}"):
+        return 100
+    if key == metric or key.endswith(f".{metric}"):
+        return 90
+    if key.endswith(metric):
+        return 60
+    return -1
+
+
+def _build_metric_records(metrics_payload: Dict[str, Any], max_items: int = 24) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if not isinstance(metrics_payload, dict):
+        return records
+    for key, value in _flatten_metrics(metrics_payload):
+        if not _is_number(value):
+            continue
+        records.append({"metric": key, "value": float(value)})
+        if len(records) >= max_items:
+            break
+    return records
+
+
+def _extract_primary_metric_value_from_records(records: Any, metric_name: str) -> Optional[float]:
+    if isinstance(records, dict):
+        records = _build_metric_records(records)
+    if not isinstance(records, list):
+        return None
+    best_score = -1
+    best_value: Optional[float] = None
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        metric_key = str(item.get("metric") or "").strip()
+        metric_value = _coerce_float(item.get("value"))
+        if metric_value is None:
+            continue
+        score = _metric_key_score(metric_key, metric_name)
+        if score > best_score:
+            best_score = score
+            best_value = metric_value
+    return best_value
+
+
+def _metric_values_differ(left: Optional[float], right: Optional[float], tol: float = 1e-6) -> bool:
+    if left is None or right is None:
+        return False
+    return abs(float(left) - float(right)) > tol
+
+
+def _extract_primary_metric_value_from_plot_summary(
+    summary_item: Dict[str, Any],
+    metric_name: str,
+) -> Optional[float]:
+    metric = str(metric_name or "").strip().lower()
+    if not metric or not isinstance(summary_item, dict):
+        return None
+    facts = summary_item.get("key_facts")
+    if not isinstance(facts, list):
+        facts = summary_item.get("facts")
+    if not isinstance(facts, list):
+        facts = [facts] if facts else []
+    number_pattern = re.compile(r"[-+]?\d+(?:\.\d+)?")
+    for raw_fact in facts:
+        fact = str(raw_fact or "")
+        fact_lower = fact.lower()
+        if metric not in fact_lower:
+            continue
+        if "std" in fact_lower and "mean" not in fact_lower:
+            continue
+        numbers = number_pattern.findall(fact)
+        if not numbers:
+            continue
+        try:
+            return float(numbers[-1])
+        except Exception:
+            continue
+    return None
+
+
+def _match_metric_loop_round(metric_loop_context: Dict[str, Any], metric_value: Optional[float]) -> Optional[Dict[str, Any]]:
+    if metric_value is None or not isinstance(metric_loop_context, dict):
+        return None
+    round_history = metric_loop_context.get("round_history")
+    if not isinstance(round_history, list):
+        return None
+    for item in round_history:
+        if not isinstance(item, dict):
+            continue
+        candidate_value = _coerce_float(item.get("candidate_metric"))
+        if candidate_value is None:
+            continue
+        if not _metric_values_differ(candidate_value, metric_value):
+            return item
+    return None
+
+
+def _build_metric_progress_summary(
+    metric_loop_context: Dict[str, Any],
+    canonical_metric_name: str,
+    canonical_metric_value: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(metric_loop_context, dict):
+        return None
+    rounds = metric_loop_context.get("round_history")
+    if not isinstance(rounds, list) or not rounds:
+        return None
+    baseline_start = _coerce_float(rounds[0].get("baseline_metric")) if isinstance(rounds[0], dict) else None
+    accepted: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    for item in rounds:
+        if not isinstance(item, dict):
+            continue
+        entry = {
+            "round_id": item.get("round_id"),
+            "baseline_metric": item.get("baseline_metric"),
+            "candidate_metric": item.get("candidate_metric"),
+            "kept": item.get("kept"),
+            "hypothesis": item.get("hypothesis"),
+        }
+        if str(item.get("kept") or "").strip().lower() == "improved":
+            accepted.append(entry)
+        else:
+            rejected.append(entry)
+    summary: Dict[str, Any] = {
+        "metric_name": canonical_metric_name or metric_loop_context.get("metric_name"),
+        "baseline_start": baseline_start,
+        "final_incumbent": canonical_metric_value,
+        "accepted_rounds": accepted,
+        "rejected_rounds": rejected,
+        "rounds_attempted": len(rounds),
+    }
+    if baseline_start is not None and canonical_metric_value is not None:
+        summary["net_change_vs_start"] = float(canonical_metric_value) - float(baseline_start)
+    return summary
+
+
+def _build_cleaning_progress_summary(
+    cleaning_manifest: Dict[str, Any],
+    *,
+    strategy_title: str = "",
+    hypothesis: str = "",
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(cleaning_manifest, dict) or not cleaning_manifest:
+        return None
+    row_counts = cleaning_manifest.get("row_counts") if isinstance(cleaning_manifest.get("row_counts"), dict) else {}
+    rows_before = (
+        row_counts.get("before")
+        or row_counts.get("original")
+        or row_counts.get("input")
+        or row_counts.get("rows_before")
+    )
+    rows_after = (
+        row_counts.get("after")
+        or row_counts.get("final")
+        or row_counts.get("output")
+        or row_counts.get("rows_after")
+    )
+    conversions_raw = cleaning_manifest.get("conversions")
+    conversion_items: List[str] = []
+    if isinstance(conversions_raw, list):
+        for item in conversions_raw:
+            text = str(item or "").strip()
+            if text:
+                conversion_items.append(text)
+    elif isinstance(conversions_raw, dict):
+        for key, value in conversions_raw.items():
+            label = str(key or "").strip()
+            if not label:
+                continue
+            if value in (None, "", {}):
+                conversion_items.append(label)
+            else:
+                conversion_items.append(f"{label}: {value}")
+    gates_status = cleaning_manifest.get("cleaning_gates_status")
+    if not isinstance(gates_status, dict):
+        gates_status = {}
+    passed_gates = [str(key) for key, value in gates_status.items() if str(value or "").strip().upper() == "PASSED"][:8]
+    progress_summary: Dict[str, Any] = {
+        "rows_before": rows_before,
+        "rows_after": rows_after,
+        "row_delta": (rows_after - rows_before) if isinstance(rows_before, int) and isinstance(rows_after, int) else None,
+        "key_operations": conversion_items[:8],
+        "passed_gates": passed_gates,
+        "output_dialect": cleaning_manifest.get("output_dialect", {}),
+        "contract_conflicts_resolved": cleaning_manifest.get("contract_conflicts_resolved", []),
+    }
+    if strategy_title:
+        progress_summary["strategy_title"] = strategy_title
+    if hypothesis:
+        progress_summary["strategy_hypothesis"] = hypothesis
+    return progress_summary
+
+
+def _prepare_translator_metric_views(
+    *,
+    metrics_payload: Dict[str, Any],
+    slot_payloads: Dict[str, Any],
+    model_metrics_context: Any,
+    plot_summaries: Optional[List[Dict[str, Any]]],
+    metric_loop_context: Dict[str, Any],
+    canonical_metric_name: str,
+    canonical_metric_value: Optional[float],
+) -> Tuple[Dict[str, Any], Any, Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
+    slot_payloads_out = copy.deepcopy(slot_payloads) if isinstance(slot_payloads, dict) else {}
+    model_metrics_context_out = copy.deepcopy(model_metrics_context)
+    plot_summaries_out = copy.deepcopy(plot_summaries) if isinstance(plot_summaries, list) else plot_summaries
+    progress_summary = _build_metric_progress_summary(
+        metric_loop_context,
+        canonical_metric_name,
+        canonical_metric_value,
+    )
+    final_metric_records = _build_metric_records(metrics_payload)
+
+    observed_slot_value = _extract_primary_metric_value_from_records(
+        slot_payloads_out.get("model_metrics"),
+        canonical_metric_name,
+    )
+    if final_metric_records:
+        if _metric_values_differ(observed_slot_value, canonical_metric_value):
+            matched_round = _match_metric_loop_round(metric_loop_context, observed_slot_value)
+            rejected_payload = slot_payloads_out.get("model_metrics")
+            if rejected_payload:
+                slot_payloads_out["rejected_challenger_metrics"] = {
+                    "scope": "rejected_challenger",
+                    "round_id": matched_round.get("round_id") if isinstance(matched_round, dict) else None,
+                    "primary_metric_name": canonical_metric_name,
+                    "primary_metric_value": observed_slot_value,
+                    "records": rejected_payload,
+                }
+        slot_payloads_out["model_metrics"] = final_metric_records
+        slot_payloads_out["model_metrics_scope"] = {
+            "scope": "final_incumbent",
+            "primary_metric_name": canonical_metric_name,
+            "primary_metric_value": canonical_metric_value,
+        }
+
+    if isinstance(model_metrics_context_out, dict):
+        if final_metric_records:
+            model_metrics_context_out["final_incumbent_metrics"] = final_metric_records
+        if "rejected_challenger_metrics" in slot_payloads_out:
+            model_metrics_context_out["rejected_challenger_metrics"] = slot_payloads_out["rejected_challenger_metrics"]
+        insights_metrics = model_metrics_context_out.get("insights_metrics")
+        observed_context_value = _extract_primary_metric_value_from_records(insights_metrics, canonical_metric_name)
+        if final_metric_records and _metric_values_differ(observed_context_value, canonical_metric_value):
+            model_metrics_context_out["insights_metrics_scope"] = "rejected_challenger"
+
+    if isinstance(plot_summaries_out, list):
+        for item in plot_summaries_out:
+            if not isinstance(item, dict):
+                continue
+            observed_plot_value = _extract_primary_metric_value_from_plot_summary(item, canonical_metric_name)
+            if not _metric_values_differ(observed_plot_value, canonical_metric_value):
+                item.setdefault("narrative_scope", "final_incumbent")
+                continue
+            matched_round = _match_metric_loop_round(metric_loop_context, observed_plot_value)
+            item["narrative_scope"] = "rejected_challenger"
+            round_id = matched_round.get("round_id") if isinstance(matched_round, dict) else None
+            existing_title = str(item.get("title") or "").strip() or "Challenger diagnostics"
+            if round_id is not None:
+                item["title"] = f"Rejected challenger (round {round_id}): {existing_title}"
+            else:
+                item["title"] = f"Rejected challenger: {existing_title}"
+            facts = item.get("key_facts")
+            if not isinstance(facts, list):
+                facts = item.get("facts")
+            if not isinstance(facts, list):
+                facts = [str(facts)] if facts else []
+            prefix = "Use only for improvement history; not final incumbent KPI evidence."
+            if round_id is not None:
+                prefix = f"Rejected challenger from round {round_id}; use only for improvement history."
+            suffix = None
+            if canonical_metric_name and canonical_metric_value is not None:
+                suffix = f"Final incumbent kept: {canonical_metric_name}={float(canonical_metric_value):.6f}"
+            updated_facts = [prefix] + [str(fact) for fact in facts if fact]
+            if suffix:
+                updated_facts.append(suffix)
+            item["facts"] = updated_facts[:6]
+            item["guidance"] = (
+                "Use only when narrating rejected challenger experiments or why the incumbent was kept. "
+                "Do not use this artifact as final KPI/stability evidence."
+            )
+
+    return slot_payloads_out, model_metrics_context_out, plot_summaries_out, progress_summary
 
 
 def _extract_lift_value(data_adequacy_report: Dict[str, Any], metrics_payload: Dict[str, Any]) -> Optional[float]:
@@ -1597,13 +1914,17 @@ def _build_embeddable_artifact_registry(
         facts = summary.get("key_facts") or summary.get("facts") or ""
         if isinstance(facts, list):
             facts = "; ".join(str(f) for f in facts[:4])
+        guidance = str(
+            summary.get("guidance")
+            or "Use inline near the specific finding it supports, then interpret the business implication."
+        ).strip()
         registry[f"chart_{idx}"] = {
             "artifact_key": f"chart_{idx}",
             "artifact_type": "chart",
             "title": title,
             "path": normalized_path,
             "summary": _summarize_prompt_text(facts or f"Chart available at {normalized_path}"),
-            "guidance": "Use inline near the specific finding it supports, then interpret the business implication.",
+            "guidance": guidance,
         }
 
     if cleaned_sample_table_text and cleaned_sample_table_text != "No data available.":
@@ -2131,7 +2452,7 @@ class BusinessTranslatorAgent:
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
         run_summary = _safe_load_json("data/run_summary.json") or {}
         recommendations_preview = _safe_load_json("reports/recommendations_preview.json") or {}
-        metrics_payload = _safe_load_json("data/metrics.json") or {}
+        metrics_payload = _load_authoritative_metrics_payload()
 
         # ── Canonical metric correction ──────────────────────────────
         # After metric loop baseline restoration, insights.json and
@@ -2258,12 +2579,18 @@ class BusinessTranslatorAgent:
             if isinstance(conversions, dict):
                 conversion_keys = list(conversions.keys())[:12]
             elif isinstance(conversions, list):
-                conversion_keys = [c.get("column") for c in conversions if isinstance(c, dict) and c.get("column")]
+                if all(isinstance(c, dict) for c in conversions):
+                    conversion_keys = [c.get("column") for c in conversions if isinstance(c, dict) and c.get("column")]
+                else:
+                    conversion_keys = [str(c) for c in conversions if str(c or "").strip()]
                 conversion_keys = conversion_keys[:12]
             return {
                 "row_counts": row_counts,
                 "dropped_rows": dropped,
                 "conversion_keys": conversion_keys,
+                "cleaning_gates_status": cleaning_manifest.get("cleaning_gates_status", {}),
+                "output_dialect": cleaning_manifest.get("output_dialect", {}),
+                "contract_conflicts_resolved": cleaning_manifest.get("contract_conflicts_resolved", []),
             }
 
         def _summarize_weights():
@@ -2289,6 +2616,8 @@ class BusinessTranslatorAgent:
                 run_metrics = run_summary.get("metrics")
                 if run_metrics:
                     metrics_summary["run_summary_metrics"] = run_metrics
+            if isinstance(metrics_payload, dict) and metrics_payload:
+                metrics_summary["final_metrics_payload"] = metrics_payload
             if isinstance(insights, dict):
                 metrics_summary["insights_metrics"] = insights.get("metrics_summary", [])
             if not metrics_summary:
@@ -2430,6 +2759,11 @@ class BusinessTranslatorAgent:
         run_summary_context = _summarize_run()
         data_adequacy_context = _summarize_data_adequacy()
         model_metrics_context = _summarize_model_metrics()
+        cleaning_progress_summary = _build_cleaning_progress_summary(
+            cleaning_manifest,
+            strategy_title=strategy_title,
+            hypothesis=hypothesis,
+        )
         facts_context = _facts_from_insights(insights) or _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
         artifacts_context = view_inventory if view_inventory else []
         raw_evidence_paths = []
@@ -2475,6 +2809,16 @@ class BusinessTranslatorAgent:
                 missing_required_slots.append(
                     {"id": slot_id, "sources": slot.get("sources", []), "insights_key": insights_key}
                 )
+        plot_summaries = state.get("plot_summaries") if isinstance(state.get("plot_summaries"), list) else None
+        slot_payloads, model_metrics_context, plot_summaries, metric_progress_summary = _prepare_translator_metric_views(
+            metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
+            slot_payloads=slot_payloads if isinstance(slot_payloads, dict) else {},
+            model_metrics_context=model_metrics_context,
+            plot_summaries=plot_summaries,
+            metric_loop_context=metric_loop_context if isinstance(metric_loop_context, dict) else {},
+            canonical_metric_name=_canonical_metric_name,
+            canonical_metric_value=_canonical_metric_value,
+        )
         slot_coverage_context = {
             "slot_payloads": slot_payloads,
             "missing_required_slots": missing_required_slots,
@@ -2594,6 +2938,7 @@ class BusinessTranslatorAgent:
                 "reasons": (data_adequacy_report or {}).get("reasons", [])[:3],
                 "recommendations": (data_adequacy_report or {}).get("recommendations", [])[:3],
             },
+            "cleaning_progress_summary": cleaning_progress_summary,
             "artifacts_summary": manifest.get("summary", {}) if isinstance(manifest, dict) else {},
             "decisioning_columns": decisioning_columns,
             "metrics_preview": _flatten_metrics(metrics_payload)[:14] if isinstance(metrics_payload, dict) else [],
@@ -2602,6 +2947,7 @@ class BusinessTranslatorAgent:
                 "value": _canonical_metric_value,
                 "source": "primary_metric_state (authoritative)",
             } if _canonical_metric_name and _canonical_metric_value is not None else None,
+            "ml_progress_summary": metric_progress_summary,
         }
 
         context_appendix = {
@@ -2612,6 +2958,7 @@ class BusinessTranslatorAgent:
             "steward_signal_pack": steward_signal_pack,
             "steward_context": steward_context,
             "cleaning_context": cleaning_context,
+            "cleaning_progress_summary": cleaning_progress_summary,
             "run_summary_context": run_summary_context,
             "artifact_manifest": manifest,
             "data_adequacy_report_json": data_adequacy_report,
@@ -2620,10 +2967,11 @@ class BusinessTranslatorAgent:
             "case_summary_context": case_summary_context,
             "scored_rows_context": scored_rows_context,
             "plot_insights_json": plot_insights,
-            "plot_summaries": state.get("plot_summaries") if isinstance(state.get("plot_summaries"), list) else None,
+            "plot_summaries": plot_summaries,
             "recommendations_preview": recommendations_preview,
             "run_timeline_context": run_timeline_context,
             "metric_loop_context": metric_loop_context if metric_loop_context else None,
+            "metric_progress_summary": metric_progress_summary,
         }
 
         # ── Pipeline scope awareness ─────────────────────────────────
@@ -2689,6 +3037,11 @@ what to do next.
    override the authoritative executive outcome.
 4. Evidence must come from listed artifacts or explicit deterministic facts.
    If support is missing, state uncertainty explicitly instead of presenting the claim as established.
+5. Separate FINAL INCUMBENT STATE from IMPROVEMENT HISTORY.
+   Valid engineering progress should be recognized, but KPI snapshots, stability
+   claims, and deployment recommendations must be grounded in the final incumbent only.
+6. If a challenger was rejected, mention it only as rejected exploration history.
+   Never present rejected challenger metrics or charts as the final model state.
 
 === TRANSLATION DECISION WORKFLOW (MANDATORY) ===
 Before writing, reason through these steps internally. Your report should
@@ -2704,11 +3057,16 @@ reflect this analysis, not just list data.
    - If the canonical_primary_metric in FACTS_BLOCK differs from metrics
      on disk, trust the canonical value — it reflects the selected incumbent.
 
+   - If improvement history exists, make the ML engineer's progress visible,
+     but keep final KPI/stability language tied to the selected incumbent only.
+
 2. IDENTIFY WHAT MATTERS
    - From all the metrics and artifacts below, select the 3-5 most
      decision-relevant findings. Not everything deserves a mention.
    - Prioritize: primary metric performance, data quality issues,
      compliance failures, and risks that affect production readiness.
+   - If cleaning work materially enabled the final result, surface the
+     most important data-engineering operations and explain why they mattered.
 
 3. EXPLAIN WHY
    - Connect results to causes. If the metric improved, what technique
@@ -2742,11 +3100,13 @@ Cleaned Data Sample: $cleaned_sample_table_text
 Scored Rows Sample: $scored_sample_table_text
 Artifact Headers: $artifact_headers_table_text
 Recommendations: $recommendations_table_text
+Cleaning Progress Summary: $cleaning_progress_summary_json
 Visuals: $visuals_context_json
 Decisioning: $decisioning_context_json
 Decisioning Columns: $decisioning_columns_text
 Reporting Policy: $reporting_policy_context
 Slot Coverage: $slot_coverage_context
+Metric Progress Summary: $metric_progress_summary_json
 
 === APPENDIX (lower priority — use only if needed for depth) ===
 $context_appendix_json
@@ -2811,7 +3171,7 @@ $execution_results
 
         artifact_registry = _build_embeddable_artifact_registry(
             plots=plots,
-            plot_summaries=state.get("plot_summaries") if isinstance(state.get("plot_summaries"), list) else None,
+            plot_summaries=plot_summaries,
             cleaned_sample_table_text=cleaned_sample_table_text,
             scored_sample_table_text=scored_sample_table_text,
             kpi_snapshot_table_html=kpi_snapshot_table_html,
@@ -2840,11 +3200,13 @@ $execution_results
             "outline_plan_json": "{}",
             "reporting_policy_context": json.dumps(reporting_policy_context, ensure_ascii=False),
             "slot_coverage_context": json.dumps(slot_coverage_context, ensure_ascii=False),
+            "metric_progress_summary_json": json.dumps(metric_progress_summary, ensure_ascii=False),
             "metrics_table_text": metrics_table_text,
             "cleaned_sample_table_text": cleaned_sample_table_text,
             "scored_sample_table_text": scored_sample_table_text,
             "artifact_headers_table_text": artifact_headers_table_text,
             "recommendations_table_text": recommendations_table_text,
+            "cleaning_progress_summary_json": json.dumps(cleaning_progress_summary, ensure_ascii=False),
             "context_appendix_json": json.dumps(context_appendix, ensure_ascii=False),
             "pipeline_scope_section": pipeline_scope_section,
             "embeddable_artifacts_registry_json": artifact_registry_prompt_json,

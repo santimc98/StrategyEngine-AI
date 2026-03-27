@@ -70,10 +70,11 @@ def test_translator_builds_artifact_manifest_and_html_tables(tmp_path, monkeypat
     assert manifest["summary"]["required_missing"] >= 1
     assert any(item.get("path") == "data/metrics.json" for item in manifest.get("items", []))
 
-    assert "Artifact Inventory (HTML):" in report
-    assert "Artifact Compliance (HTML):" in report
     assert "artifact_inventory_table_html" not in report
-    assert "exec-table artifact-inventory" in report
+    with open(os.path.join("data", "report_visual_tables.json"), "r", encoding="utf-8") as f:
+        visual_tables = json.load(f)
+    assert "exec-table artifact-inventory" in visual_tables["artifact_inventory_table_html"]
+    assert "exec-table artifact-compliance" in visual_tables["artifact_compliance_table_html"]
 
 
 def test_translator_manifest_profiles_csv_dimensions(tmp_path, monkeypatch):
@@ -232,3 +233,47 @@ def test_replay_c946b64d_manifest_deduplicates_rich_required_outputs_from_real_r
     paths = [item.get("path") for item in manifest.get("items", [])]
     assert "artifacts/clean/dataset_enriquecido.csv" in paths
     assert not any(path and str(path).startswith("{") for path in paths)
+
+
+def test_translator_manifest_treats_glob_required_plot_output_as_present_when_files_exist(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs(os.path.join("data"), exist_ok=True)
+    os.makedirs(os.path.join("static", "plots"), exist_ok=True)
+
+    with open(os.path.join("static", "plots", "cv_folds.png"), "wb") as f:
+        f.write(b"png")
+
+    with open(os.path.join("data", "execution_contract.json"), "w", encoding="utf-8") as f:
+        json.dump({"required_outputs": [{"path": "static/plots/*.png", "required": True}]}, f)
+
+    with open(os.path.join("data", "output_contract_report.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "overall_status": "error",
+                "present": [],
+                "missing": ["static/plots/*.png"],
+            },
+            f,
+        )
+
+    with open(os.path.join("data", "produced_artifact_index.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            [{"path": "static/plots/cv_folds.png", "artifact_type": "plot"}],
+            f,
+        )
+
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    _ = agent.generate_report({"execution_output": "ok", "business_objective": "Objetivo"})
+
+    with open(os.path.join("data", "report_artifact_manifest.json"), "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    wildcard_item = next(item for item in manifest["items"] if item["path"] == "static/plots/*.png")
+    assert wildcard_item["present"] is True
+    assert wildcard_item["status"] == "ok"
+    assert "static/plots/cv_folds.png" in wildcard_item.get("matched_paths", [])
+    assert manifest["summary"]["required_missing"] == 0

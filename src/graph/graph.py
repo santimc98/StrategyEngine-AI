@@ -4664,11 +4664,31 @@ def _build_translator_run_narrative(
     manifest = _load_json_any("data/cleaning_manifest.json")
     if isinstance(manifest, dict) and manifest:
         row_counts = manifest.get("row_counts", {})
+        conversions = manifest.get("conversions")
+        conversion_items = []
+        if isinstance(conversions, list):
+            conversion_items = [str(item) for item in conversions if str(item or "").strip()][:8]
+        elif isinstance(conversions, dict):
+            conversion_items = [str(key) for key in conversions.keys()][:8]
         narrative["cleaning_summary"] = {
-            "rows_before": row_counts.get("before") or row_counts.get("original"),
-            "rows_after": row_counts.get("after") or row_counts.get("final"),
+            "rows_before": (
+                row_counts.get("before")
+                or row_counts.get("original")
+                or row_counts.get("input")
+                or row_counts.get("rows_before")
+            ),
+            "rows_after": (
+                row_counts.get("after")
+                or row_counts.get("final")
+                or row_counts.get("output")
+                or row_counts.get("rows_after")
+            ),
             "nulls_handled": manifest.get("nulls_filled_count")
                 or manifest.get("null_handling_count"),
+            "conversions": conversion_items,
+            "gates_status": manifest.get("cleaning_gates_status", {}),
+            "output_dialect": manifest.get("output_dialect", {}),
+            "contract_conflicts_resolved": manifest.get("contract_conflicts_resolved", []),
         }
 
     # 5. ML improvement loop — the most important narrative element

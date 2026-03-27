@@ -69,6 +69,135 @@ def test_translator_prompt_keeps_layout_flexible_without_legacy_markdown_scaffol
     assert "Executive decision with clear rationale (always first)" not in prompt
 
 
+def test_translator_prompt_separates_final_incumbent_from_rejected_challenger(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.join("artifacts", "ml"), exist_ok=True)
+    os.makedirs(os.path.join("static", "plots"), exist_ok=True)
+
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "metrics_summary": [
+                    {"metric": "mean_mae", "value": 1489.6658896856218},
+                    {"metric": "std_mae", "value": 451.32639733203274},
+                ]
+            },
+            f,
+        )
+    with open(os.path.join("artifacts", "ml", "cv_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "mean_mae": 1410.2794030184425,
+                "std_mae": 150.89153798429797,
+                "model_performance": {
+                    "mean_mae": 1410.2794030184425,
+                    "std_mae": 150.89153798429797,
+                },
+            },
+            f,
+        )
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+
+    state = {
+        "execution_output": "OK",
+        "business_objective": "Objetivo de prueba",
+        "primary_metric_state": {
+            "primary_metric_name": "MAE",
+            "primary_metric_value": 1410.2794030184425,
+        },
+        "ml_improvement_round_history": [
+            {
+                "round_id": 1,
+                "baseline_metric": 2088.3858989698074,
+                "candidate_metric": 1564.31726834445,
+                "kept": "improved",
+                "hypothesis": {"label": "catboost"},
+            },
+            {
+                "round_id": 2,
+                "baseline_metric": 1564.31726834445,
+                "candidate_metric": 1410.2794030184425,
+                "kept": "improved",
+                "hypothesis": {"label": "log_target"},
+            },
+            {
+                "round_id": 3,
+                "baseline_metric": 1410.2794030184425,
+                "candidate_metric": 1489.6658896856218,
+                "kept": "baseline",
+                "hypothesis": {"label": "optuna_challenger"},
+            },
+        ],
+        "plot_summaries": [
+            {
+                "filename": "cv_folds.png",
+                "title": "Cross-validation fold performance",
+                "facts": [
+                    "5-fold CV MAE mean=1489.665890",
+                    "5-fold CV MAE std=451.326397",
+                ],
+            }
+        ],
+    }
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(state, plots=["static/plots/cv_folds.png"])
+
+    assert "Metrics: No data available." not in prompt
+    assert '"metric": "mean_mae", "value": 1410.2794030184425' in prompt
+    assert "Rejected challenger from round 3" in prompt
+    assert "Metric Progress Summary:" in prompt
+    assert '"baseline_start": 2088.3858989698074' in prompt
+
+
+def test_translator_prompt_includes_cleaning_progress_summary(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+    with open(os.path.join("data", "cleaning_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "output_dialect": {"sep": ";", "decimal": ",", "encoding": "utf-8"},
+                "row_counts": {"input": 352, "output": 352},
+                "conversions": [
+                    "Parsed 1stYearAmount from currency-like strings to float64",
+                    "Parsed Debtors from numeric-like strings to Float64",
+                    "Trimmed whitespace on required categorical fields",
+                ],
+                "cleaning_gates_status": {
+                    "target_is_numeric": "PASSED",
+                    "routing_column_valid": "PASSED",
+                },
+            },
+            f,
+        )
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Objetivo de prueba",
+            "selected_strategy": {
+                "title": "Modelo prescriptivo",
+                "hypothesis": "La limpieza debe rescatar variables monetarias y de perfil para soportar el modelado.",
+            },
+        }
+    )
+
+    assert "Cleaning Progress Summary:" in prompt
+    assert '"rows_before": 352' in prompt
+    assert '"rows_after": 352' in prompt
+    assert "Parsed 1stYearAmount from currency-like strings to float64" in prompt
+    assert '"passed_gates": ["target_is_numeric", "routing_column_valid"]' in prompt
+
+
 def test_translator_structure_validation_accepts_risk_semantics_without_heading():
     report = """
 # Reporte Ejecutivo
