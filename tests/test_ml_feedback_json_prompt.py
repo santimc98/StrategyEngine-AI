@@ -303,10 +303,34 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
                 "action": "APPLY",
                 "hypothesis": {"technique": "missing_indicators", "target_columns": ["ALL_NUMERIC"]},
             },
+            "repair_ground_truth": {
+                "root_cause_type": "runtime_api_misuse",
+                "repair_focus": "runtime",
+                "failure_signature": "TypeError: OneHotEncoder got an unexpected keyword argument 'sparse'",
+                "environment_facts": [
+                    {
+                        "fact": "callable_signature",
+                        "resolved_symbol": "sklearn.preprocessing.OneHotEncoder",
+                        "value": "(*, categories='auto', drop=None, sparse_output=True, dtype=<class 'numpy.float64'>, handle_unknown='error', min_frequency=None, max_categories=None, feature_name_combiner='concat')",
+                    }
+                ],
+                "verified_facts": [
+                    {"fact": "unexpected_keyword_argument", "value": "sparse", "source": "runtime_traceback"}
+                ],
+            },
         },
-        execution_contract={"required_outputs": ["data/metrics.json"], "canonical_columns": []},
+        execution_contract={
+            "required_outputs": [
+                {"path": "data/metrics.json", "required": True, "intent": "cv_metrics"},
+                {"path": "static/plots/*.png", "required": False, "intent": "model_plots"},
+            ],
+            "canonical_columns": [],
+        },
         ml_view={
-            "required_outputs": ["data/metrics.json"],
+            "required_outputs": [
+                {"path": "data/metrics.json", "required": True, "intent": "cv_metrics"},
+                {"path": "static/plots/*.png", "required": False, "intent": "model_plots"},
+            ],
             "allowed_feature_sets": {
                 "model_features": ["feature_a", "feature_b"],
                 "forbidden_features": ["label_12h"],
@@ -335,7 +359,7 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
         "OPTIMIZATION EDITOR CONTRACT",
         "CURRENT TASK CONTEXT",
         "CURRENT ROUND BRIEF:",
-        "ACTIVE HYPOTHESIS BRIEF:",
+        "ACTIVE HYPOTHESIS (proposal to test, not a literal recipe):",
         "CURRENT EVIDENCE BRIEF:",
         "LOCKED INVARIANTS:",
         "Optimization Authoritative State:",
@@ -345,11 +369,16 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
         '"label_12h"',
     )
     _assert_contains_terms(prompt, "cleaning_manifest.json", "csv dialect", "cleaning metadata", "simple arithmetic mean")
+    _assert_contains_terms(prompt, "closest compatible variant", "verified environment facts", "onehotencoder")
     assert "ARTIFACT: data/scored_rows.csv" not in prompt
     assert "STRUCTURED CRITIQUE PACKET:" not in prompt
     assert "OPTIMIZATION CONTEXT (authoritative current round):" not in prompt
     assert "CONTRACT-FIRST EXECUTION MAP (MANDATORY)" not in prompt
     assert "FEATURE GOVERNANCE" not in prompt
+    assert '"required":false' in prompt
+    assert "{'intent':" not in prompt
+    assert '"target_scope":"contract-defined target scope"' in prompt
+    assert "HYPOTHESIS TO TEST:" not in prompt
 
 
 def test_optimization_authoritative_state_accepts_submission_schema_alias_paths(monkeypatch):

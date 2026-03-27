@@ -842,7 +842,11 @@ class MLEngineerAgent:
             must_preserve = [f"Preserve generation for {path}" for path in present_outputs[:6]]
         patch_objectives = self._normalize_handoff_items(raw.get("patch_objectives"), max_items=8, max_len=260)
         if bool(editor_constraints.get("must_apply_hypothesis")):
-            enforce_msg = "Apply the active metric-improvement hypothesis with material code edits (NO_OP forbidden)."
+            enforce_msg = (
+                "Test the active metric-improvement hypothesis with a material but minimal edit. "
+                "If the literal technique conflicts with verified environment facts or runtime constraints, "
+                "implement the closest compatible variant instead of a no-op."
+            )
             if enforce_msg not in patch_objectives:
                 patch_objectives.insert(0, enforce_msg)
         if missing_outputs and not any("missing contract outputs" in item.lower() for item in patch_objectives):
@@ -1518,6 +1522,137 @@ class MLEngineerAgent:
             max_list_items=8,
         )
 
+    def _normalize_required_output_entries_for_prompt(
+        self,
+        required_outputs: Any,
+        *,
+        max_items: int = 12,
+    ) -> List[Any]:
+        if not isinstance(required_outputs, list):
+            return []
+        normalized: List[Any] = []
+        for item in required_outputs[:max_items]:
+            if isinstance(item, dict):
+                compact: Dict[str, Any] = {}
+                for key in ("intent", "kind", "path", "required", "owner"):
+                    if key not in item:
+                        continue
+                    value = item.get(key)
+                    if key == "required":
+                        compact[key] = bool(value)
+                    elif value is not None and str(value).strip():
+                        compact[key] = str(value)
+                if compact:
+                    normalized.append(compact)
+                continue
+            text = str(item or "").strip()
+            if text:
+                normalized.append(text)
+        return normalized
+
+    def _normalize_editor_target_scope(self, raw_targets: Any) -> tuple[List[str], str | None]:
+        if not isinstance(raw_targets, list):
+            return [], None
+        generic_tokens = {"ALL_NUMERIC", "ALL_TARGETS", "CONTRACT_TARGETS", "PRIMARY_TARGET"}
+        normalized: List[str] = []
+        saw_generic_scope = False
+        for item in raw_targets:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if text.upper() in generic_tokens:
+                saw_generic_scope = True
+                continue
+            normalized.append(text)
+        if normalized:
+            return normalized[:12], None
+        if saw_generic_scope:
+            return [], "contract-defined target scope"
+        return [], None
+
+    def _build_verified_environment_facts_block(
+        self,
+        repair_ground_truth: Dict[str, Any] | None,
+    ) -> str:
+        repair_ground_truth = repair_ground_truth if isinstance(repair_ground_truth, dict) else {}
+        payload: Dict[str, Any] = {
+            "root_cause_type": repair_ground_truth.get("root_cause_type") or None,
+            "repair_focus": repair_ground_truth.get("repair_focus") or None,
+            "failure_signature": repair_ground_truth.get("failure_signature") or None,
+            "environment_facts": (
+                repair_ground_truth.get("environment_facts")
+                if isinstance(repair_ground_truth.get("environment_facts"), list)
+                else []
+            )[:8],
+            "candidate_call_sites": (
+                repair_ground_truth.get("candidate_call_sites")
+                if isinstance(repair_ground_truth.get("candidate_call_sites"), list)
+                else []
+            )[:4],
+            "verified_facts": (
+                repair_ground_truth.get("verified_facts")
+                if isinstance(repair_ground_truth.get("verified_facts"), list)
+                else []
+            )[:8],
+        }
+        payload = {key: value for key, value in payload.items() if value not in (None, "", [], {})}
+        if not payload:
+            payload = {
+                "status": "no_verified_environment_facts",
+                "guidance": (
+                    "No runtime-specific compatibility facts were captured. "
+                    "Do not assume version-specific library APIs from memory; prefer the smallest "
+                    "compatible variant supported by the incumbent code, verified signatures, and observed dtypes."
+                ),
+            }
+        return self._serialize_json_for_prompt(
+            payload,
+            max_chars=2200,
+            max_str_len=240,
+            max_list_items=20,
+        )
+
+    def _build_repair_ground_truth_prompt_block(
+        self,
+        repair_ground_truth: Dict[str, Any] | None,
+    ) -> str:
+        repair_ground_truth = repair_ground_truth if isinstance(repair_ground_truth, dict) else {}
+        payload: Dict[str, Any] = {
+            "root_cause_type": repair_ground_truth.get("root_cause_type") or None,
+            "repair_focus": repair_ground_truth.get("repair_focus") or None,
+            "failure_signature": repair_ground_truth.get("failure_signature") or None,
+            "verified_facts": (
+                repair_ground_truth.get("verified_facts")
+                if isinstance(repair_ground_truth.get("verified_facts"), list)
+                else []
+            )[:10],
+            "repair_directives": (
+                repair_ground_truth.get("repair_directives")
+                if isinstance(repair_ground_truth.get("repair_directives"), list)
+                else []
+            )[:8],
+            "do_not_change": (
+                repair_ground_truth.get("do_not_change")
+                if isinstance(repair_ground_truth.get("do_not_change"), list)
+                else []
+            )[:8],
+        }
+        payload = {key: value for key, value in payload.items() if value not in (None, "", [], {})}
+        if not payload:
+            payload = {
+                "status": "no_structured_repair_ground_truth",
+                "guidance": (
+                    "Use the traceback, required outputs, and incumbent working regions to infer the smallest coherent fix. "
+                    "Prefer compatibility and contract preservation before optional optimization."
+                ),
+            }
+        return self._serialize_json_for_prompt(
+            payload,
+            max_chars=2200,
+            max_str_len=240,
+            max_list_items=20,
+        )
+
     def _build_editor_scope_brief(
         self,
         repair_scope: Dict[str, Any] | None,
@@ -1573,6 +1708,11 @@ class MLEngineerAgent:
             if isinstance(handoff_payload.get("hypothesis_packet"), dict)
             else {}
         )
+        repair_ground_truth = (
+            handoff_payload.get("repair_ground_truth")
+            if isinstance(handoff_payload.get("repair_ground_truth"), dict)
+            else {}
+        )
         invariants_lock = (
             optimization_context.get("contract_lock")
             if isinstance(optimization_context.get("contract_lock"), dict)
@@ -1618,6 +1758,7 @@ class MLEngineerAgent:
             "missing_inputs": missing_inputs,
             "action_family": action_family,
             "action_family_guidelines": action_family_guidelines,
+            "repair_ground_truth": repair_ground_truth if isinstance(repair_ground_truth, dict) else {},
         }
 
     def _build_optimization_editor_briefs(
@@ -1646,6 +1787,11 @@ class MLEngineerAgent:
         hypothesis_packet = (
             handoff_payload.get("hypothesis_packet")
             if isinstance(handoff_payload.get("hypothesis_packet"), dict)
+            else {}
+        )
+        repair_ground_truth = (
+            optimization_inputs.get("repair_ground_truth")
+            if isinstance(optimization_inputs.get("repair_ground_truth"), dict)
             else {}
         )
         hypothesis = (
@@ -1717,15 +1863,26 @@ class MLEngineerAgent:
             "missing_inputs": optimization_inputs.get("missing_inputs") or [],
         }
 
+        target_columns, target_scope = self._normalize_editor_target_scope(
+            hypothesis.get("target_columns")
+        )
         active_hypothesis_brief = {
             "action": hypothesis_packet.get("action"),
             "technique": hypothesis.get("technique"),
             "objective": hypothesis.get("objective"),
-            "target_columns": hypothesis.get("target_columns"),
             "feature_scope": hypothesis.get("feature_scope"),
             "params": hypothesis.get("params"),
             "success_criteria": hypothesis_packet.get("success_criteria"),
             "application_constraints": hypothesis_packet.get("application_constraints"),
+        }
+        if target_columns:
+            active_hypothesis_brief["target_columns"] = target_columns
+        if target_scope:
+            active_hypothesis_brief["target_scope"] = target_scope
+        active_hypothesis_brief = {
+            key: value
+            for key, value in active_hypothesis_brief.items()
+            if value not in (None, "", [], {})
         }
 
         evidence_brief = {
@@ -1734,17 +1891,46 @@ class MLEngineerAgent:
             "top_error_modes": error_modes,
             "recent_attempts": recent_tracker,
         }
+        failure_signature = str(repair_ground_truth.get("failure_signature") or "").strip()
+        if failure_signature:
+            evidence_brief["runtime_failure_signature"] = failure_signature
+        verified_runtime_facts = (
+            repair_ground_truth.get("verified_facts")
+            if isinstance(repair_ground_truth.get("verified_facts"), list)
+            else []
+        )
+        if verified_runtime_facts:
+            evidence_brief["verified_runtime_facts"] = verified_runtime_facts[:6]
 
         invariants_lock = dict(
             optimization_inputs.get("invariants_lock")
             if isinstance(optimization_inputs.get("invariants_lock"), dict)
             else {}
         )
+        invariants_lock = {
+            key: value
+            for key, value in invariants_lock.items()
+            if value not in (None, "", [], {})
+        }
+        contract_focus = (
+            handoff_payload.get("contract_focus")
+            if isinstance(handoff_payload.get("contract_focus"), dict)
+            else {}
+        )
+        required_outputs = (
+            contract_focus.get("required_outputs")
+            if isinstance(contract_focus.get("required_outputs"), list)
+            else []
+        )
+        if required_outputs and "required_outputs" not in invariants_lock:
+            invariants_lock["required_outputs"] = required_outputs[:12]
         primary_metric_name = str(round_brief.get("primary_metric_name") or "").strip()
         if primary_metric_name:
             invariants_lock.setdefault("primary_metric_name", primary_metric_name)
         if active_hypothesis_brief.get("target_columns"):
             invariants_lock.setdefault("target_columns", active_hypothesis_brief.get("target_columns"))
+        elif target_scope:
+            invariants_lock.setdefault("target_scope", target_scope)
         if (
             primary_metric_name
             and "mean" in primary_metric_name.lower()
@@ -1827,6 +2013,12 @@ class MLEngineerAgent:
                 max_chars=1600,
                 max_str_len=220,
                 max_list_items=10,
+            ),
+            "verified_environment_facts": self._build_verified_environment_facts_block(
+                repair_ground_truth
+            ),
+            "repair_ground_truth": self._build_repair_ground_truth_prompt_block(
+                repair_ground_truth
             ),
             "optimization_feedback_brief": feedback_brief or "No optimization feedback provided.",
         }
@@ -1982,15 +2174,14 @@ class MLEngineerAgent:
                 "split_column": split_spec.get("split_column"),
                 "training_rows_rule": split_spec.get("training_rows_rule"),
                 "scoring_rows_rule": split_spec.get("scoring_rows_rule"),
-                "required_outputs": [
-                    str(item)
-                    for item in (
+                "required_outputs": self._normalize_required_output_entries_for_prompt(
+                    (
                         execution_contract.get("required_outputs")
                         if isinstance(execution_contract.get("required_outputs"), list)
                         else (ml_view.get("required_outputs") if isinstance(ml_view.get("required_outputs"), list) else [])
-                    )[:12]
-                    if str(item).strip()
-                ],
+                    ),
+                    max_items=12,
+                ),
                 "per_row_output_required_columns": (
                     scored_rows_schema.get("required_columns")
                     if (
@@ -4784,7 +4975,7 @@ class MLEngineerAgent:
         $repair_ground_truth
 
         VERIFIED ENVIRONMENT FACTS (authoritative — trust these over assumptions):
-        $repair_ground_truth
+        $verified_environment_facts
 
         EDIT SCOPE:
         $repair_scope
@@ -4817,7 +5008,9 @@ class MLEngineerAgent:
         smallest coherent fix. Your priority order is: (1) make the script run
         without errors, (2) produce all contract-required artifacts with correct
         row counts, (3) then pursue any deferred metric improvement. Do not
-        pursue a later priority if an earlier one is still broken.
+        pursue a later priority if an earlier one is still broken. When verified
+        environment facts are present, prefer them over remembered library APIs
+        or generic repair heuristics.
         """
 
         USER_EDITOR_OPTIMIZATION_TEMPLATE = """
@@ -4842,19 +5035,16 @@ class MLEngineerAgent:
         FEEDBACK DIGEST:
         $optimization_feedback_brief
 
-        HYPOTHESIS TO TEST:
+        ACTIVE HYPOTHESIS (proposal to test, not a literal recipe):
         $active_hypothesis_brief
 
-        ACTIVE HYPOTHESIS BRIEF:
-        $active_hypothesis_brief
-
-        IMPLEMENTATION HINTS:
+        OPTIONAL BLUEPRINT CONTEXT (advisory, not mandatory recipe):
         $optimization_blueprint_hint
 
-        VERIFIED ENVIRONMENT FACTS (authoritative):
-        $repair_ground_truth
+        VERIFIED ENVIRONMENT FACTS (authoritative; prefer these over memory or heuristics):
+        $verified_environment_facts
 
-        REPAIR GROUND TRUTH:
+        REPAIR GROUND TRUTH (root cause + guardrails):
         $repair_ground_truth
 
         EDIT SCOPE:
@@ -4881,14 +5071,19 @@ class MLEngineerAgent:
 
         YOUR TASK:
         Return ONLY the full updated Python script. No markdown, no explanation.
-        Apply one coherent optimization move that tests the active hypothesis.
+        Treat the active hypothesis as an optimization proposal to test, not a literal recipe to copy.
         Your priority order is: (1) make the script run without errors,
         (2) produce all contract-required artifacts with correct row counts,
         (3) then implement the metric improvement hypothesis. If the script has
         a runtime failure, fix that first — a broken script cannot test any
         hypothesis. Use the evidence to target the weakest part of the incumbent
-        rather than inventing a new plan. Prefer the cheapest valid change that
-        tests the idea without destabilizing working behavior.
+        rather than inventing a new plan. If the named technique conflicts with
+        verified environment facts, callable signatures, feature dtypes, or runtime
+        constraints, implement the closest compatible variant that preserves the
+        hypothesis intent and document that choice in the script comments.
+        Use the broader authoritative system context when a lock packet is sparse
+        or generic. Prefer the cheapest valid change that tests the idea without
+        destabilizing working behavior.
         """
 
         USER_IMPROVE_TEMPLATE = """
@@ -4999,13 +5194,16 @@ class MLEngineerAgent:
                 max_str_len=260,
                 max_list_items=30,
             )
-            repair_ground_truth_block = self._serialize_json_for_prompt(
+            repair_ground_truth_payload = (
                 handoff_payload.get("repair_ground_truth")
                 if isinstance(handoff_payload.get("repair_ground_truth"), dict)
-                else {},
-                max_chars=2600,
-                max_str_len=260,
-                max_list_items=24,
+                else {}
+            )
+            repair_ground_truth_block = self._build_repair_ground_truth_prompt_block(
+                repair_ground_truth_payload
+            )
+            verified_environment_facts_block = self._build_verified_environment_facts_block(
+                repair_ground_truth_payload
             )
             repair_scope_block = self._serialize_json_for_prompt(
                 handoff_payload.get("repair_scope")
@@ -5036,7 +5234,8 @@ class MLEngineerAgent:
                     optimization_round_brief=optimization_briefs.get("round_brief") or "{}",
                     active_hypothesis_brief=optimization_briefs.get("active_hypothesis_brief") or "{}",
                     current_evidence_brief=optimization_briefs.get("current_evidence_brief") or "{}",
-                    repair_ground_truth=repair_ground_truth_block or "{}",
+                    verified_environment_facts=optimization_briefs.get("verified_environment_facts") or verified_environment_facts_block or "{}",
+                    repair_ground_truth=optimization_briefs.get("repair_ground_truth") or repair_ground_truth_block or "{}",
                     repair_scope=repair_scope_block or "{}",
                     optimization_blueprint_hint=optimization_briefs.get("optimization_blueprint_hint") or "[]",
                     invariants_lock=optimization_briefs.get("invariants_lock") or "{}",
@@ -5055,6 +5254,7 @@ class MLEngineerAgent:
                     last_run_memory=last_run_memory_block,
                     iteration_handoff_json=handoff_payload_json,
                     repair_ground_truth=repair_ground_truth_block or "{}",
+                    verified_environment_facts=verified_environment_facts_block or "{}",
                     repair_scope=repair_scope_block or "{}",
                     critic_packet_json=critic_packet_block,
                     hypothesis_packet_json=hypothesis_packet_block,
