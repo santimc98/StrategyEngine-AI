@@ -151,7 +151,7 @@ def write_final_state(run_id: str, state: Dict[str, Any]) -> None:
         "generated_code", "last_generated_code",
         "execution_output", "last_successful_execution_output",
         # Report & artifacts
-        "final_report", "pdf_path", "output_contract_report",
+        "final_report", "final_report_blocks", "pdf_path", "output_contract_report",
         "execution_feedback", "artifact_paths",
         "work_dir", "work_dir_abs",
         # Pipeline status

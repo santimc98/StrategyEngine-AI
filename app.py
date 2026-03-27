@@ -9,6 +9,7 @@ import glob
 import signal
 import threading
 import io
+import re
 import uuid as _uuid_mod
 import zipfile
 from datetime import datetime
@@ -282,6 +283,111 @@ def _resolve_ml_artifact_files(output_report: Dict[str, Any], result: Dict[str, 
                 _register(rel_path, rel_norm)
 
     return resolved
+
+
+_REPORT_IMAGE_PATTERN = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+
+
+def _resolve_report_asset_path(result: Dict[str, Any], path_ref: str) -> str | None:
+    if not isinstance(path_ref, str) or not path_ref.strip():
+        return None
+    raw = path_ref.strip()
+    if os.path.isabs(raw) and os.path.isfile(raw):
+        return raw
+
+    normalized = raw.replace("/", os.sep).replace("\\", os.sep)
+    for root in _build_artifact_roots(result if isinstance(result, dict) else {}):
+        candidate = os.path.join(root, normalized)
+        if os.path.isfile(candidate):
+            return candidate
+
+    if os.path.isfile(raw):
+        return os.path.abspath(raw)
+    return None
+
+
+def _render_report_markdown(markdown_text: str, result: Dict[str, Any]) -> None:
+    if not markdown_text:
+        return
+    last_end = 0
+    for match in _REPORT_IMAGE_PATTERN.finditer(markdown_text):
+        text_before = markdown_text[last_end:match.start()].strip()
+        if text_before:
+            st.markdown(text_before, unsafe_allow_html=True)
+        image_alt = match.group(1)
+        image_ref = match.group(2)
+        image_path = _resolve_report_asset_path(result, image_ref)
+        if image_path:
+            st.image(image_path, caption=image_alt or None, use_container_width=True)
+        last_end = match.end()
+    remainder = markdown_text[last_end:].strip()
+    if remainder:
+        st.markdown(remainder, unsafe_allow_html=True)
+
+
+def _render_report_blocks(blocks: List[Dict[str, Any]], result: Dict[str, Any]) -> bool:
+    if not isinstance(blocks, list) or not blocks:
+        return False
+    rendered_any = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "markdown":
+            text = str(block.get("content") or "").strip()
+            if text:
+                _render_report_markdown(text, result)
+                rendered_any = True
+        elif block_type == "heading":
+            level = block.get("level", 2)
+            try:
+                level = int(level)
+            except Exception:
+                level = 2
+            level = max(1, min(3, level))
+            text = str(block.get("text") or "").strip()
+            if text:
+                st.markdown(f'{"#" * level} {text}')
+                rendered_any = True
+        elif block_type == "paragraph":
+            text = str(block.get("text") or "").strip()
+            if text:
+                st.markdown(text, unsafe_allow_html=True)
+                rendered_any = True
+        elif block_type == "bullet_list":
+            items = [str(item).strip() for item in block.get("items", []) if str(item or "").strip()]
+            if items:
+                st.markdown("\n".join(f"- {item}" for item in items), unsafe_allow_html=True)
+                rendered_any = True
+        elif block_type == "numbered_list":
+            items = [str(item).strip() for item in block.get("items", []) if str(item or "").strip()]
+            if items:
+                st.markdown("\n".join(f"{idx}. {item}" for idx, item in enumerate(items, start=1)), unsafe_allow_html=True)
+                rendered_any = True
+        elif block_type == "artifact":
+            lead_in = str(block.get("lead_in") or "").strip()
+            if lead_in:
+                st.markdown(lead_in, unsafe_allow_html=True)
+            artifact_type = str(block.get("artifact_type") or "").strip().lower()
+            if artifact_type == "chart":
+                image_path = _resolve_report_asset_path(result, str(block.get("path") or ""))
+                if image_path:
+                    st.image(image_path, caption=str(block.get("title") or "").strip() or None, use_container_width=True)
+                    rendered_any = True
+            elif artifact_type == "html_table":
+                content_html = str(block.get("content_html") or "").strip()
+                if content_html:
+                    st.markdown(content_html, unsafe_allow_html=True)
+                    rendered_any = True
+            elif artifact_type == "data_preview":
+                content_markdown = str(block.get("content_markdown") or "").strip()
+                if content_markdown:
+                    st.markdown(content_markdown, unsafe_allow_html=True)
+                    rendered_any = True
+            for note in [str(item).strip() for item in block.get("analysis", []) if str(item or "").strip()]:
+                st.markdown(note, unsafe_allow_html=True)
+                rendered_any = True
+    return rendered_any
 
 
 def _sanitize_agent_model_map(raw: Any) -> Dict[str, str]:
@@ -738,6 +844,41 @@ section[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label span {
     white-space: pre-wrap;
     word-wrap: break-word;
 }
+
+/* ---------- Executive Report Tables ---------- */
+.exec-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.9rem 0 1.2rem 0;
+    font-size: 0.94rem;
+    background: #ffffff;
+}
+.exec-table th,
+.exec-table td {
+    border: 1px solid #dbe4f0;
+    padding: 0.55rem 0.7rem;
+    text-align: left;
+    vertical-align: top;
+}
+.exec-table th {
+    background: #eef4fb;
+    color: #0f172a;
+    font-weight: 700;
+}
+.exec-table tr:nth-child(even) td {
+    background: #f8fbff;
+}
+.status-badge {
+    display: inline-block;
+    padding: 0.18rem 0.6rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 700;
+}
+.status-ok { background: #dcfce7; color: #166534; }
+.status-warn { background: #fef3c7; color: #92400e; }
+.status-error { background: #fee2e2; color: #991b1b; }
+.status-neutral { background: #e2e8f0; color: #334155; }
 
 /* ---------- Download Buttons ---------- */
 .stDownloadButton > button {
@@ -2818,35 +2959,11 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
     with tab4:
         st.markdown("#### Informe Ejecutivo")
         final_report = result.get('final_report', '')
-        if final_report:
-            # Render report with inline images: split on ![alt](path) and
-            # render each image via st.image() so they appear inline.
-            import re as _re
-            _img_pattern = _re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
-            _report_run_id = st.session_state.get("viewing_run_id") or result.get("run_id")
-            _last_end = 0
-            for _m in _img_pattern.finditer(final_report):
-                # Render markdown text before this image
-                _text_before = final_report[_last_end:_m.start()].strip()
-                if _text_before:
-                    st.markdown(_text_before)
-                # Resolve image path from run dir or cwd
-                _img_alt = _m.group(1)
-                _img_rel = _m.group(2)
-                _img_resolved = None
-                if _report_run_id:
-                    _candidate = os.path.join("runs", str(_report_run_id), "work", _img_rel)
-                    if os.path.isfile(_candidate):
-                        _img_resolved = _candidate
-                if not _img_resolved and os.path.isfile(_img_rel):
-                    _img_resolved = _img_rel
-                if _img_resolved:
-                    st.image(_img_resolved, caption=_img_alt or None, use_container_width=True)
-                _last_end = _m.end()
-            # Render remaining text after last image (or full report if no images)
-            _remainder = final_report[_last_end:].strip()
-            if _remainder:
-                st.markdown(_remainder)
+        final_report_blocks = result.get("final_report_blocks")
+        if isinstance(final_report_blocks, list) and final_report_blocks:
+            _render_report_blocks(final_report_blocks, result)
+        elif final_report:
+            _render_report_markdown(final_report, result)
         else:
             st.info("No se gener\u00f3 un informe ejecutivo para esta ejecuci\u00f3n.")
 

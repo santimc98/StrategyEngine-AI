@@ -1549,6 +1549,310 @@ def _build_embeddable_artifacts_catalog(
     return "\n\n".join(entries)
 
 
+def _strip_html_tags(text: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", " ", str(text or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _summarize_prompt_text(text: str, max_chars: int = 420) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max(0, max_chars - 6)].rstrip() + " [cut]"
+
+
+def _build_embeddable_artifact_registry(
+    *,
+    plots: List[str],
+    plot_summaries: Optional[List[Dict[str, Any]]],
+    cleaned_sample_table_text: str,
+    scored_sample_table_text: str,
+    kpi_snapshot_table_html: str,
+    artifact_inventory_table_html: str,
+    artifact_compliance_table_html: str,
+) -> Dict[str, Dict[str, Any]]:
+    registry: Dict[str, Dict[str, Any]] = {}
+    summary_by_file: Dict[str, Dict[str, Any]] = {}
+    if isinstance(plot_summaries, list):
+        for item in plot_summaries:
+            if not isinstance(item, dict):
+                continue
+            fname = os.path.basename(str(item.get("filename") or item.get("path") or ""))
+            if fname:
+                summary_by_file[fname] = item
+
+    for idx, plot_path in enumerate(plots or [], start=1):
+        normalized_path = str(plot_path or "").replace("\\", "/").strip()
+        if not normalized_path:
+            continue
+        fname = os.path.basename(normalized_path)
+        name_stem = fname.rsplit(".", 1)[0].replace("_", " ").title()
+        summary = summary_by_file.get(fname, {})
+        title = str(summary.get("title") or name_stem or f"Chart {idx}").strip()
+        facts = summary.get("key_facts") or summary.get("facts") or ""
+        if isinstance(facts, list):
+            facts = "; ".join(str(f) for f in facts[:4])
+        registry[f"chart_{idx}"] = {
+            "artifact_key": f"chart_{idx}",
+            "artifact_type": "chart",
+            "title": title,
+            "path": normalized_path,
+            "summary": _summarize_prompt_text(facts or f"Chart available at {normalized_path}"),
+            "guidance": "Use inline near the specific finding it supports, then interpret the business implication.",
+        }
+
+    if cleaned_sample_table_text and cleaned_sample_table_text != "No data available.":
+        registry["cleaned_sample_preview"] = {
+            "artifact_key": "cleaned_sample_preview",
+            "artifact_type": "data_preview",
+            "title": "Cleaned dataset sample",
+            "content_markdown": cleaned_sample_table_text,
+            "summary": "Preview of the cleaned dataset structure and representative rows.",
+            "guidance": "Use when explaining data structure, cleaning outcome, or whether the modeling table is usable.",
+        }
+
+    if scored_sample_table_text and scored_sample_table_text != "No data available.":
+        registry["scored_sample_preview"] = {
+            "artifact_key": "scored_sample_preview",
+            "artifact_type": "data_preview",
+            "title": "Predictions sample",
+            "content_markdown": scored_sample_table_text,
+            "summary": "Preview of scored rows and model output structure.",
+            "guidance": "Use when explaining prediction outputs or what downstream consumers would receive.",
+        }
+
+    if kpi_snapshot_table_html and len(kpi_snapshot_table_html) > 30:
+        registry["kpi_snapshot"] = {
+            "artifact_key": "kpi_snapshot",
+            "artifact_type": "html_table",
+            "title": "KPI Snapshot",
+            "content_html": kpi_snapshot_table_html,
+            "summary": "Compact table with executive decision, data adequacy status, decisioning columns, and top numeric metrics.",
+            "guidance": "Use only if a compact KPI summary materially strengthens the executive decision.",
+        }
+
+    if artifact_inventory_table_html and len(artifact_inventory_table_html) > 30:
+        registry["artifact_inventory"] = {
+            "artifact_key": "artifact_inventory",
+            "artifact_type": "html_table",
+            "title": "Artifact Inventory",
+            "content_html": artifact_inventory_table_html,
+            "summary": "Inventory of generated artifacts with presence, row counts, column counts, and sizes.",
+            "guidance": "Use when artifact traceability matters for the argument or evidence trail.",
+        }
+
+    if artifact_compliance_table_html and len(artifact_compliance_table_html) > 30:
+        registry["artifact_compliance"] = {
+            "artifact_key": "artifact_compliance",
+            "artifact_type": "html_table",
+            "title": "Output Compliance",
+            "content_html": artifact_compliance_table_html,
+            "summary": "Table summarizing output-contract status, review verdict, required artifacts, and failed gates.",
+            "guidance": "Use when discussing delivery readiness, compliance, or governance blockers.",
+        }
+
+    return registry
+
+
+def _artifact_registry_prompt_json(registry: Dict[str, Dict[str, Any]]) -> str:
+    prompt_items: List[Dict[str, Any]] = []
+    for artifact_key, item in registry.items():
+        if not isinstance(item, dict):
+            continue
+        prompt_item: Dict[str, Any] = {
+            "artifact_key": artifact_key,
+            "artifact_type": item.get("artifact_type"),
+            "title": item.get("title"),
+            "summary": item.get("summary"),
+            "guidance": item.get("guidance"),
+        }
+        if item.get("artifact_type") == "chart":
+            prompt_item["path"] = item.get("path")
+        elif item.get("artifact_type") == "data_preview":
+            prompt_item["preview"] = _summarize_prompt_text(item.get("content_markdown", ""), max_chars=900)
+        elif item.get("artifact_type") == "html_table":
+            prompt_item["preview"] = _summarize_prompt_text(_strip_html_tags(item.get("content_html", "")), max_chars=300)
+        prompt_items.append(prompt_item)
+    return json.dumps(prompt_items, ensure_ascii=False, indent=2)
+
+
+def _coerce_block_items(value: Any, max_items: int = 8) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    items: List[str] = []
+    for item in value:
+        text = sanitize_text(str(item or "")).strip()
+        if not text:
+            continue
+        items.append(text)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _validate_structured_report_payload(
+    payload: Optional[Dict[str, Any]],
+    registry: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    issues: List[str] = []
+    if not isinstance(payload, dict):
+        return ["payload_not_dict"]
+    blocks = payload.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        return ["missing_blocks"]
+    supported = {"heading", "paragraph", "bullet_list", "numbered_list", "artifact"}
+    if len(blocks) < 4:
+        issues.append("blocks_insufficient")
+    for idx, block in enumerate(blocks[:24]):
+        if not isinstance(block, dict):
+            issues.append(f"block_{idx}_not_dict")
+            continue
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type not in supported:
+            issues.append(f"block_{idx}_unsupported_type")
+            continue
+        if block_type == "heading":
+            if not str(block.get("text") or "").strip():
+                issues.append(f"block_{idx}_missing_heading_text")
+        elif block_type == "paragraph":
+            if not str(block.get("text") or "").strip():
+                issues.append(f"block_{idx}_missing_paragraph_text")
+        elif block_type in {"bullet_list", "numbered_list"}:
+            if not _coerce_block_items(block.get("items")):
+                issues.append(f"block_{idx}_missing_items")
+        elif block_type == "artifact":
+            artifact_key = str(block.get("artifact_key") or "").strip()
+            if not artifact_key:
+                issues.append(f"block_{idx}_missing_artifact_key")
+            elif artifact_key not in registry:
+                issues.append(f"block_{idx}_unknown_artifact_key")
+    return issues
+
+
+def _hydrate_report_blocks(
+    payload: Dict[str, Any],
+    registry: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    hydrated: List[Dict[str, Any]] = []
+    for block in payload.get("blocks", []) or []:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "heading":
+            text = sanitize_text(str(block.get("text") or "")).strip()
+            if not text:
+                continue
+            level = block.get("level", 2)
+            try:
+                level = int(level)
+            except Exception:
+                level = 2
+            level = max(1, min(3, level))
+            hydrated.append({"type": "heading", "level": level, "text": text})
+            continue
+        if block_type == "paragraph":
+            text = sanitize_text(str(block.get("text") or "")).strip()
+            if text:
+                hydrated.append({"type": "paragraph", "text": text})
+            continue
+        if block_type in {"bullet_list", "numbered_list"}:
+            items = _coerce_block_items(block.get("items"))
+            if items:
+                hydrated.append({"type": block_type, "items": items})
+            continue
+        if block_type == "artifact":
+            artifact_key = str(block.get("artifact_key") or "").strip()
+            artifact = registry.get(artifact_key)
+            if not artifact:
+                continue
+            analysis_items = _coerce_block_items(block.get("analysis"), max_items=4)
+            if not analysis_items:
+                analysis_text = sanitize_text(str(block.get("analysis_text") or block.get("analysis_note") or "")).strip()
+                if analysis_text:
+                    analysis_items = [analysis_text]
+            lead_in = sanitize_text(str(block.get("lead_in") or block.get("intro") or "")).strip()
+            hydrated_block = {
+                "type": "artifact",
+                "artifact_key": artifact_key,
+                "artifact_type": artifact.get("artifact_type"),
+                "title": artifact.get("title"),
+                "lead_in": lead_in,
+                "analysis": analysis_items,
+            }
+            if artifact.get("path"):
+                hydrated_block["path"] = artifact.get("path")
+            if artifact.get("content_html"):
+                hydrated_block["content_html"] = artifact.get("content_html")
+            if artifact.get("content_markdown"):
+                hydrated_block["content_markdown"] = artifact.get("content_markdown")
+            hydrated.append(hydrated_block)
+    return hydrated
+
+
+def _render_report_blocks_to_markdown(
+    blocks: List[Dict[str, Any]],
+    *,
+    title: str,
+    evidence_paths: List[str],
+    llm_evidence_items: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    parts: List[str] = []
+    has_h1 = any(
+        isinstance(block, dict) and block.get("type") == "heading" and int(block.get("level", 2)) == 1
+        for block in (blocks or [])
+        if isinstance(block, dict)
+    )
+    clean_title = sanitize_text(str(title or "")).strip()
+    if clean_title and not has_h1:
+        parts.append(f"# {clean_title}")
+
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "markdown":
+            parts.append(str(block.get("content") or "").strip())
+        elif block_type == "heading":
+            level = max(1, min(3, int(block.get("level", 2))))
+            parts.append(f'{"#" * level} {block.get("text", "").strip()}')
+        elif block_type == "paragraph":
+            parts.append(str(block.get("text") or "").strip())
+        elif block_type == "bullet_list":
+            items = [f"- {item}" for item in block.get("items", []) if str(item or "").strip()]
+            if items:
+                parts.append("\n".join(items))
+        elif block_type == "numbered_list":
+            numbered = [
+                f"{idx}. {item}"
+                for idx, item in enumerate(
+                    [str(item).strip() for item in block.get("items", []) if str(item or "").strip()],
+                    start=1,
+                )
+            ]
+            if numbered:
+                parts.append("\n".join(numbered))
+        elif block_type == "artifact":
+            lead_in = str(block.get("lead_in") or "").strip()
+            if lead_in:
+                parts.append(lead_in)
+            artifact_type = str(block.get("artifact_type") or "").strip().lower()
+            if artifact_type == "chart" and block.get("path"):
+                title_text = str(block.get("title") or "Chart").strip() or "Chart"
+                parts.append(f'![{title_text}]({str(block.get("path")).replace("\\", "/")})')
+            elif artifact_type == "html_table" and block.get("content_html"):
+                parts.append(str(block.get("content_html")).strip())
+            elif artifact_type == "data_preview" and block.get("content_markdown"):
+                parts.append(str(block.get("content_markdown")).strip())
+            analysis_items = [str(item).strip() for item in block.get("analysis", []) if str(item or "").strip()]
+            if analysis_items:
+                parts.append("\n\n".join(analysis_items))
+
+    if not any(isinstance(block, dict) and block.get("type") == "markdown" and "## Evidencia usada" in str(block.get("content") or "") for block in (blocks or [])):
+        parts.append("## Evidencia usada")
+        parts.append(_canonical_evidence_section(evidence_paths, llm_items=llm_evidence_items))
+    return _normalize_evidence_sources("\n\n".join(part for part in parts if str(part or "").strip()).strip() + "\n")
+
+
 def _build_outline_prompt(
     *,
     target_language_code: str,
@@ -1696,6 +2000,8 @@ class BusinessTranslatorAgent:
         self.model_name = os.getenv("TRANSLATOR_MODEL", "google/gemini-3-flash-preview")
         self.last_prompt = None
         self.last_response = None
+        self.last_report_blocks = None
+        self.last_report_payload = None
 
     def _call_llm(self, prompt: str) -> str:
         model = getattr(self, "model", None)
@@ -2422,12 +2728,9 @@ Error condition: $error_condition
 === EVIDENCE SOURCES ===
 Available artifacts: $evidence_paths_text
 Metrics: $metrics_table_text
-KPI Snapshot (HTML): $kpi_snapshot_table_html
 
 === DETAILED CONTEXT ===
 Outline Plan (pass-1): $outline_plan_json
-Artifact Inventory (HTML): $artifact_inventory_table_html
-Artifact Compliance (HTML): $artifact_compliance_table_html
 Cleaned Data Sample: $cleaned_sample_table_text
 Scored Rows Sample: $scored_sample_table_text
 Artifact Headers: $artifact_headers_table_text
@@ -2441,28 +2744,56 @@ Slot Coverage: $slot_coverage_context
 === APPENDIX (lower priority — use only if needed for depth) ===
 $context_appendix_json
 
-=== EMBEDDABLE ARTIFACTS ===
-The following artifacts are available for inline embedding in your report.
+=== RENDERABLE ARTIFACT REGISTRY ===
+These artifacts are available for optional inline embedding. Decide yourself
 Place each artifact where it best supports the narrative — do NOT group all
-visuals in a single section. Each chart, data preview, or table should appear
-immediately after the claim or finding it illustrates.
+the narrative. No artifact is mandatory.
 
-$embeddable_artifacts_catalog
+$embeddable_artifacts_registry_json
 
-Embedding rules:
-- Charts: copy the ![title](path) syntax exactly as shown above. Follow each
-  embedded chart with 2-3 sentences interpreting what it reveals and why it
-  matters for the business decision.
-- Data previews (CSV samples): paste the provided text table directly into
-  the markdown. Introduce it with context (e.g. "A sample of the cleaned
-  dataset shows the structure:" or "The model predictions for the first
-  rows:").
+=== OUTPUT FORMAT ===
+Return ONLY valid JSON. No markdown, no commentary, no code fences.
+
+You are not writing raw HTML or raw markdown directly. Instead, design the
+report as a sequence of narrative blocks that the renderer will materialize.
+This gives you freedom over section order, whether a table needs a heading,
+and where each chart or table should appear.
+
+Schema:
+{
+  "title": "...",
+  "blocks": [
+    {"type": "heading", "level": 1, "text": "..."},
+    {"type": "paragraph", "text": "..."},
+    {"type": "bullet_list", "items": ["...", "..."]},
+    {"type": "numbered_list", "items": ["...", "..."]},
+    {
+      "type": "artifact",
+      "artifact_key": "kpi_snapshot",
+      "lead_in": "One short contextual sentence before the artifact.",
+      "analysis": ["Sentence 1 interpreting the artifact.", "Sentence 2 explaining business impact."]
+    }
+  ],
+  "evidence": [
+    {"claim": "...", "source": "artifact_path -> key"}
+  ]
+}
+
+Rules:
+- The first substantive blocks must communicate the executive decision and why.
+- Structure and section order are yours to determine based on what matters most.
+- Use artifact blocks only when they materially improve clarity or trust.
+- Do NOT create a separate "Visual Analysis" or "Análisis Visual" section.
+- Charts, data previews, and summary tables belong inline next to the finding they support.
+- Do NOT emit raw HTML tables or markdown image syntax inside text blocks.
+- The Evidence trail will be rendered from the "evidence" array; do not add a separate evidence heading block.
+- If the Outline Plan is non-empty, use it as a starting skeleton but adapt freely.
 - HTML tables (KPI, inventory, compliance): paste the HTML directly — it
   renders correctly in the PDF.
 - Not every artifact must be used. Select and place only those that
   strengthen the narrative. Skip artifacts that add no decision value.
 
-=== OUTPUT FORMAT ===
+LEGACY MARKDOWN GUIDANCE BELOW IS DEPRECATED - IGNORE IT.
 Markdown. The report should read as a continuous executive narrative — not
 a data dump, not a wall of tables, not charts grouped in a separate annex.
 
@@ -2490,16 +2821,14 @@ freely to improve clarity and narrative flow.
         execution_results = state.get("execution_output", "No execution results available.")
         USER_MESSAGE_TEMPLATE = """
 Analyze the context above. Reason about what happened, what matters most,
-and what the decision-maker should do. Then write the executive report.
+and what the decision-maker should do. Then return the structured report payload.
 
 EXECUTION FINDINGS:
 $execution_results
 
-The final section must be "## Evidencia Usada" with entries:
-  {claim: "...", source: "artifact_path -> key"}
 """
 
-        embeddable_catalog = _build_embeddable_artifacts_catalog(
+        artifact_registry = _build_embeddable_artifact_registry(
             plots=plots,
             plot_summaries=state.get("plot_summaries") if isinstance(state.get("plot_summaries"), list) else None,
             cleaned_sample_table_text=cleaned_sample_table_text,
@@ -2508,6 +2837,7 @@ The final section must be "## Evidencia Usada" with entries:
             artifact_inventory_table_html=artifact_inventory_table_html,
             artifact_compliance_table_html=artifact_compliance_table_html,
         )
+        artifact_registry_prompt_json = _artifact_registry_prompt_json(artifact_registry)
 
         prompt_values = {
             "senior_translation_protocol": SENIOR_TRANSLATION_PROTOCOL,
@@ -2529,9 +2859,6 @@ The final section must be "## Evidencia Usada" with entries:
             "outline_plan_json": "{}",
             "reporting_policy_context": json.dumps(reporting_policy_context, ensure_ascii=False),
             "slot_coverage_context": json.dumps(slot_coverage_context, ensure_ascii=False),
-            "artifact_inventory_table_html": artifact_inventory_table_html,
-            "artifact_compliance_table_html": artifact_compliance_table_html,
-            "kpi_snapshot_table_html": kpi_snapshot_table_html,
             "metrics_table_text": metrics_table_text,
             "cleaned_sample_table_text": cleaned_sample_table_text,
             "scored_sample_table_text": scored_sample_table_text,
@@ -2539,7 +2866,7 @@ The final section must be "## Evidencia Usada" with entries:
             "recommendations_table_text": recommendations_table_text,
             "context_appendix_json": json.dumps(context_appendix, ensure_ascii=False),
             "pipeline_scope_section": pipeline_scope_section,
-            "embeddable_artifacts_catalog": embeddable_catalog,
+            "embeddable_artifacts_registry_json": artifact_registry_prompt_json,
         }
 
         two_pass_enabled = str(os.getenv("TRANSLATOR_TWO_PASS_ENABLED", "1")).strip().lower() not in {
@@ -2626,8 +2953,49 @@ The final section must be "## Evidencia Usada" with entries:
         try:
             content = self._call_llm(full_prompt)
             is_echo_response = content.strip() == full_prompt.strip()
+            self.last_report_blocks = None
+            self.last_report_payload = None
+            structured_payload = None
+            structured_payload_issues: List[str] = []
+            structured_layout_enabled = str(os.getenv("TRANSLATOR_STRUCTURED_LAYOUT_ENABLED", "1")).strip().lower() not in {
+                "0",
+                "off",
+                "false",
+                "no",
+            }
+
+            if structured_layout_enabled and not is_echo_response:
+                structured_payload = _extract_first_json_object(content)
+                if structured_payload is None:
+                    structured_payload_issues = ["payload_parse_failed"]
+                else:
+                    structured_payload_issues = _validate_structured_report_payload(structured_payload, artifact_registry)
+                    if not structured_payload_issues:
+                        hydrated_blocks = _hydrate_report_blocks(structured_payload, artifact_registry)
+                        if hydrated_blocks:
+                            llm_evidence_items = (
+                                structured_payload.get("evidence")
+                                if isinstance(structured_payload.get("evidence"), list)
+                                else None
+                            )
+                            evidence_markdown = (
+                                "## Evidencia usada\n\n"
+                                + _canonical_evidence_section(evidence_paths, llm_items=llm_evidence_items)
+                            )
+                            content = _render_report_blocks_to_markdown(
+                                hydrated_blocks,
+                                title=sanitize_text(str(structured_payload.get("title") or "")).strip(),
+                                evidence_paths=evidence_paths,
+                                llm_evidence_items=llm_evidence_items,
+                            )
+                            self.last_report_blocks = hydrated_blocks + [{"type": "markdown", "content": evidence_markdown}]
+                            self.last_report_payload = structured_payload
+                        else:
+                            structured_payload_issues = ["hydrated_blocks_empty"]
+
             content = _sanitize_report_text(content)
-            content = _ensure_evidence_section(content, evidence_paths)
+            if self.last_report_blocks is None:
+                content = _ensure_evidence_section(content, evidence_paths)
             content = sanitize_text(content)
 
             validation = {
@@ -2669,6 +3037,9 @@ The final section must be "## Evidencia Usada" with entries:
                     if not validation.get("has_critical") and best_score >= int(os.getenv("TRANSLATOR_MIN_QUALITY_SCORE", "60")):
                         break  # Report is good enough
                     try:
+                        if self.last_report_blocks is not None:
+                            self.last_report_blocks = None
+                            self.last_report_payload = None
                         all_issues = validation.get("critical_issues", []) + validation.get("structure_issues", [])
                         if not validation.get("has_critical"):
                             # Quality is low but no critical — add hint
@@ -2730,6 +3101,16 @@ The final section must be "## Evidencia Usada" with entries:
                     + warning_lines
                     + "\n"
                 )
+                if isinstance(self.last_report_blocks, list):
+                    self.last_report_blocks.extend(
+                        [
+                            {"type": "heading", "level": 2, "text": "Validation Notes"},
+                            {
+                                "type": "bullet_list",
+                                "items": [str(item) for item in validation.get("unverified_metrics", [])[:6] if item],
+                            },
+                        ]
+                    )
             if decision_discrepancy:
                 content = (
                     content.rstrip()
@@ -2737,12 +3118,35 @@ The final section must be "## Evidencia Usada" with entries:
                     + f"Derived decision: {decision_discrepancy.get('derived_decision')} | "
                     + f"run_summary outcome: {decision_discrepancy.get('run_outcome')}\n"
                 )
+                if isinstance(self.last_report_blocks, list):
+                    self.last_report_blocks.extend(
+                        [
+                            {"type": "heading", "level": 2, "text": "Decision Reconciliation Note"},
+                            {
+                                "type": "paragraph",
+                                "text": (
+                                    f"Derived decision: {decision_discrepancy.get('derived_decision')} | "
+                                    f"run_summary outcome: {decision_discrepancy.get('run_outcome')}"
+                                ),
+                            },
+                        ]
+                    )
             if prompt_budget_notes:
                 content = (
                     content.rstrip()
                     + "\n\n## Prompt Budget Note\n"
                     + "Some low-priority context blocks were compacted to stay within model limits.\n"
                 )
+                if isinstance(self.last_report_blocks, list):
+                    self.last_report_blocks.extend(
+                        [
+                            {"type": "heading", "level": 2, "text": "Prompt Budget Note"},
+                            {
+                                "type": "paragraph",
+                                "text": "Some low-priority context blocks were compacted to stay within model limits.",
+                            },
+                        ]
+                    )
 
             _persist_quality_audit(
                 {
@@ -2754,6 +3158,12 @@ The final section must be "## Evidencia Usada" with entries:
                         "notes": two_pass_notes,
                         "outline_issues": outline_issues,
                         "outline_generated": bool(outline_payload),
+                    },
+                    "structured_layout": {
+                        "enabled": structured_layout_enabled,
+                        "payload_parsed": bool(structured_payload),
+                        "payload_issues": structured_payload_issues,
+                        "block_count": len(self.last_report_blocks or []),
                     },
                     "quality_threshold": quality_threshold,
                     "repair_loop": {
@@ -2792,11 +3202,19 @@ The final section must be "## Evidencia Usada" with entries:
                         "outline_issues": outline_issues,
                         "outline_generated": bool(outline_payload),
                     },
+                    "structured_layout": {
+                        "enabled": False,
+                        "payload_parsed": False,
+                        "payload_issues": ["llm_exception"],
+                        "block_count": 0,
+                    },
                     "quality_score": 0,
                     "validation": {"has_critical": True, "critical_issues": ["llm_exception"]},
                     "exception": str(e),
                 }
             )
+            self.last_report_blocks = None
+            self.last_report_payload = None
             self.last_response = error_report
             return error_report
 

@@ -74,6 +74,10 @@ def test_write_final_state_prefers_review_board_verdict_and_keeps_governance_fie
             "run_outcome": "NO_GO",
             "overall_status_global": "error",
             "hard_failures": ["runtime_failure"],
+            "final_report_blocks": [
+                {"type": "heading", "level": 1, "text": "Reporte Ejecutivo"},
+                {"type": "paragraph", "text": "Resumen."},
+            ],
         },
     )
 
@@ -85,3 +89,4 @@ def test_write_final_state_prefers_review_board_verdict_and_keeps_governance_fie
     assert payload["run_outcome"] == "NO_GO"
     assert payload["overall_status_global"] == "error"
     assert payload["hard_failures"] == ["runtime_failure"]
+    assert payload["final_report_blocks"][0]["type"] == "heading"

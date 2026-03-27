@@ -13928,6 +13928,7 @@ class AgentState(TypedDict):
     generated_code: str
     execution_output: str
     final_report: str
+    final_report_blocks: List[Dict[str, Any]]
     # Feedback Loop Fields
     iteration_count: int
     expensive_cycle_count: int
@@ -30667,6 +30668,11 @@ def run_translator(state: AgentState) -> AgentState:
         """
     report = sanitize_text(report or "")
     report_state["final_report"] = report
+    report_blocks = getattr(translator, "last_report_blocks", None)
+    if isinstance(report_blocks, list) and report_blocks:
+        report_state["final_report_blocks"] = report_blocks
+    else:
+        report_state.pop("final_report_blocks", None)
     if run_id:
             log_agent_snapshot(
                 run_id,
@@ -30684,9 +30690,21 @@ def run_translator(state: AgentState) -> AgentState:
         os.makedirs("data", exist_ok=True)
         with open("data/executive_summary.md", "w", encoding="utf-8") as f_exec:
             f_exec.write(report or "")
+        if isinstance(report_blocks, list) and report_blocks:
+            with open("data/final_report_blocks.json", "w", encoding="utf-8") as f_blocks:
+                json.dump(report_blocks, f_blocks, ensure_ascii=False, indent=2)
+        else:
+            _stale_blocks = "data/final_report_blocks.json"
+            if os.path.exists(_stale_blocks):
+                try:
+                    os.remove(_stale_blocks)
+                except Exception:
+                    pass
         existing_index = _load_json_any("data/produced_artifact_index.json")
         normalized_existing = existing_index if isinstance(existing_index, list) else []
         report_artifacts = ["data/executive_summary.md"]
+        if os.path.exists("data/final_report_blocks.json"):
+            report_artifacts.append("data/final_report_blocks.json")
         if os.path.exists("data/report_artifact_manifest.json"):
             report_artifacts.append("data/report_artifact_manifest.json")
         if os.path.exists("data/report_visual_tables.json"):
@@ -30802,7 +30820,11 @@ def run_translator(state: AgentState) -> AgentState:
     finally:
         # P0 FIX: Always restore cwd on exit
         exit_run_workspace(state)
-    return {"final_report": report, "pdf_path": report_state.get("pdf_path")}
+    return {
+        "final_report": report,
+        "final_report_blocks": report_state.get("final_report_blocks"),
+        "pdf_path": report_state.get("pdf_path"),
+    }
 # Generate Unique PDF Path to avoid file locks
 import uuid
 
