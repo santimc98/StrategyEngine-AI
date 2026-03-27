@@ -8,6 +8,7 @@ os.environ.setdefault("OPENROUTER_API_KEY", "dummy-openrouter")
 os.environ.setdefault("GOOGLE_API_KEY", "dummy-google")
 
 from src.graph.graph import (
+    _build_metric_improvement_patch_objectives,
     _build_metric_round_contract_lock,
     _build_hybrid_bundle_signature,
     _metric_round_has_deterministic_blockers,
@@ -195,6 +196,25 @@ def test_metric_round_contract_lock_filters_baseline_only_reviewer_gates() -> No
         "probability_output_validation",
     ]
     assert lock["reviewer_gates"] == ["submission_schema_compliance"]
+
+
+def test_metric_round_patch_objectives_prefer_compatible_variant_language() -> None:
+    objectives = _build_metric_improvement_patch_objectives(
+        {
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "target_log_transform_for_regression",
+                "target_columns": ["ALL_NUMERIC"],
+                "params": {"bundle_techniques": ["target_log_transform_for_regression", "rare_bucketing"]},
+            },
+        }
+    )
+
+    joined = "\n".join(objectives)
+    assert "closest compatible variant" in joined
+    assert "contract-defined target scope" in joined
+    assert "NO_OP is forbidden" not in joined
+    assert "Apply hypothesis technique" not in joined
 
 
 def test_restore_metric_round_baseline_state_realigns_final_governance(tmp_path, monkeypatch) -> None:

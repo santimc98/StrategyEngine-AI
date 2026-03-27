@@ -28326,25 +28326,31 @@ def _build_metric_improvement_patch_objectives(hypothesis_packet: Dict[str, Any]
     params = hypothesis.get("params") if isinstance(hypothesis.get("params"), dict) else {}
     bundle_techniques = params.get("bundle_techniques") if isinstance(params.get("bundle_techniques"), list) else []
     bundle_techniques = [str(item) for item in bundle_techniques[:3] if str(item).strip()]
-    targets_text = ", ".join([str(item) for item in target_columns[:6]]) if target_columns else "ALL_NUMERIC"
+    generic_target_tokens = {"ALL_NUMERIC", "ALL_TARGETS", "CONTRACT_TARGETS", "PRIMARY_TARGET"}
+    concrete_targets = [
+        str(item)
+        for item in target_columns[:6]
+        if str(item).strip() and str(item).strip().upper() not in generic_target_tokens
+    ]
+    targets_text = ", ".join(concrete_targets) if concrete_targets else "contract-defined target scope"
     action = str(hypothesis_packet.get("action") or "NO_OP").upper()
 
     objectives: List[str] = []
     if action == "APPLY" and technique and technique != "NO_OP":
         objectives.append(
-            "Apply hypothesis technique '" + technique + "' on target columns: " + targets_text + "."
+            "Test the active hypothesis centered on '" + technique + "' for target scope: " + targets_text + "."
         )
         objectives.append(
-            "NO_OP is forbidden in this round. Implement the hypothesis with material feature engineering edits."
+            "Make a material but minimal edit that changes evaluated behavior. If the named technique conflicts with verified environment facts or runtime constraints, use the closest compatible variant rather than a literal copy."
         )
         if len(bundle_techniques) >= 2:
             objectives.append(
-                "Exploit phase active: apply compatible hybrid bundle in sequence: "
+                "Exploit phase active: if multiple techniques are bundled, apply only the subset that remains mutually compatible and minimally invasive: "
                 + ", ".join(bundle_techniques[:2])
                 + "."
             )
         objectives.append(
-            "Keep baseline model family and CV/data-split protocol stable while injecting the hypothesis end-to-end."
+            "Preserve the incumbent model family, CV/data-split protocol, and output contract unless verified compatibility evidence forces a local adjustment."
         )
     else:
         objectives.append("No-op hypothesis selected; preserve baseline logic and keep outputs contract-compliant.")
