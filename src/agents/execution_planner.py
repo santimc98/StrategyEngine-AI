@@ -73,6 +73,7 @@ _API_KEY_SENTINEL = object()
 
 _QA_SEVERITIES = {"HARD", "SOFT"}
 _CLEANING_SEVERITIES = {"HARD", "SOFT"}
+_DEFAULT_EXECUTION_PLANNER_COMPILER_MODEL = "google/gemini-3-flash-preview"
 
 # ── Token sets removed (seniority refactoring) ──────────────────────────
 # Capability detection (resampling, decisioning, explanation, visualization)
@@ -371,7 +372,16 @@ class _OpenRouterAdapter:
     def __init__(self, api_key: str, model_name: str):
         self.api_key = str(api_key or "").strip()
         self.model_name = str(model_name or "").strip()
-        self._client = OpenAI(api_key=self.api_key, base_url="https://openrouter.ai/api/v1")
+        retries_raw = str(os.getenv("EXECUTION_PLANNER_TRANSPORT_MAX_RETRIES", "0")).strip()
+        try:
+            self.transport_max_retries = max(0, int(retries_raw))
+        except Exception:
+            self.transport_max_retries = 0
+        self._client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://openrouter.ai/api/v1",
+            max_retries=self.transport_max_retries,
+        )
 
     def generate_content(self, prompt: str, generation_config: Dict[str, Any] | None = None):
         """Call OpenRouter and return a response object compatible with _extract_openai_response_text."""
@@ -424,6 +434,15 @@ class _OpenRouterAdapter:
             raw_response = raw_api.create(**call_kwargs)
             response = raw_response.parse() if hasattr(raw_response, "parse") else raw_response
             raw_body = _read_openai_raw_response_body(raw_response)
+            raw_http_response = getattr(raw_response, "http_response", None)
+            request_id = getattr(response, "_request_id", None)
+            if not request_id and raw_http_response is not None:
+                headers = getattr(raw_http_response, "headers", None)
+                if headers is not None:
+                    try:
+                        request_id = headers.get("x-request-id") or headers.get("request-id")
+                    except Exception:
+                        request_id = None
             if raw_body:
                 try:
                     setattr(response, "_codex_raw_body", raw_body)
@@ -431,6 +450,9 @@ class _OpenRouterAdapter:
                     pass
             try:
                 setattr(response, "_codex_transport_mode", "with_raw_response")
+                setattr(response, "_codex_transport_max_retries", self.transport_max_retries)
+                if request_id:
+                    setattr(response, "_codex_request_id", str(request_id))
             except Exception:
                 pass
             return response
@@ -438,6 +460,10 @@ class _OpenRouterAdapter:
         response = self._client.chat.completions.create(**call_kwargs)
         try:
             setattr(response, "_codex_transport_mode", "standard")
+            setattr(response, "_codex_transport_max_retries", self.transport_max_retries)
+            request_id = getattr(response, "_request_id", None)
+            if request_id:
+                setattr(response, "_codex_request_id", str(request_id))
         except Exception:
             pass
         return response
@@ -7590,12 +7616,13 @@ class ExecutionPlannerAgent:
                     chain.append(model)
         self.model_chain = chain
         self._default_model_chain = list(chain)
-        # Optional separate model for Task B (compilation).
-        # Falls back to the primary model when not set.
+        # Task B (contract compilation) defaults to Flash to keep the
+        # semantic pass on Pro while preserving a lower-cost compiler path.
+        # The UI/runtime can still override this explicitly.
         _compiler_model_raw = (
             os.getenv("EXECUTION_PLANNER_COMPILER_MODEL", "").strip()
         )
-        self.compiler_model_name: str | None = _compiler_model_raw or None
+        self.compiler_model_name: str = _compiler_model_raw or _DEFAULT_EXECUTION_PLANNER_COMPILER_MODEL
         self.last_prompt = None
         self.last_response = None
         self.last_contract_diagnostics = None
@@ -8390,6 +8417,15 @@ class ExecutionPlannerAgent:
             transport_mode = getattr(response_obj, "_codex_transport_mode", None)
             if transport_mode:
                 entry["transport_mode"] = str(transport_mode)
+            transport_max_retries = getattr(response_obj, "_codex_transport_max_retries", None)
+            if isinstance(transport_max_retries, int):
+                entry["transport_max_retries"] = int(transport_max_retries)
+            request_id = (
+                getattr(response_obj, "_codex_request_id", None)
+                or getattr(response_obj, "_request_id", None)
+            )
+            if request_id:
+                entry["request_id"] = str(request_id)
             if isinstance(extra, dict) and extra:
                 entry.update(_safe_json_serializable(extra))
             planner_llm_call_trace.append(entry)

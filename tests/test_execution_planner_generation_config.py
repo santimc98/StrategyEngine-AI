@@ -86,11 +86,21 @@ def test_execution_planner_generate_content_uses_plain_json_generation_without_t
 def test_execution_planner_defaults_to_openrouter_json_generation_stack(monkeypatch):
     monkeypatch.delenv("EXECUTION_PLANNER_PRIMARY_MODEL", raising=False)
     monkeypatch.delenv("EXECUTION_PLANNER_MODEL", raising=False)
+    monkeypatch.delenv("EXECUTION_PLANNER_COMPILER_MODEL", raising=False)
 
     agent = ExecutionPlannerAgent(api_key=None)
 
     assert agent.provider == "openrouter"
     assert agent.model_name == "google/gemini-3.1-pro-preview"
+    assert agent.compiler_model_name == "google/gemini-3-flash-preview"
+
+
+def test_execution_planner_allows_explicit_compiler_model_override(monkeypatch):
+    monkeypatch.setenv("EXECUTION_PLANNER_COMPILER_MODEL", "google/gemini-3.1-pro-preview")
+
+    agent = ExecutionPlannerAgent(api_key=None)
+
+    assert agent.compiler_model_name == "google/gemini-3.1-pro-preview"
 
 
 def test_execution_planner_uses_openrouter_api_key_env(monkeypatch):
@@ -147,6 +157,7 @@ def test_execution_planner_transport_validation_rejects_empty_payload():
 
 def test_openrouter_adapter_uses_single_standard_transport_call_by_default(monkeypatch):
     monkeypatch.delenv("EXECUTION_PLANNER_CAPTURE_RAW_RESPONSE", raising=False)
+    monkeypatch.delenv("EXECUTION_PLANNER_TRANSPORT_MAX_RETRIES", raising=False)
 
     class _FakeCreate:
         def __init__(self):
@@ -157,6 +168,7 @@ def test_openrouter_adapter_uses_single_standard_transport_call_by_default(monke
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))],
                 usage=SimpleNamespace(completion_tokens=5, prompt_tokens=7),
+                _request_id="req_standard_123",
             )
 
     create_api = _FakeCreate()
@@ -170,14 +182,20 @@ def test_openrouter_adapter_uses_single_standard_transport_call_by_default(monke
 
     assert len(create_api.calls) == 1
     assert getattr(response, "_codex_transport_mode", None) == "standard"
+    assert getattr(response, "_codex_transport_max_retries", None) == 0
+    assert getattr(response, "_codex_request_id", None) == "req_standard_123"
 
 
 def test_openrouter_adapter_raw_capture_mode_makes_single_raw_request(monkeypatch):
     monkeypatch.setenv("EXECUTION_PLANNER_CAPTURE_RAW_RESPONSE", "1")
+    monkeypatch.delenv("EXECUTION_PLANNER_TRANSPORT_MAX_RETRIES", raising=False)
 
     class _FakeRawResponse:
         def __init__(self):
-            self.http_response = SimpleNamespace(text='{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}')
+            self.http_response = SimpleNamespace(
+                text='{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}',
+                headers={"x-request-id": "req_raw_456"},
+            )
 
         def parse(self):
             return SimpleNamespace(
@@ -213,3 +231,41 @@ def test_openrouter_adapter_raw_capture_mode_makes_single_raw_request(monkeypatc
     assert standard_calls == []
     assert getattr(response, "_codex_transport_mode", None) == "with_raw_response"
     assert isinstance(getattr(response, "_codex_raw_body", None), str)
+    assert getattr(response, "_codex_transport_max_retries", None) == 0
+    assert getattr(response, "_codex_request_id", None) == "req_raw_456"
+
+
+def test_openrouter_adapter_disables_sdk_retries_by_default(monkeypatch):
+    monkeypatch.delenv("EXECUTION_PLANNER_TRANSPORT_MAX_RETRIES", raising=False)
+
+    captured = {}
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.chat = SimpleNamespace(completions=SimpleNamespace())
+
+    monkeypatch.setattr("src.agents.execution_planner.OpenAI", _FakeOpenAI)
+
+    adapter = _OpenRouterAdapter(api_key="test-key", model_name="model-name")
+
+    assert adapter.transport_max_retries == 0
+    assert captured.get("max_retries") == 0
+
+
+def test_openrouter_adapter_respects_explicit_transport_retry_override(monkeypatch):
+    monkeypatch.setenv("EXECUTION_PLANNER_TRANSPORT_MAX_RETRIES", "1")
+
+    captured = {}
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.chat = SimpleNamespace(completions=SimpleNamespace())
+
+    monkeypatch.setattr("src.agents.execution_planner.OpenAI", _FakeOpenAI)
+
+    adapter = _OpenRouterAdapter(api_key="test-key", model_name="model-name")
+
+    assert adapter.transport_max_retries == 1
+    assert captured.get("max_retries") == 1
