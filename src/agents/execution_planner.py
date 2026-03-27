@@ -2,6 +2,7 @@ import json
 import os
 import ast
 import copy
+import hashlib
 import math
 from typing import Dict, Any, List, Optional, Tuple, Callable
 import re
@@ -245,7 +246,7 @@ DATA_ENGINEER section:
   cleaning_gates: array of gate objects for data quality
   runbook: objectives + constraints for cleaning task
   artifact_requirements: cleaned_dataset paths, required_columns, transforms
-    CRITICAL: required_columns must NOT include "decision" role columns.
+    CRITICAL: required_columns plus optional_passthrough_columns must preserve every operational dependency the contract needs. A column may be disallowed as a model feature and still need to survive for filtering, splitting, label scoping, lineage, or audit.
     Include output_manifest_path for downstream provenance chain.
   outlier_policy: (optional) {"enabled", "target_columns", "methods"}
   constraints: (optional) additional execution constraints
@@ -410,21 +411,36 @@ class _OpenRouterAdapter:
                 allowed = fcc.get("allowedFunctionNames", [])
                 if allowed:
                     call_kwargs["tool_choice"] = {"type": "function", "function": {"name": allowed[0]}}
-        raw_api = getattr(self._client.chat.completions, "with_raw_response", None)
-        if raw_api is not None and hasattr(raw_api, "create"):
+        use_raw_capture = str(os.getenv("EXECUTION_PLANNER_CAPTURE_RAW_RESPONSE", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if use_raw_capture:
+            raw_api = getattr(self._client.chat.completions, "with_raw_response", None)
+            if raw_api is None or not hasattr(raw_api, "create"):
+                raise RuntimeError("with_raw_response transport unavailable while raw capture is enabled")
+            raw_response = raw_api.create(**call_kwargs)
+            response = raw_response.parse() if hasattr(raw_response, "parse") else raw_response
+            raw_body = _read_openai_raw_response_body(raw_response)
+            if raw_body:
+                try:
+                    setattr(response, "_codex_raw_body", raw_body)
+                except Exception:
+                    pass
             try:
-                raw_response = raw_api.create(**call_kwargs)
-                response = raw_response.parse() if hasattr(raw_response, "parse") else raw_response
-                raw_body = _read_openai_raw_response_body(raw_response)
-                if raw_body:
-                    try:
-                        setattr(response, "_codex_raw_body", raw_body)
-                    except Exception:
-                        pass
-                return response
+                setattr(response, "_codex_transport_mode", "with_raw_response")
             except Exception:
                 pass
-        return self._client.chat.completions.create(**call_kwargs)
+            return response
+
+        response = self._client.chat.completions.create(**call_kwargs)
+        try:
+            setattr(response, "_codex_transport_mode", "standard")
+        except Exception:
+            pass
+        return response
 
 SEMANTIC_EXECUTION_PLANNER_PROMPT = """
 You are a Semantic Execution Planner for a multi-agent business intelligence system.
@@ -434,7 +450,7 @@ Decide what this run should achieve and produce ONE semantic_core JSON object th
 
 FIVE CORE PRINCIPLES
 1. Evidence-grounded: Every field must be supported by evidence from the business objective, strategy, column inventory, or dataset profile.
-2. Semantic closure: If you declare a concept (future ML handoff, feature sets, column exclusions), close every dependency it implies. model_features must exclude columns you classified as leakage/admin/PII. Allowed feature sets must be concretely closed through model_features.
+2. Semantic closure: If you declare a concept (future ML handoff, feature sets, column exclusions), close every dependency it implies. model_features must exclude columns you classified as leakage/admin/PII. But excluding a column from model_features does NOT mean the column can disappear from the run if task semantics, routing, filtering, temporal validation, or auditability still depend on it. Allowed feature sets must be concretely closed through model_features.
 3. Downstream-executable: The compiler and downstream agents must be able to build an executable plan from your semantic_core alone plus data context.
 4. No invention: Do not reference columns, artifacts, or capabilities that are not supported by the inputs.
 5. Minimal: The smallest semantic_core that satisfies principles 1-4.
@@ -447,9 +463,9 @@ SOURCE OF TRUTH
 REASONING WORKFLOW
 Before emitting JSON, reason through:
 1. What is the business asking this run to achieve now versus in a future run?
-2. Classify columns into semantic roles grounded in business meaning and leakage risk. A column that encodes the outcome or is only available after the prediction moment is leakage. When uncertain, exclude from features.
-3. Close every dependency: model_features must name explicit columns (not just conceptual families) whenever this run prepares a future modeling subset. Do not leave model_features empty while claiming future-ML readiness.
-4. Verify consistency: every column in model_features appears in column_roles.pre_decision. Every column in column_roles.outcome is excluded from model_features.
+2. Classify columns into semantic roles grounded in business meaning, availability at prediction time, and operational use. A column that encodes the outcome or is only available after the prediction moment cannot be a model feature. But some non-feature columns are still operationally required to define row filters, scoring scope, split logic, temporal ordering, label availability, or audit trace.
+3. Close every dependency: model_features must name explicit columns (not just conceptual families) whenever this run prepares a future modeling subset. Do not leave model_features empty while claiming future-ML readiness. If task_semantics, evaluation, or gates depend on a column, keep that dependency explicit even when the column is excluded from model_features.
+4. Verify consistency: every column in model_features appears in column_roles.pre_decision. Every column in column_roles.outcome is excluded from model_features. Columns referenced by task_semantics, gating, or validation remain represented as operational dependencies even when they are not model features.
 
 CANONICAL_COLUMNS
 canonical_columns must list ALL columns from column_inventory that this run acknowledges. This is the dataset's full column manifest — not just anchor columns or role-specific subsets. If column_inventory has 42 columns and none are excluded, canonical_columns has 42 entries. The compiler and downstream agents use canonical_columns as the ground truth for what columns exist.
@@ -504,7 +520,7 @@ The cleaning_reviewer inherits the data_engineer context (cleaning_gates, artifa
 
 FIVE CORE PRINCIPLES
 1. Evidence-grounded: Every field must be supported by evidence from semantic_core or support_context. Do not invent columns, paths, or artifacts.
-2. Semantic closure: If you declare a concept anywhere, close its dependencies everywhere. model_features must appear in cleaned_dataset.required_columns. Evaluation metric must match in evaluation_spec and validation_requirements. HARD gate columns must be covered by required_columns or optional_passthrough_columns.
+2. Semantic closure: If you declare a concept anywhere, close its dependencies everywhere. model_features must appear in cleaned_dataset.required_columns. Evaluation metric must match in evaluation_spec and validation_requirements. HARD gate columns and task_semantics dependencies must be covered by required_columns or optional_passthrough_columns even when they are excluded from model_features.
 3. Downstream-executable: Each downstream agent must be able to execute its task from its contract section alone (plus shared). The contract is the single source of truth for execution.
 4. No invention: Do not reference columns not in column_inventory, do not create training sections when model_training=false, do not invent artifacts beyond what the semantic core implies.
 5. Minimal: The shortest valid contract that satisfies principles 1-4. No filler sections, no padding with defaults when context provides specifics.
@@ -546,7 +562,7 @@ COMPILATION REASONING
 Before emitting JSON, reason through:
 1. What did semantic_core already decide? Preserve it in "shared".
 2. What does each agent need exclusively? Place it in that agent's section.
-3. Are all dependencies closed? Every model_feature in cleaned_dataset.required_columns? Every HARD gate column covered? Every metric consistent across sections?
+3. Are all dependencies closed? Every model_feature in cleaned_dataset.required_columns? Every HARD gate and task_semantics dependency covered? If a column is needed operationally but not as a model feature, preserve it through required_columns or optional_passthrough_columns. Every metric consistent across sections?
 4. Is anything invented? Remove it. Is anything redundant? Remove it.
 
 RUNBOOK PRINCIPLES
@@ -7584,6 +7600,7 @@ class ExecutionPlannerAgent:
         self.last_response = None
         self.last_contract_diagnostics = None
         self.last_semantic_core = None
+        self.last_llm_call_trace = None
 
     @staticmethod
     def _estimate_prompt_tokens(prompt: str) -> int:
@@ -8317,7 +8334,10 @@ class ExecutionPlannerAgent:
                 os.makedirs(planner_dir, exist_ok=True)
 
         planner_diag: List[Dict[str, Any]] = []
+        planner_llm_call_trace: List[Dict[str, Any]] = []
+        adjudication_cache: Dict[str, Dict[str, Any]] = {}
         self.last_planner_diag = planner_diag
+        self.last_llm_call_trace = planner_llm_call_trace
         self.last_contract_min = None
         self.last_contract_canonical = None
         planner_candidate_invalid: Dict[str, Any] | None = None
@@ -8340,6 +8360,39 @@ class ExecutionPlannerAgent:
                     json.dump(payload, handle, indent=2, ensure_ascii=True)
             except Exception:
                 pass
+
+        def _prompt_fingerprint(prompt_text: str) -> str:
+            text = prompt_text if isinstance(prompt_text, str) else ""
+            return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+        def _record_llm_call(
+            stage: str,
+            *,
+            model_name: str,
+            prompt_text: str,
+            response_text: Optional[str] = None,
+            usage_metadata: Any = None,
+            cached: bool = False,
+            extra: Optional[Dict[str, Any]] = None,
+            response_obj: Any = None,
+        ) -> None:
+            entry: Dict[str, Any] = {
+                "stage": str(stage or "").strip() or "unknown",
+                "model_name": str(model_name or "").strip(),
+                "prompt_char_len": len(prompt_text or ""),
+                "prompt_fingerprint": _prompt_fingerprint(prompt_text or ""),
+                "response_char_len": len(response_text or ""),
+                "cached": bool(cached),
+            }
+            normalized_usage = _normalize_usage_metadata(usage_metadata)
+            if isinstance(normalized_usage, dict):
+                entry["usage_metadata"] = normalized_usage
+            transport_mode = getattr(response_obj, "_codex_transport_mode", None)
+            if transport_mode:
+                entry["transport_mode"] = str(transport_mode)
+            if isinstance(extra, dict) and extra:
+                entry.update(_safe_json_serializable(extra))
+            planner_llm_call_trace.append(entry)
 
         def _persist_attempt(prompt_name: str, response_name: str, prompt_text: str, response_text: str | None) -> None:
             if not planner_dir:
@@ -8371,7 +8424,10 @@ class ExecutionPlannerAgent:
             if projection_contract:
                 _write_json(os.path.join(planner_dir, "contract_projection.json"), projection_contract)
             if planner_diag:
-                _write_json(os.path.join(planner_dir, "planner_diag.json"), {"attempts": planner_diag})
+                _write_json(
+                    os.path.join(planner_dir, "planner_diag.json"),
+                    {"attempts": planner_diag, "llm_call_trace": planner_llm_call_trace},
+                )
             if diagnostics_payload:
                 _write_json(
                     os.path.join(planner_dir, "contract_diagnostics.json"),
@@ -8639,6 +8695,7 @@ class ExecutionPlannerAgent:
             *,
             model_client: Any,
             model_name: str,
+            trace_stage: str = "validation_adjudication",
         ) -> Dict[str, Any]:
             adjudicable_issues = _collect_adjudicable_validation_issues(validation_result)
             if not adjudicable_issues or model_client is None:
@@ -8673,6 +8730,27 @@ class ExecutionPlannerAgent:
                 + "\n\nSUPPORT_CONTEXT:\n"
                 + json.dumps(support_context_payload, ensure_ascii=False, indent=2)
             )
+            cache_key = hashlib.sha256(
+                (
+                    str(model_name or "")
+                    + "\n"
+                    + str(trace_stage or "")
+                    + "\n"
+                    + prompt
+                ).encode("utf-8", errors="replace")
+            ).hexdigest()
+            cached_payload = adjudication_cache.get(cache_key)
+            if isinstance(cached_payload, dict):
+                _record_llm_call(
+                    trace_stage,
+                    model_name=model_name,
+                    prompt_text=prompt,
+                    response_text=None,
+                    usage_metadata=cached_payload.get("_usage_metadata"),
+                    cached=True,
+                    extra={"adjudicable_issue_count": len(adjudicable_issues)},
+                )
+                return copy.deepcopy(cached_payload.get("result") or {})
             try:
                 response, _ = self._generate_content_with_budget(
                     model_client,
@@ -8683,6 +8761,16 @@ class ExecutionPlannerAgent:
                 )
                 response_text = self._extract_openai_response_text(response)
                 parsed_payload, _ = _parse_json_response(response_text)
+                _record_llm_call(
+                    trace_stage,
+                    model_name=model_name,
+                    prompt_text=prompt,
+                    response_text=response_text,
+                    usage_metadata=getattr(response, "usage", None) or getattr(response, "usage_metadata", None),
+                    cached=False,
+                    extra={"adjudicable_issue_count": len(adjudicable_issues)},
+                    response_obj=response,
+                )
                 if not isinstance(parsed_payload, dict):
                     return copy.deepcopy(validation_result) if isinstance(validation_result, dict) else {}
                 adjudicated = _apply_validation_adjudication(validation_result, parsed_payload)
@@ -8690,6 +8778,12 @@ class ExecutionPlannerAgent:
                     summary = dict(adjudicated.get("summary") or {})
                     summary["adjudicator_model"] = model_name
                     adjudicated["summary"] = summary
+                    adjudication_cache[cache_key] = {
+                        "result": copy.deepcopy(adjudicated),
+                        "_usage_metadata": _normalize_usage_metadata(
+                            getattr(response, "usage", None) or getattr(response, "usage_metadata", None)
+                        ),
+                    }
                 return adjudicated
             except Exception:
                 return copy.deepcopy(validation_result) if isinstance(validation_result, dict) else {}
@@ -9351,6 +9445,7 @@ class ExecutionPlannerAgent:
                     validation_result,
                     model_client=diagnostics_model_client,
                     model_name=self.model_name,
+                    trace_stage="contract_diagnostics_adjudication",
                 )
             except Exception as err:
                 validation_result = {
@@ -9499,9 +9594,13 @@ class ExecutionPlannerAgent:
                     post_validation,
                     model_client=self._build_model_client(self.model_name) if self.client else None,
                     model_name=self.model_name,
+                    trace_stage="finalize_post_validation_adjudication",
                 )
             diagnostics = _build_contract_diagnostics(contract if isinstance(contract, dict) else {}, where, llm_success)
+            if isinstance(diagnostics, dict):
+                diagnostics["llm_call_trace"] = copy.deepcopy(planner_llm_call_trace)
             self.last_contract_diagnostics = diagnostics
+            self.last_llm_call_trace = copy.deepcopy(planner_llm_call_trace)
             _persist_contracts(
                 contract if isinstance(contract, dict) else {},
                 semantic_core=planner_semantic_core,
@@ -9856,6 +9955,20 @@ domain_expert_critique:
                             )
 
                 _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
+                _record_llm_call(
+                    "semantic_core",
+                    model_name=model_name,
+                    prompt_text=current_prompt,
+                    response_text=response_text,
+                    usage_metadata=usage_metadata,
+                    cached=False,
+                    extra={
+                        "attempt_index": attempt_counter,
+                        "quality_round": 0,
+                        "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                    },
+                    response_obj=response,
+                )
 
                 parsed_payload, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
                 if parse_exc:
@@ -10004,6 +10117,21 @@ domain_expert_critique:
                                 )
 
                     _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
+                    _record_llm_call(
+                        "contract_patch_repair" if current_tool_mode == "patch" else "contract_compile",
+                        model_name=model_name,
+                        prompt_text=current_prompt,
+                        response_text=response_text,
+                        usage_metadata=usage_metadata,
+                        cached=False,
+                        extra={
+                            "attempt_index": attempt_counter,
+                            "quality_round": quality_round,
+                            "tool_mode": current_tool_mode,
+                            "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                        },
+                        response_obj=response,
+                    )
 
                     parsed_payload, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
                     if parse_exc:
@@ -10088,6 +10216,7 @@ domain_expert_critique:
                                 validation_result,
                                 model_client=model_client,
                                 model_name=model_name,
+                                trace_stage="compile_validation_adjudication",
                             )
                         except Exception as val_err:
                             validation_result = {

@@ -953,3 +953,148 @@ def test_empty_completion_with_tokens_is_classified_as_transport_empty_completio
     assert transport.get("accepted") is False
     issues = transport.get("issues") or []
     assert any(issue.get("rule") == "semantic_core.transport_empty_completion" for issue in issues if isinstance(issue, dict))
+
+
+def test_execution_planner_records_llm_call_trace_for_main_stages(monkeypatch):
+    planner = ExecutionPlannerAgent(api_key="mock_key")
+    planner.client = object()
+    planner._build_model_client = lambda _model_name: object()
+
+    semantic_payload = {
+        "scope": "full_pipeline",
+        "strategy_title": "Duplicate outputs",
+        "business_objective": "Predict target.",
+        "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
+        "canonical_columns": ["id", "feature", "target"],
+        "allowed_feature_sets": {
+            "model_features": ["feature"],
+            "segmentation_features": [],
+            "forbidden_features": ["target"],
+            "audit_only_features": ["id"],
+        },
+        "task_semantics": {
+            "problem_family": "classification",
+            "objective_type": "binary_classification",
+            "primary_target": "target",
+            "target_columns": ["target"],
+            "prediction_unit": "row",
+        },
+        "active_workstreams": {
+            "data_engineering": True,
+            "model_training": True,
+            "review": True,
+        },
+        "required_outputs": ["artifacts/ml/predictions.csv", "artifacts/ml/predictions.csv"],
+        "column_roles": {
+            "pre_decision": ["feature"],
+            "decision": [],
+            "outcome": ["target"],
+            "post_decision_audit_only": [],
+            "identifiers": ["id"],
+            "time_columns": [],
+            "unknown": [],
+        },
+        "model_features": ["feature"],
+        "cleaning_gates": [],
+        "qa_gates": [],
+        "reviewer_gates": [],
+        "data_engineer_runbook": {"steps": ["load", "clean", "persist"]},
+        "optimization_policy": {"primary_objective": "maximize roc_auc"},
+    }
+    compiled_contract = {
+        "contract_version": "5.0",
+        "scope": "full_pipeline",
+        "strategy_title": "Duplicate outputs",
+        "business_objective": "Predict target.",
+        "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
+        "canonical_columns": ["id", "feature", "target"],
+        "active_workstreams": {
+            "data_engineering": True,
+            "model_training": True,
+            "review": True,
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature"],
+            "segmentation_features": [],
+            "forbidden_features": ["target"],
+            "audit_only_features": ["id"],
+        },
+        "task_semantics": {
+            "problem_family": "classification",
+            "objective_type": "binary_classification",
+            "primary_target": "target",
+            "target_columns": ["target"],
+            "prediction_unit": "row",
+        },
+        "column_roles": {
+            "pre_decision": ["feature"],
+            "decision": [],
+            "outcome": ["target"],
+            "post_decision_audit_only": [],
+            "identifiers": ["id"],
+            "time_columns": [],
+            "unknown": [],
+        },
+        "required_outputs": [
+            {"path": "artifacts/ml/predictions.csv", "owner": "ml_engineer", "required": True},
+            {"path": "artifacts/ml/predictions.csv", "owner": "ml_engineer", "required": True},
+        ],
+        "model_features": ["feature"],
+        "cleaning_gates": [],
+        "qa_gates": [],
+        "reviewer_gates": [],
+        "data_engineer_runbook": {"steps": ["load", "clean", "persist"]},
+        "optimization_policy": {"primary_objective": "maximize roc_auc"},
+        "shared": {
+            "column_dtype_targets": {"id": {"target_dtype": "object"}, "target": {"target_dtype": "float64"}},
+            "optimization_policy": {"primary_objective": "maximize roc_auc"},
+            "iteration_policy": {"max_iterations": 1, "metric_improvement_max": 0, "runtime_fix_max": 0, "compliance_bootstrap_max": 0},
+        },
+        "data_engineer": {
+            "artifact_requirements": {
+                "cleaned_dataset": {
+                    "output_path": "artifacts/clean/dataset_cleaned.csv",
+                    "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+                    "required_columns": ["id", "feature", "target"],
+                }
+            }
+        },
+        "ml_engineer": {
+            "artifact_requirements": {},
+            "evaluation_spec": {"primary_metric": "roc_auc"},
+            "validation_requirements": {"primary_metric": "roc_auc"},
+        },
+        "reviewer": {"reviewer_gates": []},
+        "qa_reviewer": {"qa_gates": []},
+        "reporting_policy": {},
+    }
+
+    calls = []
+
+    def _fake_generate(_client, prompt, output_token_floor=1024, *, model_name=None, tool_mode="contract"):
+        if "AMBIGUOUS_ISSUES_JSON" in prompt:
+            payload = {"issue_verdicts": [{"issue_index": 1, "decision": "clear", "reason": "duplicate output path is acceptable here"}]}
+        elif tool_mode == "semantic":
+            payload = semantic_payload
+        else:
+            payload = compiled_contract
+        response = SimpleNamespace(
+            text=json.dumps(payload),
+            candidates=[],
+            usage_metadata={"completion_tokens": 11, "prompt_tokens": 17},
+        )
+        calls.append({"tool_mode": tool_mode, "model_name": model_name, "is_adjudicator": "AMBIGUOUS_ISSUES_JSON" in prompt})
+        return response, {"max_output_tokens": output_token_floor, "model_name": model_name}
+
+    planner._generate_content_with_budget = _fake_generate
+
+    planner.generate_contract(
+        strategy={"required_columns": ["id", "feature", "target"], "title": "Duplicate outputs"},
+        business_objective="Predict target.",
+        column_inventory=["id", "feature", "target"],
+    )
+
+    llm_trace = planner.last_llm_call_trace or []
+    assert llm_trace
+    assert llm_trace[0].get("stage") == "semantic_core"
+    assert all(entry.get("prompt_fingerprint") for entry in llm_trace)

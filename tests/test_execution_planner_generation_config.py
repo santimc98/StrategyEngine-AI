@@ -1,4 +1,6 @@
-from src.agents.execution_planner import ExecutionPlannerAgent
+from types import SimpleNamespace
+
+from src.agents.execution_planner import ExecutionPlannerAgent, _OpenRouterAdapter
 from src.utils.contract_response_schema import EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
 
 
@@ -141,3 +143,73 @@ def test_execution_planner_transport_validation_rejects_empty_payload():
     assert result.get("accepted") is False
     issues = result.get("issues") or []
     assert any(issue.get("rule") == "contract.transport_payload_empty" for issue in issues if isinstance(issue, dict))
+
+
+def test_openrouter_adapter_uses_single_standard_transport_call_by_default(monkeypatch):
+    monkeypatch.delenv("EXECUTION_PLANNER_CAPTURE_RAW_RESPONSE", raising=False)
+
+    class _FakeCreate:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))],
+                usage=SimpleNamespace(completion_tokens=5, prompt_tokens=7),
+            )
+
+    create_api = _FakeCreate()
+    raw_api = SimpleNamespace(create=lambda **kwargs: (_ for _ in ()).throw(AssertionError("raw transport should not be used")))
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_api.create, with_raw_response=raw_api)))
+
+    adapter = _OpenRouterAdapter(api_key="test", model_name="model")
+    adapter._client = fake_client
+
+    response = adapter.generate_content("hello", {"max_output_tokens": 123})
+
+    assert len(create_api.calls) == 1
+    assert getattr(response, "_codex_transport_mode", None) == "standard"
+
+
+def test_openrouter_adapter_raw_capture_mode_makes_single_raw_request(monkeypatch):
+    monkeypatch.setenv("EXECUTION_PLANNER_CAPTURE_RAW_RESPONSE", "1")
+
+    class _FakeRawResponse:
+        def __init__(self):
+            self.http_response = SimpleNamespace(text='{"choices":[{"message":{"content":"{\\"ok\\": true}"}}]}')
+
+        def parse(self):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))],
+                usage=SimpleNamespace(completion_tokens=5, prompt_tokens=7),
+            )
+
+    class _RawAPI:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return _FakeRawResponse()
+
+    raw_api = _RawAPI()
+    standard_calls = []
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: standard_calls.append(kwargs),
+                with_raw_response=raw_api,
+            )
+        )
+    )
+
+    adapter = _OpenRouterAdapter(api_key="test", model_name="model")
+    adapter._client = fake_client
+
+    response = adapter.generate_content("hello", {"max_output_tokens": 123})
+
+    assert len(raw_api.calls) == 1
+    assert standard_calls == []
+    assert getattr(response, "_codex_transport_mode", None) == "with_raw_response"
+    assert isinstance(getattr(response, "_codex_raw_body", None), str)
