@@ -648,16 +648,22 @@ class QAReviewerAgent:
            - If X is explicitly built from contract feature_cols and excludes extra columns, this is sufficient.
            
         4. OUTPUT SAFETY (only if gate enabled):
-           - If saving plots, `os.makedirs('static/plots', exist_ok=True)` MUST be called.
+           - Verify that required outputs are written safely and to the intended paths.
+           - Explicit directory creation is one acceptable pattern, but not the only valid implementation.
 
         5. INPUT CSV LOADING (only if gate enabled):
-           - The code MUST call pandas.read_csv(...) to load the ML dataset specified in context (ml_data_path).
+           - Verify the code loads the authoritative ML dataset declared in context (ml_data_path) or an equivalent
+             contract-backed path. Prefer evidence of correct data provenance over a specific API call shape.
 
         6. NO SYNTHETIC DATA (only if gate enabled):
-           - The code MUST NOT fabricate datasets via random generators, sklearn.datasets.make_*, or literal DataFrame constructors.
+           - Reject only when there is concrete evidence that fabricated or synthetic data replaces the required real dataset.
+           - Random generators, sklearn.datasets.make_*, or literal DataFrame constructors are strong evidence patterns,
+             but judge them in context instead of treating them as a blind string match.
 
         7. CONTRACT COLUMNS (only if gate enabled):
-           - The code MUST reference canonical contract columns explicitly.
+           - Verify that feature and target selection remain traceable to contract columns, declared aliases, or
+             authoritative selectors from the provided QA context.
+           - Explicit canonical column references are helpful evidence, but not the only acceptable implementation.
 
         8. OUTPUT ROW COUNT CONSISTENCY (only if gate enabled):
            - For CSV artifacts with artifact_requirements.file_schemas.<path>.expected_row_count, verify code writes

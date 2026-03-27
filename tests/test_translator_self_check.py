@@ -1,7 +1,11 @@
 import json
 import os
 
-from src.agents.business_translator import BusinessTranslatorAgent, _score_report_quality
+from src.agents.business_translator import (
+    BusinessTranslatorAgent,
+    _score_report_quality,
+    _validate_report_structure,
+)
 
 
 class _EchoModel:
@@ -43,6 +47,48 @@ def test_translator_prompt_declares_source_of_truth_and_authoritative_outcome(tm
 
     assert "=== SOURCE OF TRUTH AND PRECEDENCE ===" in report
     assert "The authoritative executive outcome for this report is: NO_GO" in report
+
+
+def test_translator_prompt_keeps_layout_flexible_without_legacy_markdown_scaffold(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "NO_GO"}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    agent.generate_report(
+        {"execution_output": "OK", "business_objective": "Objetivo de prueba"}
+    )
+
+    prompt = agent.last_prompt or ""
+    assert "Make the authoritative executive decision and its rationale clear early." in prompt
+    assert "LEGACY MARKDOWN GUIDANCE BELOW IS DEPRECATED" not in prompt
+    assert "Executive decision with clear rationale (always first)" not in prompt
+
+
+def test_translator_structure_validation_accepts_risk_semantics_without_heading():
+    report = """
+# Reporte Ejecutivo
+
+NO_GO por falta de confianza en la evidencia disponible.
+
+## Hallazgos Clave
+
+La señal principal es insuficiente para producción y mantiene un riesgo operativo alto, por lo que requiere una nueva iteración controlada.
+
+## Evidencia usada
+
+evidence:
+{claim: "La conclusión procede del resumen de la run", source: "data/run_summary.json -> run_outcome"}
+"""
+
+    issues = _validate_report_structure(report, expected_language="es")
+
+    assert "missing_decision_section" not in issues
+    assert "missing_risks_section" not in issues
 
 
 def test_translator_quality_score_penalizes_decision_discrepancy_context():

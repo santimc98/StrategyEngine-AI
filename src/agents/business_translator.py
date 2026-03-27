@@ -1252,11 +1252,16 @@ def _validate_report_structure(content: str, expected_language: str) -> List[str
         r"(?im)^\s*##\s+.{0,10}(Riesgo|Risk|Limitaci|Limitation).{0,30}$",
         content,
     )
-    if not decision_header:
+    decision_signal = decision_header or _extract_report_decision(content[:1200] or content)
+    risk_signal = risk_header or re.search(
+        r"(?is)\b(riesgo(?:s)?|risk(?:s)?|limitaci(?:o|ó)n(?:es)?|limitation(?:s)?)\b",
+        content,
+    )
+    if not decision_signal:
         issues.append("missing_decision_section")
     if not evidence_header:
         issues.append("missing_evidence_section")
-    if not risk_header:
+    if not risk_signal:
         issues.append("missing_risks_section")
     if expected_language == "es":
         if re.search(r"(?i)\b(the|therefore|however)\b", content[:600]):
@@ -1873,7 +1878,9 @@ The final decision label must be: $executive_decision_label
 
 Reasoning workflow:
 1. Decide what an executive needs to know first.
-2. Design a narrative that flows naturally: decision → evidence → risks → actions.
+2. Design the narrative order that best serves the decision-maker for this run.
+   The executive decision and its rationale should become clear early, but the
+   exact sequence of evidence, risks, and actions is yours to decide.
 3. For each section, decide which artifacts (charts, data previews, tables) should
    be embedded inline to support the claims. Charts and data previews should NOT be
    grouped in a separate "Visual Analysis" section — they belong next to the finding
@@ -2780,7 +2787,7 @@ Schema:
 }
 
 Rules:
-- The first substantive blocks must communicate the executive decision and why.
+- Make the authoritative executive decision and its rationale clear early.
 - Structure and section order are yours to determine based on what matters most.
 - Use artifact blocks only when they materially improve clarity or trust.
 - Do NOT create a separate "Visual Analysis" or "Análisis Visual" section.
@@ -2788,34 +2795,8 @@ Rules:
 - Do NOT emit raw HTML tables or markdown image syntax inside text blocks.
 - The Evidence trail will be rendered from the "evidence" array; do not add a separate evidence heading block.
 - If the Outline Plan is non-empty, use it as a starting skeleton but adapt freely.
-- HTML tables (KPI, inventory, compliance): paste the HTML directly — it
-  renders correctly in the PDF.
 - Not every artifact must be used. Select and place only those that
   strengthen the narrative. Skip artifacts that add no decision value.
-
-LEGACY MARKDOWN GUIDANCE BELOW IS DEPRECATED - IGNORE IT.
-Markdown. The report should read as a continuous executive narrative — not
-a data dump, not a wall of tables, not charts grouped in a separate annex.
-
-The structure and section order are yours to determine based on what matters
-most for this specific run. Think like a senior consultant presenting to the
-C-suite: lead with the decision, support it with evidence, surface risks,
-and close with actionable next steps.
-
-Required elements (structure is flexible):
-- Executive decision with clear rationale (always first)
-- Key findings connected to business impact, with supporting charts and
-  data previews embedded inline where they strengthen the argument
-- Risks and limitations
-- Recommended next actions (specific, not generic)
-- Evidence trail (## Evidencia Usada) — always the FINAL section
-
-Do NOT create a separate "Visual Analysis" or "Análisis Visual" section.
-Charts and data previews belong inline, woven into the narrative next to
-the finding they illustrate.
-
-If the Outline Plan is non-empty, use it as a starting skeleton but adapt
-freely to improve clarity and narrative flow.
 """)
 
         execution_results = state.get("execution_output", "No execution results available.")

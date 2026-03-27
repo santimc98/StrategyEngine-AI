@@ -438,8 +438,9 @@ def _review_cleaning_impl(
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": (
-                    "Analyze this evidence payload. Pay special attention to cleaning_quality_summary "
-                    "(if present) for null inflation and possible datetime parsing failures. "
+                    "Analyze this evidence payload. Treat cleaning_quality_summary (if present) as supplementary "
+                    "evidence for null inflation or datetime parsing issues, but keep header, manifest, gate params, "
+                    "and deterministic results as the primary anchors for your judgment. "
                     "Then evaluate each cleaning gate and return your JSON verdict.\n\n"
                     + json.dumps(payload, ensure_ascii=True)
                 )},

@@ -742,21 +742,21 @@ class ReviewerAgent:
         1. **SECURITY & SAFETY (Non-Negotiable):**
            - No malicious code, no external network calls (except sanctioned APIs), no file system deletions outside `data/`.
            
-        2. **METHODOLOGY VERIFICATION (Results-Based, Not Syntax-Based):**
-           - **Baseline Check:** If Metric Improvement Round Active=false, a simple baseline is preferred but not required.
-             If Metric Improvement Round Active=true, baseline-establishment and baseline-simplicity preferences are out of scope unless explicitly listed in ACTIVE_REVIEWER_GATES.
-           - **Validation Rigor:**
-             * WARN (not REJECT) if a predictive model uses a single `train_test_split` on a small dataset.
-             * Cross-Validation is PREFERRED but holdout is ACCEPTABLE if metrics.json shows reasonable results.
-             * REJECT only if testing is done on Training Data (actual Leakage detected in results).
-           - **Assumption Check:** Does the code handle critical assumptions? (WARN if missing, REJECT only if results are clearly invalid).
-           - **EXECUTION-AWARE PRINCIPLE:** If the code produces valid metrics.json and alignment_check.json,
-             the methodology is likely sound. Trust execution results over static code patterns.
+        2. **METHOD FIT & EXECUTION RELIABILITY (Evidence-First, Context-Relative):**
+           - Judge the chosen approach relative to the active Reviewer Gates, Evaluation Spec, Strategy Context,
+             and concrete execution evidence. Do NOT inject a generic preferred methodology from memory.
+           - Baseline simplicity, cross-validation style, model family preferences, and similar design choices are
+             only relevant when they materially affect correctness, trustworthiness, or a gate that is actually active.
+           - If the code produces valid metrics.json and alignment_check.json, trust the execution evidence over
+             static pattern matching unless there is concrete evidence of leakage, invalid evaluation, or broken outputs.
+           - Missing assumption handling is a warning unless it demonstrably invalidates the results.
            
-        3. **BUSINESS VALUE CHECK (The "So What?"):**
-           - **Alignment:** Does this analysis *actually* answer: "$business_objective"?
-           - *Example:* If objective is "Explain Drivers", a "Black Box" Neural Net is bad. A Decision Tree or Regression is better.
-           - *Action:* If the model choice contradicts the objective's need for explainability vs. performance, REJECT it with this specific feedback.
+        3. **BUSINESS OBJECTIVE FIT (The "So What?"):**
+           - Does this analysis *actually* answer: "$business_objective"?
+           - Evaluate explainability, performance, calibration, latency, and other trade-offs only as they matter
+             for this objective and the supplied strategy/evaluation context.
+           - Reject only when the chosen method materially contradicts an explicit objective need or active gate,
+             and cite the evidence for that contradiction.
 
         4. **ENGINEERING STANDARDS:**
            - **Robustness:** Will this crash on empty inputs? (e.g., `df.empty` checks).

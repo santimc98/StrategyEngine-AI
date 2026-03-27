@@ -58,3 +58,20 @@ def test_reviewer_evaluate_results_parses_wrapped_json(monkeypatch):
     )
     assert result.get("status") == "APPROVED"
     assert result.get("feedback") == "looks good"
+
+
+def test_reviewer_prompt_is_context_relative_not_recipe_driven():
+    reviewer = ReviewerAgent(api_key=None)
+
+    reviewer.review_code(
+        "print('ok')",
+        business_objective="Predecir el valor del contrato con validacion fiable",
+        strategy_context="Usar el contexto de estrategia provisto por la run",
+        evaluation_spec={"reviewer_gates": []},
+    )
+
+    prompt = reviewer.last_prompt or ""
+    assert "METHOD FIT & EXECUTION RELIABILITY" in prompt
+    assert "generic preferred methodology from memory" in prompt
+    assert "Baseline Check:" not in prompt
+    assert '"Black Box" Neural Net is bad' not in prompt
