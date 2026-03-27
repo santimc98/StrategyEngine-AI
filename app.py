@@ -60,13 +60,33 @@ except Exception as cwd_err:
 # Apply stored API keys to environment on startup
 apply_keys_to_env()
 
-from src.graph.graph import (
-    app_graph,
-    request_abort,
-    clear_abort,
-    get_runtime_agent_models,
-    set_runtime_agent_models,
-)
+_GRAPH_BOOTSTRAP_ERROR = ""
+
+try:
+    from src.graph.graph import (
+        app_graph,
+        request_abort,
+        clear_abort,
+        get_runtime_agent_models,
+        set_runtime_agent_models,
+    )
+except ValueError as exc:
+    if "OPENROUTER_API_KEY or GOOGLE_API_KEY is required." not in str(exc):
+        raise
+    _GRAPH_BOOTSTRAP_ERROR = str(exc)
+    app_graph = None
+
+    def request_abort(*args, **kwargs):
+        return None
+
+    def clear_abort(*args, **kwargs):
+        return None
+
+    def get_runtime_agent_models():
+        return {}
+
+    def set_runtime_agent_models(overrides):
+        return dict(overrides or {})
 
 _SIGNAL_HANDLER_INSTALLED = False
 
@@ -375,7 +395,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+if _GRAPH_BOOTSTRAP_ERROR:
+    st.session_state.setdefault("show_api_keys", True)
+
 _init_runtime_model_settings()
+
+if _GRAPH_BOOTSTRAP_ERROR:
+    st.warning(
+        "Faltan claves API para inicializar el runtime de agentes. "
+        "Configuralas desde la barra lateral en `Claves API` y la app se recargara correctamente."
+    )
 
 # ---------------------------------------------------------------------------
 # Professional CSS Design System
