@@ -478,6 +478,66 @@ def test_finalize_round_syncs_review_board_verdict_with_kept_artifact(tmp_path, 
     assert persisted_finalization.get("kept") == "baseline"
 
 
+def test_finalize_round_refreshes_output_contract_after_baseline_restore(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("artifacts/ml/cv_metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline = {"roc_auc": 0.8000}
+    metrics_path.write_text(json.dumps(baseline), encoding="utf-8")
+    snapshot_dir = Path("work/ml_baseline_snapshot")
+    output_paths = ["artifacts/ml/cv_metrics.json"]
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    metrics_path.write_text(json.dumps({"roc_auc": 0.8002}), encoding="utf-8")
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path("data/output_contract_report.json").write_text(
+        json.dumps(
+            {
+                "overall_status": "error",
+                "missing": ["artifacts/ml/cv_metrics.json"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    board_payload = {
+        "status": "APPROVED",
+        "final_review_verdict": "APPROVED",
+        "summary": "Candidate approved by review board.",
+    }
+    Path("data/review_board_verdict.json").write_text(json.dumps(board_payload), encoding="utf-8")
+    state = {
+        "review_verdict": "APPROVED",
+        "execution_contract": {
+            "artifact_requirements": {"required_files": [{"path": "artifacts/ml/cv_metrics.json"}]},
+            "required_outputs": ["artifacts/ml/cv_metrics.json"],
+        },
+        "output_contract_report": {
+            "overall_status": "error",
+            "missing": ["artifacts/ml/cv_metrics.json"],
+        },
+        "ml_improvement_round_active": True,
+        "ml_improvement_primary_metric_name": "roc_auc",
+        "ml_improvement_baseline_metric": 0.8000,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": True,
+        "ml_improvement_output_paths": output_paths,
+        "ml_improvement_snapshot_dir": str(snapshot_dir),
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "review_board_verdict": board_payload,
+        "feedback_history": [],
+    }
+
+    route = check_evaluation(state)
+
+    assert route == "approved"
+    refreshed = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
+    assert refreshed.get("missing") == []
+    assert refreshed.get("overall_status") != "error"
+    persisted = json.loads(Path("data/output_contract_report.json").read_text(encoding="utf-8"))
+    assert persisted.get("missing") == []
+    assert persisted.get("overall_status") != "error"
+
+
 def test_finalize_round_keeps_canonical_candidate_when_advisor_delta_signal_is_wrong(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     report_path = Path("artifacts/ml/evaluation_summary.json")

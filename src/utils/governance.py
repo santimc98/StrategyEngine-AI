@@ -27,6 +27,46 @@ def _load_metric_loop_state(state: Dict[str, Any] | None = None) -> Dict[str, An
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _resolve_output_contract_report(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    state_obj = state if isinstance(state, dict) else {}
+    current = state_obj.get("output_contract_report")
+    if not isinstance(current, dict):
+        current = {}
+    persisted = _safe_load_json("data/output_contract_report.json")
+    if not isinstance(persisted, dict):
+        persisted = {}
+    if not current:
+        current = dict(persisted)
+
+    best = state_obj.get("best_attempt_output_contract_report")
+    if not isinstance(best, dict):
+        best = {}
+    last_success = state_obj.get("last_successful_output_contract_report")
+    if not isinstance(last_success, dict):
+        last_success = {}
+
+    def _is_clean(report: Dict[str, Any]) -> bool:
+        if not isinstance(report, dict) or not report:
+            return False
+        missing = [str(item).strip() for item in (report.get("missing") or []) if str(item).strip()]
+        status = str(report.get("overall_status") or "").strip().lower()
+        return not missing and status != "error"
+
+    current_missing = [str(item).strip() for item in (current.get("missing") or []) if str(item).strip()]
+    current_status = str(current.get("overall_status") or "").strip().lower()
+    if (current_missing or current_status == "error") and _is_clean(best):
+        return dict(best)
+    if (current_missing or current_status == "error") and _is_clean(last_success):
+        return dict(last_success)
+    if current:
+        return dict(current)
+    if best:
+        return dict(best)
+    if last_success:
+        return dict(last_success)
+    return dict(persisted) if persisted else {}
+
+
 def _load_metrics_report(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Load metrics from the first available canonical metrics artifact path."""
     state_obj = state if isinstance(state, dict) else {}
@@ -420,7 +460,7 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     and run_outcome from multiple compliance sources.
     """
     case_alignment = _safe_load_json("data/case_alignment_report.json")
-    output_contract = _safe_load_json("data/output_contract_report.json")
+    output_contract = _resolve_output_contract_report(state)
     data_adequacy = _safe_load_json("data/data_adequacy_report.json")
     alignment_check = _safe_load_json("data/alignment_check.json")
     integrity = _safe_load_json("data/integrity_audit_report.json")

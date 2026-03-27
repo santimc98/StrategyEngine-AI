@@ -213,3 +213,32 @@ def test_run_summary_uses_metric_loop_state_to_clear_stale_pipeline_abort_and_bu
     assert metric_improvement.get("metric_name") == "mean_multi_horizon_log_loss"
     assert metric_improvement.get("kept") == "incumbent"
     assert metric_improvement.get("final_metric_reported") == 0.033403701215064016
+
+
+def test_run_summary_prefers_clean_state_output_contract_over_stale_persisted_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open("data/metrics.json", "w", encoding="utf-8") as f:
+        json.dump({"auc": 0.61}, f)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "overall_status": "error",
+                "missing": ["artifacts/ml/cv_metrics.json"],
+            },
+            f,
+        )
+
+    state = {
+        "review_verdict": "APPROVED",
+        "last_successful_output_contract_report": {
+            "overall_status": "ok",
+            "missing": [],
+            "present": ["artifacts/ml/cv_metrics.json"],
+        },
+    }
+
+    summary = build_run_summary(state)
+
+    assert "output_contract_missing" not in (summary.get("failed_gates") or [])
+    assert "output_contract_report.overall_status=error" not in (summary.get("governance_reasons") or [])

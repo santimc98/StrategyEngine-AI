@@ -3321,6 +3321,26 @@ def _persist_output_contract_report(
         pass
     return report
 
+
+def _refresh_output_contract_state(
+    state: Dict[str, Any],
+    *,
+    reason: str,
+) -> Dict[str, Any]:
+    contract = state.get("execution_contract") if isinstance(state, dict) else {}
+    if not isinstance(contract, dict) or not contract:
+        current = state.get("output_contract_report") if isinstance(state, dict) else {}
+        return dict(current) if isinstance(current, dict) else {}
+
+    report = _persist_output_contract_report(state, reason=reason)
+    if isinstance(state, dict) and isinstance(report, dict):
+        state["output_contract_report"] = copy.deepcopy(report)
+        missing = [str(item).strip() for item in (report.get("missing") or []) if str(item).strip()]
+        overall_status = str(report.get("overall_status") or "").strip().lower()
+        if not missing and overall_status != "error":
+            state["last_successful_output_contract_report"] = copy.deepcopy(report)
+    return report if isinstance(report, dict) else {}
+
 def _stage_illustrative_assets(
     source_root: str,
     report_root: str = "report",
@@ -28964,6 +28984,10 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     state["opt_incumbent_selection"] = incumbent_selection
     if not improved:
         _restore_ml_outputs(snapshot_dir, output_paths)
+        _refresh_output_contract_state(
+            state,
+            reason="metric_round_baseline_restore",
+        )
         state["ml_improvement_kept"] = "baseline"
         state["review_verdict"] = baseline_verdict
         state["stop_reason"] = "IMPROVEMENT_ROUND_RESTORE_INCUMBENT"
