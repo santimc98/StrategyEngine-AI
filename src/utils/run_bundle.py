@@ -611,6 +611,9 @@ def write_run_manifest(
     run_summary = _safe_load_json(os.path.join(run_dir, "report", "run_summary.json"))
     if not run_summary:
         run_summary = _safe_load_json(os.path.join(run_dir, "artifacts", "data", "run_summary.json")) or {}
+    review_board_verdict = _safe_load_json(os.path.join(run_dir, "report", "review_board_verdict.json"))
+    if not review_board_verdict:
+        review_board_verdict = _safe_load_json(os.path.join(run_dir, "artifacts", "data", "review_board_verdict.json")) or {}
     required_outputs = _normalize_required_outputs(contract)
     produced_outputs = sorted(set(_scan_run_outputs(run_dir)))
     trace_summary_path = os.path.join(run_dir, "report", "governance", "ml_iteration_trace_summary.json")
@@ -644,7 +647,20 @@ def write_run_manifest(
     existing = _safe_load_json(manifest_path)
     existing_dict = existing if isinstance(existing, dict) else {}
 
-    raw_status = state.get("review_verdict_normalized") or run_summary.get("status") or state.get("review_verdict")
+    board_status = ""
+    if isinstance(review_board_verdict, dict):
+        board_status = str(
+            review_board_verdict.get("final_review_verdict")
+            or review_board_verdict.get("status")
+            or ""
+        ).strip()
+    raw_status = (
+        status_final
+        or run_summary.get("status")
+        or board_status
+        or state.get("review_verdict_normalized")
+        or state.get("review_verdict")
+    )
     normalized_status = normalize_review_status(raw_status)
     normalized_reason = state.get("review_feedback_normalized") or (state.get("last_gate_context") or {}).get("feedback")
     gates_summary = {

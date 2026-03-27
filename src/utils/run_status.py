@@ -110,17 +110,35 @@ def append_log(run_id: str, agent: str, message: str, level: str = "info") -> No
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _resolve_authoritative_review_verdict(state: Dict[str, Any]) -> str:
+    board_payload = state.get("review_board_verdict")
+    if isinstance(board_payload, dict):
+        verdict = str(
+            board_payload.get("final_review_verdict")
+            or board_payload.get("status")
+            or ""
+        ).strip()
+        if verdict:
+            return verdict
+    return str(state.get("review_verdict") or "").strip()
+
+
 def write_final_state(run_id: str, state: Dict[str, Any]) -> None:
     """Serialize the final graph state for the results dashboard."""
     # Only keep JSON-serializable fields that the UI needs.
     # P3 fix: expanded whitelist — previous version lost observability fields
     # that the dashboard and governance summary depend on.
+    view_state = dict(state if isinstance(state, dict) else {})
+    authoritative_verdict = _resolve_authoritative_review_verdict(view_state)
+    if authoritative_verdict:
+        view_state["review_verdict"] = authoritative_verdict
     keys_to_keep = [
         # Core identification
         "run_id", "business_objective", "csv_path",
         # Review & governance
         "review_verdict", "last_successful_review_verdict",
         "review_board_verdict", "gate_status",
+        "run_outcome", "overall_status_global", "hard_failures", "failed_gates",
         "budget_counters", "iteration_count", "current_iteration",
         # Strategy
         "selected_strategy", "strategies", "selection_reason",
@@ -142,7 +160,7 @@ def write_final_state(run_id: str, state: Dict[str, Any]) -> None:
     ]
     serializable = {}
     for k in keys_to_keep:
-        v = state.get(k)
+        v = view_state.get(k)
         if v is not None:
             try:
                 json.dumps(v, ensure_ascii=False)

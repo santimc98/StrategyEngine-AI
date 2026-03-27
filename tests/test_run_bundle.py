@@ -192,6 +192,43 @@ def test_run_manifest_includes_metric_round_records(tmp_path, monkeypatch):
     assert rounds[-1].get("hypothesis", {}).get("technique") == "rare_grouping"
 
 
+def test_run_manifest_gates_summary_prefers_run_summary_status_over_legacy_review_verdict(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run_id = "run_status_authority_01"
+    csv_path = tmp_path / "input.csv"
+    csv_path.write_text("a,b\n1,2\n", encoding="utf-8")
+    state = {
+        "run_id": run_id,
+        "run_start_ts": "2026-02-20T00:00:00",
+        "csv_path": str(csv_path),
+        "csv_encoding": "utf-8",
+        "csv_sep": ",",
+        "csv_decimal": ".",
+        "review_verdict_normalized": "APPROVED",
+    }
+    run_dir = init_run_bundle(run_id, state, base_dir=str(tmp_path / "runs"), enable_tee=False)
+    report_dir = Path(run_dir) / "report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "run_summary.json").write_text(
+        json.dumps({"status": "NEEDS_IMPROVEMENT", "failed_gates": ["runtime_failure"]}),
+        encoding="utf-8",
+    )
+    (report_dir / "review_board_verdict.json").write_text(
+        json.dumps({"status": "REJECTED", "final_review_verdict": "NEEDS_IMPROVEMENT"}),
+        encoding="utf-8",
+    )
+    (report_dir / "output_contract_report.json").write_text(
+        json.dumps({"overall_status": "ok", "missing": []}),
+        encoding="utf-8",
+    )
+
+    manifest_path = write_run_manifest(run_id, state)
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+
+    assert manifest["status_final"] == "NEEDS_IMPROVEMENT"
+    assert manifest["gates_summary"]["status"] == "NEEDS_IMPROVEMENT"
+
+
 def test_log_agent_snapshot_supports_iteration_and_attempt_paths(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     run_id = "run_snapshot_trace_01"

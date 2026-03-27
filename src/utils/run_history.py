@@ -53,7 +53,15 @@ def _extract_run_summary(run_id: str, run_dir: str) -> Optional[Dict[str, Any]]:
         if isinstance(selected, dict):
             strategy_title = selected.get("title", "")
         iteration_count = final_state.get("iteration_count", 0) or 0
-        review_verdict = final_state.get("review_verdict", "")
+        board_payload = final_state.get("review_board_verdict")
+        if isinstance(board_payload, dict):
+            review_verdict = (
+                board_payload.get("final_review_verdict")
+                or board_payload.get("status")
+                or final_state.get("review_verdict", "")
+            )
+        else:
+            review_verdict = final_state.get("review_verdict", "")
 
     # Try metric from status (last reported during run)
     metric_name = status.get("metric_name", "")
