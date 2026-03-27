@@ -11918,16 +11918,35 @@ def _build_candidate_call_site_facts(runtime_output: Any, code: Any) -> List[Dic
         if obj is None:
             continue
         try:
-            signature = str(inspect.signature(obj))
+            sig = inspect.signature(obj)
+            signature = str(sig)
         except Exception:
             signature = ""
+            sig = None
         if not signature:
             continue
+        parameter_names = []
+        if sig is not None:
+            try:
+                parameter_names = [str(name) for name in sig.parameters.keys() if str(name).strip()]
+            except Exception:
+                parameter_names = []
+        module_name = str(getattr(obj, "__module__", "") or "").strip()
+        module_version = ""
+        if module_name:
+            try:
+                root_module = importlib.import_module(module_name.split(".", 1)[0])
+                module_version = str(getattr(root_module, "__version__", "") or "").strip()
+            except Exception:
+                module_version = ""
         facts.append(
             {
                 "expression": expression,
                 "resolved_symbol": resolved_symbol or expression,
                 "signature": signature,
+                "parameter_names": parameter_names[:20],
+                "module_name": module_name or None,
+                "module_version": module_version or None,
                 "source": "inspect.signature",
                 "origin": origin or None,
             }
@@ -11935,6 +11954,101 @@ def _build_candidate_call_site_facts(runtime_output: Any, code: Any) -> List[Dic
         if len(facts) >= 4:
             break
     return facts
+
+
+def _build_callable_api_compatibility_payload(
+    candidate_call_sites: List[Dict[str, Any]] | None,
+    *,
+    unexpected_keyword: str = "",
+    missing_required_argument: str = "",
+    failure_signature: str = "",
+) -> Dict[str, List[Any]]:
+    payload: Dict[str, List[Any]] = {
+        "verified_facts": [],
+        "environment_facts": [],
+        "repair_directives": [],
+        "compatibility_notes": [],
+    }
+    candidate_call_sites = candidate_call_sites if isinstance(candidate_call_sites, list) else []
+    unexpected_keyword = str(unexpected_keyword or "").strip()
+    missing_required_argument = str(missing_required_argument or "").strip()
+    failure_signature = str(failure_signature or "").strip().lower()
+    ranked_sites: List[Dict[str, Any]] = []
+    if failure_signature:
+        def _site_rank(site: Dict[str, Any]) -> Tuple[int, int]:
+            resolved_symbol = str(site.get("resolved_symbol") or "").strip()
+            expression = str(site.get("expression") or "").strip()
+            short_name = resolved_symbol.rsplit(".", 1)[-1].lower() if resolved_symbol else ""
+            expr_name = expression.lower()
+            if short_name and short_name in failure_signature:
+                return (0, -len(short_name))
+            if expr_name and expr_name in failure_signature:
+                return (1, -len(expr_name))
+            return (2, 0)
+        ranked_sites = sorted(
+            [site for site in candidate_call_sites if isinstance(site, dict)],
+            key=_site_rank,
+        )
+    else:
+        ranked_sites = [site for site in candidate_call_sites if isinstance(site, dict)]
+    for call_site in ranked_sites:
+        params = [str(item).strip() for item in (call_site.get("parameter_names") or []) if str(item).strip()]
+        if not params:
+            continue
+        resolved_symbol = str(call_site.get("resolved_symbol") or call_site.get("expression") or "callable").strip()
+        expression = str(call_site.get("expression") or "").strip()
+        module_name = str(call_site.get("module_name") or "").strip()
+        module_version = str(call_site.get("module_version") or "").strip()
+        base_fact: Dict[str, Any] = {
+            "fact": "callable_accepted_parameters",
+            "resolved_symbol": resolved_symbol,
+            "value": params[:12],
+            "source": "inspect.signature",
+        }
+        if expression:
+            base_fact["expression"] = expression
+        payload["verified_facts"].append(base_fact)
+        if module_name and module_version:
+            payload["environment_facts"].append(
+                {
+                    "fact": "library_version",
+                    "module": module_name.split(".", 1)[0],
+                    "value": module_version,
+                    "source": "runtime_environment",
+                }
+            )
+        if unexpected_keyword and unexpected_keyword not in params:
+            payload["verified_facts"].append(
+                {
+                    "fact": "unexpected_keyword_callable_mismatch",
+                    "resolved_symbol": resolved_symbol,
+                    "value": {
+                        "unsupported_keyword": unexpected_keyword,
+                        "accepted_parameters": params[:12],
+                    },
+                    "source": "inspect.signature",
+                }
+            )
+            payload["repair_directives"].append(
+                "When runtime reports an unexpected keyword argument, patch the call using only parameters present in the verified callable signature."
+            )
+            note = (
+                f"{resolved_symbol} does not accept '{unexpected_keyword}'. "
+                f"Verified parameters: {', '.join(params[:8])}."
+            )
+            if module_name and module_version:
+                note += f" Runtime environment reports {module_name.split('.', 1)[0]}=={module_version}."
+            payload["compatibility_notes"].append(note)
+            break
+        if missing_required_argument and missing_required_argument in params:
+            payload["repair_directives"].append(
+                "If a required argument is missing, satisfy it using the verified callable signature before widening the patch."
+            )
+            payload["compatibility_notes"].append(
+                f"{resolved_symbol} expects '{missing_required_argument}' in its verified signature. Fill that contract before changing unrelated logic."
+            )
+            break
+    return payload
 
 
 def _build_repair_ground_truth(
@@ -12042,10 +12156,38 @@ def _build_repair_ground_truth(
                 "expression": call_site.get("expression"),
                 "resolved_symbol": call_site.get("resolved_symbol"),
                 "value": call_site.get("signature"),
+                "parameter_names": call_site.get("parameter_names") or [],
+                "module_name": call_site.get("module_name"),
+                "module_version": call_site.get("module_version"),
                 "origin": call_site.get("origin"),
                 "source": call_site.get("source"),
             }
         )
+    failure_signature = specific_error or ""
+    if exception_type or exception_message:
+        failure_signature = ": ".join([part for part in [exception_type, exception_message] if part]).strip()
+    failure_signature = failure_signature[:320]
+    compatibility_notes: List[str] = []
+    compatibility_payload = _build_callable_api_compatibility_payload(
+        candidate_call_sites,
+        unexpected_keyword=keyword_match.group(1) if keyword_match else "",
+        missing_required_argument=missing_arg_match.group(1) if missing_arg_match else "",
+        failure_signature=failure_signature,
+    )
+    for item in compatibility_payload.get("verified_facts") or []:
+        if item not in verified_facts:
+            verified_facts.append(item)
+    for item in compatibility_payload.get("environment_facts") or []:
+        if item not in environment_facts:
+            environment_facts.append(item)
+    for item in compatibility_payload.get("repair_directives") or []:
+        text = str(item or "").strip()
+        if text and text not in repair_directives:
+            repair_directives.append(text)
+    for item in compatibility_payload.get("compatibility_notes") or []:
+        text = str(item or "").strip()
+        if text and text not in compatibility_notes:
+            compatibility_notes.append(text)
     for path in (present_outputs or [])[:6]:
         do_not_change.append(f"Keep artifact generation for {path} unchanged unless the failing block directly requires it.")
     if error_type == "runtime_api_misuse":
@@ -12071,10 +12213,6 @@ def _build_repair_ground_truth(
         if len([item for item in verified_facts if item.get("fact") == "failed_gate"]) >= 6:
             break
 
-    failure_signature = specific_error or ""
-    if exception_type or exception_message:
-        failure_signature = ": ".join([part for part in [exception_type, exception_message] if part]).strip()
-    failure_signature = failure_signature[:320]
     if not error_type and missing_outputs:
         error_type = "output_missing"
     if not repair_focus and error_type in {"runtime_api_misuse", "runtime_error", "timeout", "oom", "import_error", "shape_or_dtype"}:
@@ -12093,6 +12231,7 @@ def _build_repair_ground_truth(
         "environment_facts": environment_facts[:8],
         "repair_directives": repair_directives[:8],
         "candidate_call_sites": candidate_call_sites[:4],
+        "compatibility_notes": compatibility_notes[:6],
         "do_not_change": do_not_change[:8],
     }
 

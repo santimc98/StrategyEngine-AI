@@ -307,6 +307,9 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
                 "root_cause_type": "runtime_api_misuse",
                 "repair_focus": "runtime",
                 "failure_signature": "TypeError: OneHotEncoder got an unexpected keyword argument 'sparse'",
+                "compatibility_notes": [
+                    "sklearn.preprocessing.OneHotEncoder does not accept 'sparse'. Verified parameters: categories, drop, sparse_output, dtype, handle_unknown."
+                ],
                 "environment_facts": [
                     {
                         "fact": "callable_signature",
@@ -369,7 +372,7 @@ def test_metric_optimization_editor_prompt_uses_optimization_template(monkeypatc
         '"label_12h"',
     )
     _assert_contains_terms(prompt, "cleaning_manifest.json", "csv dialect", "cleaning metadata", "simple arithmetic mean")
-    _assert_contains_terms(prompt, "closest compatible variant", "verified environment facts", "onehotencoder")
+    _assert_contains_terms(prompt, "closest compatible variant", "verified environment facts", "onehotencoder", "sparse_output")
     assert "ARTIFACT: data/scored_rows.csv" not in prompt
     assert "STRUCTURED CRITIQUE PACKET:" not in prompt
     assert "OPTIMIZATION CONTEXT (authoritative current round):" not in prompt

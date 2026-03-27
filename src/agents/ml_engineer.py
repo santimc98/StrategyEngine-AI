@@ -1579,6 +1579,11 @@ class MLEngineerAgent:
             "root_cause_type": repair_ground_truth.get("root_cause_type") or None,
             "repair_focus": repair_ground_truth.get("repair_focus") or None,
             "failure_signature": repair_ground_truth.get("failure_signature") or None,
+            "compatibility_notes": (
+                repair_ground_truth.get("compatibility_notes")
+                if isinstance(repair_ground_truth.get("compatibility_notes"), list)
+                else []
+            )[:6],
             "environment_facts": (
                 repair_ground_truth.get("environment_facts")
                 if isinstance(repair_ground_truth.get("environment_facts"), list)
@@ -1621,6 +1626,11 @@ class MLEngineerAgent:
             "root_cause_type": repair_ground_truth.get("root_cause_type") or None,
             "repair_focus": repair_ground_truth.get("repair_focus") or None,
             "failure_signature": repair_ground_truth.get("failure_signature") or None,
+            "compatibility_notes": (
+                repair_ground_truth.get("compatibility_notes")
+                if isinstance(repair_ground_truth.get("compatibility_notes"), list)
+                else []
+            )[:6],
             "verified_facts": (
                 repair_ground_truth.get("verified_facts")
                 if isinstance(repair_ground_truth.get("verified_facts"), list)

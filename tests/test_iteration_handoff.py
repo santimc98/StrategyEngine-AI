@@ -186,6 +186,75 @@ def test_iteration_handoff_builds_repair_ground_truth_for_runtime_api_misuse():
         and "encoding" in str(env.get("value") or "")
         for env in repair_ground_truth["environment_facts"]
     )
+    assert any(
+        "does not accept 'extra'" in str(note or "")
+        for note in repair_ground_truth.get("compatibility_notes", [])
+    )
+
+
+def test_iteration_handoff_builds_callable_compatibility_facts_for_sklearn_api_misuse():
+    generated_code = (
+        "from sklearn.preprocessing import OneHotEncoder\n"
+        "from sklearn.pipeline import Pipeline\n"
+        "\n"
+        "def build_preprocessor():\n"
+        "    return Pipeline([('ohe', OneHotEncoder(handle_unknown='ignore', sparse=False))])\n"
+        "\n"
+        "build_preprocessor()\n"
+    )
+    runtime_output = (
+        "Traceback (most recent call last)\n"
+        "  File \"script.py\", line 7, in <module>\n"
+        "    build_preprocessor()\n"
+        "  File \"script.py\", line 5, in build_preprocessor\n"
+        "    return Pipeline([('ohe', OneHotEncoder(handle_unknown='ignore', sparse=False))])\n"
+        "TypeError: OneHotEncoder.__init__() got an unexpected keyword argument 'sparse'\n"
+    )
+
+    state = {
+        "iteration_count": 1,
+        "execution_contract": {"required_outputs": ["data/metrics.json"]},
+        "generated_code": generated_code,
+        "execution_output": runtime_output,
+        "last_runtime_error_tail": runtime_output,
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Patch the failing OneHotEncoder call using the verified signature."],
+            "feedback": "Runtime crash in sklearn preprocessing.",
+        },
+        oc_report={"present": [], "missing": ["data/metrics.json"]},
+        review_result={"feedback": "Runtime failed before metrics."},
+        qa_result={},
+        evaluation_spec={"primary_metric": "mae"},
+    )
+
+    repair_ground_truth = handoff["repair_ground_truth"]
+    assert repair_ground_truth["root_cause_type"] == "runtime_api_misuse"
+    assert any(
+        fact.get("fact") == "unexpected_keyword_argument" and fact.get("value") == "sparse"
+        for fact in repair_ground_truth["verified_facts"]
+    )
+    assert any(
+        fact.get("fact") == "callable_accepted_parameters"
+        and "OneHotEncoder" in str(fact.get("resolved_symbol") or "")
+        and "sparse_output" in list(fact.get("value") or [])
+        for fact in repair_ground_truth["verified_facts"]
+    )
+    assert any(
+        fact.get("fact") == "unexpected_keyword_callable_mismatch"
+        and fact.get("value", {}).get("unsupported_keyword") == "sparse"
+        and "sparse_output" in list(fact.get("value", {}).get("accepted_parameters") or [])
+        for fact in repair_ground_truth["verified_facts"]
+    )
+    assert any(
+        "does not accept 'sparse'" in str(note or "") and "sparse_output" in str(note or "")
+        for note in repair_ground_truth.get("compatibility_notes", [])
+    )
 
 
 def test_iteration_handoff_builds_patch_only_repair_scope_for_runtime_repair():
