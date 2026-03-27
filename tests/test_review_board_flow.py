@@ -203,6 +203,11 @@ def test_run_review_board_metric_only_needs_improvement_is_downgraded(tmp_path, 
     assert result["review_verdict"] == "APPROVE_WITH_WARNINGS"
     assert "iteration_count" not in result
     assert any("REVIEW_BOARD_POLICY" in item for item in (result.get("feedback_history") or []))
+    with open("data/review_board_verdict.json", "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    assert payload["status"] == "APPROVE_WITH_WARNINGS"
+    assert payload["final_review_verdict"] == "APPROVE_WITH_WARNINGS"
+    assert payload["candidate_assessment_status"] == "NEEDS_IMPROVEMENT"
 
 
 def test_run_review_board_reconciles_provisional_attempt_cycle(tmp_path, monkeypatch):

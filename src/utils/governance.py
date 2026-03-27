@@ -8,6 +8,7 @@ from src.utils.governance_reducer import (
     compute_governance_verdict,
     derive_run_outcome,
 )
+from src.utils.metric_eval import normalize_metrics_report_payload
 
 
 def _safe_load_json(path: str) -> Dict[str, Any]:
@@ -72,13 +73,15 @@ def _load_metrics_report(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
     state_obj = state if isinstance(state, dict) else {}
     state_metrics = state_obj.get("metrics_report")
     if isinstance(state_metrics, dict) and state_metrics:
-        return dict(state_metrics)
+        normalized = normalize_metrics_report_payload(state_metrics)
+        return normalized if isinstance(normalized, dict) and normalized else dict(state_metrics)
 
     metrics_snapshot = state_obj.get("metrics_artifact_snapshot")
     if isinstance(metrics_snapshot, dict):
         snapshot_payload = metrics_snapshot.get("metrics_payload")
         if isinstance(snapshot_payload, dict) and snapshot_payload:
-            return dict(snapshot_payload)
+            normalized = normalize_metrics_report_payload(snapshot_payload)
+            return normalized if isinstance(normalized, dict) and normalized else dict(snapshot_payload)
 
     loop_state = state_obj.get("metric_loop_state")
     if isinstance(loop_state, dict):
@@ -87,7 +90,8 @@ def _load_metrics_report(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
         for entry in (final_entry, incumbent_entry):
             payload = entry.get("metrics_payload") if isinstance(entry.get("metrics_payload"), dict) else {}
             if payload:
-                return dict(payload)
+                normalized = normalize_metrics_report_payload(payload)
+                return normalized if isinstance(normalized, dict) and normalized else dict(payload)
 
     candidates = [
         "artifacts/ml/cv_metrics.json",
@@ -104,7 +108,8 @@ def _load_metrics_report(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
     for path in candidates:
         payload = _safe_load_json(path)
         if isinstance(payload, dict) and payload:
-            return payload
+            normalized = normalize_metrics_report_payload(payload)
+            return normalized if isinstance(normalized, dict) and normalized else payload
     return {}
 
 

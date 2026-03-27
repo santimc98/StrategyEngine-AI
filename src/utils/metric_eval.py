@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -400,6 +402,150 @@ def extract_primary_metric(metrics_json: Dict[str, Any], metric_name: str) -> Op
     resolved = resolve_metric_value(metrics_json, metric_name)
     value = resolved.get("value") if isinstance(resolved, dict) else None
     return float(value) if value is not None else None
+
+
+def _infer_primary_metric_name(payload: Dict[str, Any], model_performance: Dict[str, Any]) -> str:
+    primary_metric = payload.get("primary_metric")
+    if isinstance(primary_metric, dict):
+        candidate = str(
+            primary_metric.get("name")
+            or primary_metric.get("metric")
+            or primary_metric.get("id")
+            or ""
+        ).strip()
+        if candidate:
+            return candidate
+    if isinstance(primary_metric, str) and primary_metric.strip():
+        return primary_metric.strip()
+    primary_metric_name = str(payload.get("primary_metric_name") or "").strip()
+    if primary_metric_name:
+        return primary_metric_name
+    model_perf_primary_name = str(model_performance.get("primary_metric_name") or "").strip()
+    if model_perf_primary_name:
+        return model_perf_primary_name
+    for key in list(payload.keys()) + list(model_performance.keys()):
+        key_text = str(key or "").strip()
+        if key_text.lower().startswith("mean_") and len(key_text) > 5:
+            return key_text[5:]
+    return ""
+
+
+def normalize_metrics_report_payload(payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(payload, dict) or not payload:
+        return {}
+
+    normalized = dict(payload)
+    existing_model_perf = normalized.get("model_performance")
+    model_performance: Dict[str, Any] = dict(existing_model_perf) if isinstance(existing_model_perf, dict) else {}
+
+    aggregate_metrics = normalized.get("aggregate_metrics")
+    if isinstance(aggregate_metrics, dict):
+        for raw_key, raw_value in aggregate_metrics.items():
+            key_text = str(raw_key or "").strip()
+            metric_value = _coerce_float(raw_value)
+            if not key_text or metric_value is None:
+                continue
+            match = re.match(r"(.+?)_(mean|avg|average|std|stdev|stddev)$", key_text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            metric_name = str(match.group(1) or "").strip()
+            suffix = str(match.group(2) or "").strip().lower()
+            canonical = canonicalize_metric_name(metric_name)
+            if not canonical:
+                continue
+            if suffix in {"mean", "avg", "average"}:
+                canonical_key = f"mean_{canonical}"
+            else:
+                canonical_key = f"std_{canonical}"
+            normalized.setdefault(canonical_key, float(metric_value))
+            model_performance.setdefault(canonical_key, float(metric_value))
+
+    fold_metrics = normalized.get("fold_metrics")
+    if isinstance(fold_metrics, list):
+        for idx, fold_payload in enumerate(fold_metrics):
+            if not isinstance(fold_payload, dict):
+                continue
+            for metric_name, metric_value in fold_payload.items():
+                numeric = _coerce_float(metric_value)
+                if numeric is None:
+                    continue
+                model_performance.setdefault(f"fold_metrics[{idx}].{metric_name}", float(numeric))
+
+    field_aliases = {
+        "feature_columns_used": "feature_columns",
+        "training_rows": "n_train_rows",
+        "score_rows": "n_score_rows",
+        "scoring_rows": "n_score_rows",
+        "model_name": "model_family",
+    }
+    for legacy_key, canonical_key in field_aliases.items():
+        if canonical_key not in normalized and legacy_key in normalized:
+            normalized[canonical_key] = normalized[legacy_key]
+
+    generic_metrics = flatten_numeric_metrics(normalized)
+    for metric_key, metric_value in generic_metrics:
+        if not metric_key:
+            continue
+        metric_tokens = str(metric_key).split(".")
+        final_key = metric_tokens[-1]
+        if final_key.startswith("aggregate_metrics."):
+            final_key = final_key.split(".", 1)[-1]
+        if "aggregate_metrics." in metric_key:
+            final_key = metric_key.split("aggregate_metrics.", 1)[-1]
+        if "fold_metrics[" in metric_key:
+            model_performance.setdefault(metric_key, float(metric_value))
+        elif canonicalize_metric_name(final_key):
+            model_performance.setdefault(final_key, float(metric_value))
+
+    primary_metric_name = _infer_primary_metric_name(normalized, model_performance)
+    if primary_metric_name:
+        normalized.setdefault("primary_metric_name", primary_metric_name)
+        normalized.setdefault("primary_metric", primary_metric_name)
+        primary_metric_canonical_name = canonicalize_metric_name(primary_metric_name)
+        if primary_metric_canonical_name:
+            normalized.setdefault("primary_metric_canonical_name", primary_metric_canonical_name)
+            metric_value = normalized.get("primary_metric_value")
+            if metric_value is None:
+                resolved = resolve_metric_value(normalized, primary_metric_name)
+                metric_value = resolved.get("value") if isinstance(resolved, dict) else None
+            metric_value_num = _coerce_float(metric_value)
+            if metric_value_num is None and primary_metric_canonical_name:
+                metric_value_num = _coerce_float(normalized.get(f"mean_{primary_metric_canonical_name}"))
+            if metric_value_num is not None:
+                normalized["primary_metric_value"] = float(metric_value_num)
+                model_performance.setdefault("primary_metric_name", primary_metric_name)
+                model_performance.setdefault("primary_metric_value", float(metric_value_num))
+                model_performance.setdefault(
+                    "primary_metric",
+                    {"name": primary_metric_name, "value": float(metric_value_num)},
+                )
+
+    if model_performance:
+        normalized["model_performance"] = model_performance
+
+    return normalized
+
+
+def canonicalize_metrics_report_file(path: str) -> Dict[str, Any]:
+    path_text = str(path or "").strip()
+    if not path_text or not os.path.exists(path_text):
+        return {}
+    try:
+        with open(path_text, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+
+    normalized = normalize_metrics_report_payload(payload if isinstance(payload, dict) else {})
+    if not normalized:
+        return payload if isinstance(payload, dict) else {}
+    if normalized != payload:
+        try:
+            with open(path_text, "w", encoding="utf-8") as handle:
+                json.dump(normalized, handle, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    return normalized
 
 
 def extract_stability_signals(critique_packet: Dict[str, Any] | None) -> Dict[str, Any]:

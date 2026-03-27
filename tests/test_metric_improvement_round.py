@@ -588,6 +588,43 @@ def test_finalize_round_syncs_review_board_verdict_with_kept_artifact(tmp_path, 
     assert persisted_finalization.get("kept") == "baseline"
 
 
+def test_sync_review_board_verdict_promotes_authoritative_status_and_preserves_candidate_assessment(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    Path("data").mkdir(parents=True, exist_ok=True)
+    board_payload = {
+        "status": "NEEDS_IMPROVEMENT",
+        "final_review_verdict": "APPROVE_WITH_WARNINGS",
+        "summary": "Candidate regressed but baseline was restored.",
+    }
+    Path("data/review_board_verdict.json").write_text(json.dumps(board_payload), encoding="utf-8")
+    state = {
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "review_board_verdict": dict(board_payload),
+    }
+    metric_loop_state = {
+        "target": {"name": "MAE", "min_delta": 0.0005},
+        "round": {"baseline": {"metric_value": 10.0}},
+        "candidate": {"metric_value": 12.5},
+        "final": {"label": "baseline", "metric_value": 10.0},
+        "selection": {
+            "selected_label": "baseline",
+            "approved": True,
+            "improved_by_metric": False,
+            "stability_ok": True,
+            "deterministic_blockers": False,
+            "advisory_review_mode": True,
+            "force_finalize": False,
+        },
+    }
+
+    _sync_review_board_verdict_after_metric_round(state, metric_loop_state=metric_loop_state)
+
+    payload = state["review_board_verdict"]
+    assert payload["status"] == "APPROVE_WITH_WARNINGS"
+    assert payload["final_review_verdict"] == "APPROVE_WITH_WARNINGS"
+    assert payload["candidate_assessment_status"] == "NEEDS_IMPROVEMENT"
+
+
 def test_finalize_round_refreshes_output_contract_after_baseline_restore(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     metrics_path = Path("artifacts/ml/cv_metrics.json")

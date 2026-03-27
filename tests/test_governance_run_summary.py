@@ -263,3 +263,30 @@ def test_run_summary_loads_cv_metrics_artifact_when_data_metrics_file_is_missing
     summary = build_run_summary({"review_verdict": "APPROVED"})
 
     assert summary.get("metrics", {}).get("metric_pool_size", 0) > 0
+
+
+def test_run_summary_loads_legacy_cv_metrics_artifact_schema(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs(os.path.join("artifacts", "ml"), exist_ok=True)
+    os.makedirs("data", exist_ok=True)
+    with open("artifacts/ml/cv_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "primary_metric": "MAE",
+                "aggregate_metrics": {
+                    "MAE_mean": 2088.3858989698074,
+                    "MAE_std": 592.4474116389869,
+                },
+                "training_rows": 85,
+            },
+            f,
+        )
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"missing": []}, f)
+
+    summary = build_run_summary({"review_verdict": "APPROVED"})
+
+    baseline_pairs = summary.get("baseline_vs_model") or []
+    metric_summary = summary.get("metrics") or {}
+    assert metric_summary.get("metric_pool_size", 0) > 0
+    assert isinstance(baseline_pairs, list)

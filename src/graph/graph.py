@@ -248,6 +248,8 @@ from src.utils.metric_eval import (
     extract_stability_signals as metric_eval_extract_stability_signals,
     stability_ok as metric_eval_stability_ok,
     select_incumbent as metric_eval_select_incumbent,
+    normalize_metrics_report_payload as metric_eval_normalize_metrics_report_payload,
+    canonicalize_metrics_report_file as metric_eval_canonicalize_metrics_report_file,
 )
 
 
@@ -865,65 +867,7 @@ def _merge_model_performance_entry(model_perf: Dict[str, Any], metric_name: str,
 
 
 def _normalize_metrics_report_payload(payload: Dict[str, Any] | None) -> Dict[str, Any]:
-    if not isinstance(payload, dict) or not payload:
-        return {}
-    existing_model_perf = payload.get("model_performance")
-    if isinstance(existing_model_perf, dict) and bool(existing_model_perf):
-        return dict(payload)
-
-    model_perf: Dict[str, Any] = {}
-
-    primary_metric = payload.get("primary_metric")
-    if isinstance(primary_metric, dict):
-        metric_name = primary_metric.get("name") or primary_metric.get("metric")
-        _merge_model_performance_entry(model_perf, str(metric_name or ""), primary_metric.get("value"))
-
-    explicit_primary_name = (
-        payload.get("primary_metric_name")
-        or (primary_metric if isinstance(primary_metric, str) else None)
-    )
-    if explicit_primary_name and payload.get("primary_metric_value") is not None:
-        _merge_model_performance_entry(
-            model_perf,
-            str(explicit_primary_name),
-            payload.get("primary_metric_value"),
-        )
-
-    for block_name in ("cv_summary", "all_metrics", "metrics", "summary"):
-        block = payload.get(block_name)
-        if not isinstance(block, dict):
-            continue
-        for metric_name, metric_value in block.items():
-            _merge_model_performance_entry(model_perf, str(metric_name), metric_value)
-
-    for list_name in ("metrics_summary", "model_metrics"):
-        block = payload.get(list_name)
-        if not isinstance(block, list):
-            continue
-        for item in block:
-            if not isinstance(item, dict):
-                continue
-            metric_name = item.get("metric") or item.get("name")
-            if not metric_name:
-                continue
-            metric_name = str(metric_name)
-            if metric_name.lower().startswith("model_performance."):
-                metric_name = metric_name.split(".", 1)[1]
-            metric_value = item.get("value")
-            if metric_value is None:
-                metric_value = item.get("mean")
-            _merge_model_performance_entry(model_perf, metric_name, metric_value)
-
-    generic_metrics = _extract_metric_like_numbers(payload)
-    if generic_metrics:
-        for metric_key, metric_value in generic_metrics.items():
-            _merge_model_performance_entry(model_perf, metric_key, metric_value)
-
-    if not model_perf:
-        return {}
-    normalized = dict(payload)
-    normalized["model_performance"] = model_perf
-    return normalized
+    return metric_eval_normalize_metrics_report_payload(payload)
 
 
 def _resolve_output_contract_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1051,8 +995,7 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     for path in artifact_paths:
         if not _is_metrics_like_path(path):
             continue
-        payload = _load_json_safe(path)
-        normalized = _normalize_metrics_report_payload(payload if isinstance(payload, dict) else {})
+        normalized = metric_eval_canonicalize_metrics_report_file(path)
         if _metrics_report_has_values(normalized):
             normalized.setdefault("source", f"artifact:{path}")
             return normalized
@@ -1062,7 +1005,7 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
         "metrics.json",
         kind="metrics",
     )
-    file_metrics = _load_json_safe(metrics_path) if metrics_path else {}
+    file_metrics = metric_eval_canonicalize_metrics_report_file(metrics_path) if metrics_path else {}
     if isinstance(file_metrics, dict) and file_metrics:
         normalized = _normalize_metrics_report_payload(file_metrics)
         if _metrics_report_has_values(normalized):
@@ -1081,8 +1024,7 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     for path in artifact_paths:
         if not _is_metrics_like_path(path):
             continue
-        payload = _load_json_safe(path)
-        normalized = _normalize_metrics_report_payload(payload if isinstance(payload, dict) else {})
+        normalized = metric_eval_canonicalize_metrics_report_file(path)
         if _metrics_report_has_values(normalized):
             normalized.setdefault("source", f"artifact:{path}")
             return normalized
@@ -8895,14 +8837,9 @@ def _score_attempt(
 
         metrics_json: Dict[str, Any] = {}
         for metrics_path in metrics_candidates:
-            candidate_payload = _load_json_safe(metrics_path)
+            candidate_payload = metric_eval_canonicalize_metrics_report_file(metrics_path)
             if isinstance(candidate_payload, dict) and candidate_payload:
-                normalized_payload = _normalize_metrics_report_payload(candidate_payload)
-                metrics_json = (
-                    normalized_payload
-                    if isinstance(normalized_payload, dict) and normalized_payload
-                    else candidate_payload
-                )
+                metrics_json = candidate_payload
                 metrics_json.setdefault("source", metrics_path)
                 break
         if isinstance(metrics_json, dict) and metrics_json:
@@ -9013,14 +8950,9 @@ def _snapshot_best_attempt(
                 _append_metrics_candidate(normalized)
 
         for candidate_path in metrics_candidates:
-            candidate_payload = _load_json_safe(candidate_path)
+            candidate_payload = metric_eval_canonicalize_metrics_report_file(candidate_path)
             if isinstance(candidate_payload, dict) and candidate_payload:
-                normalized_payload = _normalize_metrics_report_payload(candidate_payload)
-                metrics_payload = (
-                    normalized_payload
-                    if isinstance(normalized_payload, dict) and normalized_payload
-                    else candidate_payload
-                )
+                metrics_payload = candidate_payload
                 metrics_payload.setdefault("source", candidate_path)
                 metrics_path = candidate_path
                 break
@@ -24497,7 +24429,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         kind="weights",
     )
     manifest_path = _resolve_cleaning_manifest_path_from_state(state if isinstance(state, dict) else {})
-    raw_metrics_payload = _load_json_safe(metrics_path) if metrics_path else {}
+    raw_metrics_payload = metric_eval_canonicalize_metrics_report_file(metrics_path) if metrics_path else {}
     raw_metrics_present = isinstance(raw_metrics_payload, dict) and bool(raw_metrics_payload)
     weights_report = _load_json_safe(weights_path) if weights_path else {}
     metrics_signature = _hash_json(metrics_report)
@@ -26324,8 +26256,9 @@ def run_review_board(state: AgentState) -> AgentState:
         )
 
     board_payload = {
-        "status": board_status,
+        "status": final_status,
         "final_review_verdict": final_status,
+        "candidate_assessment_status": board_status,
         "summary": board_summary,
         "failed_areas": failed_areas,
         "deterministic_blockers": deterministic_blockers,
@@ -26363,7 +26296,11 @@ def run_review_board(state: AgentState) -> AgentState:
         log_run_event(
             run_id,
             "review_board_complete",
-            {"status": board_status, "final_review_verdict": final_status},
+            {
+                "status": final_status,
+                "final_review_verdict": final_status,
+                "candidate_assessment_status": board_status,
+            },
         )
 
     result = {
@@ -30416,6 +30353,9 @@ def _sync_review_board_verdict_after_metric_round(
         if baseline_board_payload:
             payload = copy.deepcopy(baseline_board_payload)
     final_verdict = normalize_review_status(payload.get("final_review_verdict") or state.get("review_verdict"))
+    candidate_assessment_status = normalize_review_status(
+        payload.get("candidate_assessment_status") or payload.get("status") or final_verdict
+    )
     summary_line = (
         "METRIC_IMPROVEMENT_FINAL: "
         + f"kept={kept or 'unknown'} "
@@ -30426,7 +30366,9 @@ def _sync_review_board_verdict_after_metric_round(
         + f"min_delta={min_delta}"
     )
     payload["summary"] = _upsert_metric_improvement_summary(str(payload.get("summary") or ""), summary_line)
+    payload["status"] = final_verdict
     payload["final_review_verdict"] = final_verdict
+    payload["candidate_assessment_status"] = candidate_assessment_status
     payload["runtime_fix_terminal"] = bool(state.get("runtime_fix_terminal"))
     if kept == "baseline":
         payload["deterministic_blockers"] = [
