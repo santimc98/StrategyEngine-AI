@@ -25,6 +25,40 @@ def test_write_worker_input_persists_sandbox_config(tmp_path, monkeypatch):
     }
 
 
+def test_write_worker_input_preserves_execution_backend_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_status, "RUNS_DIR", str(tmp_path))
+
+    run_status.write_worker_input(
+        "backend-run",
+        __file__,
+        "Objetivo",
+        sandbox_config={
+            "provider": "local",
+            "settings": {
+                "execution_backend": {
+                    "mode": "cloudrun",
+                    "cloudrun_enabled": True,
+                    "job": "corp-heavy",
+                    "region": "europe-southwest1",
+                    "bucket": "corp-bucket",
+                }
+            },
+        },
+    )
+
+    input_path = os.path.join(str(tmp_path), "backend-run", "worker_input.json")
+    with open(input_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    assert payload["sandbox_config"]["settings"]["execution_backend"] == {
+        "mode": "cloudrun",
+        "cloudrun_enabled": True,
+        "job": "corp-heavy",
+        "region": "europe-southwest1",
+        "bucket": "corp-bucket",
+    }
+
+
 def test_write_final_state_prefers_review_board_verdict_and_keeps_governance_fields(tmp_path, monkeypatch):
     monkeypatch.setattr(run_status, "RUNS_DIR", str(tmp_path))
 

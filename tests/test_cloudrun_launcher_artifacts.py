@@ -378,3 +378,43 @@ def test_job_failure_is_overridden_when_status_ok_and_artifacts_present():
         assert result["job_failed_raw"] is True
         assert result["status_arbitration"]["applied"] is True
         assert result["status_arbitration"]["ignored_job_failure"] is True
+
+
+def test_launch_heavy_runner_job_accepts_ui_cli_overrides():
+    from src.utils.cloudrun_launcher import launch_heavy_runner_job
+
+    captured_exists_bins = []
+
+    with patch("src.utils.cloudrun_launcher._ensure_cli"), \
+         patch("src.utils.cloudrun_launcher._gsutil_cp"), \
+         patch("src.utils.cloudrun_launcher._gsutil_exists") as mock_exists, \
+         patch("src.utils.cloudrun_launcher._gsutil_ls") as mock_ls, \
+         patch("src.utils.cloudrun_launcher._run_gcloud_job_execute") as mock_execute, \
+         patch("os.path.exists") as mock_path_exists, \
+         patch("os.makedirs"):
+
+        mock_execute.return_value = ("stdout", "stderr", "update-env-vars")
+        mock_path_exists.return_value = True
+        mock_ls.return_value = []
+
+        def exists_side_effect(uri, gsutil_bin):
+            captured_exists_bins.append(gsutil_bin)
+            return False
+
+        mock_exists.side_effect = exists_side_effect
+
+        launch_heavy_runner_job(
+            run_id="test_run",
+            request={"dataset_uri": "gs://bucket/test.csv"},
+            dataset_path="data/test.csv",
+            bucket="test-bucket",
+            job="test-job",
+            region="us-central1",
+            download_map={},
+            gcloud_bin="C:/tools/gcloud.cmd",
+            gsutil_bin="C:/tools/gsutil.cmd",
+        )
+
+        assert mock_execute.call_args.kwargs["gcloud_bin"] == "C:/tools/gcloud.cmd"
+        assert captured_exists_bins
+        assert all(item == "C:/tools/gsutil.cmd" for item in captured_exists_bins)

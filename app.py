@@ -47,9 +47,12 @@ from src.utils.api_keys_store import (
     test_key_connectivity as _test_api_key,
 )
 from src.utils.sandbox_config import (
+    get_execution_backend_config as _get_execution_backend_config,
     load_sandbox_config as _load_sandbox_config,
     mask_sandbox_secret as _mask_sandbox_secret,
+    merge_execution_backend_config as _merge_execution_backend_config,
     normalize_sandbox_config as _normalize_sandbox_config,
+    normalize_execution_backend_config as _normalize_execution_backend_config,
     save_sandbox_config as _save_sandbox_config,
 )
 import src.utils.sandbox_provider as _sandbox_provider
@@ -101,11 +104,36 @@ _test_sandbox_provider_connectivity = getattr(
     ),
 )
 
-AGENT_MODEL_LABELS: Dict[str, str] = {
-    "strategist": "Estratega",
-    "data_engineer": "Ingeniero de Datos",
-    "ml_engineer": "Ingeniero ML",
+MODEL_SETTING_SPECS: List[Dict[str, str]] = [
+    {"key": "steward", "label": "Steward", "section": "primary"},
+    {"key": "strategist", "label": "Strategist", "section": "primary"},
+    {"key": "execution_planner", "label": "Execution Planner", "section": "primary"},
+    {"key": "data_engineer", "label": "Data Engineer", "section": "primary"},
+    {"key": "ml_engineer", "label": "ML Engineer", "section": "primary"},
+    {"key": "cleaning_reviewer", "label": "Cleaning Reviewer", "section": "primary"},
+    {"key": "reviewer", "label": "Reviewer", "section": "primary"},
+    {"key": "qa_reviewer", "label": "QA Reviewer", "section": "primary"},
+    {"key": "review_board", "label": "Review Board", "section": "primary"},
+    {"key": "translator", "label": "Business Translator", "section": "primary"},
+    {"key": "results_advisor", "label": "Results Advisor", "section": "primary"},
+    {"key": "failure_explainer", "label": "Failure Explainer", "section": "primary"},
+    {"key": "strategist_fallback", "label": "Strategist Fallback", "section": "advanced"},
+    {"key": "execution_planner_compiler", "label": "Execution Planner Compiler", "section": "advanced"},
+    {"key": "data_engineer_fallback", "label": "Data Engineer Fallback", "section": "advanced"},
+    {"key": "ml_engineer_editor", "label": "ML Engineer Editor", "section": "advanced"},
+    {"key": "ml_engineer_fallback", "label": "ML Engineer Fallback", "section": "advanced"},
+    {"key": "results_advisor_critique", "label": "Results Advisor Critique", "section": "advanced"},
+    {"key": "results_advisor_llm", "label": "Results Advisor LLM", "section": "advanced"},
+]
+MODEL_SETTING_LABELS: Dict[str, str] = {
+    spec["key"]: spec["label"] for spec in MODEL_SETTING_SPECS
 }
+PRIMARY_MODEL_KEYS: List[str] = [
+    spec["key"] for spec in MODEL_SETTING_SPECS if spec["section"] == "primary"
+]
+ADVANCED_MODEL_KEYS: List[str] = [
+    spec["key"] for spec in MODEL_SETTING_SPECS if spec["section"] == "advanced"
+]
 MODEL_PRESET_OPTIONS: List[Tuple[str, str]] = [
     ("z-ai/glm-5", "GLM-5"),
     ("moonshotai/kimi-k2.5", "Kimi K2.5"),
@@ -115,8 +143,11 @@ MODEL_PRESET_OPTIONS: List[Tuple[str, str]] = [
     ("anthropic/claude-opus-4.6", "Claude Opus 4.6"),
     ("openai/chatgpt-5.2", "ChatGPT 5.2"),
     ("openai/gpt-5.3-codex", "GPT-5.3 Codex"),
+    ("openai/gpt-5.4-mini", "GPT-5.4 Mini"),
     ("openai/gpt-5.4-nano", "GPT-5.4 Nano"),
     ("openai/gpt-5.4", "GPT-5.4"),
+    ("google/gemini-3-flash-preview", "Gemini 3 Flash Preview"),
+    ("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
 ]
 CUSTOM_MODEL_OPTION = "__custom_model__"
 MODEL_OVERRIDES_PATH = os.path.join(APP_ROOT, "data", "agent_model_overrides.json")
@@ -237,7 +268,7 @@ def _sanitize_agent_model_map(raw: Any) -> Dict[str, str]:
     cleaned: Dict[str, str] = {}
     if not isinstance(raw, dict):
         return cleaned
-    for agent_key in AGENT_MODEL_LABELS:
+    for agent_key in MODEL_SETTING_LABELS:
         value = str(raw.get(agent_key) or "").strip()
         if value:
             cleaned[agent_key] = value
@@ -248,7 +279,7 @@ def _merge_agent_model_maps(base: Dict[str, Any], overrides: Dict[str, Any]) -> 
     merged: Dict[str, str] = {}
     base_map = _sanitize_agent_model_map(base)
     overrides_map = _sanitize_agent_model_map(overrides)
-    for agent_key in AGENT_MODEL_LABELS:
+    for agent_key in MODEL_SETTING_LABELS:
         merged[agent_key] = overrides_map.get(agent_key) or base_map.get(agent_key) or ""
     return merged
 
@@ -302,6 +333,20 @@ def _sandbox_status_summary(config: Dict[str, Any]) -> tuple[str, str, str]:
         color = "#f9e2af"
         detail = "Pendiente de backend"
     return spec.label, detail, color
+
+
+def _execution_backend_status_summary(config: Dict[str, Any]) -> tuple[str, str, str]:
+    backend = _get_execution_backend_config(config)
+    mode = str(backend.get("mode") or "cloudrun").strip().lower() or "cloudrun"
+    if mode == "local":
+        return "Local Runner", "Activo", "#a6e3a1"
+    enabled = bool(backend.get("cloudrun_enabled"))
+    has_required = all(str(backend.get(key) or "").strip() for key in ("job", "region", "bucket"))
+    if enabled and has_required:
+        return "Cloud Run", "Configurado", "#a6e3a1"
+    if enabled or has_required:
+        return "Cloud Run", "Incompleto", "#f9e2af"
+    return "Cloud Run", "Sin configurar", "#f38ba8"
 
 
 def _handle_shutdown(signum, frame):
@@ -989,10 +1034,19 @@ with st.sidebar:
         st.session_state.get("base_agent_models", {}),
         st.session_state.get("agent_model_overrides", {}),
     )
-    active_model_lines = "".join(
-        f"<div><strong>{AGENT_MODEL_LABELS[agent_key]}:</strong> {active_models.get(agent_key, 'N/A')}</div>"
-        for agent_key in AGENT_MODEL_LABELS
+    primary_model_lines = "".join(
+        f"<div><strong>{MODEL_SETTING_LABELS[agent_key]}:</strong> {active_models.get(agent_key, 'N/A')}</div>"
+        for agent_key in PRIMARY_MODEL_KEYS
+        if str(active_models.get(agent_key) or "").strip()
     )
+    advanced_model_lines = "".join(
+        f"<div><strong>{MODEL_SETTING_LABELS[agent_key]}:</strong> {active_models.get(agent_key, 'N/A')}</div>"
+        for agent_key in ADVANCED_MODEL_KEYS
+        if str(active_models.get(agent_key) or "").strip()
+    )
+    active_model_lines = f"<div><strong>Principales</strong></div>{primary_model_lines}"
+    if advanced_model_lines:
+        active_model_lines += f"<div style='margin-top:0.45rem;'><strong>Avanzados</strong></div>{advanced_model_lines}"
     st.markdown(
         f"""
         <div class="sidebar-settings-panel">
@@ -1007,8 +1061,8 @@ with st.sidebar:
         st.markdown(
             """
             <div class="sidebar-settings-panel">
-                <div class="ssp-title">Configuraci&oacute;n de Modelos por Agente</div>
-                <div class="ssp-desc">Selecciona el modelo de IA principal para cada agente del pipeline.</div>
+                <div class="ssp-title">Configuraci&oacute;n de Modelos del Runtime</div>
+                <div class="ssp-desc">La UI es la fuente de verdad del runtime: los cambios se persisten y el worker los carga al arrancar, sin tocar archivos internos.</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1018,30 +1072,42 @@ with st.sidebar:
         preset_ids = [model_id for model_id, _ in MODEL_PRESET_OPTIONS]
         selector_options = preset_ids + [CUSTOM_MODEL_OPTION]
 
-        for agent_key, agent_label in AGENT_MODEL_LABELS.items():
-            current_model = str(active_models.get(agent_key) or "").strip()
-            current_is_preset = current_model in MODEL_PRESET_LABELS
-            default_option = current_model if current_is_preset else CUSTOM_MODEL_OPTION
-            if default_option not in selector_options:
-                default_option = CUSTOM_MODEL_OPTION
-            selected_option = st.selectbox(
-                f"Modelo para {agent_label}",
-                selector_options,
-                index=selector_options.index(default_option),
-                format_func=_model_option_label,
-                key=f"model_option_{agent_key}",
-            )
-            if selected_option == CUSTOM_MODEL_OPTION:
-                custom_default = "" if current_is_preset else current_model
-                custom_model = st.text_input(
-                    f"ID del modelo ({agent_label})",
-                    value=custom_default,
-                    placeholder="proveedor/nombre-modelo",
-                    key=f"model_custom_{agent_key}",
+        def _render_model_controls(model_keys: List[str]) -> None:
+            for agent_key in model_keys:
+                agent_label = MODEL_SETTING_LABELS[agent_key]
+                current_model = str(active_models.get(agent_key) or "").strip()
+                current_is_preset = current_model in MODEL_PRESET_LABELS
+                default_option = current_model if current_is_preset else CUSTOM_MODEL_OPTION
+                if default_option not in selector_options:
+                    default_option = CUSTOM_MODEL_OPTION
+                selected_option = st.selectbox(
+                    f"Modelo para {agent_label}",
+                    selector_options,
+                    index=selector_options.index(default_option),
+                    format_func=_model_option_label,
+                    key=f"model_option_{agent_key}",
                 )
-                pending_models[agent_key] = str(custom_model or "").strip()
-            else:
-                pending_models[agent_key] = selected_option
+                if selected_option == CUSTOM_MODEL_OPTION:
+                    custom_default = "" if current_is_preset else current_model
+                    custom_model = st.text_input(
+                        f"ID del modelo ({agent_label})",
+                        value=custom_default,
+                        placeholder="proveedor/nombre-modelo",
+                        key=f"model_custom_{agent_key}",
+                    )
+                    pending_models[agent_key] = str(custom_model or "").strip()
+                else:
+                    pending_models[agent_key] = selected_option
+
+        st.markdown("**Agentes Principales**")
+        _render_model_controls(PRIMARY_MODEL_KEYS)
+
+        with st.expander("Slots avanzados y secundarios", expanded=False):
+            st.caption(
+                "Incluye compiladores, editores y fallbacks. "
+                "Solo toca estos slots si quieres un routing distinto al estandar."
+            )
+            _render_model_controls(ADVANCED_MODEL_KEYS)
 
         apply_col, reset_col = st.columns(2)
         with apply_col:
@@ -1050,7 +1116,7 @@ with st.sidebar:
             reset_models_btn = st.button("Restablecer", key="reset_agent_models", use_container_width=True)
 
         if apply_models_btn:
-            missing_agents = [AGENT_MODEL_LABELS[k] for k, v in pending_models.items() if not str(v or "").strip()]
+            missing_agents = [MODEL_SETTING_LABELS[k] for k, v in pending_models.items() if not str(v or "").strip()]
             if missing_agents:
                 st.error(f"Falta seleccionar un modelo para: {', '.join(missing_agents)}")
             else:
@@ -1072,7 +1138,7 @@ with st.sidebar:
             applied_models = _sanitize_agent_model_map(set_runtime_agent_models(default_models))
             st.session_state["agent_model_overrides"] = _merge_agent_model_maps(default_models, applied_models)
             _save_agent_model_overrides(st.session_state["agent_model_overrides"])
-            for agent_key in AGENT_MODEL_LABELS:
+            for agent_key in MODEL_SETTING_LABELS:
                 option_key = f"model_option_{agent_key}"
                 custom_key = f"model_custom_{agent_key}"
                 if option_key in st.session_state:
@@ -1185,6 +1251,8 @@ with st.sidebar:
 
     if "show_sandbox_settings" not in st.session_state:
         st.session_state["show_sandbox_settings"] = False
+    if "show_execution_backend_settings" not in st.session_state:
+        st.session_state["show_execution_backend_settings"] = False
 
     if st.button("Sandbox de ejecucion", key="toggle_sandbox_settings", use_container_width=True):
         st.session_state["show_sandbox_settings"] = not bool(st.session_state.get("show_sandbox_settings"))
@@ -1272,8 +1340,9 @@ with st.sidebar:
                 )
 
         sandbox_save_col, sandbox_test_col = st.columns(2)
-        candidate_sandbox_config = _normalize_sandbox_config(
-            {"provider": selected_provider, "settings": pending_sandbox_settings}
+        candidate_sandbox_config = _merge_execution_backend_config(
+            _normalize_sandbox_config({"provider": selected_provider, "settings": pending_sandbox_settings}),
+            _get_execution_backend_config(stored_sandbox_config, include_env_fallback=False),
         )
 
         with sandbox_save_col:
@@ -1300,6 +1369,326 @@ with st.sidebar:
                     st.success(msg)
                 else:
                     st.error(msg)
+
+    if st.button("Backend de ejecucion", key="toggle_execution_backend_settings", use_container_width=True):
+        st.session_state["show_execution_backend_settings"] = not bool(
+            st.session_state.get("show_execution_backend_settings")
+        )
+
+    execution_backend_label, execution_backend_status, execution_backend_color = _execution_backend_status_summary(
+        stored_sandbox_config
+    )
+    st.markdown(
+        f"""
+        <div class="sidebar-settings-panel">
+            <div class="ssp-title">Backend de ejecucion</div>
+            <div class="ssp-desc">
+                <div><strong>Motor:</strong> {execution_backend_label}</div>
+                <div style="color:{execution_backend_color};">{execution_backend_status}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state.get("show_execution_backend_settings"):
+        st.markdown(
+            """
+            <div class="sidebar-settings-panel">
+                <div class="ssp-title">Configuraci&oacute;n de Backend</div>
+                <div class="ssp-desc">Controla desde aqu&iacute; c&oacute;mo se ejecutan los scripts: runner local o Cloud Run corporativo. Esta configuraci&oacute;n acompa&ntilde;a a cada run y evita depender del archivo .env.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        stored_backend_config = _get_execution_backend_config(stored_sandbox_config)
+        backend_mode = st.selectbox(
+            "Modo de ejecucion",
+            ["local", "cloudrun"],
+            index=0 if str(stored_backend_config.get("mode") or "cloudrun").strip().lower() == "local" else 1,
+            format_func=lambda value: "Local Runner" if value == "local" else "Cloud Run",
+            key="execution_backend_mode",
+        )
+
+        cloudrun_enabled = st.checkbox(
+            "Activar backend Cloud Run",
+            value=bool(stored_backend_config.get("cloudrun_enabled", False)),
+            key="execution_backend_cloudrun_enabled",
+        )
+        de_cloudrun_enabled = st.checkbox(
+            "Permitir heavy runner para Data Engineer",
+            value=bool(stored_backend_config.get("data_engineer_cloudrun_enabled", True)),
+            key="execution_backend_de_cloudrun_enabled",
+        )
+
+        backend_field_defaults = {
+            "job": str(stored_backend_config.get("job") or ""),
+            "region": str(stored_backend_config.get("region") or ""),
+            "bucket": str(stored_backend_config.get("bucket") or ""),
+            "project": str(stored_backend_config.get("project") or ""),
+            "gcloud_bin": str(stored_backend_config.get("gcloud_bin") or ""),
+            "gsutil_bin": str(stored_backend_config.get("gsutil_bin") or ""),
+            "input_prefix": str(stored_backend_config.get("input_prefix") or ""),
+            "output_prefix": str(stored_backend_config.get("output_prefix") or ""),
+            "dataset_prefix": str(stored_backend_config.get("dataset_prefix") or ""),
+            "script_timeout_seconds": str(stored_backend_config.get("script_timeout_seconds") or ""),
+            "local_script_timeout_seconds": str(stored_backend_config.get("local_script_timeout_seconds") or ""),
+            "script_timeout_min_seconds": str(stored_backend_config.get("script_timeout_min_seconds") or ""),
+            "script_timeout_max_seconds": str(stored_backend_config.get("script_timeout_max_seconds") or ""),
+            "local_script_timeout_min_seconds": str(stored_backend_config.get("local_script_timeout_min_seconds") or ""),
+            "local_script_timeout_max_seconds": str(stored_backend_config.get("local_script_timeout_max_seconds") or ""),
+            "timeout_margin_multiplier": str(stored_backend_config.get("timeout_margin_multiplier") or ""),
+            "timeout_margin_seconds": str(stored_backend_config.get("timeout_margin_seconds") or ""),
+            "default_cpu": str(stored_backend_config.get("default_cpu") or ""),
+            "default_memory_gb": str(stored_backend_config.get("default_memory_gb") or ""),
+            "cpu_hint": str(stored_backend_config.get("cpu_hint") or ""),
+            "memory_gb_hint": str(stored_backend_config.get("memory_gb_hint") or ""),
+            "model_type": str(stored_backend_config.get("model_type") or ""),
+        }
+        model_params_default = stored_backend_config.get("model_params")
+        if isinstance(model_params_default, dict):
+            model_params_default_text = json.dumps(model_params_default, ensure_ascii=False, indent=2)
+        else:
+            model_params_default_text = str(model_params_default or "")
+
+        if backend_mode == "cloudrun":
+            st.markdown(
+                '<span style="color:#e6edf3; font-size:0.82rem; font-weight:600;">Cloud Run Job *</span>'
+                '<br><span style="color:#6c7086; font-size:0.72rem;">Nombre del job corporativo que ejecuta el heavy runner.</span>',
+                unsafe_allow_html=True,
+            )
+            backend_field_defaults["job"] = st.text_input(
+                "Cloud Run Job",
+                value=backend_field_defaults["job"],
+                key="execution_backend_job",
+                label_visibility="collapsed",
+            )
+            st.markdown(
+                '<span style="color:#e6edf3; font-size:0.82rem; font-weight:600;">Region *</span>'
+                '<br><span style="color:#6c7086; font-size:0.72rem;">Regi&oacute;n donde vive el job de Cloud Run.</span>',
+                unsafe_allow_html=True,
+            )
+            backend_field_defaults["region"] = st.text_input(
+                "Region",
+                value=backend_field_defaults["region"],
+                key="execution_backend_region",
+                label_visibility="collapsed",
+            )
+            st.markdown(
+                '<span style="color:#e6edf3; font-size:0.82rem; font-weight:600;">Bucket GCS *</span>'
+                '<br><span style="color:#6c7086; font-size:0.72rem;">Bucket usado para subir requests, datasets y artifacts de ejecuci&oacute;n.</span>',
+                unsafe_allow_html=True,
+            )
+            backend_field_defaults["bucket"] = st.text_input(
+                "Bucket GCS",
+                value=backend_field_defaults["bucket"],
+                key="execution_backend_bucket",
+                label_visibility="collapsed",
+            )
+            st.markdown(
+                '<span style="color:#e6edf3; font-size:0.82rem; font-weight:600;">Project</span>'
+                '<br><span style="color:#6c7086; font-size:0.72rem;">ID de proyecto de Google Cloud si el job no usa el proyecto por defecto del CLI.</span>',
+                unsafe_allow_html=True,
+            )
+            backend_field_defaults["project"] = st.text_input(
+                "Project",
+                value=backend_field_defaults["project"],
+                key="execution_backend_project",
+                label_visibility="collapsed",
+            )
+        else:
+            st.info("Las runs se resolveran en Local Runner. Cloud Run queda guardado como configuracion corporativa opcional.")
+
+        with st.expander("Opciones avanzadas del backend"):
+            backend_field_defaults["gcloud_bin"] = st.text_input(
+                "Ruta gcloud",
+                value=backend_field_defaults["gcloud_bin"],
+                placeholder="Opcional. Ej: C:\\...\\gcloud.cmd",
+                key="execution_backend_gcloud_bin",
+            )
+            backend_field_defaults["gsutil_bin"] = st.text_input(
+                "Ruta gsutil",
+                value=backend_field_defaults["gsutil_bin"],
+                placeholder="Opcional. Ej: C:\\...\\gsutil.cmd",
+                key="execution_backend_gsutil_bin",
+            )
+            backend_field_defaults["input_prefix"] = st.text_input(
+                "Input prefix",
+                value=backend_field_defaults["input_prefix"],
+                placeholder="inputs",
+                key="execution_backend_input_prefix",
+            )
+            backend_field_defaults["output_prefix"] = st.text_input(
+                "Output prefix",
+                value=backend_field_defaults["output_prefix"],
+                placeholder="outputs",
+                key="execution_backend_output_prefix",
+            )
+            backend_field_defaults["dataset_prefix"] = st.text_input(
+                "Dataset prefix",
+                value=backend_field_defaults["dataset_prefix"],
+                placeholder="datasets",
+                key="execution_backend_dataset_prefix",
+            )
+            backend_field_defaults["script_timeout_seconds"] = st.text_input(
+                "Timeout script Cloud Run (s)",
+                value=backend_field_defaults["script_timeout_seconds"],
+                key="execution_backend_script_timeout_seconds",
+            )
+            backend_field_defaults["local_script_timeout_seconds"] = st.text_input(
+                "Timeout script local (s)",
+                value=backend_field_defaults["local_script_timeout_seconds"],
+                key="execution_backend_local_script_timeout_seconds",
+            )
+            backend_field_defaults["script_timeout_min_seconds"] = st.text_input(
+                "Min timeout Cloud Run (s)",
+                value=backend_field_defaults["script_timeout_min_seconds"],
+                key="execution_backend_script_timeout_min_seconds",
+            )
+            backend_field_defaults["script_timeout_max_seconds"] = st.text_input(
+                "Max timeout Cloud Run (s)",
+                value=backend_field_defaults["script_timeout_max_seconds"],
+                key="execution_backend_script_timeout_max_seconds",
+            )
+            backend_field_defaults["local_script_timeout_min_seconds"] = st.text_input(
+                "Min timeout local (s)",
+                value=backend_field_defaults["local_script_timeout_min_seconds"],
+                key="execution_backend_local_script_timeout_min_seconds",
+            )
+            backend_field_defaults["local_script_timeout_max_seconds"] = st.text_input(
+                "Max timeout local (s)",
+                value=backend_field_defaults["local_script_timeout_max_seconds"],
+                key="execution_backend_local_script_timeout_max_seconds",
+            )
+            backend_field_defaults["timeout_margin_multiplier"] = st.text_input(
+                "Multiplicador de margen",
+                value=backend_field_defaults["timeout_margin_multiplier"],
+                key="execution_backend_timeout_margin_multiplier",
+            )
+            backend_field_defaults["timeout_margin_seconds"] = st.text_input(
+                "Margen fijo extra (s)",
+                value=backend_field_defaults["timeout_margin_seconds"],
+                key="execution_backend_timeout_margin_seconds",
+            )
+            backend_field_defaults["default_cpu"] = st.text_input(
+                "CPU por defecto Cloud Run",
+                value=backend_field_defaults["default_cpu"],
+                key="execution_backend_default_cpu",
+            )
+            backend_field_defaults["default_memory_gb"] = st.text_input(
+                "Memoria por defecto Cloud Run",
+                value=backend_field_defaults["default_memory_gb"],
+                placeholder="Ej: 32Gi",
+                key="execution_backend_default_memory_gb",
+            )
+            backend_field_defaults["cpu_hint"] = st.text_input(
+                "CPU hint",
+                value=backend_field_defaults["cpu_hint"],
+                key="execution_backend_cpu_hint",
+            )
+            backend_field_defaults["memory_gb_hint"] = st.text_input(
+                "Memory hint",
+                value=backend_field_defaults["memory_gb_hint"],
+                placeholder="Ej: 16Gi",
+                key="execution_backend_memory_gb_hint",
+            )
+            backend_field_defaults["model_type"] = st.text_input(
+                "Model type del heavy runner",
+                value=backend_field_defaults["model_type"],
+                key="execution_backend_model_type",
+            )
+            model_params_default_text = st.text_area(
+                "Model params (JSON opcional)",
+                value=model_params_default_text,
+                height=120,
+                key="execution_backend_model_params",
+            )
+            force_cloudrun = st.checkbox(
+                "Forzar Cloud Run para ML",
+                value=bool(stored_backend_config.get("force_cloudrun", False)),
+                key="execution_backend_force_cloudrun",
+            )
+            force_de_cloudrun = st.checkbox(
+                "Forzar Cloud Run para Data Engineer",
+                value=bool(stored_backend_config.get("force_data_engineer_cloudrun", False)),
+                key="execution_backend_force_de_cloudrun",
+            )
+            safe_mode = st.checkbox(
+                "Safe mode del heavy runner",
+                value=bool(stored_backend_config.get("safe_mode", False)),
+                key="execution_backend_safe_mode",
+            )
+            float32 = st.checkbox(
+                "Forzar float32 en heavy runner",
+                value=bool(stored_backend_config.get("float32", False)),
+                key="execution_backend_float32",
+            )
+
+        candidate_execution_backend = _normalize_execution_backend_config(
+            {
+                "mode": backend_mode,
+                "cloudrun_enabled": cloudrun_enabled,
+                "data_engineer_cloudrun_enabled": de_cloudrun_enabled,
+                "force_cloudrun": force_cloudrun,
+                "force_data_engineer_cloudrun": force_de_cloudrun,
+                "safe_mode": safe_mode,
+                "float32": float32,
+                "job": backend_field_defaults["job"],
+                "region": backend_field_defaults["region"],
+                "bucket": backend_field_defaults["bucket"],
+                "project": backend_field_defaults["project"],
+                "gcloud_bin": backend_field_defaults["gcloud_bin"],
+                "gsutil_bin": backend_field_defaults["gsutil_bin"],
+                "input_prefix": backend_field_defaults["input_prefix"],
+                "output_prefix": backend_field_defaults["output_prefix"],
+                "dataset_prefix": backend_field_defaults["dataset_prefix"],
+                "script_timeout_seconds": backend_field_defaults["script_timeout_seconds"],
+                "local_script_timeout_seconds": backend_field_defaults["local_script_timeout_seconds"],
+                "script_timeout_min_seconds": backend_field_defaults["script_timeout_min_seconds"],
+                "script_timeout_max_seconds": backend_field_defaults["script_timeout_max_seconds"],
+                "local_script_timeout_min_seconds": backend_field_defaults["local_script_timeout_min_seconds"],
+                "local_script_timeout_max_seconds": backend_field_defaults["local_script_timeout_max_seconds"],
+                "timeout_margin_multiplier": backend_field_defaults["timeout_margin_multiplier"],
+                "timeout_margin_seconds": backend_field_defaults["timeout_margin_seconds"],
+                "default_cpu": backend_field_defaults["default_cpu"],
+                "default_memory_gb": backend_field_defaults["default_memory_gb"],
+                "cpu_hint": backend_field_defaults["cpu_hint"],
+                "memory_gb_hint": backend_field_defaults["memory_gb_hint"],
+                "model_type": backend_field_defaults["model_type"],
+                "model_params": model_params_default_text,
+            }
+        )
+
+        backend_save_col, backend_preview_col = st.columns(2)
+        with backend_save_col:
+            if st.button("Guardar backend", key="save_execution_backend_settings", use_container_width=True):
+                must_validate_cloudrun = backend_mode == "cloudrun" and (
+                    cloudrun_enabled
+                    or any(
+                        str(candidate_execution_backend.get(key) or "").strip()
+                        for key in ("job", "region", "bucket")
+                    )
+                )
+                missing_backend_fields: List[str] = []
+                if must_validate_cloudrun:
+                    for key, label in (("job", "Cloud Run Job"), ("region", "Region"), ("bucket", "Bucket GCS")):
+                        if not str(candidate_execution_backend.get(key) or "").strip():
+                            missing_backend_fields.append(label)
+                if missing_backend_fields:
+                    st.error(f"Faltan campos obligatorios del backend: {', '.join(missing_backend_fields)}")
+                else:
+                    merged_backend_config = _merge_execution_backend_config(
+                        stored_sandbox_config,
+                        candidate_execution_backend,
+                    )
+                    _save_sandbox_config(merged_backend_config)
+                    st.success("Configuracion de backend guardada.")
+                    st.rerun()
+
+        with backend_preview_col:
+            if st.button("Ver resumen backend", key="preview_execution_backend_settings", use_container_width=True):
+                st.json(candidate_execution_backend)
 
     # ---- CRM Connectors (alternative data source) ----
     _show_crm = st.session_state.get("show_crm_panel", False)

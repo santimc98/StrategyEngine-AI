@@ -196,9 +196,11 @@ def launch_heavy_runner_job(
     required_artifacts: Optional[list[str]] = None,
     attempt_id: Optional[int] = None,
     stage_namespace: Optional[str] = None,
+    gcloud_bin: Optional[str] = None,
+    gsutil_bin: Optional[str] = None,
 ) -> Dict[str, Any]:
-    gcloud_bin = _resolve_cli_override("gcloud", "HEAVY_RUNNER_GCLOUD_BIN")
-    gsutil_bin = _resolve_cli_override("gsutil", "HEAVY_RUNNER_GSUTIL_BIN")
+    gcloud_bin = str(gcloud_bin or "").strip() or _resolve_cli_override("gcloud", "HEAVY_RUNNER_GCLOUD_BIN")
+    gsutil_bin = str(gsutil_bin or "").strip() or _resolve_cli_override("gsutil", "HEAVY_RUNNER_GSUTIL_BIN")
     _ensure_cli(gcloud_bin)
     _ensure_cli(gsutil_bin)
 

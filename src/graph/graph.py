@@ -35,6 +35,13 @@ def _resolve_state_sandbox_config(state: Optional[Dict[str, Any]]) -> Dict[str, 
     return normalize_sandbox_config(state.get("sandbox_config"))
 
 
+def _resolve_state_execution_backend_config(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    from src.utils.sandbox_config import get_execution_backend_config
+
+    sandbox_config = _resolve_state_sandbox_config(state)
+    return get_execution_backend_config(sandbox_config)
+
+
 def _resolve_state_sandbox_class(state: Optional[Dict[str, Any]]):
     sandbox_config = _resolve_state_sandbox_config(state)
     provider = str(sandbox_config.get("provider") or "local").strip().lower() or "local"
@@ -8046,7 +8053,10 @@ def dialect_guard_violations(code: str, csv_sep: str, csv_decimal: str, csv_enco
         "decimal": csv_decimal,
         "encoding": csv_encoding,
     }
-    kw_map = {kw.arg: kw.value for kw in target_call.keywords if kw.arg}
+    raw_kw_map = {kw.arg: kw.value for kw in target_call.keywords if kw.arg}
+    kw_map = dict(raw_kw_map)
+    if "sep" not in kw_map and "delimiter" in raw_kw_map:
+        kw_map["sep"] = raw_kw_map["delimiter"]
 
     def _normalize_encoding(value: str) -> str:
         return str(value).strip().lower().replace("_", "-")
@@ -14128,7 +14138,27 @@ failure_explainer = FailureExplainerAgent()
 results_advisor = ResultsAdvisorAgent()
 
 
-_RUNTIME_MODEL_AGENT_KEYS = ("strategist", "data_engineer", "ml_engineer")
+_RUNTIME_MODEL_AGENT_KEYS = (
+    "steward",
+    "strategist",
+    "strategist_fallback",
+    "execution_planner",
+    "execution_planner_compiler",
+    "data_engineer",
+    "data_engineer_fallback",
+    "ml_engineer",
+    "ml_engineer_editor",
+    "ml_engineer_fallback",
+    "cleaning_reviewer",
+    "reviewer",
+    "qa_reviewer",
+    "review_board",
+    "translator",
+    "results_advisor",
+    "results_advisor_critique",
+    "results_advisor_llm",
+    "failure_explainer",
+)
 
 
 def _normalize_runtime_model_name(raw_value: Any) -> str:
@@ -14137,12 +14167,39 @@ def _normalize_runtime_model_name(raw_value: Any) -> str:
 
 def get_runtime_agent_models() -> Dict[str, str]:
     models = {
+        "steward": _normalize_runtime_model_name(getattr(steward, "model_name", "")),
         "strategist": _normalize_runtime_model_name(getattr(strategist, "model_name", "")),
+        "strategist_fallback": _normalize_runtime_model_name(getattr(strategist, "fallback_model_name", "")),
+        "execution_planner": _normalize_runtime_model_name(getattr(execution_planner, "model_name", "")),
+        "execution_planner_compiler": _normalize_runtime_model_name(
+            getattr(execution_planner, "compiler_model_name", "")
+            or getattr(execution_planner, "model_name", "")
+        ),
         "data_engineer": _normalize_runtime_model_name(getattr(data_engineer, "model_name", "")),
+        "data_engineer_fallback": _normalize_runtime_model_name(getattr(data_engineer, "fallback_model_name", "")),
         "ml_engineer": _normalize_runtime_model_name(getattr(ml_engineer, "model_name", "")),
+        "ml_engineer_fallback": _normalize_runtime_model_name(getattr(ml_engineer, "fallback_model_name", "")),
+        "cleaning_reviewer": _normalize_runtime_model_name(getattr(cleaning_reviewer, "model_name", "")),
+        "reviewer": _normalize_runtime_model_name(getattr(reviewer, "model_name", "")),
+        "qa_reviewer": _normalize_runtime_model_name(getattr(qa_reviewer, "model_name", "")),
+        "review_board": _normalize_runtime_model_name(getattr(review_board, "model_name", "")),
+        "translator": _normalize_runtime_model_name(getattr(translator, "model_name", "")),
+        "results_advisor": _normalize_runtime_model_name(getattr(results_advisor, "model_name", "")),
+        "results_advisor_critique": _normalize_runtime_model_name(
+            getattr(results_advisor, "critique_model_name", "")
+            or getattr(results_advisor, "model_name", "")
+        ),
+        "results_advisor_llm": _normalize_runtime_model_name(
+            getattr(results_advisor, "fe_model_name", "")
+            or getattr(results_advisor, "model_name", "")
+        ),
+        "failure_explainer": _normalize_runtime_model_name(getattr(failure_explainer, "_model_name", "")),
     }
-    editor_model = _normalize_runtime_model_name(getattr(ml_engineer, "editor_model_name", ""))
-    if editor_model and editor_model != models["ml_engineer"]:
+    editor_model = _normalize_runtime_model_name(
+        getattr(ml_engineer, "editor_model_name", "")
+        or getattr(ml_engineer, "model_name", "")
+    )
+    if editor_model:
         models["ml_engineer_editor"] = editor_model
     return models
 
@@ -14157,9 +14214,25 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
         if candidate:
             normalized[agent_key] = candidate
 
+    steward_model = normalized.get("steward")
+    if steward_model:
+        steward.model_name = steward_model
+        if getattr(steward, "provider", "") == "gemini":
+            try:
+                from google import generativeai as _genai  # type: ignore
+
+                if getattr(_genai, "GenerativeModel", None):
+                    steward.client = _genai.GenerativeModel(steward.model_name)
+            except Exception:
+                pass
+
     strategist_model = normalized.get("strategist")
+    strategist_fallback_model = normalized.get("strategist_fallback")
     if strategist_model:
         strategist.model_name = strategist_model
+    if strategist_fallback_model:
+        strategist.fallback_model_name = strategist_fallback_model
+    if strategist_model or strategist_fallback_model:
         strategist.model_chain = [
             model_name
             for model_name in [
@@ -14170,18 +14243,38 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
         ]
         strategist.last_model_used = None
 
+    execution_planner_model = normalized.get("execution_planner")
+    execution_planner_compiler_model = normalized.get("execution_planner_compiler")
+    if execution_planner_model:
+        execution_planner.model_name = execution_planner_model
+        if getattr(execution_planner, "client", None) is not None:
+            try:
+                execution_planner.client.model_name = execution_planner_model
+            except Exception:
+                pass
+        execution_planner.model_chain = [execution_planner_model]
+        execution_planner._default_model_chain = [execution_planner_model]
+    if execution_planner_compiler_model:
+        execution_planner.compiler_model_name = execution_planner_compiler_model
+
     data_engineer_model = normalized.get("data_engineer")
+    data_engineer_fallback_model = normalized.get("data_engineer_fallback")
     if data_engineer_model:
         data_engineer.model_name = data_engineer_model
-        if hasattr(data_engineer, "last_model_used"):
-            data_engineer.last_model_used = None
+    if data_engineer_fallback_model:
+        data_engineer.fallback_model_name = data_engineer_fallback_model
+    if (data_engineer_model or data_engineer_fallback_model) and hasattr(data_engineer, "last_model_used"):
+        data_engineer.last_model_used = None
 
     ml_engineer_model = normalized.get("ml_engineer")
     ml_engineer_editor_model = _normalize_runtime_model_name(overrides.get("ml_engineer_editor"))
+    ml_engineer_fallback_model = normalized.get("ml_engineer_fallback")
     if ml_engineer_model:
         ml_engineer.model_name = ml_engineer_model
         ml_engineer.last_model_used = None
-    if ml_engineer_model or ml_engineer_editor_model:
+    if ml_engineer_fallback_model:
+        ml_engineer.fallback_model_name = ml_engineer_fallback_model
+    if ml_engineer_model or ml_engineer_editor_model or ml_engineer_fallback_model:
         resolver = getattr(ml_engineer, "resolve_editor_model_name", None)
         if callable(resolver):
             ml_engineer.editor_model_name = _normalize_runtime_model_name(
@@ -14194,6 +14287,31 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
             ml_engineer.editor_model_name = ml_engineer_editor_model
         elif ml_engineer_model:
             ml_engineer.editor_model_name = _normalize_runtime_model_name(getattr(ml_engineer, "model_name", ""))
+
+    for key, agent_obj in (
+        ("cleaning_reviewer", cleaning_reviewer),
+        ("reviewer", reviewer),
+        ("qa_reviewer", qa_reviewer),
+        ("review_board", review_board),
+        ("translator", translator),
+    ):
+        model_name = normalized.get(key)
+        if model_name:
+            setattr(agent_obj, "model_name", model_name)
+
+    results_advisor_model = normalized.get("results_advisor")
+    results_advisor_critique_model = normalized.get("results_advisor_critique")
+    results_advisor_llm_model = normalized.get("results_advisor_llm")
+    if results_advisor_model:
+        results_advisor.model_name = results_advisor_model
+    if results_advisor_critique_model:
+        results_advisor.critique_model_name = results_advisor_critique_model
+    if results_advisor_llm_model:
+        results_advisor.fe_model_name = results_advisor_llm_model
+
+    failure_explainer_model = normalized.get("failure_explainer")
+    if failure_explainer_model:
+        failure_explainer._model_name = failure_explainer_model
 
     return get_runtime_agent_models()
 
@@ -14764,8 +14882,8 @@ def run_strategist(state: AgentState) -> AgentState:
     column_manifest = state.get("column_manifest")
     if not isinstance(column_manifest, dict) or not column_manifest:
         column_manifest = _load_json_safe("data/column_manifest.json") or {}
-    compute_constraints: Dict[str, Any] = {"runtime_mode": _get_execution_runtime_mode()}
-    _heavy_cfg = _get_heavy_runner_config() or {}
+    compute_constraints: Dict[str, Any] = {"runtime_mode": _get_execution_runtime_mode(state)}
+    _heavy_cfg = _get_heavy_runner_config(state) or {}
     if isinstance(_heavy_cfg, dict):
         _timeout_sec = _heavy_cfg.get("script_timeout_seconds")
         if isinstance(_timeout_sec, int) and _timeout_sec > 0:
@@ -14926,34 +15044,20 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _get_execution_runtime_mode() -> str:
-    raw = (
-        os.getenv("RUN_EXECUTION_MODE")
-        or os.getenv("EXECUTION_RUNTIME_MODE")
-        or os.getenv("CODE_EXECUTION_RUNTIME")
-        or "cloudrun"
-    )
-    mode = str(raw).strip().lower()
+def _get_execution_runtime_mode(state: Optional[Dict[str, Any]] = None) -> str:
+    backend_cfg = _resolve_state_execution_backend_config(state)
+    mode = str(backend_cfg.get("mode") or "cloudrun").strip().lower()
     if mode in {"local", "cloudrun"}:
         return mode
     return "cloudrun"
 
 
-def _get_heavy_runner_config() -> Dict[str, Any] | None:
-    runtime_mode = _get_execution_runtime_mode()
+def _get_heavy_runner_config(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any] | None:
+    backend_cfg = _resolve_state_execution_backend_config(state)
+    runtime_mode = _get_execution_runtime_mode(state)
     if runtime_mode == "local":
-        timeout_raw = (
-            os.getenv("LOCAL_RUNNER_SCRIPT_TIMEOUT_SECONDS")
-            or os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS")
-        )
-        script_timeout_seconds = None
-        if timeout_raw is not None:
-            try:
-                parsed = int(str(timeout_raw).strip())
-                if parsed > 0:
-                    script_timeout_seconds = parsed
-            except Exception:
-                script_timeout_seconds = None
+        timeout_raw = backend_cfg.get("local_script_timeout_seconds") or backend_cfg.get("script_timeout_seconds")
+        script_timeout_seconds = _safe_int(timeout_raw, 0) or None
         return {
             "mode": "local",
             "job": "local_runner",
@@ -14966,31 +15070,25 @@ def _get_heavy_runner_config() -> Dict[str, Any] | None:
             "script_timeout_seconds": script_timeout_seconds,
         }
 
-    if not _env_flag("HEAVY_RUNNER_ENABLED", False):
+    if not bool(backend_cfg.get("cloudrun_enabled", False)):
         return None
-    job = os.getenv("HEAVY_RUNNER_JOB")
-    region = os.getenv("HEAVY_RUNNER_REGION")
-    bucket = os.getenv("HEAVY_RUNNER_BUCKET")
+    job = str(backend_cfg.get("job") or "").strip()
+    region = str(backend_cfg.get("region") or "").strip()
+    bucket = str(backend_cfg.get("bucket") or "").strip()
     if not job or not region or not bucket:
         return None
-    timeout_raw = os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_SECONDS")
-    script_timeout_seconds = None
-    if timeout_raw is not None:
-        try:
-            parsed = int(str(timeout_raw).strip())
-            if parsed > 0:
-                script_timeout_seconds = parsed
-        except Exception:
-            script_timeout_seconds = None
+    script_timeout_seconds = _safe_int(backend_cfg.get("script_timeout_seconds"), 0) or None
     return {
         "mode": "cloudrun",
         "job": job,
         "region": region,
         "bucket": bucket,
-        "project": os.getenv("HEAVY_RUNNER_PROJECT"),
-        "input_prefix": os.getenv("HEAVY_RUNNER_INPUT_PREFIX", "inputs"),
-        "output_prefix": os.getenv("HEAVY_RUNNER_OUTPUT_PREFIX", "outputs"),
-        "dataset_prefix": os.getenv("HEAVY_RUNNER_DATASET_PREFIX", "datasets"),
+        "project": str(backend_cfg.get("project") or "").strip() or None,
+        "input_prefix": str(backend_cfg.get("input_prefix") or "inputs").strip() or "inputs",
+        "output_prefix": str(backend_cfg.get("output_prefix") or "outputs").strip() or "outputs",
+        "dataset_prefix": str(backend_cfg.get("dataset_prefix") or "datasets").strip() or "datasets",
+        "gcloud_bin": str(backend_cfg.get("gcloud_bin") or "").strip() or None,
+        "gsutil_bin": str(backend_cfg.get("gsutil_bin") or "").strip() or None,
         "script_timeout_seconds": script_timeout_seconds,
     }
 
@@ -15319,28 +15417,29 @@ def _estimate_heavy_script_timeout(
         tags.append("boosting_detected")
 
     raw_estimate = base_seconds + complexity_bonus
-    margin_multiplier = _safe_float(os.getenv("HEAVY_RUNNER_TIMEOUT_MARGIN_MULTIPLIER"), 1.45)
+    backend_cfg = _resolve_state_execution_backend_config(state)
+    margin_multiplier = _safe_float(backend_cfg.get("timeout_margin_multiplier"), 1.45)
     margin_multiplier = max(1.0, margin_multiplier)
-    margin_seconds = _safe_int(os.getenv("HEAVY_RUNNER_TIMEOUT_MARGIN_SECONDS"), 900)
+    margin_seconds = _safe_int(backend_cfg.get("timeout_margin_seconds"), 900)
     estimated = int(round(raw_estimate * margin_multiplier)) + max(0, margin_seconds)
 
-    runtime_mode = _get_execution_runtime_mode()
+    runtime_mode = _get_execution_runtime_mode(state)
     if runtime_mode == "local":
         default_min = 1800 if stage_norm == "data_engineer" else 3600
         min_timeout = _safe_int(
-            os.getenv("LOCAL_RUNNER_SCRIPT_TIMEOUT_MIN_SECONDS")
-            or os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MIN_SECONDS"),
+            backend_cfg.get("local_script_timeout_min_seconds")
+            or backend_cfg.get("script_timeout_min_seconds"),
             default_min,
         )
         max_timeout = _safe_int(
-            os.getenv("LOCAL_RUNNER_SCRIPT_TIMEOUT_MAX_SECONDS")
-            or os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MAX_SECONDS"),
+            backend_cfg.get("local_script_timeout_max_seconds")
+            or backend_cfg.get("script_timeout_max_seconds"),
             43200,
         )
     else:
         default_min = 1200 if stage_norm == "data_engineer" else 2400
-        min_timeout = _safe_int(os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MIN_SECONDS"), default_min)
-        max_timeout = _safe_int(os.getenv("HEAVY_RUNNER_SCRIPT_TIMEOUT_MAX_SECONDS"), 7200)
+        min_timeout = _safe_int(backend_cfg.get("script_timeout_min_seconds"), default_min)
+        max_timeout = _safe_int(backend_cfg.get("script_timeout_max_seconds"), 7200)
     if max_timeout <= 0:
         max_timeout = 7200
     if min_timeout <= 0:
@@ -15729,7 +15828,8 @@ def _should_use_heavy_runner(
 ) -> tuple[bool, str]:
     if state.get("heavy_runner_unavailable"):
         return False, "unavailable"
-    if _env_flag("HEAVY_RUNNER_FORCE", False):
+    backend_cfg = _resolve_state_execution_backend_config(state)
+    if bool(backend_cfg.get("force_cloudrun", False)):
         return True, "forced"
     memory_decision = _build_backend_memory_decision(state, data_profile, ml_plan)
     state["backend_memory_estimate"] = memory_decision
@@ -15737,8 +15837,8 @@ def _should_use_heavy_runner(
 
 
 def _resolve_ml_backend_selection(state: Dict[str, Any]) -> Dict[str, Any]:
-    heavy_cfg = _get_heavy_runner_config()
-    runtime_mode = _get_execution_runtime_mode()
+    heavy_cfg = _get_heavy_runner_config(state)
+    runtime_mode = _get_execution_runtime_mode(state)
     contract, _contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     required_deps = contract.get("required_dependencies", []) if isinstance(contract, dict) else []
     heavy_deps_required = requires_cloudrun_backend(required_deps)
@@ -15868,7 +15968,7 @@ def _build_ml_execution_profile_for_prompt(
     state = state if isinstance(state, dict) else {}
     backend_selection = _resolve_ml_backend_selection(state)
     heavy_cfg = backend_selection.get("heavy_cfg") if isinstance(backend_selection.get("heavy_cfg"), dict) else {}
-    runtime_mode = str(backend_selection.get("runtime_mode") or _get_execution_runtime_mode())
+    runtime_mode = str(backend_selection.get("runtime_mode") or _get_execution_runtime_mode(state))
     hints = state.get("dataset_scale_hints") if isinstance(state.get("dataset_scale_hints"), dict) else {}
     timeout_decision = _estimate_heavy_script_timeout(
         stage="ml_engineer",
@@ -15881,19 +15981,9 @@ def _build_ml_execution_profile_for_prompt(
     # local runner mirrors heavy/cloudrun semantics (same artifact contract),
     # so expose backend as cloudrun and carry runtime_mode separately.
     backend = "cloudrun" if runtime_mode == "local" else ("cloudrun" if bool(backend_selection.get("use_heavy")) else "local")
-    cpu_hint = _read_int_env_hint(
-        "HEAVY_RUNNER_CPU_HINT",
-        "HEAVY_RUNNER_CPU",
-        "CLOUDRUN_JOB_CPU",
-        "CLOUD_RUN_CPU",
-    )
-    memory_gb_hint = _read_memory_env_hint(
-        "HEAVY_RUNNER_MEMORY_GB_HINT",
-        "HEAVY_RUNNER_MEMORY_GB",
-        "HEAVY_RUNNER_MEMORY",
-        "CLOUDRUN_JOB_MEMORY",
-        "CLOUD_RUN_MEMORY",
-    )
+    execution_backend_cfg = _resolve_state_execution_backend_config(state)
+    cpu_hint = _safe_int(execution_backend_cfg.get("cpu_hint"), 0) or None
+    memory_gb_hint = _parse_memory_gb_hint(execution_backend_cfg.get("memory_gb_hint"))
     resource_source = "env_hints"
     if runtime_mode == "local":
         if cpu_hint is None:
@@ -15905,28 +15995,14 @@ def _build_ml_execution_profile_for_prompt(
         # Keep infrastructure context actionable even when env hints are absent.
         # Defaults match heavy-runner deploy defaults and remain advisory-only.
         if cpu_hint is None:
-            cpu_hint = _safe_int(os.getenv("HEAVY_RUNNER_DEFAULT_CPU"), 0)
+            cpu_hint = _safe_int(execution_backend_cfg.get("default_cpu"), 0)
             if cpu_hint <= 0:
                 cpu_hint = 8
         if memory_gb_hint is None:
-            memory_gb_hint = _parse_memory_gb_hint(
-                os.getenv("HEAVY_RUNNER_DEFAULT_MEMORY_GB")
-                or os.getenv("HEAVY_RUNNER_DEFAULT_MEMORY")
-                or "32Gi"
-            )
+            memory_gb_hint = _parse_memory_gb_hint(execution_backend_cfg.get("default_memory_gb") or "32Gi")
             if memory_gb_hint is None or memory_gb_hint <= 0:
                 memory_gb_hint = 32.0
-        if (
-            os.getenv("HEAVY_RUNNER_CPU_HINT") is None
-            and os.getenv("HEAVY_RUNNER_CPU") is None
-            and os.getenv("CLOUDRUN_JOB_CPU") is None
-            and os.getenv("CLOUD_RUN_CPU") is None
-            and os.getenv("HEAVY_RUNNER_MEMORY_GB_HINT") is None
-            and os.getenv("HEAVY_RUNNER_MEMORY_GB") is None
-            and os.getenv("HEAVY_RUNNER_MEMORY") is None
-            and os.getenv("CLOUDRUN_JOB_MEMORY") is None
-            and os.getenv("CLOUD_RUN_MEMORY") is None
-        ):
+        if execution_backend_cfg.get("cpu_hint") in {None, ""} and execution_backend_cfg.get("memory_gb_hint") in {None, ""}:
             resource_source = "cloudrun_defaults"
     else:
         resource_source = "env_hints_or_unknown"
@@ -16078,9 +16154,10 @@ def _should_use_heavy_runner_for_data_engineer(
 ) -> tuple[bool, str]:
     if state.get("heavy_runner_unavailable"):
         return False, "unavailable"
-    if not _env_flag("HEAVY_RUNNER_DE_ENABLED", True):
+    backend_cfg = _resolve_state_execution_backend_config(state)
+    if not bool(backend_cfg.get("data_engineer_cloudrun_enabled", True)):
         return False, "disabled"
-    if _env_flag("HEAVY_RUNNER_FORCE_DE", False) or _env_flag("HEAVY_RUNNER_FORCE", False):
+    if bool(backend_cfg.get("force_data_engineer_cloudrun", False)) or bool(backend_cfg.get("force_cloudrun", False)):
         return True, "forced"
     if state.get("de_force_heavy_runner"):
         return True, "forced_retry"
@@ -16314,7 +16391,7 @@ def _execute_data_engineer_via_heavy_runner(
     attempt_id: int,
     reason: str,
 ) -> Dict[str, Any]:
-    runtime_mode = _get_execution_runtime_mode()
+    runtime_mode = _get_execution_runtime_mode(state)
     _, _, required_artifacts = _resolve_de_output_artifacts(state)
     optional_outlier_report = _resolve_de_outlier_report_path(state)
     optional_download_artifacts: List[str] = []
@@ -16395,24 +16472,30 @@ def _execute_data_engineer_via_heavy_runner(
     launch_fn = launch_local_runner_job if runtime_mode == "local" else launch_heavy_runner_job
     launch_exc = (LocalRunnerLaunchError,) if runtime_mode == "local" else (CloudRunLaunchError,)
     try:
+        launch_kwargs = {
+            "run_id": run_id or "unknown",
+            "request": request,
+            "dataset_path": csv_path,
+            "bucket": heavy_cfg.get("bucket", "local"),
+            "job": heavy_cfg.get("job", "local_runner"),
+            "region": heavy_cfg.get("region", "local"),
+            "project": heavy_cfg.get("project"),
+            "input_prefix": heavy_cfg.get("input_prefix", "inputs"),
+            "output_prefix": heavy_cfg.get("output_prefix", "outputs"),
+            "dataset_prefix": heavy_cfg.get("dataset_prefix", "datasets"),
+            "download_map": download_map,
+            "code_text": code,
+            "support_files": support_files,
+            "data_path": "data/raw.csv",
+            "required_artifacts": required_artifacts,
+            "attempt_id": attempt_id,
+            "stage_namespace": "data_engineer",
+        }
+        if runtime_mode != "local":
+            launch_kwargs["gcloud_bin"] = heavy_cfg.get("gcloud_bin")
+            launch_kwargs["gsutil_bin"] = heavy_cfg.get("gsutil_bin")
         heavy_result = launch_fn(
-            run_id=run_id or "unknown",
-            request=request,
-            dataset_path=csv_path,
-            bucket=heavy_cfg.get("bucket", "local"),
-            job=heavy_cfg.get("job", "local_runner"),
-            region=heavy_cfg.get("region", "local"),
-            project=heavy_cfg.get("project"),
-            input_prefix=heavy_cfg.get("input_prefix", "inputs"),
-            output_prefix=heavy_cfg.get("output_prefix", "outputs"),
-            dataset_prefix=heavy_cfg.get("dataset_prefix", "datasets"),
-            download_map=download_map,
-            code_text=code,
-            support_files=support_files,
-            data_path="data/raw.csv",
-            required_artifacts=required_artifacts,
-            attempt_id=attempt_id,
-            stage_namespace="data_engineer",
+            **launch_kwargs,
         )
     except launch_exc as exc:
         msg = str(exc)
@@ -17857,8 +17940,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if scale_flag in {"medium", "large"} or file_mb >= 50 or est_rows >= 200_000 or n_cols >= 500:
             memory_guard_active = True
     state["de_memory_guard_active"] = memory_guard_active
-    runtime_mode = _get_execution_runtime_mode()
-    de_heavy_cfg = _get_heavy_runner_config()
+    runtime_mode = _get_execution_runtime_mode(state)
+    de_heavy_cfg = _get_heavy_runner_config(state)
+    execution_backend_cfg = _resolve_state_execution_backend_config(state)
     de_use_heavy_runner = bool(de_heavy_cfg)
     if runtime_mode == "local" and de_heavy_cfg:
         de_heavy_reason = "local_runner_mode"
@@ -19118,7 +19202,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         memory_error_detected = _is_memory_pressure_error(error_details)
                         can_try_heavy_after_memory_error = bool(
                             de_heavy_cfg
-                            and _env_flag("HEAVY_RUNNER_DE_ENABLED", True)
+                            and bool(execution_backend_cfg.get("data_engineer_cloudrun_enabled", True))
                             and not state.get("heavy_runner_unavailable")
                         )
                         if memory_error_detected and can_try_heavy_after_memory_error and not _flag_active_for_run(
@@ -19753,7 +19837,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 is_oom_like = _is_memory_pressure_error(err_details)
                 can_try_heavy_after_memory_error = bool(
                     de_heavy_cfg
-                    and _env_flag("HEAVY_RUNNER_DE_ENABLED", True)
+                    and bool(execution_backend_cfg.get("data_engineer_cloudrun_enabled", True))
                     and not state.get("heavy_runner_unavailable")
                 )
                 if is_oom_like and can_try_heavy_after_memory_error and not _flag_active_for_run(
@@ -21377,6 +21461,48 @@ def run_engineer(state: AgentState) -> AgentState:
                     pass
 
         code = ml_engineer.generate_code(**kwargs)
+        try:
+            from src.utils.dialect_code_patch import (
+                has_kwargs_in_read_csv,
+                patch_read_csv_dialect,
+            )
+
+            ml_expected_path = str(kwargs.get("data_path") or state.get("ml_data_path") or "").strip()
+            ml_dialect_issues = dialect_guard_violations(
+                code,
+                csv_sep,
+                csv_decimal,
+                csv_encoding,
+                expected_path=ml_expected_path or None,
+            )
+            ml_has_kwargs = has_kwargs_in_read_csv(
+                code,
+                expected_path=ml_expected_path or "data/cleaned_data.csv",
+            )
+            if ml_dialect_issues or ml_has_kwargs:
+                patched_code, patch_notes, changed = patch_read_csv_dialect(
+                    code,
+                    csv_sep,
+                    csv_decimal,
+                    csv_encoding,
+                    expected_path=ml_expected_path or "data/cleaned_data.csv",
+                )
+                if changed:
+                    code = patched_code
+                    print(f"✅ ML_DIALECT_AUTOPATCH: {patch_notes}")
+                    if run_id:
+                        log_run_event(
+                            run_id,
+                            "ml_engineer_dialect_autopatched",
+                            {
+                                "notes": patch_notes,
+                                "sep": csv_sep,
+                                "decimal": csv_decimal,
+                                "encoding": csv_encoding,
+                            },
+                        )
+        except Exception as patch_err:
+            print(f"⚠️ ML_DIALECT_AUTOPATCH: Failed to apply autopatch: {patch_err}")
         apply_guard_report: Dict[str, Any] = {}
         if bool(state.get("ml_improvement_round_active")):
             apply_guard_report = _evaluate_metric_round_hypothesis_application(
@@ -22297,7 +22423,7 @@ def execute_code(state: AgentState) -> AgentState:
     visuals_missing = False
     contract, contract_min = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
     backend_selection = _resolve_ml_backend_selection(state if isinstance(state, dict) else {})
-    runtime_mode = str(backend_selection.get("runtime_mode") or _get_execution_runtime_mode())
+    runtime_mode = str(backend_selection.get("runtime_mode") or _get_execution_runtime_mode(state))
     heavy_cfg = backend_selection.get("heavy_cfg")
     use_heavy = bool(backend_selection.get("use_heavy"))
     heavy_reason = str(backend_selection.get("reason") or "unknown")
@@ -22497,12 +22623,13 @@ def execute_code(state: AgentState) -> AgentState:
             dataset_scale = state.get("dataset_scale_hints") or {}
             float32_default = (dataset_scale.get("scale") in {"medium", "large"})
             safe_mode_default = (dataset_scale.get("scale") in {"medium", "large"})
-            float32 = _env_flag("HEAVY_RUNNER_FLOAT32", default=float32_default)
-            safe_mode = _env_flag("HEAVY_RUNNER_SAFE_MODE", default=safe_mode_default)
+            execution_backend_cfg = _resolve_state_execution_backend_config(state)
+            float32 = bool(execution_backend_cfg.get("float32", float32_default))
+            safe_mode = bool(execution_backend_cfg.get("safe_mode", safe_mode_default))
 
-            model_type_env = os.getenv("HEAVY_RUNNER_MODEL_TYPE")
-            if model_type_env:
-                model_type = model_type_env
+            model_type_cfg = str(execution_backend_cfg.get("model_type") or "").strip()
+            if model_type_cfg:
+                model_type = model_type_cfg
             elif problem_type == "classification":
                 model_type = "random_forest_classifier"
             elif problem_type == "regression":
@@ -22510,10 +22637,12 @@ def execute_code(state: AgentState) -> AgentState:
             else:
                 model_type = "custom_script"
             model_params = {}
-            params_env = os.getenv("HEAVY_RUNNER_MODEL_PARAMS")
-            if params_env:
+            params_cfg = execution_backend_cfg.get("model_params")
+            if isinstance(params_cfg, dict):
+                model_params = dict(params_cfg)
+            elif params_cfg:
                 try:
-                    model_params = json.loads(params_env)
+                    model_params = json.loads(str(params_cfg))
                 except Exception:
                     model_params = {}
 
@@ -22617,8 +22746,8 @@ def execute_code(state: AgentState) -> AgentState:
                     {
                         "mode": "execute_code",
                         "runtime_mode": runtime_mode,
-                        "gcloud_bin": (os.getenv("HEAVY_RUNNER_GCLOUD_BIN") or "PATH") if runtime_mode != "local" else "local",
-                        "gsutil_bin": (os.getenv("HEAVY_RUNNER_GSUTIL_BIN") or "PATH") if runtime_mode != "local" else "local",
+                        "gcloud_bin": (heavy_cfg.get("gcloud_bin") or "PATH") if runtime_mode != "local" else "local",
+                        "gsutil_bin": (heavy_cfg.get("gsutil_bin") or "PATH") if runtime_mode != "local" else "local",
                         "target_col": target_col,
                         "feature_count": len(feature_cols or []),
                         "problem_type": problem_type,
@@ -22642,25 +22771,29 @@ def execute_code(state: AgentState) -> AgentState:
             launch_fn = launch_local_runner_job if runtime_mode == "local" else launch_heavy_runner_job
             launch_exc = (LocalRunnerLaunchError,) if runtime_mode == "local" else (CloudRunLaunchError,)
             try:
-                heavy_result = launch_fn(
-                    run_id=run_id or "unknown",
-                    request=request,
-                    dataset_path=local_csv,
-                    bucket=heavy_cfg.get("bucket", "local"),
-                    job=heavy_cfg.get("job", "local_runner"),
-                    region=heavy_cfg.get("region", "local"),
-                    project=heavy_cfg.get("project"),
-                    input_prefix=heavy_cfg.get("input_prefix", "inputs"),
-                    output_prefix=heavy_cfg.get("output_prefix", "outputs"),
-                    dataset_prefix=heavy_cfg.get("dataset_prefix", "datasets"),
-                    download_map=download_map,
-                    code_text=code,
-                    support_files=support_files,
-                    data_path=local_csv,
-                    required_artifacts=required_artifacts,
-                    attempt_id=attempt_id,
-                    stage_namespace="ml_engineer",
-                )
+                launch_kwargs = {
+                    "run_id": run_id or "unknown",
+                    "request": request,
+                    "dataset_path": local_csv,
+                    "bucket": heavy_cfg.get("bucket", "local"),
+                    "job": heavy_cfg.get("job", "local_runner"),
+                    "region": heavy_cfg.get("region", "local"),
+                    "project": heavy_cfg.get("project"),
+                    "input_prefix": heavy_cfg.get("input_prefix", "inputs"),
+                    "output_prefix": heavy_cfg.get("output_prefix", "outputs"),
+                    "dataset_prefix": heavy_cfg.get("dataset_prefix", "datasets"),
+                    "download_map": download_map,
+                    "code_text": code,
+                    "support_files": support_files,
+                    "data_path": local_csv,
+                    "required_artifacts": required_artifacts,
+                    "attempt_id": attempt_id,
+                    "stage_namespace": "ml_engineer",
+                }
+                if runtime_mode != "local":
+                    launch_kwargs["gcloud_bin"] = heavy_cfg.get("gcloud_bin")
+                    launch_kwargs["gsutil_bin"] = heavy_cfg.get("gsutil_bin")
+                heavy_result = launch_fn(**launch_kwargs)
             except launch_exc as exc:
                 if run_id:
                     log_run_event(
