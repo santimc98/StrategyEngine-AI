@@ -64,6 +64,29 @@ _STAGE_NAMES = {
 }
 
 
+def _has_execution_failure(final_state: dict) -> bool:
+    if not isinstance(final_state, dict):
+        return False
+    if bool(final_state.get("execution_error")) or bool(final_state.get("sandbox_failed")):
+        return True
+    output_contract = final_state.get("output_contract_report")
+    if isinstance(output_contract, dict):
+        if str(output_contract.get("overall_status") or "").strip().lower() == "error":
+            return True
+        if any(str(item).strip() for item in (output_contract.get("missing") or [])):
+            return True
+    execution_output = str(final_state.get("execution_output", "") or "")
+    failure_markers = [
+        "TIMEOUT:",
+        "HEAVY_RUNNER_ERROR",
+        "HEAVY_RUNNER_CODE_ERROR",
+        "Sandbox Execution Failed",
+        "Traceback (most recent call last)",
+        "RuntimeError:",
+    ]
+    return any(marker in execution_output for marker in failure_markers)
+
+
 def _update_status(run_id, *, stage, progress, completed_steps,
                    iteration=0, max_iterations=6,
                    metric_name="", metric_value="",
@@ -260,6 +283,7 @@ def main(run_id: str) -> None:
 
             elif "execute_code" in event:
                 exec_output = str(final_state.get("execution_output", ""))
+                attempt_metric_value = ""
                 for pattern in [
                     r"(?:RMSLE|rmsle)[:\s=]+([0-9]+\.?[0-9]*)",
                     r"(?:RMSE|rmse)[:\s=]+([0-9]+\.?[0-9]*)",
@@ -271,17 +295,22 @@ def main(run_id: str) -> None:
                 ]:
                     match = re.search(pattern, exec_output, re.IGNORECASE)
                     if match:
-                        current_metric_value = match.group(1)
+                        attempt_metric_value = match.group(1)
                         if best_metric_name == "Metric":
                             name_match = re.search(
-                                r"([A-Za-z0-9_-]+)[:\s=]+" + re.escape(current_metric_value),
+                                r"([A-Za-z0-9_-]+)[:\s=]+" + re.escape(attempt_metric_value),
                                 exec_output,
                             )
                             if name_match:
                                 best_metric_name = name_match.group(1).upper()
                         break
-                metric_str = f" -- {best_metric_name}: {current_metric_value}" if current_metric_value else ""
-                append_log(run_id, "ML Engineer", f"Ejecucion completada (Iteracion {ml_iteration}){metric_str}.", "ok")
+                if attempt_metric_value:
+                    current_metric_value = attempt_metric_value
+                metric_str = f" -- {best_metric_name}: {attempt_metric_value}" if attempt_metric_value else ""
+                if _has_execution_failure(final_state):
+                    append_log(run_id, "ML Engineer", f"Ejecucion fallida (Iteracion {ml_iteration}){metric_str}.", "warn")
+                else:
+                    append_log(run_id, "ML Engineer", f"Ejecucion completada (Iteracion {ml_iteration}){metric_str}.", "ok")
                 append_log(run_id, "Reviewer", "Evaluando resultados vs. objetivo de negocio...", "info")
                 active_step = "evaluate_results"
 
