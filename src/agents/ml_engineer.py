@@ -4069,6 +4069,9 @@ class MLEngineerAgent:
         - Implement training_rows_policy and train_filter exactly when present.
         - Use evaluation_spec and validation_requirements as metric/CV authority.
         - If contract says requires_target=false, do not fit supervised models; still emit required artifacts with explicit no-train status.
+        - Derive model family choice from ML_VIEW, ML_PLAN, strategy context, and observed data constraints; do not introduce generic default model recipes.
+        - If upstream strategy context names multiple candidate families, compare only those that remain compatible with the cleaned data, runtime dependencies, and contract.
+        - Every candidate pipeline must be internally compatible end-to-end: preprocessing output format, feature representation, estimator input requirements, and runtime dependency availability.
         - Choose preprocessing, validation, and scoring logic that matches the data structure rather than generic boilerplate.
         - Handle outliers with data-driven, non-destructive methods unless contract says otherwise.
 
@@ -4129,15 +4132,16 @@ class MLEngineerAgent:
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title ($analysis_type)
         - Strategy Hypothesis: $hypothesis
-        - Strategy Techniques: $strategy_techniques
-        - Strategy Fallback Chain: $strategy_fallback_chain
+        - Upstream Strategy Techniques (authoritative context, not prompt defaults): $strategy_techniques
+        - Upstream Strategy Fallback Chain (authoritative context, not prompt defaults): $strategy_fallback_chain
         - ML_VIEW_CONTEXT: $ml_view_context
         - Evaluation Spec: $evaluation_spec_json
         - Required Outputs: $deliverables_json
         - Artifact Schema (authoritative output column format):
         $artifact_schema_block
         - Canonical Columns: $canonical_columns
-        - Required Features: $required_columns
+        - Model Input Candidates: $model_input_candidates
+        - Artifact-required Clean Columns: $artifact_required_columns
         - Column Dtype Targets: $column_dtype_targets_json
         - Data Sample Context: $data_sample_context_json
         - Cleaned Data Summary (advisory): $cleaned_data_summary_min_json
@@ -4173,7 +4177,26 @@ class MLEngineerAgent:
         # V4.1: Build deliverables from required_outputs, no spec_extraction
         deliverables: List[Dict[str, Any]] = []
         if required_outputs:
-            deliverables = [{"path": path, "required": True} for path in required_outputs if path]
+            for item in required_outputs:
+                if isinstance(item, str):
+                    path = str(item).strip()
+                    if path:
+                        deliverables.append({"path": path, "required": True})
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                path = item.get("path")
+                if not path:
+                    continue
+                deliverable: Dict[str, Any] = {
+                    "path": path,
+                    "required": bool(item.get("required", True)),
+                }
+                if item.get("intent"):
+                    deliverable["intent"] = item.get("intent")
+                if item.get("kind"):
+                    deliverable["kind"] = item.get("kind")
+                deliverables.append(deliverable)
         required_deliverables = [item.get("path") for item in deliverables if item.get("required") and item.get("path")]
         deliverables_json = self._serialize_json_for_prompt(
             deliverables,
@@ -4444,6 +4467,30 @@ class MLEngineerAgent:
             required_columns_payload = summarize_long_list(required_columns_payload)
             required_columns_payload["note"] = COLUMN_LIST_POINTER
 
+        model_input_candidates_payload: Any = []
+        model_features_from_view = ml_view.get("model_features")
+        if isinstance(model_features_from_view, list) and model_features_from_view:
+            model_input_candidates_payload = model_features_from_view
+        else:
+            allowed_feature_sets_source = ml_view.get("allowed_feature_sets")
+            if not isinstance(allowed_feature_sets_source, dict):
+                allowed_feature_sets_source = (
+                    execution_contract_input.get("allowed_feature_sets")
+                    if isinstance(execution_contract_input.get("allowed_feature_sets"), dict)
+                    else {}
+                )
+            if isinstance(allowed_feature_sets_source, dict):
+                allowed_model_features = allowed_feature_sets_source.get("model_features")
+                if isinstance(allowed_model_features, list) and allowed_model_features:
+                    model_input_candidates_payload = allowed_model_features
+        if not model_input_candidates_payload:
+            strategy_required = strategy.get("required_columns", [])
+            if isinstance(strategy_required, list) and strategy_required:
+                model_input_candidates_payload = strategy_required
+        if isinstance(model_input_candidates_payload, list) and len(model_input_candidates_payload) > 80:
+            model_input_candidates_payload = summarize_long_list(model_input_candidates_payload)
+            model_input_candidates_payload["note"] = COLUMN_LIST_POINTER
+
         required_dependencies = execution_contract_input.get("required_dependencies")
         if not isinstance(required_dependencies, list):
             required_dependencies = []
@@ -4556,7 +4603,18 @@ class MLEngineerAgent:
             strategy_techniques_compact=_strategy_techniques_compact,
             strategy_fallback_chain=_strategy_fallback_chain,
             optional_context_block=_optional_context_block,
-            required_columns=json.dumps(required_columns_payload),
+            model_input_candidates=self._serialize_json_for_prompt(
+                model_input_candidates_payload,
+                max_chars=5000,
+                max_str_len=400,
+                max_list_items=120,
+            ),
+            artifact_required_columns=self._serialize_json_for_prompt(
+                required_columns_payload,
+                max_chars=5000,
+                max_str_len=400,
+                max_list_items=120,
+            ),
             deliverables_json=deliverables_json,
             canonical_columns=self._serialize_json_for_prompt(
                 canonical_columns_source,
@@ -4641,8 +4699,8 @@ class MLEngineerAgent:
         - Apply training/validation/evaluation exactly from contract + ML view.
         - Produce required outputs at exact contract paths.
         - Include alignment evidence artifact when required.
-        - IGNORE complex feature_engineering_tasks from the contract in this first pass. 
-          Focus on a robust BASELINE model only (simple cleaning/imputation/encoding).
+        - In this first BUILD pass, implement the smallest contract-valid modeling pipeline justified by ML_VIEW, ML_PLAN, and observed data compatibility.
+        - Do not add speculative model families or complex feature engineering unless strategy/plan context explicitly requires them.
 
 
         Return Python code only.

@@ -78,6 +78,97 @@ def test_editor_mode_prompt_includes_structured_feedback_json(monkeypatch):
     assert "submission_format_validation" in prompt
 
 
+def test_build_prompt_uses_strategy_context_without_default_model_recipe(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={
+            "title": "Pricing Strategy",
+            "analysis_type": "predictive",
+            "required_columns": [],
+            "techniques": ["time-aware regression on allowed features"],
+            "fallback_chain": ["Fallback: simpler linear model if the primary family is incompatible."],
+        },
+        data_path="data/cleaned_data.csv",
+        execution_contract={
+            "required_outputs": [
+                {"path": "artifacts/ml/cv_metrics.json", "required": True, "intent": "cv_metrics"},
+                {"path": "static/plots/*.png", "required": False, "intent": "model_plots"},
+            ],
+            "artifact_requirements": {
+                "clean_dataset": {"required_columns": ["CurrentPhase", "FiscalId"]},
+            },
+        },
+        ml_view={
+            "required_outputs": [
+                {"path": "artifacts/ml/cv_metrics.json", "required": True, "intent": "cv_metrics"},
+                {"path": "static/plots/*.png", "required": False, "intent": "model_plots"},
+            ],
+            "allowed_feature_sets": {"model_features": ["Size", "Debtors"]},
+        },
+    )
+
+    prompt = str(agent.last_prompt or "")
+    _assert_contains_all(
+        prompt,
+        "Model Input Candidates:",
+        '["Size","Debtors"]',
+        "Artifact-required Clean Columns:",
+        '["CurrentPhase","FiscalId"]',
+        "Do not add speculative model families",
+    )
+    assert "Required Features:" not in prompt
+    assert "robust BASELINE model only" not in prompt
+    _assert_contains_terms(prompt, "authoritative context, not prompt defaults")
+
+
+def test_build_prompt_preserves_optional_required_output_flags(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={"title": "Output Policy Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        execution_contract={
+            "required_outputs": [
+                {"path": "artifacts/ml/cv_metrics.json", "required": True, "intent": "cv_metrics", "kind": "metrics"},
+                {"path": "static/plots/*.png", "required": False, "intent": "model_plots", "kind": "visualization"},
+            ],
+        },
+        ml_view={
+            "required_outputs": [
+                {"path": "artifacts/ml/cv_metrics.json", "required": True, "intent": "cv_metrics", "kind": "metrics"},
+                {"path": "static/plots/*.png", "required": False, "intent": "model_plots", "kind": "visualization"},
+            ],
+        },
+    )
+
+    prompt = str(agent.last_prompt or "")
+    _assert_contains_all(prompt, "artifacts/ml/cv_metrics.json", "static/plots/*.png", '"required":false')
+    _assert_contains_terms(prompt, '"intent":"model_plots"')
+
+
 def test_generate_code_prompt_preserves_string_runbook(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
