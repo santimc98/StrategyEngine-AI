@@ -8831,6 +8831,7 @@ def _score_attempt(
     output_contract_report: Dict[str, Any],
     content_issues: List[str],
     artifact_paths: List[str],
+    contract: Dict[str, Any] | None = None,
 ) -> float:
     """Score an attempt for best_attempt selection.
 
@@ -8857,29 +8858,86 @@ def _score_attempt(
     # that even a 0.0001 AUC improvement (+0.1 score) overwhelms any
     # completeness difference (~1-2 points).
     try:
+        metrics_aliases = {
+            "metrics.json",
+            "cv_metrics.json",
+            "evaluation_metrics.json",
+            "evaluation_report.json",
+            "evaluation_summary.json",
+        }
         metrics_candidates: List[str] = []
+        seen_candidates: set[str] = set()
+
+        def _append_candidate(path: Any) -> None:
+            normalized = normalize_artifact_path(path)
+            if not normalized or normalized in seen_candidates:
+                return
+            seen_candidates.add(normalized)
+            metrics_candidates.append(normalized)
+
+        declared_metrics = get_declared_artifact_path(
+            contract if isinstance(contract, dict) else {},
+            kind="metrics",
+        )
+        declared_metrics_norm = normalize_artifact_path(declared_metrics)
+        declared_metrics_base = os.path.basename(declared_metrics_norm).lower() if declared_metrics_norm else ""
         for path in artifact_paths or []:
             normalized = normalize_artifact_path(path)
-            if normalized and os.path.basename(normalized).lower() == "metrics.json" and normalized not in metrics_candidates:
-                metrics_candidates.insert(0, normalized)
-        metrics_json = {}
+            if not normalized:
+                continue
+            base = os.path.basename(normalized).lower()
+            if declared_metrics_norm and (
+                normalized == declared_metrics_norm or (declared_metrics_base and base == declared_metrics_base)
+            ):
+                _append_candidate(normalized)
+            if base in metrics_aliases:
+                _append_candidate(normalized)
+
+        metrics_json: Dict[str, Any] = {}
         for metrics_path in metrics_candidates:
             candidate_payload = _load_json_safe(metrics_path)
             if isinstance(candidate_payload, dict) and candidate_payload:
-                metrics_json = candidate_payload
+                normalized_payload = _normalize_metrics_report_payload(candidate_payload)
+                metrics_json = (
+                    normalized_payload
+                    if isinstance(normalized_payload, dict) and normalized_payload
+                    else candidate_payload
+                )
+                metrics_json.setdefault("source", metrics_path)
                 break
-        if isinstance(metrics_json, dict):
-            # Determine metric name from metrics.json or default
-            metric_name = str(metrics_json.get("primary_metric") or "roc_auc").strip()
-            ml_value = _extract_primary_metric(metrics_json, metric_name)
-            if ml_value is not None and 0.0 < ml_value < 1e6:
-                higher_is_better = bool(_metric_higher_is_better(metric_name))
-                # For higher-is-better metrics (e.g. AUC): add directly
-                # For lower-is-better metrics (e.g. logloss): negate
+        if isinstance(metrics_json, dict) and metrics_json:
+            evaluation_spec = (
+                contract.get("evaluation_spec")
+                if isinstance(contract, dict) and isinstance(contract.get("evaluation_spec"), dict)
+                else {}
+            )
+            primary_metric_state = _build_primary_metric_state(
+                state={"execution_contract": contract or {}, "evaluation_spec": evaluation_spec},
+                metrics_report=metrics_json,
+                weights_report={},
+                objective_type=str(evaluation_spec.get("objective_type") or ""),
+                evaluation_spec=evaluation_spec,
+                contract=contract or {},
+            )
+            metric_name = str(
+                primary_metric_state.get("primary_metric_name")
+                or metrics_json.get("primary_metric_name")
+                or metrics_json.get("primary_metric")
+                or ""
+            ).strip()
+            ml_value = _coerce_float(primary_metric_state.get("primary_metric_value"))
+            if ml_value is None and metric_name:
+                ml_value = _extract_primary_metric(metrics_json, metric_name)
+            if ml_value is not None and abs(float(ml_value)) < 1e12:
+                higher_is_better = (
+                    bool(primary_metric_state.get("higher_is_better"))
+                    if isinstance(primary_metric_state.get("higher_is_better"), bool)
+                    else bool(_metric_higher_is_better(metric_name or ""))
+                )
                 if higher_is_better:
                     score += float(ml_value) * 1000.0
                 else:
-                    score += (1.0 - float(ml_value)) * 1000.0
+                    score -= float(ml_value) * 1000.0
     except Exception:
         pass  # If metrics unavailable, fall back to completeness-only scoring
 
@@ -8894,6 +8952,7 @@ def _snapshot_best_attempt(
     plots_local: List[str],
     diagnostics: Dict[str, Any] | None = None,
     dest_root: str = os.path.join("artifacts", "best_attempt"),
+    contract: Dict[str, Any] | None = None,
 ) -> str | None:
     if attempt_id < 1:
         return None
@@ -8916,6 +8975,75 @@ def _snapshot_best_attempt(
             "plots_local": plots_local,
             "diagnostics": diagnostics or {},
         }
+        metrics_aliases = {
+            "metrics.json",
+            "cv_metrics.json",
+            "evaluation_metrics.json",
+            "evaluation_report.json",
+            "evaluation_summary.json",
+        }
+        metrics_payload: Dict[str, Any] = {}
+        metrics_path = ""
+        declared_metrics = get_declared_artifact_path(
+            contract if isinstance(contract, dict) else {},
+            kind="metrics",
+        )
+        declared_metrics_norm = normalize_artifact_path(declared_metrics)
+        declared_metrics_base = os.path.basename(declared_metrics_norm).lower() if declared_metrics_norm else ""
+        metrics_candidates: List[str] = []
+        seen_candidates: set[str] = set()
+
+        def _append_metrics_candidate(path: Any) -> None:
+            normalized = normalize_artifact_path(path)
+            if not normalized or normalized in seen_candidates:
+                return
+            seen_candidates.add(normalized)
+            metrics_candidates.append(normalized)
+
+        for path in artifact_paths or []:
+            normalized = normalize_artifact_path(path)
+            if not normalized:
+                continue
+            base = os.path.basename(normalized).lower()
+            if declared_metrics_norm and (
+                normalized == declared_metrics_norm or (declared_metrics_base and base == declared_metrics_base)
+            ):
+                _append_metrics_candidate(normalized)
+            if base in metrics_aliases:
+                _append_metrics_candidate(normalized)
+
+        for candidate_path in metrics_candidates:
+            candidate_payload = _load_json_safe(candidate_path)
+            if isinstance(candidate_payload, dict) and candidate_payload:
+                normalized_payload = _normalize_metrics_report_payload(candidate_payload)
+                metrics_payload = (
+                    normalized_payload
+                    if isinstance(normalized_payload, dict) and normalized_payload
+                    else candidate_payload
+                )
+                metrics_payload.setdefault("source", candidate_path)
+                metrics_path = candidate_path
+                break
+        if metrics_payload:
+            meta["metrics_payload"] = metrics_payload
+        if metrics_path:
+            meta["metrics_path"] = metrics_path
+        if metrics_payload:
+            evaluation_spec = (
+                contract.get("evaluation_spec")
+                if isinstance(contract, dict) and isinstance(contract.get("evaluation_spec"), dict)
+                else {}
+            )
+            primary_metric_state = _build_primary_metric_state(
+                state={"execution_contract": contract or {}, "evaluation_spec": evaluation_spec},
+                metrics_report=metrics_payload,
+                weights_report={},
+                objective_type=str(evaluation_spec.get("objective_type") or ""),
+                evaluation_spec=evaluation_spec,
+                contract=contract or {},
+            )
+            if isinstance(primary_metric_state, dict) and primary_metric_state:
+                meta["primary_metric_state"] = primary_metric_state
         with open(os.path.join(dest_root, "best_attempt.json"), "w", encoding="utf-8") as f_meta:
             json.dump(meta, f_meta, indent=2, ensure_ascii=False)
         return dest_root
@@ -8955,6 +9083,56 @@ def _promote_best_attempt(state: Dict[str, Any]) -> Dict[str, Any]:
                     dump_json("data/output_contract_report.json", meta.get("output_contract_report"))
                 except Exception:
                     pass
+            metrics_payload = meta.get("metrics_payload") if isinstance(meta.get("metrics_payload"), dict) else {}
+            metrics_path = normalize_artifact_path(meta.get("metrics_path"))
+            if metrics_payload:
+                updated["metrics_report"] = copy.deepcopy(metrics_payload)
+                primary_metric_state = (
+                    meta.get("primary_metric_state")
+                    if isinstance(meta.get("primary_metric_state"), dict)
+                    else {}
+                )
+                if not primary_metric_state:
+                    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+                    evaluation_spec = (
+                        contract.get("evaluation_spec")
+                        if isinstance(contract, dict) and isinstance(contract.get("evaluation_spec"), dict)
+                        else {}
+                    )
+                    primary_metric_state = _build_primary_metric_state(
+                        state={"execution_contract": contract, "evaluation_spec": evaluation_spec},
+                        metrics_report=metrics_payload,
+                        weights_report={},
+                        objective_type=str(evaluation_spec.get("objective_type") or ""),
+                        evaluation_spec=evaluation_spec,
+                        contract=contract,
+                    )
+                if isinstance(primary_metric_state, dict) and primary_metric_state:
+                    updated["primary_metric_state"] = copy.deepcopy(primary_metric_state)
+                    try:
+                        os.makedirs("data", exist_ok=True)
+                        dump_json("data/metric_state.json", primary_metric_state)
+                    except Exception:
+                        pass
+                metrics_snapshot = _build_metrics_artifact_snapshot(
+                    state=state if isinstance(state, dict) else {},
+                    role="best_attempt",
+                    metrics_payload=metrics_payload,
+                    path=metrics_path or "",
+                    source=f"best_attempt:{metrics_path}" if metrics_path else "best_attempt",
+                    metric_name=(
+                        primary_metric_state.get("primary_metric_name")
+                        if isinstance(primary_metric_state, dict)
+                        else None
+                    ),
+                    higher_is_better=(
+                        primary_metric_state.get("higher_is_better")
+                        if isinstance(primary_metric_state, dict)
+                        else None
+                    ),
+                )
+                if metrics_snapshot:
+                    updated["metrics_artifact_snapshot"] = metrics_snapshot
             if meta.get("execution_output"):
                 updated.update(_clear_runtime_blockers())
                 updated["execution_output"] = meta.get("execution_output")
@@ -16870,7 +17048,7 @@ def _finalize_heavy_execution(
     except Exception as idx_err:
         print(f"Warning: failed to persist produced_artifact_index.json: {idx_err}")
 
-    attempt_score = _score_attempt(outputs_valid, oc_report, content_issues, artifact_paths)
+    attempt_score = _score_attempt(outputs_valid, oc_report, content_issues, artifact_paths, contract)
     attempt_valid = bool(
         outputs_valid
         and not oc_report.get("missing")
@@ -16919,6 +17097,7 @@ def _finalize_heavy_execution(
             execution_output=output,
             plots_local=plots_local,
             diagnostics=content_diagnostics,
+            contract=contract,
         )
         result["best_attempt_score"] = attempt_score
         result["best_attempt_id"] = attempt_id
@@ -23644,7 +23823,7 @@ def execute_code(state: AgentState) -> AgentState:
     except Exception as idx_err:
         print(f"Warning: failed to persist produced_artifact_index.json: {idx_err}")
 
-    attempt_score = _score_attempt(outputs_valid, oc_report, content_issues, artifact_paths)
+    attempt_score = _score_attempt(outputs_valid, oc_report, content_issues, artifact_paths, contract)
     attempt_valid = bool(
         outputs_valid
         and not oc_report.get("missing")
@@ -23693,6 +23872,7 @@ def execute_code(state: AgentState) -> AgentState:
             execution_output=output,
             plots_local=plots_local,
             diagnostics=content_diagnostics,
+            contract=contract,
         )
         result["best_attempt_score"] = attempt_score
         result["best_attempt_id"] = attempt_id

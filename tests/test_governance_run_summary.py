@@ -242,3 +242,24 @@ def test_run_summary_prefers_clean_state_output_contract_over_stale_persisted_re
 
     assert "output_contract_missing" not in (summary.get("failed_gates") or [])
     assert "output_contract_report.overall_status=error" not in (summary.get("governance_reasons") or [])
+
+
+def test_run_summary_loads_cv_metrics_artifact_when_data_metrics_file_is_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs(os.path.join("artifacts", "ml"), exist_ok=True)
+    os.makedirs("data", exist_ok=True)
+    with open("artifacts/ml/cv_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "primary_metric_name": "mae",
+                "primary_metric_value": 40.342921920665276,
+                "metrics": {"mae": 40.342921920665276, "rmse": 49.680905103143104},
+            },
+            f,
+        )
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"missing": []}, f)
+
+    summary = build_run_summary({"review_verdict": "APPROVED"})
+
+    assert summary.get("metrics", {}).get("metric_pool_size", 0) > 0

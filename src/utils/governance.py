@@ -90,6 +90,11 @@ def _load_metrics_report(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
                 return dict(payload)
 
     candidates = [
+        "artifacts/ml/cv_metrics.json",
+        "artifacts/ml/metrics.json",
+        "artifacts/ml/evaluation_metrics.json",
+        "artifacts/ml/evaluation_report.json",
+        "artifacts/ml/evaluation_summary.json",
         "data/metrics.json",
         "reports/evaluation_metrics.json",
         "data/evaluation_metrics.json",
