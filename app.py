@@ -19,25 +19,6 @@ APP_ROOT = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(APP_ROOT)
 
 from src.utils.paths import PROJECT_ROOT as _PROJECT_ROOT_PATHS
-
-from src.graph.graph import (
-    app_graph,
-    request_abort,
-    clear_abort,
-    get_runtime_agent_models,
-    set_runtime_agent_models,
-)
-from src.utils.run_workspace import recover_orphaned_workspace_cwd
-from src.utils.run_status import (
-    get_active_run_id as _get_active_run_id,
-    is_process_alive as _is_process_alive,
-    kill_worker as _kill_worker,
-    read_final_state as _read_final_state,
-    read_log_entries as _read_log_entries,
-    read_status as _read_run_status,
-    request_run_abort as _request_run_abort,
-    write_worker_input as _write_worker_input,
-)
 from src.utils.api_keys_store import (
     API_KEY_REGISTRY,
     apply_keys_to_env,
@@ -57,6 +38,17 @@ from src.utils.sandbox_config import (
 )
 import src.utils.sandbox_provider as _sandbox_provider
 from src.utils.run_history import list_runs as _list_runs, load_run_result as _load_run_result
+from src.utils.run_workspace import recover_orphaned_workspace_cwd
+from src.utils.run_status import (
+    get_active_run_id as _get_active_run_id,
+    is_process_alive as _is_process_alive,
+    kill_worker as _kill_worker,
+    read_final_state as _read_final_state,
+    read_log_entries as _read_log_entries,
+    read_status as _read_run_status,
+    request_run_abort as _request_run_abort,
+    write_worker_input as _write_worker_input,
+)
 
 # Auto-heal cwd when prior run crashed inside runs/<run_id>/work.
 recover_orphaned_workspace_cwd(project_root=APP_ROOT)
@@ -67,6 +59,14 @@ except Exception as cwd_err:
 
 # Apply stored API keys to environment on startup
 apply_keys_to_env()
+
+from src.graph.graph import (
+    app_graph,
+    request_abort,
+    clear_abort,
+    get_runtime_agent_models,
+    set_runtime_agent_models,
+)
 
 _SIGNAL_HANDLER_INSTALLED = False
 

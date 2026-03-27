@@ -26,6 +26,7 @@ if _PROJECT_ROOT not in sys.path:
 from src.utils.paths import PROJECT_ROOT
 os.chdir(PROJECT_ROOT)
 
+from src.utils.api_keys_store import apply_keys_to_env
 from src.utils.run_status import (
     append_log,
     is_run_abort_requested,
@@ -37,6 +38,8 @@ from src.utils.sandbox_provider import (
     get_sandbox_class,
     get_sandbox_provider_spec,
 )
+
+apply_keys_to_env()
 
 # Progress weight per step (cumulative %)
 _STEP_PROGRESS = {
