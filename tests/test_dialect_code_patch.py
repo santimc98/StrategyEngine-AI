@@ -184,6 +184,24 @@ df = pd.read_csv('data/raw.csv', sep=my_sep)
         assert "sep=';'" in patched or 'sep=";"' in patched
         assert any("Replaced sep" in note for note in notes)
 
+    def test_normalizes_manifest_dialect_alias_lookups(self):
+        """Test that helper functions reading manifest dialect support sep/delimiter aliases."""
+        code = """
+import pandas as pd
+def read_csv_with_dialect(path, dialect):
+    sep = dialect.get('delimiter', ',')
+    return pd.read_csv(path, sep=sep, decimal=',', encoding='utf-8')
+df = read_csv_with_dialect('data/raw.csv', {'sep': ';'})
+"""
+
+        patched, notes, changed = patch_read_csv_dialect(
+            code, csv_sep=";", csv_decimal=",", csv_encoding="utf-8"
+        )
+
+        assert changed is True
+        assert "dialect.get('sep') or dialect.get('delimiter', ',')" in patched or 'dialect.get("sep") or dialect.get("delimiter", ",")' in patched
+        assert any("sep/delimiter alias" in note for note in notes)
+
 
 class TestHasKwargsInReadCsv:
     """Tests for has_kwargs_in_read_csv helper."""

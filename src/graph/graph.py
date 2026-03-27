@@ -14981,6 +14981,15 @@ def run_steward(state: AgentState) -> AgentState:
         "ml_improvement_round_baseline_metrics": {},
         "ml_improvement_round_baseline_reviewer_packet": {},
         "ml_improvement_round_baseline_qa_packet": {},
+        "ml_improvement_round_baseline_gate_context": {},
+        "ml_improvement_round_baseline_board_payload": {},
+        "ml_improvement_round_baseline_review_stack": {},
+        "ml_improvement_round_baseline_hard_failures": [],
+        "ml_improvement_round_baseline_runtime_fix_terminal": False,
+        "ml_improvement_round_baseline_runtime_fix_terminal_reason": "",
+        "ml_improvement_round_baseline_sandbox_failed": False,
+        "ml_improvement_round_baseline_execution_error": "",
+        "ml_improvement_round_baseline_error_message": "",
         "ml_improvement_incumbent_metric": None,
         "ml_improvement_baseline_metric": None,
         "ml_improvement_baseline_metrics": {},
@@ -21671,44 +21680,31 @@ def run_engineer(state: AgentState) -> AgentState:
         code = ml_engineer.generate_code(**kwargs)
         try:
             from src.utils.dialect_code_patch import (
-                has_kwargs_in_read_csv,
                 patch_read_csv_dialect,
             )
 
             ml_expected_path = str(kwargs.get("data_path") or state.get("ml_data_path") or "").strip()
-            ml_dialect_issues = dialect_guard_violations(
+            patched_code, patch_notes, changed = patch_read_csv_dialect(
                 code,
                 csv_sep,
                 csv_decimal,
                 csv_encoding,
-                expected_path=ml_expected_path or None,
-            )
-            ml_has_kwargs = has_kwargs_in_read_csv(
-                code,
                 expected_path=ml_expected_path or "data/cleaned_data.csv",
             )
-            if ml_dialect_issues or ml_has_kwargs:
-                patched_code, patch_notes, changed = patch_read_csv_dialect(
-                    code,
-                    csv_sep,
-                    csv_decimal,
-                    csv_encoding,
-                    expected_path=ml_expected_path or "data/cleaned_data.csv",
-                )
-                if changed:
-                    code = patched_code
-                    print(f"✅ ML_DIALECT_AUTOPATCH: {patch_notes}")
-                    if run_id:
-                        log_run_event(
-                            run_id,
-                            "ml_engineer_dialect_autopatched",
-                            {
-                                "notes": patch_notes,
-                                "sep": csv_sep,
-                                "decimal": csv_decimal,
-                                "encoding": csv_encoding,
-                            },
-                        )
+            if changed:
+                code = patched_code
+                print(f"✅ ML_DIALECT_AUTOPATCH: {patch_notes}")
+                if run_id:
+                    log_run_event(
+                        run_id,
+                        "ml_engineer_dialect_autopatched",
+                        {
+                            "notes": patch_notes,
+                            "sep": csv_sep,
+                            "decimal": csv_decimal,
+                            "encoding": csv_encoding,
+                        },
+                    )
         except Exception as patch_err:
             print(f"⚠️ ML_DIALECT_AUTOPATCH: Failed to apply autopatch: {patch_err}")
         apply_guard_report: Dict[str, Any] = {}
@@ -29194,6 +29190,37 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         if isinstance(state.get("qa_last_result"), dict)
         else {}
     )
+    state["ml_improvement_round_baseline_gate_context"] = (
+        copy.deepcopy(state.get("last_successful_gate_context"))
+        if isinstance(state.get("last_successful_gate_context"), dict)
+        else (
+            copy.deepcopy(state.get("last_gate_context"))
+            if isinstance(state.get("last_gate_context"), dict)
+            else {}
+        )
+    )
+    state["ml_improvement_round_baseline_board_payload"] = (
+        copy.deepcopy(state.get("review_board_verdict"))
+        if isinstance(state.get("review_board_verdict"), dict)
+        else {}
+    )
+    state["ml_improvement_round_baseline_review_stack"] = (
+        copy.deepcopy(state.get("ml_review_stack"))
+        if isinstance(state.get("ml_review_stack"), dict)
+        else {}
+    )
+    state["ml_improvement_round_baseline_hard_failures"] = [
+        str(item)
+        for item in (state.get("hard_failures") or [])
+        if str(item).strip()
+    ]
+    state["ml_improvement_round_baseline_runtime_fix_terminal"] = bool(state.get("runtime_fix_terminal"))
+    state["ml_improvement_round_baseline_runtime_fix_terminal_reason"] = str(
+        state.get("runtime_fix_terminal_reason") or ""
+    )
+    state["ml_improvement_round_baseline_sandbox_failed"] = bool(state.get("sandbox_failed"))
+    state["ml_improvement_round_baseline_execution_error"] = str(state.get("execution_error") or "")
+    state["ml_improvement_round_baseline_error_message"] = str(state.get("error_message") or "")
     state["ml_improvement_baseline_review_verdict"] = normalize_review_status(state.get("review_verdict"))
     state["ml_improvement_best_round"] = int(state.get("ml_improvement_best_round", 0) or 0)
     if not isinstance(state.get("ml_improvement_round_history"), list):
@@ -29599,6 +29626,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             state,
             reason="metric_round_baseline_restore",
         )
+        _restore_metric_round_baseline_state(state)
         state["ml_improvement_kept"] = "baseline"
         state["review_verdict"] = baseline_verdict
         state["stop_reason"] = "IMPROVEMENT_ROUND_RESTORE_INCUMBENT"
@@ -30127,6 +30155,78 @@ def _upsert_metric_improvement_summary(summary: str, line: str) -> str:
     return "\n".join(filtered)
 
 
+def _restore_metric_round_baseline_state(state: Dict[str, Any]) -> None:
+    if not isinstance(state, dict):
+        return
+
+    baseline_verdict = normalize_review_status(
+        state.get("ml_improvement_baseline_review_verdict")
+        or state.get("last_successful_review_verdict")
+        or state.get("review_verdict")
+        or "APPROVED"
+    )
+    baseline_gate_context = (
+        copy.deepcopy(state.get("ml_improvement_round_baseline_gate_context"))
+        if isinstance(state.get("ml_improvement_round_baseline_gate_context"), dict)
+        else {}
+    )
+    baseline_board_payload = (
+        copy.deepcopy(state.get("ml_improvement_round_baseline_board_payload"))
+        if isinstance(state.get("ml_improvement_round_baseline_board_payload"), dict)
+        else {}
+    )
+    baseline_review_stack = (
+        copy.deepcopy(state.get("ml_improvement_round_baseline_review_stack"))
+        if isinstance(state.get("ml_improvement_round_baseline_review_stack"), dict)
+        else {}
+    )
+    baseline_hard_failures = [
+        str(item)
+        for item in (state.get("ml_improvement_round_baseline_hard_failures") or [])
+        if str(item).strip()
+    ]
+
+    state["review_verdict"] = baseline_verdict
+    state["review_verdict_normalized"] = baseline_verdict
+    state["last_successful_review_verdict"] = baseline_verdict
+    state["hard_failures"] = baseline_hard_failures
+    state["runtime_fix_terminal"] = bool(state.get("ml_improvement_round_baseline_runtime_fix_terminal"))
+    state["runtime_fix_terminal_reason"] = str(
+        state.get("ml_improvement_round_baseline_runtime_fix_terminal_reason") or ""
+    )
+    state["sandbox_failed"] = bool(state.get("ml_improvement_round_baseline_sandbox_failed"))
+    state["execution_error"] = str(state.get("ml_improvement_round_baseline_execution_error") or "")
+    state["error_message"] = str(state.get("ml_improvement_round_baseline_error_message") or "")
+
+    if baseline_gate_context:
+        state["last_gate_context"] = baseline_gate_context
+        state["last_successful_gate_context"] = copy.deepcopy(baseline_gate_context)
+        baseline_feedback = str(
+            baseline_gate_context.get("feedback")
+            or state.get("review_feedback")
+            or ""
+        )
+        state["review_feedback"] = baseline_feedback
+        state["review_feedback_normalized"] = baseline_feedback
+        state["execution_feedback"] = baseline_feedback
+
+    if baseline_board_payload:
+        state["review_board_verdict"] = baseline_board_payload
+        try:
+            os.makedirs("data", exist_ok=True)
+            dump_json("data/review_board_verdict.json", baseline_board_payload)
+        except Exception:
+            pass
+
+    if baseline_review_stack:
+        state["ml_review_stack"] = baseline_review_stack
+        try:
+            os.makedirs("data", exist_ok=True)
+            dump_json("data/ml_review_stack.json", baseline_review_stack)
+        except Exception:
+            pass
+
+
 def _sync_review_board_verdict_after_metric_round(
     state: Dict[str, Any],
     *,
@@ -30161,10 +30261,15 @@ def _sync_review_board_verdict_after_metric_round(
     force_finalize = bool(selection.get("force_finalize"))
     force_finalize_reason = str(controller.get("force_finalize_reason") or selection.get("force_finalize_reason") or "")
 
-    payload = dict(board_payload)
-    # P1 fix: board's explicit verdict is authoritative.
-    # state["review_verdict"] may contain the *baseline* verdict restored during
-    # metric-round rollback (L28968), which would shadow the board's real ruling.
+    payload = copy.deepcopy(board_payload)
+    if kept == "baseline":
+        baseline_board_payload = (
+            state.get("ml_improvement_round_baseline_board_payload")
+            if isinstance(state.get("ml_improvement_round_baseline_board_payload"), dict)
+            else {}
+        )
+        if baseline_board_payload:
+            payload = copy.deepcopy(baseline_board_payload)
     final_verdict = normalize_review_status(payload.get("final_review_verdict") or state.get("review_verdict"))
     summary_line = (
         "METRIC_IMPROVEMENT_FINAL: "
@@ -30178,6 +30283,12 @@ def _sync_review_board_verdict_after_metric_round(
     payload["summary"] = _upsert_metric_improvement_summary(str(payload.get("summary") or ""), summary_line)
     payload["final_review_verdict"] = final_verdict
     payload["runtime_fix_terminal"] = bool(state.get("runtime_fix_terminal"))
+    if kept == "baseline":
+        payload["deterministic_blockers"] = [
+            str(item)
+            for item in (payload.get("deterministic_blockers") or [])
+            if str(item).strip()
+        ]
     if not deterministic_blockers:
         payload["deterministic_blockers"] = []
     payload["metric_round_finalization"] = {

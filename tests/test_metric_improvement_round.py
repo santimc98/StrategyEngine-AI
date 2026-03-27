@@ -1,7 +1,11 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
+
+os.environ.setdefault("OPENROUTER_API_KEY", "dummy-openrouter")
+os.environ.setdefault("GOOGLE_API_KEY", "dummy-google")
 
 from src.graph.graph import (
     _build_metric_round_contract_lock,
@@ -9,6 +13,8 @@ from src.graph.graph import (
     _metric_round_has_deterministic_blockers,
     _promote_best_attempt,
     _resolve_metric_round_hybrid_policy,
+    _restore_metric_round_baseline_state,
+    _sync_review_board_verdict_after_metric_round,
     check_evaluation,
     check_metric_improvement_bootstrap_route,
     _is_improvement,
@@ -20,6 +26,7 @@ from src.graph.graph import (
     _evaluate_metric_round_hypothesis_application,
 )
 from src.graph import graph as graph_mod
+from src.utils.governance import build_run_summary
 
 
 def test_should_run_metric_improvement_round_defaults_to_true_after_baseline_approved() -> None:
@@ -188,6 +195,89 @@ def test_metric_round_contract_lock_filters_baseline_only_reviewer_gates() -> No
         "probability_output_validation",
     ]
     assert lock["reviewer_gates"] == ["submission_schema_compliance"]
+
+
+def test_restore_metric_round_baseline_state_realigns_final_governance(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path("data/output_contract_report.json").write_text(
+        json.dumps({"overall_status": "ok", "missing": []}),
+        encoding="utf-8",
+    )
+
+    state = {
+        "run_id": "unit-metric-restore",
+        "review_verdict": "NEEDS_IMPROVEMENT",
+        "last_gate_context": {
+            "status": "REJECTED",
+            "failed_gates": ["runtime_failure"],
+            "hard_failures": ["runtime_failure"],
+            "feedback": "candidate runtime failure",
+        },
+        "hard_failures": ["runtime_failure"],
+        "runtime_fix_terminal": True,
+        "runtime_fix_terminal_reason": "repeated_root_cause",
+        "review_board_verdict": {
+            "status": "REJECTED",
+            "final_review_verdict": "NEEDS_IMPROVEMENT",
+            "summary": "candidate failed",
+            "deterministic_blockers": ["result_evaluator_failed_gate:runtime_failure"],
+        },
+        "ml_review_stack": {
+            "result_evaluator": {"status": "NEEDS_IMPROVEMENT"},
+        },
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "ml_improvement_round_baseline_gate_context": {
+            "status": "APPROVED",
+            "failed_gates": [],
+            "hard_failures": [],
+            "feedback": "baseline approved",
+        },
+        "ml_improvement_round_baseline_board_payload": {
+            "status": "APPROVED",
+            "final_review_verdict": "APPROVED",
+            "summary": "baseline approved",
+            "deterministic_blockers": [],
+        },
+        "ml_improvement_round_baseline_review_stack": {
+            "result_evaluator": {"status": "APPROVED"},
+        },
+        "ml_improvement_round_baseline_hard_failures": [],
+        "ml_improvement_round_baseline_runtime_fix_terminal": False,
+        "ml_improvement_round_baseline_runtime_fix_terminal_reason": "",
+        "ml_improvement_round_baseline_sandbox_failed": False,
+        "ml_improvement_round_baseline_execution_error": "",
+        "ml_improvement_round_baseline_error_message": "",
+    }
+
+    _restore_metric_round_baseline_state(state)
+    _sync_review_board_verdict_after_metric_round(
+        state,
+        metric_loop_state={
+            "target": {"name": "MAE", "min_delta": 0.0005},
+            "round": {"baseline": {"metric_value": 1729.15}},
+            "candidate": {"metric_value": 1729.15},
+            "final": {"label": "baseline", "metric_value": 1729.15},
+            "selection": {
+                "approved": False,
+                "improved_by_metric": False,
+                "stability_ok": False,
+                "deterministic_blockers": True,
+                "advisory_review_mode": True,
+            },
+        },
+    )
+
+    summary = build_run_summary(state)
+
+    assert state["review_verdict"] == "APPROVED"
+    assert state["last_gate_context"]["status"] == "APPROVED"
+    assert state["hard_failures"] == []
+    assert state["runtime_fix_terminal"] is False
+    assert state["review_board_verdict"]["final_review_verdict"] == "APPROVED"
+    assert state["review_board_verdict"]["deterministic_blockers"] == []
+    assert summary["status"] == "APPROVED"
+    assert summary["run_outcome"] == "GO"
 
 
 def test_bootstrap_metric_round_active_gates_context_excludes_baseline_only_gates(tmp_path, monkeypatch) -> None:

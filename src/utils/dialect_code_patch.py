@@ -8,6 +8,7 @@ NOT a heuristic or dataset-specific fix - purely mechanical AST transformation.
 """
 
 import ast
+import copy
 from typing import List, Tuple
 
 
@@ -65,6 +66,53 @@ def patch_read_csv_dialect(
     except SyntaxError as e:
         return code, [f"AST parse error: {e}"], False
 
+    changed = False
+    helper_needed = False
+
+    class _DialectAliasLookupTransformer(ast.NodeTransformer):
+        def __init__(self) -> None:
+            self.changed = False
+
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            node = self.generic_visit(node)
+            func = getattr(node, "func", None)
+            if not isinstance(func, ast.Attribute) or func.attr != "get":
+                return node
+            if not node.args:
+                return node
+            first_arg = node.args[0]
+            if not (isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str)):
+                return node
+            key = first_arg.value
+            if key not in {"sep", "delimiter"}:
+                return node
+
+            default_arg = copy.deepcopy(node.args[1]) if len(node.args) > 1 else ast.Constant(value=None)
+            owner = copy.deepcopy(func.value)
+            normalized = ast.BoolOp(
+                op=ast.Or(),
+                values=[
+                    ast.Call(
+                        func=ast.Attribute(value=copy.deepcopy(owner), attr="get", ctx=ast.Load()),
+                        args=[ast.Constant(value="sep")],
+                        keywords=[],
+                    ),
+                    ast.Call(
+                        func=ast.Attribute(value=copy.deepcopy(owner), attr="get", ctx=ast.Load()),
+                        args=[ast.Constant(value="delimiter"), default_arg],
+                        keywords=[],
+                    ),
+                ],
+            )
+            self.changed = True
+            return ast.copy_location(normalized, node)
+
+    alias_transformer = _DialectAliasLookupTransformer()
+    tree = alias_transformer.visit(tree)
+    if alias_transformer.changed:
+        patch_notes.append("Normalized dialect.get sep/delimiter alias lookups")
+        changed = True
+
     # Find all pd.read_csv calls
     calls: List[ast.Call] = []
     for node in ast.walk(tree):
@@ -77,7 +125,14 @@ def patch_read_csv_dialect(
                 calls.append(node)
 
     if not calls:
-        return code, ["No pd.read_csv calls found"], False
+        if not changed:
+            return code, ["No pd.read_csv calls found"], False
+        try:
+            ast.fix_missing_locations(tree)
+            patched_code = ast.unparse(tree)
+        except Exception as e:
+            return code, [f"AST unparse error: {e}"], False
+        return patched_code, patch_notes, True
 
     # Select target call: prefer one reading expected_path, else first
     def _is_expected_path(arg: ast.AST) -> bool:
@@ -99,9 +154,6 @@ def patch_read_csv_dialect(
         "decimal": csv_decimal,
         "encoding": csv_encoding,
     }
-
-    changed = False
-    helper_needed = False
 
     def _normalize_encoding(value: str) -> str:
         return str(value).strip().lower().replace("_", "-")
