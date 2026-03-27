@@ -176,28 +176,38 @@ cd strategy-engine-ai
 pip install -r requirements.txt
 ```
 
-### 3. Configure Environment
+### 3. Bootstrap Environment
 
-Create a `.env` file in the root directory:
+Copy `.env.example` to `.env`.
+
+The product is now **UI-first** for commercial deployment:
+- **API keys** are configured from the sidebar and stored in the encrypted local key store
+- **Agent models** are configured from the sidebar and persisted as runtime overrides
+- **Sandbox / execution backend** are configured from the sidebar and persisted in the sandbox config store
+
+`.env` is only a **bootstrap / fallback** file and should stay minimal:
 
 ```env
-# Required: Google Gemini (core reasoning agents)
-GOOGLE_API_KEY=your_gemini_api_key
-
-# Required: OpenRouter (ML Engineer, Data Engineer, Strategist, Model Analyst)
-OPENROUTER_API_KEY=your_openrouter_api_key
+OPENROUTER_TIMEOUT_SECONDS=120
+RUN_EXECUTION_MODE=local
 ```
 
-All OpenRouter-routed agents use a single API key. Model selection is done per-agent from the Streamlit UI.
+Do not store production secrets in `.env` if the UI store is available.
 
 ### 4. Run
 ```bash
 streamlit run app.py
 ```
 
-### 5. Configure Models (Optional)
+### 5. Configure the Runtime from the UI
 
-In the Streamlit sidebar, click **Model Settings** to select LLMs per agent. Changes persist automatically.
+In the Streamlit sidebar, configure:
+- **API Keys**
+- **Models**
+- **Sandbox de ejecucion**
+- **Backend de ejecucion**
+
+Changes persist automatically and are used by the background worker on new runs.
 
 ---
 
