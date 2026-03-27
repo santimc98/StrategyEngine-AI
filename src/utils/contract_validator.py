@@ -3420,6 +3420,133 @@ def _collect_ml_required_columns(contract: Dict[str, Any]) -> Tuple[List[str], L
     return required, selector_hints
 
 
+def _iter_declared_column_candidates(
+    contract: Dict[str, Any],
+    column_inventory: Optional[List[str]] = None,
+) -> List[str]:
+    candidates: List[str] = []
+
+    def _extend(values: Any) -> None:
+        cleaned, _ = _normalize_nonempty_str_list(values)
+        for col in cleaned:
+            if col not in candidates:
+                candidates.append(col)
+
+    if isinstance(column_inventory, list):
+        _extend(column_inventory)
+
+    _extend(contract.get("canonical_columns"))
+
+    column_roles = contract.get("column_roles")
+    if isinstance(column_roles, dict):
+        for values in column_roles.values():
+            _extend(values)
+
+    task_semantics = contract.get("task_semantics")
+    if isinstance(task_semantics, dict):
+        _extend(task_semantics.get("target_columns"))
+        _extend(task_semantics.get("primary_target"))
+
+    evaluation_spec = contract.get("evaluation_spec")
+    if isinstance(evaluation_spec, dict):
+        _extend(evaluation_spec.get("split_column"))
+        _extend(evaluation_spec.get("split_columns"))
+        _extend(evaluation_spec.get("fold_column"))
+
+    validation_requirements = contract.get("validation_requirements")
+    if isinstance(validation_requirements, dict):
+        _extend(validation_requirements.get("split_column"))
+        _extend(validation_requirements.get("split_columns"))
+        params = validation_requirements.get("params")
+        if isinstance(params, dict):
+            _extend(params.get("split_column"))
+            _extend(params.get("split_columns"))
+
+    return candidates
+
+
+def _text_references_declared_column(text: str, column_name: str) -> bool:
+    if not text or not column_name:
+        return False
+    pattern = r"(?<![A-Za-z0-9_])" + re.escape(str(column_name)) + r"(?![A-Za-z0-9_])"
+    try:
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+    except re.error:
+        return str(column_name).lower() in text.lower()
+
+
+def collect_contract_operational_dependency_columns(
+    contract: Dict[str, Any],
+    *,
+    column_inventory: Optional[List[str]] = None,
+) -> Dict[str, List[str]]:
+    """
+    Collect contract-declared non-feature columns that remain operationally required.
+
+    This intentionally stays narrow: only exact dependencies explicitly referenced by
+    task/evaluation/validation semantics are collected, and only if they match a
+    declared column candidate.
+    """
+    if not isinstance(contract, dict):
+        return {
+            "task_semantics_filters": [],
+            "split_columns": [],
+            "all": [],
+        }
+
+    candidates = _iter_declared_column_candidates(contract, column_inventory=column_inventory)
+    if not candidates:
+        return {
+            "task_semantics_filters": [],
+            "split_columns": [],
+            "all": [],
+        }
+
+    task_semantics_filters: List[str] = []
+    split_columns: List[str] = []
+
+    task_semantics = contract.get("task_semantics")
+    if isinstance(task_semantics, dict):
+        for key in ("training_row_filter", "scoring_rows_rule", "scoring_rows_rule_primary", "scoring_rows_rule_secondary"):
+            raw_text = str(task_semantics.get(key) or "").strip()
+            if not raw_text:
+                continue
+            for candidate in candidates:
+                if _text_references_declared_column(raw_text, candidate) and candidate not in task_semantics_filters:
+                    task_semantics_filters.append(candidate)
+
+    for scope in (
+        contract.get("evaluation_spec"),
+        contract.get("validation_requirements"),
+    ):
+        if not isinstance(scope, dict):
+            continue
+        values: List[str] = []
+        for key in ("split_column", "split_columns", "fold_column"):
+            cleaned, _ = _normalize_nonempty_str_list(scope.get(key))
+            values.extend(cleaned)
+        params = scope.get("params")
+        if isinstance(params, dict):
+            for key in ("split_column", "split_columns", "fold_column"):
+                cleaned, _ = _normalize_nonempty_str_list(params.get(key))
+                values.extend(cleaned)
+        for value in values:
+            if value in candidates and value not in split_columns:
+                split_columns.append(value)
+
+    all_columns: List[str] = []
+    for seq in (task_semantics_filters, split_columns):
+        for col in seq:
+            if col not in all_columns:
+                all_columns.append(col)
+
+    return {
+        "task_semantics_filters": task_semantics_filters,
+        "split_columns": split_columns,
+        "all": all_columns,
+    }
+
+
 _MULTI_TARGET_MARKERS = (
     "multi_output",
     "multioutput",
@@ -4423,6 +4550,10 @@ def validate_contract_minimal_readonly(
 
         if requires_ml or requires_feature_prep:
             ml_required_cols, ml_selector_hints = _collect_ml_required_columns(contract)
+            operational_dependency_cols = collect_contract_operational_dependency_columns(
+                contract,
+                column_inventory=column_inventory,
+            ).get("all", [])
             if ml_selector_hints:
                 if not has_declared_selectors:
                     issues.append(
@@ -4453,6 +4584,21 @@ def validate_contract_minimal_readonly(
                         "Contract leaves future-ML / feature-engineering required columns outside clean_dataset coverage "
                         "(required_columns/optional_passthrough_columns/required_feature_selectors).",
                         missing_ml_cols[:25],
+                    )
+                )
+            operational_missing = [
+                col
+                for col in operational_dependency_cols
+                if isinstance(col, str) and col.strip() and col.lower() not in coverage_norm
+            ]
+            if operational_missing:
+                issues.append(
+                    _strict_issue(
+                        "contract.clean_dataset_operational_dependencies_uncovered",
+                        "warning",
+                        "Contract declares operational dependencies (filters/split semantics) that are not preserved "
+                        "through clean_dataset coverage. Downstream execution may require planner repair.",
+                        operational_missing[:25],
                     )
                 )
             drop_vs_ml = [

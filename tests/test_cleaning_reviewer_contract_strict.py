@@ -16,8 +16,10 @@ import pytest
 from src.agents.cleaning_reviewer import (
     CleaningReviewerAgent,
     _build_llm_prompt,
+    _build_facts,
     _enforce_contract_strict_rejection,
     _merge_cleaning_gates,
+    _resolve_required_columns_for_review,
     _CONTRACT_MISSING_CLEANING_GATES,
 )
 
@@ -80,10 +82,69 @@ class TestContractStrictMode:
             "supporting evidence",
             "guidance",
             "substitute for reasoning",
+            "missing_required_columns",
+            "forbidden columns",
         )
         assert payload["contract_source_used"] == "cleaning_view"
         assert "column_resolution_context" in payload
         assert "artifact_obligations" in payload
+
+    def test_required_columns_prefer_artifact_obligations_over_polluted_file(self, tmp_path: Path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "required_columns.json").write_text(
+            json.dumps(["OppStatus", "DateOfClose", "id_sk_TerminatedDate"]),
+            encoding="utf-8",
+        )
+        view = {
+            "required_columns_path": "data/required_columns.json",
+            "output_path": "artifacts/clean/dataset_cleaned.csv",
+        }
+        artifact_obligations = {
+            "artifact_bindings": [
+                {
+                    "binding_name": "cleaned_dataset",
+                    "source_contract_path": "artifact_requirements.cleaned_dataset",
+                    "declared_binding": {
+                        "output_path": "artifacts/clean/dataset_cleaned.csv",
+                        "required_columns": ["col_a", "col_b"],
+                    },
+                }
+            ]
+        }
+
+        resolved = _resolve_required_columns_for_review(
+            view,
+            manifest={},
+            artifact_obligations=artifact_obligations,
+        )
+
+        assert resolved == ["col_a", "col_b"]
+
+    def test_build_facts_exposes_forbidden_column_presence_explicitly(self):
+        facts = _build_facts(
+            cleaned_header=["col_a", "col_b"],
+            required_columns=["col_a"],
+            manifest={"dropped_columns": ["leak_col"]},
+            sample_str=None,
+            sample_infer=None,
+            raw_sample=None,
+            gates=[
+                {
+                    "name": "leakage_exclusion",
+                    "severity": "HARD",
+                    "params": {"forbidden_columns": ["leak_col", "target_leak"]},
+                }
+            ],
+            column_roles={},
+        )
+
+        assert facts["forbidden_columns"] == ["leak_col", "target_leak"]
+        assert facts["forbidden_columns_present_in_cleaned_header"] == []
+        assert facts["forbidden_columns_absent_in_cleaned_header"] == ["leak_col", "target_leak"]
+        assert facts["forbidden_columns_declared_removed_in_manifest"] == ["leak_col"]
+        _assert_contains_terms(facts["required_columns_scope_note"], "missing_required_columns", "cleaned artifact scope")
 
     def test_merge_cleaning_gates_returns_fallback_source_when_empty(self):
         """When cleaning_gates is missing/empty, source should be 'fallback'."""

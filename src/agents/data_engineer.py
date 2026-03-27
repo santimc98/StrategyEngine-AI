@@ -4,6 +4,7 @@ import ast
 import json
 import logging
 import csv
+import warnings
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 from src.utils.code_extract import extract_code_block
@@ -798,7 +799,9 @@ class DataEngineerAgent:
                 if not profile.get("looks_numeric"):
                     sample_for_dt = non_null.head(200)
                     if len(sample_for_dt) > 0:
-                        dt_parsed = pd.to_datetime(sample_for_dt, errors="coerce")
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", category=UserWarning)
+                            dt_parsed = pd.to_datetime(sample_for_dt, errors="coerce")
                         dt_valid_count = int(dt_parsed.notna().sum())
                         if dt_valid_count > len(sample_for_dt) * 0.4:
                             profile["looks_datetime"] = True
@@ -881,6 +884,7 @@ class DataEngineerAgent:
         data_audit: str,
         strategy: Dict[str, Any],
         input_path: str,
+        prompt_input_path: Optional[str] = None,
         business_objective: str = "",
         csv_encoding: str = "utf-8",
         csv_sep: str = ",",
@@ -1059,19 +1063,20 @@ class DataEngineerAgent:
             compress_long_lists(column_resolution_context)[0],
             indent=2,
         )
+        prompt_input_path = str(prompt_input_path or input_path or "").strip()
         runtime_dependency_context = self._build_runtime_dependency_context()
         runtime_dependency_context_json = json.dumps(
             compress_long_lists(runtime_dependency_context)[0], indent=2
         )
         data_sample_context = self._build_data_sample_context(
-            input_path=input_path,
+            input_path=prompt_input_path,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,
         )
         selector_expansion_context = self._build_selector_expansion_context(
             de_view=de_view,
-            input_path=input_path,
+            input_path=prompt_input_path,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
         )
@@ -1188,6 +1193,16 @@ class DataEngineerAgent:
         #    - When raw context shows invalid or mixed temporal formats, preserve
         #      unresolved values as null plus traceability flags/log entries unless
         #      the contract or a gate explicitly requires complete recoverability.
+        #    - Treat COLUMN_DTYPE_TARGETS_CONTEXT as a downstream handoff goal, not as
+        #      automatic permission to coerce away mixed or ambiguous semantics.
+        #    - Reconcile dtype targets against DATA_SAMPLE_CONTEXT, COLUMN_RESOLUTION_CONTEXT,
+        #      and the DATA AUDIT before deciding the final representation.
+        #    - If evidence shows mixed numeric/range/label semantics or coercion would
+        #      destroy defensible signal, prefer the least-destructive representation and
+        #      document the trade-off instead of forcing a brittle cast.
+        #    - If DATA_SAMPLE_CONTEXT is unavailable, stay conservative and reason from
+        #      COLUMN_RESOLUTION_CONTEXT + DATA AUDIT; do not invent unsupported precision
+        #      about raw value formats.
         #
         # 4. TYPE CONVERSION (AFTER format resolution):
         #    Apply COLUMN_DTYPE_TARGETS once the parsing strategy is settled.
@@ -1346,7 +1361,8 @@ class DataEngineerAgent:
         ===================================================================
         AUTHORITATIVE CONTEXT
         ===================================================================
-        Input: '$input_path'
+        Execution Input Path (must be used by the generated script): '$input_path'
+        Prompt Profiling Source (used only to build DATA_SAMPLE_CONTEXT / selector expansion): '$prompt_input_path'
         Encoding: '$csv_encoding' | Sep: '$csv_sep' | Decimal: '$csv_decimal'
         DE Cleaning Objective: "$business_objective"
 
@@ -1379,12 +1395,14 @@ class DataEngineerAgent:
             "Reason first about the deliverable closure for THIS run — which artifacts you must write, "
             "how each one is materialized, and how the cleaning plan supports them. "
             "Then reason about the correct operation order for THIS specific dataset — "
-            "use the column_profiles to decide: which columns need null handling (check null_pct), "
-            "which look numeric vs datetime (check looks_numeric, looks_datetime), "
-            "what format patterns exist (check observed_format_patterns), "
-            "and what the actual cardinality and value distribution is (check unique_count, top_values). "
+            "use the column_profiles when available to decide: which columns need null handling "
+            "(check null_pct), which look numeric vs datetime (check looks_numeric, looks_datetime), "
+            "what format patterns exist (check observed_format_patterns), and what the actual cardinality "
+            "and value distribution is (check unique_count, top_values). If DATA_SAMPLE_CONTEXT is unavailable, "
+            "reason from COLUMN_RESOLUTION_CONTEXT and DATA AUDIT instead of guessing hidden raw patterns. "
+            "Treat dtype targets as downstream goals that must be justified by evidence, not as blind coercion instructions. "
             "For each parsing step, mentally verify that your approach will not inflate nulls "
-            "beyond the raw null_pct shown in the profile. "
+            "beyond the raw null_pct shown in the profile or erase mixed semantics that the context still treats as signal. "
             "Check pandas_pitfalls in RUNTIME_DEPENDENCY_CONTEXT before using any pandas API. "
             "Then generate the complete cleaning script."
         )
@@ -1409,9 +1427,12 @@ class DataEngineerAgent:
         $previous_code
 
         Repair task:
-        - Consult the column_profiles in DATA_SAMPLE_CONTEXT (system prompt) to verify your
+        - Consult the column_profiles in DATA_SAMPLE_CONTEXT when available to verify your
           parsing approach matches the actual data patterns (null_pct, looks_datetime,
-          observed_format_patterns, looks_numeric). Do not guess — use the profile.
+          observed_format_patterns, looks_numeric). If the profile is unavailable, reason
+          from COLUMN_RESOLUTION_CONTEXT + DATA AUDIT and avoid unsupported assumptions.
+        - Treat dtype targets as downstream goals to be reconciled with evidence, not as
+          automatic permission for destructive coercion.
         - Apply a minimal but sufficient patch to the previous script body.
         - Keep already-working logic stable unless it directly caused the failure.
         - Preserve output paths, owned artifact materialization, and manifest logic unless fixing them is part of the patch.
@@ -1431,6 +1452,7 @@ class DataEngineerAgent:
         system_prompt = render_prompt(
             SYSTEM_TEMPLATE,
             input_path=input_path,
+            prompt_input_path=prompt_input_path,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
             csv_decimal=csv_decimal,

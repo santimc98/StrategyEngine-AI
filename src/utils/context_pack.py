@@ -291,6 +291,9 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
     guard_warnings = state.get("data_engineer_guard_warnings")
     if not isinstance(guard_warnings, list):
         guard_warnings = []
+    planner_repair_context = state.get("planner_repair_context")
+    if not isinstance(planner_repair_context, dict):
+        planner_repair_context = {}
 
     payload = {
         "stage": stage,
@@ -302,6 +305,7 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
         "column_sets_summary": column_sets_summary,
         "column_manifest_summary": column_manifest_summary,
         "guard_warnings": _limit_list([str(item) for item in guard_warnings if item], max_items=10),
+        "planner_repair_context": planner_repair_context if planner_repair_context else None,
         "artifacts": artifacts,
         "evidence_index": evidence_index,
     }

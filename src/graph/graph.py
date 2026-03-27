@@ -128,6 +128,7 @@ from src.utils.contract_validator import (
     derive_contract_scope_from_workstreams,
     get_default_optimization_policy,
     normalize_optimization_policy,
+    collect_contract_operational_dependency_columns,
 )
 from src.utils.contract_views import (
     build_contract_views_projection,
@@ -4472,7 +4473,7 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
         return file_required
     if contract and isinstance(contract, dict):
         artifact_reqs = contract.get("artifact_requirements") or {}
-        clean_cfg = artifact_reqs.get("clean_dataset") or {}
+        clean_cfg = artifact_reqs.get("cleaned_dataset") or artifact_reqs.get("clean_dataset") or {}
         required = clean_cfg.get("required_columns")
         if isinstance(required, list) and required:
             return required
@@ -4482,6 +4483,151 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
             return canonical
     # Fallback to strategy if contract has no usable columns
     return strategy.get("required_columns", []) if strategy else []
+
+
+def _resolve_clean_dataset_coverage(contract: Dict[str, Any] | None) -> Dict[str, List[str]]:
+    contract = contract if isinstance(contract, dict) else {}
+    artifact_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
+    clean_cfg = artifact_reqs.get("cleaned_dataset") or artifact_reqs.get("clean_dataset") or {}
+    clean_cfg = clean_cfg if isinstance(clean_cfg, dict) else {}
+
+    required_cols = [str(col) for col in (clean_cfg.get("required_columns") or []) if str(col).strip()]
+
+    optional_cols_raw = clean_cfg.get("optional_passthrough_columns")
+    if not isinstance(optional_cols_raw, list):
+        schema_binding = clean_cfg.get("schema_binding")
+        if isinstance(schema_binding, dict):
+            optional_cols_raw = schema_binding.get("optional_passthrough_columns")
+    optional_cols = [str(col) for col in (optional_cols_raw or []) if str(col).strip()]
+
+    return {
+        "required_columns": list(dict.fromkeys(required_cols)),
+        "optional_passthrough_columns": list(dict.fromkeys(optional_cols)),
+    }
+
+
+def _build_contract_operational_dependency_mismatch(
+    contract: Dict[str, Any] | None,
+    *,
+    cleaned_header: List[str] | None,
+    column_inventory: List[str] | None = None,
+) -> Dict[str, Any]:
+    contract = contract if isinstance(contract, dict) else {}
+    header_cols = [str(col) for col in (cleaned_header or []) if str(col).strip()]
+    dependency_report = collect_contract_operational_dependency_columns(
+        contract,
+        column_inventory=column_inventory,
+    )
+    dependencies = [
+        str(col)
+        for col in (dependency_report.get("all") or [])
+        if isinstance(col, str) and col.strip()
+    ]
+    coverage = _resolve_clean_dataset_coverage(contract)
+    required_cols = coverage.get("required_columns", [])
+    passthrough_cols = coverage.get("optional_passthrough_columns", [])
+
+    header_norm = {_norm_name(col): col for col in header_cols if _norm_name(col)}
+    coverage_norm = {
+        _norm_name(col): col
+        for col in (required_cols + passthrough_cols)
+        if isinstance(col, str) and _norm_name(col)
+    }
+
+    missing_in_header: List[str] = []
+    uncovered_by_contract: List[str] = []
+    actionable_dependencies: List[str] = []
+    for col in dependencies:
+        norm = _norm_name(col)
+        if not norm:
+            continue
+        is_missing = norm not in header_norm
+        is_uncovered = norm not in coverage_norm
+        if is_missing:
+            missing_in_header.append(col)
+        if is_uncovered:
+            uncovered_by_contract.append(col)
+        if is_missing and is_uncovered:
+            actionable_dependencies.append(col)
+
+    return {
+        "dependencies": dependencies,
+        "required_columns": required_cols,
+        "optional_passthrough_columns": passthrough_cols,
+        "missing_in_header": missing_in_header,
+        "uncovered_by_contract": uncovered_by_contract,
+        "actionable_dependencies": actionable_dependencies,
+        "should_replan": bool(actionable_dependencies),
+    }
+
+
+def _build_planner_contract_mismatch_payload(
+    contract: Dict[str, Any] | None,
+    *,
+    cleaned_header: List[str] | None,
+    column_inventory: List[str] | None = None,
+) -> Dict[str, Any]:
+    report = _build_contract_operational_dependency_mismatch(
+        contract,
+        cleaned_header=cleaned_header,
+        column_inventory=column_inventory,
+    )
+    if not report.get("should_replan"):
+        return {}
+    actionable = [str(col) for col in (report.get("actionable_dependencies") or []) if str(col).strip()]
+    return {
+        "status": "REJECTED",
+        "reason": "planner_contract_mismatch",
+        "failed_gates": ["planner_contract_mismatch"],
+        "required_fixes": [
+            "Repair the execution contract so all operational dependency columns used by task semantics are preserved in cleaned_dataset coverage.",
+            "Do not reinterpret these columns as model features unless the planner explicitly decides so.",
+        ],
+        "evidence": [
+            {
+                "claim": "Operational dependency columns declared by the contract are missing from the cleaned artifact and are not preserved by cleaned_dataset coverage.",
+                "source": "contract_operational_dependency_guard",
+            }
+        ],
+        "report": report,
+        "summary": (
+            "PLANNER_CONTRACT_MISMATCH: actionable_dependencies="
+            + str(actionable[:10])
+            + " missing_in_header="
+            + str((report.get("missing_in_header") or [])[:10])
+            + " uncovered_by_contract="
+            + str((report.get("uncovered_by_contract") or [])[:10])
+        ),
+    }
+
+
+def _detect_planner_contract_mismatch_for_state(
+    state: Dict[str, Any] | None,
+    *,
+    runtime_text: str | None = None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    if not contract:
+        return {}
+
+    if runtime_text is not None:
+        runtime_lower = str(runtime_text or "").lower()
+        if "missing required input columns" not in runtime_lower and "missing required columns" not in runtime_lower:
+            return {}
+
+    data_path = str(state.get("ml_data_path") or "").strip()
+    csv_sep = str(state.get("csv_sep") or ",")
+    csv_encoding = str(state.get("csv_encoding") or "utf-8")
+    header_cols = _read_csv_header(data_path, csv_encoding, csv_sep) if data_path and os.path.exists(data_path) else []
+    if not header_cols:
+        return {}
+
+    return _build_planner_contract_mismatch_payload(
+        contract,
+        cleaned_header=header_cols,
+        column_inventory=get_canonical_columns(contract),
+    )
 
 def _load_constant_columns_from_profile(profile_path: str = "data/data_profile.json") -> List[str]:
     profile = _load_json_safe(profile_path)
@@ -14031,11 +14177,23 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
             data_engineer.last_model_used = None
 
     ml_engineer_model = normalized.get("ml_engineer")
+    ml_engineer_editor_model = _normalize_runtime_model_name(overrides.get("ml_engineer_editor"))
     if ml_engineer_model:
         ml_engineer.model_name = ml_engineer_model
-        ml_engineer.editor_model_name = ml_engineer_model
         ml_engineer.last_model_used = None
-    ml_engineer.editor_model_name = _normalize_runtime_model_name(getattr(ml_engineer, "model_name", ""))
+    if ml_engineer_model or ml_engineer_editor_model:
+        resolver = getattr(ml_engineer, "resolve_editor_model_name", None)
+        if callable(resolver):
+            ml_engineer.editor_model_name = _normalize_runtime_model_name(
+                resolver(
+                    primary_model=_normalize_runtime_model_name(getattr(ml_engineer, "model_name", "")),
+                    editor_model_override=ml_engineer_editor_model or None,
+                )
+            )
+        elif ml_engineer_editor_model:
+            ml_engineer.editor_model_name = ml_engineer_editor_model
+        elif ml_engineer_model:
+            ml_engineer.editor_model_name = _normalize_runtime_model_name(getattr(ml_engineer, "model_name", ""))
 
     return get_runtime_agent_models()
 
@@ -16730,25 +16888,18 @@ def _extract_required_columns_from_contract(
         artifact_reqs = cfg.get("artifact_requirements")
         if not isinstance(artifact_reqs, dict):
             continue
-        clean_cfg = artifact_reqs.get("clean_dataset")
+        clean_cfg = artifact_reqs.get("cleaned_dataset")
+        if not isinstance(clean_cfg, dict):
+            clean_cfg = artifact_reqs.get("clean_dataset")
         if isinstance(clean_cfg, dict):
             required = clean_cfg.get("required_columns")
             if isinstance(required, list) and required:
-                return [str(c) for c in required if c], source_name
+                return [str(c) for c in required if c], f"{source_name}.artifact_requirements.cleaned_dataset"
         schema_binding = artifact_reqs.get("schema_binding")
         if isinstance(schema_binding, dict):
             required = schema_binding.get("required_columns")
             if isinstance(required, list) and required:
-                return [str(c) for c in required if c], source_name
-    # Keep DE required columns in sync with DE view semantics:
-    # when clean_dataset/schema_binding are absent, canonical_columns are the
-    # contract-declared input columns and must seed required_columns.json.
-    for source_name, cfg in sources:
-        if not isinstance(cfg, dict):
-            continue
-        canonical = cfg.get("canonical_columns")
-        if isinstance(canonical, list) and canonical:
-            return [str(c) for c in canonical if c], f"{source_name}.canonical_columns"
+                return [str(c) for c in required if c], f"{source_name}.artifact_requirements.schema_binding"
     return [], ""
 
 
@@ -17367,7 +17518,15 @@ def run_execution_planner(state: AgentState) -> AgentState:
         "execution_contract": contract,
         "execution_contract_raw_path": "data/execution_contract_raw.json",
         "execution_planner_failed": False,
+        "planner_repair_required": False,
+        "planner_repair_reason": "",
+        "planner_repair_context": {},
+        "reset_ml_patch_context": False,
+        "error_message": "",
+        "execution_output": "",
+        "runtime_fix_count": 0,
     }
+    result.update(_clear_runtime_blockers())
     if planner_contract_diagnostics:
         result["execution_contract_diagnostics"] = planner_contract_diagnostics
         result["execution_contract_diagnostics_path"] = "data/execution_contract_diagnostics.json"
@@ -17881,7 +18040,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
     except Exception as ctx_err:
         print(f"Warning: failed to persist data_engineer_context.json: {ctx_err}")
 
-    # Generate cleaning script (targeting REMOTE path)
+    # Generate cleaning script using the REMOTE path for execution and the
+    # local csv_path for prompt-time profiling/context enrichment.
     import inspect
 
     kwargs = {
@@ -17922,6 +18082,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
         else None
     )
     sig = inspect.signature(data_engineer.generate_cleaning_script)
+    if "prompt_input_path" in sig.parameters:
+        kwargs["prompt_input_path"] = csv_path
     if "execution_contract" in sig.parameters and not minimal_context_mode:
         kwargs["execution_contract"] = execution_contract
     if "de_view" in sig.parameters:
@@ -20740,6 +20902,54 @@ def run_engineer(state: AgentState) -> AgentState:
                 f"{missing_required[:10]} (total={len(missing_required)})"
             )
             data_audit_context = _merge_de_audit_override(data_audit_context, note)
+    planner_contract_mismatch = _build_planner_contract_mismatch_payload(
+        execution_contract,
+        cleaned_header=header_cols,
+        column_inventory=get_canonical_columns(execution_contract) if isinstance(execution_contract, dict) else None,
+    )
+    if planner_contract_mismatch:
+        summary = str(planner_contract_mismatch.get("summary") or "PLANNER_CONTRACT_MISMATCH")
+        print(summary)
+        if run_id:
+            log_run_event(
+                run_id,
+                "planner_contract_mismatch_pre_ml",
+                {
+                    "actionable_dependencies": (planner_contract_mismatch.get("report") or {}).get("actionable_dependencies", []),
+                    "missing_in_header": (planner_contract_mismatch.get("report") or {}).get("missing_in_header", []),
+                    "uncovered_by_contract": (planner_contract_mismatch.get("report") or {}).get("uncovered_by_contract", []),
+                },
+            )
+        feedback_history = list(state.get("feedback_history", []) or [])
+        if summary not in feedback_history:
+            feedback_history.append(summary)
+        guard_warnings = [str(item) for item in (state.get("data_engineer_guard_warnings") or []) if str(item).strip()]
+        if summary not in guard_warnings:
+            guard_warnings.append(summary)
+        last_gate_context = {
+            "status": "REJECTED",
+            "source": "planner_contract_mismatch_guard",
+            "iteration_type": "planning",
+            "failed_gates": list(planner_contract_mismatch.get("failed_gates") or ["planner_contract_mismatch"]),
+            "required_fixes": list(planner_contract_mismatch.get("required_fixes") or []),
+            "hard_failures": [],
+            "evidence": list(planner_contract_mismatch.get("evidence") or []),
+            "planner_repair_context": planner_contract_mismatch.get("report") or {},
+        }
+        return {
+            "error_message": summary,
+            "execution_output": summary,
+            "planner_repair_required": True,
+            "planner_repair_reason": "planner_contract_mismatch",
+            "planner_repair_context": planner_contract_mismatch.get("report") or {},
+            "reset_ml_patch_context": True,
+            "last_gate_context": last_gate_context,
+            "feedback_history": feedback_history[-25:],
+            "data_engineer_guard_warnings": guard_warnings[-10:],
+            "ml_skipped_reason": "planner_contract_mismatch",
+            "budget_counters": counters,
+            "ml_engineer_attempt": ml_attempt,
+        }
     # V4.1: Removed legacy feature_availability and availability_summary
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
     iteration_memory_block = state.get("ml_iteration_memory_block", "")
@@ -21441,6 +21651,8 @@ def _is_budget_exceeded_error(message: Any) -> bool:
 
 def check_engineer_success(state: AgentState):
     if state.get("error_message"):
+        if bool(state.get("planner_repair_required")):
+            return "replan"
         if bool(state.get("ml_improvement_round_active")) and _is_budget_exceeded_error(state.get("error_message")):
             return "finalize_metric_round"
         if bool(state.get("ml_engineer_host_crash")):
@@ -25831,6 +26043,35 @@ def check_execution_status(state: AgentState):
         return "evaluate"
 
     if has_error:
+        planner_contract_mismatch = _detect_planner_contract_mismatch_for_state(
+            state if isinstance(state, dict) else {},
+            runtime_text=str(output or ""),
+        )
+        if planner_contract_mismatch:
+            summary = str(planner_contract_mismatch.get("summary") or "PLANNER_CONTRACT_MISMATCH")
+            state["planner_repair_required"] = True
+            state["planner_repair_reason"] = "planner_contract_mismatch"
+            state["planner_repair_context"] = planner_contract_mismatch.get("report") or {}
+            state["ml_skipped_reason"] = "planner_contract_mismatch"
+            state["reset_ml_patch_context"] = True
+            gate_context = {
+                "status": "REJECTED",
+                "source": "planner_contract_mismatch_runtime_guard",
+                "iteration_type": "planning",
+                "failed_gates": list(planner_contract_mismatch.get("failed_gates") or ["planner_contract_mismatch"]),
+                "required_fixes": list(planner_contract_mismatch.get("required_fixes") or []),
+                "hard_failures": [],
+                "evidence": list(planner_contract_mismatch.get("evidence") or []),
+                "planner_repair_context": planner_contract_mismatch.get("report") or {},
+            }
+            state["last_gate_context"] = gate_context
+            _append_feedback_history(state, summary)
+            guard_warnings = [str(item) for item in (state.get("data_engineer_guard_warnings") or []) if str(item).strip()]
+            if summary not in guard_warnings:
+                guard_warnings.append(summary)
+            state["data_engineer_guard_warnings"] = guard_warnings[-10:]
+            print(summary)
+            return "replan_contract"
         runtime_root_cause = _derive_root_cause_signature(state, "runtime")
         repeated_root_cause_stop, predicted_streak, repeat_limit = _should_stop_repeated_root_cause(
             state,
@@ -30599,6 +30840,7 @@ workflow.add_conditional_edges(
     check_engineer_success,
     {
         "success": "execute_code",
+        "replan": "execution_planner",
         "retry_host_crash": "engineer",
         "finalize_metric_round": "finalize_improvement_round",
         "failed": "translator"
@@ -30637,6 +30879,7 @@ workflow.add_conditional_edges(
     check_execution_status,
     {
         "evaluate": "evaluate_results",
+        "replan_contract": "execution_planner",
         "retry_fix": "prepare_runtime_fix",
         "retry_sandbox": "retry_sandbox",
         "failed": "translator",

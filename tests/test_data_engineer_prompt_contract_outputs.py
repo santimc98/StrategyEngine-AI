@@ -293,6 +293,67 @@ def test_data_engineer_prompt_frames_date_and_numeric_cleaning_as_format_resolut
         "coercing unresolved strings to null",
         "null inflation",
         "raw quality",
+        "downstream handoff goal",
+        "least-destructive representation",
+    )
+
+
+def test_data_engineer_prompt_profiles_real_csv_while_preserving_remote_execution_path(tmp_path):
+    csv_path = tmp_path / "real_input.csv"
+    csv_path.write_text(
+        "Size;Debtors;Sector\n"
+        "€ 10.294.332;15;Industrial\n"
+        "\"10-25M €\";32;Services\n"
+        "€ 8.000.000;8;Retail\n",
+        encoding="utf-8",
+    )
+    agent = DataEngineerAgent(api_key="fake")
+    execution_contract = {
+        "scope": "full_pipeline",
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer", "required": True},
+        ],
+    }
+    de_view = {
+        "required_columns": ["Size", "Debtors", "Sector"],
+        "output_path": "artifacts/clean/dataset_cleaned.csv",
+        "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+        "cleaning_gates": [],
+        "column_dtype_targets": {
+            "Size": {"target_dtype": "float64"},
+            "Debtors": {"target_dtype": "float64"},
+            "Sector": {"target_dtype": "object"},
+        },
+        "data_engineer_runbook": {"steps": ["profile", "clean", "persist"]},
+    }
+
+    with patch(
+        "src.agents.data_engineer.call_chat_with_fallback",
+        return_value=(_mock_response("print('ok')"), "mock/model"),
+    ):
+        agent.generate_cleaning_script(
+            data_audit="audit",
+            strategy={"required_columns": ["Size", "Debtors", "Sector"]},
+            input_path="data/raw.csv",
+            prompt_input_path=str(csv_path),
+            execution_contract=execution_contract,
+            de_view=de_view,
+        )
+
+    prompt = agent.last_prompt or ""
+    _assert_contains_all(
+        prompt,
+        "Execution Input Path (must be used by the generated script): 'data/raw.csv'",
+        "Prompt Profiling Source (used only to build DATA_SAMPLE_CONTEXT / selector expansion)",
+        str(csv_path),
+        "column_profiles",
+        "10-25M €",
+    )
+    _assert_contains_terms(
+        prompt,
+        "dtype targets as downstream goals",
+        "least-destructive representation",
+        "mixed semantics",
     )
 
 

@@ -300,7 +300,11 @@ def _review_cleaning_impl(
     gate_names = [gate["name"] for gate in gates]
 
     manifest = _load_json(cleaning_manifest_path)
-    required_columns = _resolve_required_columns_for_review(view, manifest=manifest)
+    required_columns = _resolve_required_columns_for_review(
+        view,
+        manifest=manifest,
+        artifact_obligations=artifact_obligations,
+    )
     column_roles = _coerce_roles(view.get("column_roles"))
     dialect_in_context = _resolve_dialect(view.get("dialect"))
     dialect_raw = _resolve_dialect(view.get("input_dialect") or view.get("dialect") or dialect_in_context)
@@ -362,6 +366,8 @@ def _review_cleaning_impl(
         sample_str=sample_str,
         sample_infer=sample_infer,
         raw_sample=raw_sample,
+        gates=gates,
+        column_roles=column_roles,
         dataset_profile=dataset_profile,
         outlier_policy=outlier_policy,
         outlier_report=outlier_report,
@@ -1124,7 +1130,16 @@ def _load_column_inventory_names(path: str = "data/column_inventory.json") -> Li
 def _resolve_required_columns_for_review(
     view: Dict[str, Any],
     manifest: Optional[Dict[str, Any]] = None,
+    artifact_obligations: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
+    preferred_output_path = str(view.get("output_path") or "").strip()
+    obligated_required = _resolve_required_columns_from_artifact_obligations(
+        artifact_obligations,
+        preferred_output_path=preferred_output_path or None,
+    )
+    if obligated_required:
+        return obligated_required
+
     required = view.get("required_columns")
     required_selectors = view.get("required_feature_selectors")
     column_transformations = view.get("column_transformations")
@@ -1170,6 +1185,62 @@ def _resolve_required_columns_for_review(
     return base_required
 
 
+def _resolve_required_columns_from_artifact_obligations(
+    artifact_obligations: Optional[Dict[str, Any]],
+    *,
+    preferred_output_path: Optional[str] = None,
+) -> List[str]:
+    if not isinstance(artifact_obligations, dict):
+        return []
+    bindings = artifact_obligations.get("artifact_bindings")
+    if not isinstance(bindings, list):
+        return []
+
+    preferred_output_norm = str(preferred_output_path or "").strip().lower()
+    candidates: List[Tuple[int, int, List[str]]] = []
+    fallback_candidates: List[List[str]] = []
+
+    for idx, binding in enumerate(bindings):
+        if not isinstance(binding, dict):
+            continue
+        declared = binding.get("declared_binding")
+        if not isinstance(declared, dict):
+            continue
+
+        required = _list_str(declared.get("required_columns"))
+        if not required:
+            schema_binding = declared.get("schema_binding")
+            if isinstance(schema_binding, dict):
+                required = _list_str(schema_binding.get("required_columns"))
+        if not required:
+            continue
+
+        binding_name = str(binding.get("binding_name") or binding.get("artifact_name") or "").strip().lower()
+        source_path = str(binding.get("source_contract_path") or "").strip().lower()
+        output_path = str(declared.get("output_path") or "").strip().lower()
+
+        score = 0
+        if "cleaned_dataset" in binding_name or "cleaned_dataset" in source_path:
+            score += 4
+        elif "clean_dataset" in binding_name or "clean_dataset" in source_path:
+            score += 3
+        if preferred_output_norm and output_path and output_path == preferred_output_norm:
+            score += 2
+
+        deduped_required = _dedupe_list(required)
+        fallback_candidates.append(deduped_required)
+        candidates.append((score, idx, deduped_required))
+
+    if not candidates:
+        return []
+    best = sorted(candidates, key=lambda item: (-item[0], item[1]))[0]
+    if best[0] > 0:
+        return best[2]
+    if len(fallback_candidates) == 1:
+        return fallback_candidates[0]
+    return []
+
+
 def _coerce_roles(raw: Any) -> Dict[str, List[str]]:
     if not isinstance(raw, dict):
         return {}
@@ -1187,6 +1258,8 @@ def _build_facts(
     sample_str: Optional[pd.DataFrame],
     sample_infer: Optional[pd.DataFrame],
     raw_sample: Optional[pd.DataFrame],
+    gates: Optional[List[Dict[str, Any]]] = None,
+    column_roles: Optional[Dict[str, List[str]]] = None,
     dataset_profile: Optional[Dict[str, Any]] = None,
     outlier_policy: Optional[Dict[str, Any]] = None,
     outlier_report: Optional[Dict[str, Any]] = None,
@@ -1196,6 +1269,25 @@ def _build_facts(
     facts["cleaned_header"] = cleaned_header[:200]
     facts["required_columns"] = required_columns
     facts["missing_required_columns"] = [c for c in required_columns if c not in cleaned_header]
+    forbidden_columns = _collect_forbidden_columns_for_review(gates or [], column_roles or {})
+    if forbidden_columns:
+        cleaned_header_norm = {str(col).strip().lower(): str(col) for col in cleaned_header if str(col).strip()}
+        manifest_removed = _collect_manifest_removed_columns(manifest)
+        manifest_removed_norm = {str(col).strip().lower(): str(col) for col in manifest_removed if str(col).strip()}
+        facts["forbidden_columns"] = forbidden_columns
+        facts["forbidden_columns_present_in_cleaned_header"] = [
+            col for col in forbidden_columns if str(col).strip().lower() in cleaned_header_norm
+        ]
+        facts["forbidden_columns_absent_in_cleaned_header"] = [
+            col for col in forbidden_columns if str(col).strip().lower() not in cleaned_header_norm
+        ]
+        facts["forbidden_columns_declared_removed_in_manifest"] = [
+            col for col in forbidden_columns if str(col).strip().lower() in manifest_removed_norm
+        ]
+        facts["required_columns_scope_note"] = (
+            "missing_required_columns tracks columns expected in the cleaned artifact scope; "
+            "it does not imply that those columns are still present in the cleaned header."
+        )
 
     row_counts = manifest.get("row_counts") or {}
     facts["row_counts"] = {
@@ -1255,6 +1347,40 @@ def _build_facts(
         facts["outlier_policy"] = policy_summary
 
     return facts
+
+
+def _collect_forbidden_columns_for_review(
+    gates: List[Dict[str, Any]],
+    column_roles: Dict[str, List[str]],
+) -> List[str]:
+    forbidden: List[str] = []
+    for gate in gates:
+        if not isinstance(gate, dict):
+            continue
+        if _normalize_gate_name(gate.get("name")) != "leakage_exclusion":
+            continue
+        params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+        for key in ("forbidden_columns", "forbidden_at_inference", "excluded_columns", "columns"):
+            forbidden.extend(_list_str(params.get(key)))
+    if isinstance(column_roles, dict):
+        for role_name, columns in column_roles.items():
+            role_key = str(role_name or "").strip().lower()
+            if not role_key:
+                continue
+            if any(token in role_key for token in ("forbidden", "leakage", "post_decision", "postdecision")):
+                forbidden.extend(_list_str(columns))
+    return _dedupe_list(forbidden)
+
+
+def _collect_manifest_removed_columns(manifest: Dict[str, Any]) -> List[str]:
+    if not isinstance(manifest, dict):
+        return []
+    dropped = manifest.get("dropped_columns")
+    if isinstance(dropped, dict):
+        return _dedupe_list(list(dropped.keys()))
+    if isinstance(dropped, list):
+        return _dedupe_list(dropped)
+    return []
 
 
 def _build_column_stats(
@@ -1648,6 +1774,7 @@ def _build_llm_prompt(
         "HIGH-RISK EXAMPLES (GUIDANCE, NOT A SUBSTITUTE FOR REASONING)\n"
         "- no_semantic_rescale: do not infer rescaling from low numeric ranges alone. Look for explicit code evidence such as division by constants, scaler objects, or explicit multiplicative rescaling. If data is already in a low range but no such code exists, that is not a violation.\n"
         "- no_synthetic_data: distinguish between generating synthetic rows/datasets and limited stochastic operations such as noise or imputation support. Reject only when the code clearly fabricates data beyond the contract.\n\n"
+        "- leakage_exclusion: reason from direct evidence of the cleaned artifact. If forbidden columns are absent from cleaned_header and/or explicitly listed as dropped in the manifest, that supports PASS. Do not treat missing_required_columns as evidence that forbidden columns are still present.\n\n"
         "NULL INFLATION DETECTION (CRITICAL)\n"
         "- The payload may include 'cleaning_quality_summary' with per-column null rates before (raw) and after (cleaned) cleaning.\n"
         "- If any column shows null_inflation_pp > 35, the Data Engineer's parsing likely destroyed valid data.\n"

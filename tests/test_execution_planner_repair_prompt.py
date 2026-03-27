@@ -66,6 +66,12 @@ class TestSemanticPlannerPromptProperties:
     def test_mentions_model_features(self):
         assert "model_features" in SEMANTIC_EXECUTION_PLANNER_PROMPT
 
+    def test_distinguishes_model_features_from_operational_dependencies(self):
+        prompt = SEMANTIC_EXECUTION_PLANNER_PROMPT.lower()
+        assert "operational" in prompt
+        assert "filter" in prompt or "split" in prompt
+        assert "model feature" in prompt or "model_features" in prompt
+
     def test_has_output_section(self):
         assert "OUTPUT" in SEMANTIC_EXECUTION_PLANNER_PROMPT
 
@@ -114,6 +120,12 @@ class TestContractCompilerPromptProperties:
 
     def test_mentions_output_manifest_path(self):
         assert "output_manifest_path" in MINIMAL_CONTRACT_COMPILER_PROMPT
+
+    def test_preserves_non_feature_operational_columns(self):
+        prompt = MINIMAL_CONTRACT_COMPILER_PROMPT.lower()
+        assert "optional_passthrough_columns" in prompt
+        assert "operational" in prompt
+        assert "task_semantics" in prompt
 
     def test_references_schema_examples(self):
         prompt = MINIMAL_CONTRACT_COMPILER_PROMPT.lower()

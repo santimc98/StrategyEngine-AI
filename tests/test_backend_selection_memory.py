@@ -101,14 +101,14 @@ def test_memory_pressure_detector_matches_common_oom_signatures():
     assert not graph_mod._is_memory_pressure_error("ValueError: invalid literal for int()")
 
 
-def test_extract_required_columns_falls_back_to_canonical_columns():
+def test_extract_required_columns_requires_cleaned_dataset_binding():
     contract = {
         "canonical_columns": ["id", "target", "feature_a"],
         "artifact_requirements": {},
     }
     required, source = graph_mod._extract_required_columns_from_contract(contract, {})
-    assert required == ["id", "target", "feature_a"]
-    assert source == "contract.canonical_columns"
+    assert required == []
+    assert source == ""
 
 
 def test_de_backend_selection_uses_total_header_columns_signal():
