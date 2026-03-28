@@ -2,6 +2,7 @@ from src.agents.execution_planner import build_execution_plan
 from src.agents.results_advisor import ResultsAdvisorAgent
 from src.utils.problem_capabilities import (
     infer_problem_capabilities,
+    metric_higher_is_better,
     metric_family_for_metric,
     metric_preference_tokens,
     problem_metric_families,
@@ -66,3 +67,8 @@ def test_metric_family_helpers_cover_survival_and_optimization():
     assert metric_family_for_metric("objective_value") == "optimization"
     assert "regression" in problem_metric_families("forecasting")
     assert "concordance_index" in metric_preference_tokens("survival")
+
+
+def test_metric_higher_is_better_handles_violation_reduction_semantics():
+    assert metric_higher_is_better("Reduction in case-level ordering violations") is True
+    assert metric_higher_is_better("violation_count") is False

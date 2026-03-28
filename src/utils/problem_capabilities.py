@@ -267,6 +267,8 @@ def metric_higher_is_better(metric_name: Any) -> bool:
     token = _normalize_token(metric_name)
     if not token:
         return True
+    if any(pattern in token for pattern in ("reduction", "improvement", "uplift", "lift", "gain")):
+        return True
     if any(pattern in token for pattern in ("loss", "error", "mae", "rmse", "mse", "mape", "smape", "brier", "regret", "violation")):
         return False
     return True

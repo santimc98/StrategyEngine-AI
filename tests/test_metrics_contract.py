@@ -59,3 +59,22 @@ def test_canonicalize_metrics_report_file_rewrites_legacy_payload(tmp_path):
     assert persisted["mean_mae"] == 10.5
     assert persisted["std_mae"] == 1.25
     assert persisted["primary_metric_canonical_name"] == "mae"
+
+
+def test_normalize_metrics_report_payload_resolves_ordering_violation_reduction() -> None:
+    payload = {
+        "primary_metric_name": "Reduction in case-level ordering violations",
+        "full_data_ordering": {
+            "baseline_violation_count": 19,
+            "calibrated_violation_count": 16,
+            "violation_reduction": 3,
+        },
+    }
+
+    normalized = normalize_metrics_report_payload(payload)
+
+    assert normalized["primary_metric_canonical_name"] == "violation_reduction"
+    assert normalized["primary_metric_value"] == 3.0
+    assert normalized["higher_is_better"] is True
+    assert normalized["model_performance"]["primary_metric_value"] == 3.0
+    assert normalized["model_performance"]["higher_is_better"] is True

@@ -158,7 +158,11 @@ def _merge_explicit_primary_metric(metric_pool: Dict[str, float], metrics_report
 
 def _metric_higher_is_better(name: str) -> bool:
     key = str(name or "").lower()
+    if any(token in key for token in ["reduction", "improvement", "uplift", "lift", "gain"]):
+        return True
     if any(token in key for token in ["loss", "error", "mae", "rmse", "mse", "mape", "smape", "logloss", "brier"]):
+        return False
+    if "violation" in key:
         return False
     return True
 

@@ -15,6 +15,17 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
+def _metric_higher_is_better(metric_name: Any) -> bool:
+    key = _norm_token(metric_name)
+    if not key:
+        return True
+    if any(token in key for token in ("reduction", "improvement", "uplift", "lift", "gain")):
+        return True
+    if any(token in key for token in ("loss", "error", "mae", "rmse", "mse", "mape", "smape", "brier", "regret", "violation")):
+        return False
+    return True
+
+
 def _norm_token(text: Any) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(text or "").lower())
 
@@ -65,6 +76,30 @@ _METRIC_CANONICAL_ALIASES: Dict[str, Tuple[str, ...]] = {
     "mrr": ("mrr", "mean_reciprocal_rank"),
     "spearman": ("spearman", "spearmanr"),
     "kendall": ("kendall", "kendalltau"),
+    "violation_reduction": (
+        "violation_reduction",
+        "violation reduction",
+        "reduction_in_case_level_ordering_violations",
+        "reduction in case-level ordering violations",
+        "reduction_in_ordering_violations",
+        "reduction in ordering violations",
+        "ordering_violation_reduction",
+        "ordering violation reduction",
+        "case_level_ordering_violation_reduction",
+        "case level ordering violation reduction",
+    ),
+    "violation_count": (
+        "violation_count",
+        "violation count",
+        "ordering_violation_count",
+        "ordering violation count",
+        "ordering_violations",
+        "ordering violations",
+        "case_level_ordering_violation_count",
+        "case level ordering violation count",
+        "case_level_ordering_violations",
+        "case level ordering violations",
+    ),
 }
 
 _PREFERRED_METRIC_KEY_TOKENS: Dict[str, int] = {
@@ -347,7 +382,15 @@ def resolve_metric_value(metrics_json: Dict[str, Any], metric_name: str) -> Dict
     best_score: int | None = None
 
     for key, value in flat:
-        score = _score_metric_candidate(metric_name, key)
+        candidate_names = [str(key)]
+        final_key = str(key).split(".")[-1].strip()
+        if final_key and final_key not in candidate_names:
+            candidate_names.append(final_key)
+        score_candidates = [
+            _score_metric_candidate(metric_name, candidate_name)
+            for candidate_name in candidate_names
+        ]
+        score = max((item for item in score_candidates if item is not None), default=None)
         if score is None:
             continue
         # Penalize deeply nested keys — top-level metrics (depth 0) are almost
@@ -503,7 +546,8 @@ def normalize_metrics_report_payload(payload: Dict[str, Any] | None) -> Dict[str
         normalized.setdefault("primary_metric", primary_metric_name)
         primary_metric_canonical_name = canonicalize_metric_name(primary_metric_name)
         if primary_metric_canonical_name:
-            normalized.setdefault("primary_metric_canonical_name", primary_metric_canonical_name)
+            normalized["primary_metric_canonical_name"] = primary_metric_canonical_name
+            normalized.setdefault("higher_is_better", _metric_higher_is_better(primary_metric_name))
             metric_value = normalized.get("primary_metric_value")
             if metric_value is None:
                 resolved = resolve_metric_value(normalized, primary_metric_name)
@@ -515,6 +559,7 @@ def normalize_metrics_report_payload(payload: Dict[str, Any] | None) -> Dict[str
                 normalized["primary_metric_value"] = float(metric_value_num)
                 model_performance.setdefault("primary_metric_name", primary_metric_name)
                 model_performance.setdefault("primary_metric_value", float(metric_value_num))
+                model_performance.setdefault("higher_is_better", _metric_higher_is_better(primary_metric_name))
                 model_performance.setdefault(
                     "primary_metric",
                     {"name": primary_metric_name, "value": float(metric_value_num)},
