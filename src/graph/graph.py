@@ -10970,11 +10970,44 @@ def _clear_runtime_blockers() -> Dict[str, Any]:
         "runtime_fix_terminal": False,
         "runtime_fix_terminal_reason": "",
         "last_runtime_error_tail": None,
+        "hard_failures": [],
         # Clear residual error context from previous failed attempts so that
         # _resolve_authoritative_runtime_text and _build_review_board_facts
         # do not pick up stale tracebacks after a successful retry.
         "heavy_runner_error_context": None,
     }
+
+
+def _clear_gate_context_after_success(gate_context: Any) -> Dict[str, Any]:
+    if not isinstance(gate_context, dict):
+        return {}
+    cleaned = copy.deepcopy(gate_context)
+    for key in (
+        "traceback",
+        "execution_output_tail",
+        "runtime_error",
+        "edit_instructions",
+        "feedback_json",
+    ):
+        cleaned.pop(key, None)
+    if isinstance(cleaned.get("feedback_record"), dict):
+        feedback_record = dict(cleaned.get("feedback_record") or {})
+        feedback_record.pop("hard_failures", None)
+        feedback_record.pop("failed_gates", None)
+        feedback_record.pop("required_fixes", None)
+        cleaned["feedback_record"] = feedback_record
+    cleaned["failed_gates"] = []
+    cleaned["required_fixes"] = []
+    cleaned["hard_failures"] = []
+    if str(cleaned.get("status") or "").strip().upper() in {
+        "NEEDS_IMPROVEMENT",
+        "REJECTED",
+        "FAILED",
+        "ERROR",
+        "CRASH",
+    }:
+        cleaned["status"] = "EXECUTION_OK"
+    return cleaned
 
 
 def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
@@ -11448,6 +11481,9 @@ def _build_retry_context(
     )
     error_type = str(runtime_details.get("failure_type") or "unknown")
     specific_error = str(runtime_details.get("summary") or "")
+    exc_type, exc_message = _extract_runtime_exception_signature(authoritative_runtime or runtime_tail)
+    if exc_type and not _is_wrapper_exception_type(exc_type):
+        specific_error = _format_runtime_exception_signature(exc_type, exc_message)
     blocked_imports: List[str] = []
     runtime_lower = str(authoritative_runtime or runtime_tail or "").lower()
     if not specific_error and failed_gates:
@@ -11508,12 +11544,25 @@ def _is_wrapper_exception_type(exc_type: Any) -> bool:
     return token in {
         "",
         "HEAVYRUNNER",
+        "HEAVYRUNNERERROR",
+        "HEAVYRUNNERCODEERROR",
+        "HEAVYRUNNERINFRAERROR",
         "LOCALRUNNER",
+        "LOCALRUNNEREXITCODE",
         "JOBERRORDETAIL",
         "STATUS",
         "EXECUTION",
         "EXECUTIONERROR",
+        "VALIDATIONWARNING",
     }
+
+
+def _format_runtime_exception_signature(exc_type: Any, message: Any) -> str:
+    exc_token = str(exc_type or "").strip()
+    msg_token = str(message or "").strip()
+    if exc_token and msg_token:
+        return f"{exc_token}: {msg_token}"
+    return exc_token or msg_token
 
 
 def _score_runtime_text_candidate(text: Any) -> int:
@@ -12014,7 +12063,7 @@ def _build_repair_ground_truth(
     required_fixes: List[str] | None,
 ) -> Dict[str, Any]:
     retry_context = retry_context if isinstance(retry_context, dict) else {}
-    runtime_text = str(runtime_output or "").strip()
+    runtime_text = _resolve_authoritative_runtime_text(runtime_output, state=state) or str(runtime_output or "").strip()
     error_type = str(retry_context.get("error_type") or "").strip().lower()
     repair_focus = str(retry_context.get("repair_focus") or "").strip().lower()
     specific_error = str(retry_context.get("specific_error") or "").strip()
@@ -12501,7 +12550,11 @@ def _classify_runtime_failure_details(
             "Regenerate required artifacts after the runtime issue is resolved.",
         ]
 
-    summary = last_line or text[:320]
+    summary = (
+        _format_runtime_exception_signature(exception_type, exception_message)
+        if has_explicit_runtime_exception
+        else (last_line or text[:320])
+    )
     if failure_type == "output_missing" and missing_outputs:
         summary = "Missing outputs: " + ", ".join([str(path) for path in (missing_outputs or [])[:5]])
     return {
@@ -12547,6 +12600,34 @@ def _resolve_repair_first_focus(
     if retry_focus in {"runtime", "persistence", "compliance"}:
         return retry_focus
     return ""
+
+
+def _prune_stale_execution_hard_failures(
+    hard_failures: List[str] | None,
+    *,
+    runtime_failure_detected: bool,
+    output_contract_report: Dict[str, Any] | None,
+) -> List[str]:
+    items = [str(item) for item in (hard_failures or []) if str(item).strip()]
+    if not items:
+        return []
+    oc_report = output_contract_report if isinstance(output_contract_report, dict) else {}
+    oc_has_missing = bool(oc_report.get("missing"))
+    oc_is_error = str(oc_report.get("overall_status") or "").strip().lower() == "error"
+    stale_exact: set[str] = set()
+    if not runtime_failure_detected:
+        stale_exact.update({"runtime_failure", "runtime_failed", "sandbox_failed"})
+    if not oc_has_missing and not oc_is_error:
+        stale_exact.update({"output_contract_error", "contract_required_artifacts_missing"})
+
+    cleaned: List[str] = []
+    for item in items:
+        lower = item.strip().lower()
+        normalized = lower.split(":", 1)[1].strip() if ":" in lower else lower
+        if normalized in stale_exact:
+            continue
+        cleaned.append(item)
+    return cleaned
 
 
 def _prune_patch_objectives_for_repair_focus(
@@ -17219,6 +17300,7 @@ def _finalize_heavy_execution(
         result["last_successful_execution_output"] = output
         result["last_successful_plots"] = plots_local
         result["last_successful_output_contract_report"] = oc_report
+        result["last_gate_context"] = _clear_gate_context_after_success(state.get("last_gate_context"))
     best_score = state.get("best_attempt_score")
     if attempt_valid and (best_score is None or attempt_score > float(best_score)):
         dest = _snapshot_best_attempt(
@@ -23981,6 +24063,7 @@ def execute_code(state: AgentState) -> AgentState:
         result["last_successful_execution_output"] = output
         result["last_successful_plots"] = plots_local
         result["last_successful_output_contract_report"] = oc_report
+        result["last_gate_context"] = _clear_gate_context_after_success(state.get("last_gate_context"))
     best_score = state.get("best_attempt_score")
     if attempt_valid and (best_score is None or attempt_score > float(best_score)):
         dest = _snapshot_best_attempt(
@@ -25267,7 +25350,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         ml_feedback_record["repair_hints"] = repair_hints[:2]
     if ml_feedback_record:
         gate_context["feedback_record"] = ml_feedback_record
-    existing_hard_failures = [str(h) for h in (state.get("hard_failures") or []) if h]
+    existing_hard_failures = _prune_stale_execution_hard_failures(
+        [str(h) for h in (state.get("hard_failures") or []) if h],
+        runtime_failure_detected=runtime_failure_detected,
+        output_contract_report=oc_report,
+    )
     merged_hard_failures = list(dict.fromkeys(existing_hard_failures + qa_hard_failures))
     if merged_hard_failures:
         gate_context["hard_failures"] = merged_hard_failures

@@ -158,3 +158,25 @@ class TestClearRuntimeBlockers:
         assert cleared["sandbox_failed"] is False
         assert cleared["runtime_fix_terminal"] is False
         assert cleared["last_runtime_error_tail"] is None
+        assert cleared["hard_failures"] == []
+
+    def test_clears_gate_context_runtime_signals(self):
+        from src.graph.graph import _clear_gate_context_after_success
+
+        cleaned = _clear_gate_context_after_success(
+            {
+                "status": "NEEDS_IMPROVEMENT",
+                "failed_gates": ["runtime_failure", "contract_required_artifacts_missing"],
+                "required_fixes": ["Fix runtime", "Write outputs"],
+                "hard_failures": ["runtime_failure"],
+                "traceback": "Traceback (most recent call last): ...",
+                "execution_output_tail": "AttributeError: boom",
+                "runtime_error": {"summary": "AttributeError: boom"},
+            }
+        )
+        assert cleaned["status"] == "EXECUTION_OK"
+        assert cleaned["failed_gates"] == []
+        assert cleaned["required_fixes"] == []
+        assert cleaned["hard_failures"] == []
+        assert "traceback" not in cleaned
+        assert "runtime_error" not in cleaned

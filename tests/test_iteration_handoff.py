@@ -376,3 +376,37 @@ def test_iteration_handoff_keeps_assertion_runtime_root_cause_even_with_missing_
         fact.get("fact") == "exception_type" and fact.get("value") == "AssertionError"
         for fact in handoff["repair_ground_truth"]["verified_facts"]
     )
+
+
+def test_iteration_handoff_prefers_real_exception_over_heavy_runner_infra_marker():
+    runtime_tail = (
+        "HEAVY_RUNNER_ERROR_CONTEXT:\n"
+        "Traceback (most recent call last):\n"
+        "  File \"ml_script.py\", line 227, in main\n"
+        "    if not df['case_id'].between(1, 20).all():\n"
+        "AttributeError: 'DataFrame' object has no attribute 'between'\n"
+        "HEAVY_RUNNER_INFRA_ERROR\n"
+    )
+    state = {
+        "iteration_count": 2,
+        "execution_contract": {"required_outputs": ["artifacts/ml/calibration_metrics.json"]},
+        "execution_output": runtime_tail,
+        "last_runtime_error_tail": runtime_tail,
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Fix runtime failure."],
+        },
+        oc_report={"present": [], "missing": ["artifacts/ml/calibration_metrics.json"]},
+        review_result={},
+        qa_result={},
+        evaluation_spec={"primary_metric": "mae"},
+    )
+
+    assert handoff["retry_context"]["specific_error"] == "AttributeError: 'DataFrame' object has no attribute 'between'"
+    assert handoff["repair_ground_truth"]["failure_signature"] == "AttributeError: 'DataFrame' object has no attribute 'between'"
+    assert "HEAVY_RUNNER_INFRA_ERROR" not in handoff["repair_ground_truth"]["failure_signature"]

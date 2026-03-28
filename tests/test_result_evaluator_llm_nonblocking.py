@@ -243,6 +243,42 @@ def test_result_evaluator_missing_contract_artifact_forces_retry(tmp_path, monke
     assert graph_mod.check_evaluation(state) == "retry"
 
 
+def test_result_evaluator_ignores_stale_runtime_hard_failures_after_clean_retry(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump({"metric": 0.9}, f)
+
+    state = {
+        "execution_output": "HEAVY_RUNNER: status=success reason=local_runner_mode",
+        "execution_error": False,
+        "sandbox_failed": False,
+        "hard_failures": ["runtime_failure", "result_evaluator_failed_gate:runtime_failure"],
+        "last_gate_context": {
+            "status": "NEEDS_IMPROVEMENT",
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Fix runtime"],
+            "hard_failures": ["runtime_failure"],
+            "traceback": "Traceback (most recent call last): ...",
+        },
+        "selected_strategy": {},
+        "business_objective": "",
+        "generated_code": "print('hello')",
+        "execution_contract": {"spec_extraction": {"case_taxonomy": []}},
+        "evaluation_spec": {},
+        "iteration_count": 0,
+        "feedback_history": [],
+    }
+
+    monkeypatch.setattr(graph_mod, "reviewer", _StubReviewerApproved())
+    monkeypatch.setattr(graph_mod, "qa_reviewer", _StubQAApproved())
+    result = graph_mod.run_result_evaluator(state)
+
+    assert result["review_verdict"] == "APPROVED"
+    assert "hard_failures" not in result or result["hard_failures"] == []
+    assert result["last_gate_context"].get("hard_failures") in ([], None)
+
+
 def test_check_evaluation_advisory_needs_improvement_stops_without_retry():
     state = {
         "review_verdict": "NEEDS_IMPROVEMENT",
