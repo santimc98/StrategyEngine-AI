@@ -14380,6 +14380,8 @@ class AgentState(TypedDict):
     ml_improvement_round_baseline_metrics: Dict[str, Any]
     ml_improvement_round_baseline_reviewer_packet: Dict[str, Any]
     ml_improvement_round_baseline_qa_packet: Dict[str, Any]
+    ml_improvement_round_baseline_generated_code: str
+    ml_improvement_round_baseline_last_generated_code: str
     ml_improvement_incumbent_metric: float
     ml_improvement_baseline_metric: float
     ml_improvement_baseline_metrics: Dict[str, Any]
@@ -15081,6 +15083,8 @@ def run_steward(state: AgentState) -> AgentState:
         "ml_improvement_round_baseline_sandbox_failed": False,
         "ml_improvement_round_baseline_execution_error": "",
         "ml_improvement_round_baseline_error_message": "",
+        "ml_improvement_round_baseline_generated_code": "",
+        "ml_improvement_round_baseline_last_generated_code": "",
         "ml_improvement_incumbent_metric": None,
         "ml_improvement_baseline_metric": None,
         "ml_improvement_baseline_metrics": {},
@@ -29292,6 +29296,12 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         if isinstance(state.get("qa_last_result"), dict)
         else {}
     )
+    state["ml_improvement_round_baseline_generated_code"] = str(
+        state.get("generated_code") or ""
+    )
+    state["ml_improvement_round_baseline_last_generated_code"] = str(
+        state.get("last_generated_code") or state.get("generated_code") or ""
+    )
     state["ml_improvement_round_baseline_gate_context"] = (
         copy.deepcopy(state.get("last_successful_gate_context"))
         if isinstance(state.get("last_successful_gate_context"), dict)
@@ -30319,6 +30329,17 @@ def _restore_metric_round_baseline_state(state: Dict[str, Any]) -> None:
     state["sandbox_failed"] = bool(state.get("ml_improvement_round_baseline_sandbox_failed"))
     state["execution_error"] = str(state.get("ml_improvement_round_baseline_execution_error") or "")
     state["error_message"] = str(state.get("ml_improvement_round_baseline_error_message") or "")
+    baseline_generated_code = str(state.get("ml_improvement_round_baseline_generated_code") or "")
+    baseline_last_generated_code = str(
+        state.get("ml_improvement_round_baseline_last_generated_code")
+        or baseline_generated_code
+        or ""
+    )
+    if baseline_generated_code:
+        state["generated_code"] = baseline_generated_code
+        state["last_successful_generated_code"] = baseline_generated_code
+    if baseline_last_generated_code:
+        state["last_generated_code"] = baseline_last_generated_code
 
     if baseline_gate_context:
         state["last_gate_context"] = baseline_gate_context

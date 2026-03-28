@@ -170,6 +170,8 @@ def test_bootstrap_metric_improvement_round_supports_nested_metric_aliases(tmp_p
     assert state.get("ml_improvement_round_active") is True
     assert state.get("ml_improvement_primary_metric_name") == "ROC-AUC"
     assert state.get("ml_improvement_round_baseline_metric") == pytest.approx(0.9160376006743025, abs=1e-12)
+    assert state.get("ml_improvement_round_baseline_generated_code") == "def train():\n    return None\n"
+    assert state.get("ml_improvement_round_baseline_last_generated_code") == "def train():\n    return None\n"
     handoff = state.get("iteration_handoff", {})
     assert handoff.get("optimization_focus", {}).get("primary_metric_name") == "ROC-AUC"
 
@@ -737,6 +739,10 @@ def test_finalize_round_restores_baseline_when_review_board_rejects_candidate(tm
         },
         "ml_improvement_round_baseline_reviewer_packet": {"status": "APPROVED"},
         "ml_improvement_round_baseline_qa_packet": {"status": "APPROVED"},
+        "ml_improvement_round_baseline_generated_code": "print('baseline incumbent')\n",
+        "ml_improvement_round_baseline_last_generated_code": "print('baseline incumbent')\n",
+        "generated_code": "print('rejected challenger')\n",
+        "last_generated_code": "print('rejected challenger')\n",
         "last_gate_context": {"status": "NEEDS_IMPROVEMENT", "failed_gates": [], "hard_failures": []},
         "feedback_history": [],
     }
@@ -748,6 +754,9 @@ def test_finalize_round_restores_baseline_when_review_board_rejects_candidate(tm
     assert state["review_verdict"] == "APPROVED"
     assert state["review_board_verdict"]["final_review_verdict"] == "APPROVED"
     assert state["review_board_verdict"]["candidate_assessment_status"] == "REJECTED"
+    assert state["generated_code"] == "print('baseline incumbent')\n"
+    assert state["last_generated_code"] == "print('baseline incumbent')\n"
+    assert state["last_successful_generated_code"] == "print('baseline incumbent')\n"
     assert json.loads(metrics_path.read_text(encoding="utf-8"))["roc_auc"] == pytest.approx(0.8000, abs=1e-12)
 
 
