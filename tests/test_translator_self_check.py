@@ -33,6 +33,30 @@ class _SequencedModel:
         return _Resp(text)
 
 
+class _CaptureChatCompletions:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+
+        class _Msg:
+            content = '{"title":"Executive Report","blocks":[],"evidence":[]}'
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+
+class _CaptureClient:
+    def __init__(self):
+        self.chat = type("Chat", (), {"completions": _CaptureChatCompletions()})()
+
+
 def test_translator_self_check_instructions_present(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)
@@ -64,6 +88,20 @@ def test_translator_prompt_declares_source_of_truth_and_authoritative_outcome(tm
 
     assert "=== SOURCE OF TRUTH AND PRECEDENCE ===" in report
     assert "The authoritative executive outcome for this report is: NO_GO" in report
+
+
+def test_translator_openrouter_call_uses_configured_max_tokens(monkeypatch):
+    monkeypatch.setenv("TRANSLATOR_MAX_TOKENS", "8000")
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    client = _CaptureClient()
+    agent.client = client
+
+    payload = agent._call_llm("Return JSON only.")
+
+    assert payload
+    calls = client.chat.completions.calls
+    assert calls
+    assert calls[0]["max_tokens"] == 8000
 
 
 def test_translator_prompt_keeps_layout_flexible_without_legacy_markdown_scaffold(tmp_path, monkeypatch):

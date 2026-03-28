@@ -2806,8 +2806,8 @@ def _build_embeddable_artifact_registry(
             "artifact_type": "html_table",
             "title": "KPI Snapshot",
             "content_html": kpi_snapshot_table_html,
-            "summary": "Compact table with executive decision, data adequacy status, decisioning columns, and top numeric metrics.",
-            "guidance": "Use only if a compact KPI summary materially strengthens the executive decision.",
+            "summary": "Table with executive decision, data adequacy status, decisioning columns, and top numeric metrics.",
+            "guidance": "Use when a KPI table materially strengthens the executive decision or clarifies the final state.",
         }
 
     if artifact_inventory_table_html and len(artifact_inventory_table_html) > 30:
@@ -3195,6 +3195,10 @@ class BusinessTranslatorAgent:
         self.last_response = None
         self.last_report_blocks = None
         self.last_report_payload = None
+        try:
+            self._max_tokens = int(os.getenv("TRANSLATOR_MAX_TOKENS", "8000"))
+        except Exception:
+            self._max_tokens = 8000
 
     def _call_llm(self, prompt: str) -> str:
         model = getattr(self, "model", None)
@@ -3209,6 +3213,7 @@ class BusinessTranslatorAgent:
             model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
+            max_tokens=int(self._max_tokens),
         )
         return (response.choices[0].message.content or "").strip()
 
@@ -4015,8 +4020,9 @@ reflect this analysis, not just list data.
      but keep final KPI/stability language tied to the selected incumbent only.
 
 2. IDENTIFY WHAT MATTERS
-   - From all the metrics and artifacts below, select the 3-5 most
-     decision-relevant findings. Not everything deserves a mention.
+   - From all the metrics and artifacts below, decide which findings are
+     truly decision-relevant for this run. Include as much supporting detail
+     as needed to make the report clear, rigorous, and useful.
    - Prioritize: primary metric performance, data quality issues,
      compliance failures, and risks that affect production readiness.
    - If cleaning work materially enabled the final result, surface the
@@ -4030,8 +4036,9 @@ reflect this analysis, not just list data.
 
 3. ATTRIBUTE ENGINEERING IMPACT
    - Ask internally which engineering interventions actually changed the system state.
-   - Compress the work into the few accepted data-engineering and model-engineering
-     moves that changed readiness, incumbent quality, or deployment trust.
+   - Describe the accepted data-engineering and model-engineering moves that
+     changed readiness, incumbent quality, or deployment trust at the level of
+     detail that best serves the report.
    - If experiments were rejected, mention them only when they explain why the
      final incumbent was kept or why deployment remains limited.
    - Do not mention agents as workflow theater. Give credit to data engineering
@@ -4043,8 +4050,8 @@ reflect this analysis, not just list data.
    - If there are contradictions between reviewers, governance outputs, and metrics, flag them.
    - Explain how the problem was solved or partially solved through those
      engineering decisions, not as a flat chronological list of steps.
-   - Start with the business problem briefly, then spend most of the narrative
-     on how the team changed the data or model state.
+   - Introduce the business problem with the amount of context needed for the
+     report, then explain how the team changed the data or model state.
 
 5. RECOMMEND ACTIONS
    - Be specific: "retry with X", "investigate Y in artifact Z",
@@ -4115,7 +4122,7 @@ Schema:
     {
       "type": "artifact",
       "artifact_key": "kpi_snapshot",
-      "lead_in": "One short contextual sentence before the artifact.",
+      "lead_in": "Contextual lead-in before the artifact.",
       "analysis": ["Sentence 1 interpreting the artifact.", "Sentence 2 explaining business impact."]
     }
   ],
@@ -4133,8 +4140,8 @@ Rules:
 - Do NOT emit raw HTML tables or markdown image syntax inside text blocks.
 - The Evidence trail will be rendered from the "evidence" array; do not add a separate evidence heading block.
 - If the Outline Plan is non-empty, use it as a starting skeleton but adapt freely.
-- Keep problem framing concise. Use the report to explain how the problem was solved,
-  partially solved, or blocked by engineering decisions grounded in the run context.
+- Use the report to explain how the problem was solved, partially solved,
+  or blocked by engineering decisions grounded in the run context.
 - Not every artifact must be used. Select and place only those that
   strengthen the narrative. Skip artifacts that add no decision value.
 """)

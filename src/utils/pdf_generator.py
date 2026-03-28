@@ -5,6 +5,45 @@ import re
 from pathlib import Path
 from typing import Optional
 
+
+def _soft_wrap_table_text(text: str) -> str:
+    raw = str(text or "")
+    if not raw.strip():
+        return raw
+
+    def _wrap_token(token: str) -> str:
+        if len(token) < 14:
+            return token
+        wrapped = token
+        for marker in ("/", "_", "-", "."):
+            wrapped = wrapped.replace(marker, marker + "<br/>")
+        return wrapped
+
+    parts = re.split(r"(\s+)", raw)
+    return "".join(_wrap_token(part) if not part.isspace() else part for part in parts)
+
+
+def _prepare_exec_tables_for_pdf(html_content: str) -> str:
+    if not html_content or "exec-table" not in html_content:
+        return html_content
+
+    cell_pattern = re.compile(r"(<t[dh][^>]*>)(.*?)(</t[dh]>)", flags=re.IGNORECASE | re.DOTALL)
+    text_node_pattern = re.compile(r"(?<=>)([^<>]+)(?=<)", flags=re.DOTALL)
+
+    def _replace_cell(match: re.Match) -> str:
+        open_tag, inner_html, close_tag = match.groups()
+        if "<" not in inner_html and ">" not in inner_html:
+            return f"{open_tag}{_soft_wrap_table_text(inner_html)}{close_tag}"
+
+        def _replace_text_node(text_match: re.Match) -> str:
+            return _soft_wrap_table_text(text_match.group(1))
+
+        wrapped_inner = text_node_pattern.sub(_replace_text_node, inner_html)
+        return f"{open_tag}{wrapped_inner}{close_tag}"
+
+    return cell_pattern.sub(_replace_cell, html_content)
+
+
 def resolve_image_path(img_path: str, base_dir_abs: Optional[str]) -> Optional[str]:
     if not img_path:
         return None
@@ -90,6 +129,7 @@ def convert_report_to_pdf(
         
         # 2. Convert Markdown to HTML (keeping inline figures in-place)
         html_content = markdown.markdown(markdown_text_with_inline_images, extensions=['tables', 'fenced_code'])
+        html_content = _prepare_exec_tables_for_pdf(html_content)
         
         # 3. Construct Image Grid (2-Column Table)
         image_grid_html = ""
@@ -156,8 +196,8 @@ def convert_report_to_pdf(
                 table.data th {{ background-color: #f2f2f2; font-weight: bold; }}
 
                 /* Executive HTML tables injected by translator */
-                table.exec-table {{ width: 100%; border-collapse: collapse; margin: 12px 0 16px 0; font-size: 9.5pt; }}
-                table.exec-table th, table.exec-table td {{ border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; vertical-align: top; }}
+                table.exec-table {{ width: 100%; border-collapse: collapse; margin: 12px 0 16px 0; font-size: 8.5pt; table-layout: fixed; }}
+                table.exec-table th, table.exec-table td {{ border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; vertical-align: top; word-wrap: break-word; white-space: normal; }}
                 table.exec-table th {{ background-color: #e2e8f0; color: #0f172a; font-weight: bold; }}
                 table.exec-table tr:nth-child(even) td {{ background-color: #f8fafc; }}
                 .status-badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 8pt; font-weight: bold; }}
