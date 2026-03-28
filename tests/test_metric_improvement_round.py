@@ -1696,6 +1696,78 @@ def test_finalize_metric_round_persists_canonical_metric_loop_state_without_mixi
     assert state.get("metrics_artifact_snapshot", {}).get("role") == "baseline"
     persisted_loop_state = json.loads(Path("data/metric_loop_state.json").read_text(encoding="utf-8"))
     assert persisted_loop_state.get("final", {}).get("label") == "baseline"
+    assert isinstance(persisted_loop_state.get("round_history"), list)
+    assert persisted_loop_state.get("round_history", [])[0].get("round_id") == 1
+    assert persisted_loop_state.get("round_history", [])[0].get("metric_improved") is False
+
+
+def test_sync_metric_loop_legacy_fields_restores_round_history_from_canonical_state() -> None:
+    state = {}
+    metric_loop_state = {
+        "schema_version": "v1",
+        "target": {
+            "name": "roc_auc",
+            "canonical_name": "roc_auc",
+            "higher_is_better": True,
+            "min_delta": 0.0005,
+            "source": "test",
+        },
+        "round": {
+            "round_id": 2,
+            "rounds_allowed": 3,
+            "patience": 2,
+            "no_improve_streak": 1,
+            "status": "complete",
+            "baseline": {
+                "label": "round_baseline",
+                "metric_name": "roc_auc",
+                "metric_value": 0.801,
+                "metrics_payload": {"roc_auc": 0.801},
+                "review_verdict": "APPROVED",
+            },
+        },
+        "incumbent": {
+            "label": "incumbent",
+            "metric_name": "roc_auc",
+            "metric_value": 0.801,
+            "metrics_payload": {"roc_auc": 0.801},
+        },
+        "best_observed": {
+            "label": "candidate",
+            "metric_name": "roc_auc",
+            "metric_value": 0.804,
+            "round_id": 2,
+            "source": "candidate_kept",
+        },
+        "final": {"label": "candidate"},
+        "selection": {"selected_label": "candidate"},
+        "controller": {"active": False, "continue_round": False},
+        "round_history": [
+            {
+                "round_id": 1,
+                "baseline_metric": 0.8,
+                "candidate_metric": 0.801,
+                "kept": "improved",
+                "metric_improved": True,
+                "governance_approved": True,
+            },
+            {
+                "round_id": 2,
+                "baseline_metric": 0.801,
+                "candidate_metric": 0.804,
+                "kept": "improved",
+                "metric_improved": True,
+                "governance_approved": True,
+            },
+        ],
+        "artifacts": {"output_paths": ["data/metrics.json"]},
+    }
+
+    graph_mod._sync_metric_loop_legacy_fields(state, metric_loop_state)
+
+    assert isinstance(state.get("ml_improvement_round_history"), list)
+    assert len(state["ml_improvement_round_history"]) == 2
+    assert state["ml_improvement_round_history"][1]["candidate_metric"] == pytest.approx(0.804, abs=1e-12)
 
 
 def test_resolve_metrics_report_for_facts_prefers_current_round_artifact_index_over_stale_declared_metrics_file(

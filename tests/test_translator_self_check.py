@@ -634,6 +634,9 @@ def test_translator_prompt_includes_engineering_change_summaries(tmp_path, monke
     assert "Data Engineer Change Summary:" in prompt
     assert "ML Engineer Change Summary:" in prompt
     assert "Run Causal Impact Summary:" in prompt
+    assert "ATTRIBUTE ENGINEERING IMPACT" in prompt
+    assert "Business Objective Summary:" in prompt
+    assert "Do not mention agents as workflow theater." in prompt
     assert '"accepted_interventions": ["Parsed 1stYearAmount from currency-like strings to float64", "Parsed Debtors from numeric-like strings to Float64"]' in prompt
     assert '"accepted_improvements": [{"round_id": 1, "hypothesis_label": "catboost"' in prompt
     assert '"rejected_after_metric_improvement": [{"round_id": 2, "hypothesis_label": "optuna_challenger"' in prompt
@@ -649,6 +652,62 @@ def test_translator_prompt_includes_engineering_change_summaries(tmp_path, monke
     assert data_summary["gates_cleared"] == ["target_is_numeric"]
     assert ml_summary["current_incumbent_basis"] == "last_accepted_improvement"
     assert causal_summary["executive_decision_label"] == "GO_WITH_LIMITATIONS"
+
+
+def test_translator_recovers_ml_history_from_persisted_metric_loop_state(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+    with open(os.path.join("data", "metric_loop_state.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "schema_version": "v1",
+                "round": {"round_id": 2, "rounds_allowed": 3, "no_improve_streak": 1, "patience": 2},
+                "incumbent": {"metric_value": 0.585571447601806},
+                "best_observed": {"metric_value": 0.585571447601806, "label": "candidate"},
+                "round_history": [
+                    {
+                        "round_id": 1,
+                        "baseline_metric": 1.5314284471774324,
+                        "candidate_metric": 0.585571447601806,
+                        "kept": "improved",
+                        "metric_improved": True,
+                        "governance_approved": True,
+                        "hypothesis": {"technique": "static_reference_buckets", "label": "static_reference_buckets"},
+                    },
+                    {
+                        "round_id": 2,
+                        "baseline_metric": 0.585571447601806,
+                        "candidate_metric": 55.81055555555555,
+                        "kept": "baseline",
+                        "metric_improved": False,
+                        "governance_approved": False,
+                        "hypothesis": {"technique": "aggressive_bucket_override", "label": "aggressive_bucket_override"},
+                    },
+                ],
+            },
+            f,
+        )
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Improve calibrated ranking quality while preserving business ordering constraints.",
+            "primary_metric_state": {
+                "primary_metric_name": "Mean absolute deviation from reference score",
+                "primary_metric_value": 0.585571447601806,
+            },
+        }
+    )
+
+    assert '"accepted_improvements": [{"round_id": 1, "hypothesis_label": "static_reference_buckets"' in prompt
+    assert '"rejected_experiments": [{"round_id": 2, "hypothesis_label": "aggressive_bucket_override"' in prompt
+    assert '"rounds_attempted": 2' in prompt
 
 
 def test_translator_structure_validation_accepts_risk_semantics_without_heading():

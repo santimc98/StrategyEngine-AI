@@ -1565,6 +1565,8 @@ def _has_metric_loop_legacy_evidence(state: Dict[str, Any] | None) -> bool:
     state = state if isinstance(state, dict) else {}
     if not state:
         return False
+    if isinstance(state.get("ml_improvement_round_history"), list) and bool(state.get("ml_improvement_round_history")):
+        return True
     if any(
         bool(state.get(key))
         for key in (
@@ -1597,6 +1599,22 @@ def _has_metric_loop_legacy_evidence(state: Dict[str, Any] | None) -> bool:
         if isinstance(payload, dict) and payload:
             return True
     return False
+
+
+def _normalize_metric_round_history(
+    round_history: Any,
+    *,
+    limit: int = 24,
+) -> List[Dict[str, Any]]:
+    if not isinstance(round_history, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for item in round_history:
+        if isinstance(item, dict) and item:
+            normalized.append(copy.deepcopy(item))
+    if limit <= 0:
+        return normalized
+    return normalized[-int(limit):]
 
 
 def _build_metric_loop_state(
@@ -1633,6 +1651,7 @@ def _build_metric_loop_state(
     review_mode: str | None = None,
     continue_round: bool | None = None,
     force_finalize_reason: str | None = None,
+    round_history: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     contract = contract if isinstance(contract, dict) else {}
     metric_target = _resolve_contract_metric_target(state if isinstance(state, dict) else {}, contract)
@@ -1765,6 +1784,7 @@ def _build_metric_loop_state(
         normalized = normalize_artifact_path(item)
         if normalized and normalized not in normalized_output_paths:
             normalized_output_paths.append(normalized)
+    normalized_round_history = _normalize_metric_round_history(round_history)
 
     return {
         "schema_version": "v1",
@@ -1812,6 +1832,7 @@ def _build_metric_loop_state(
             "baseline_review_verdict": str(baseline_review_verdict or "").strip() or None,
             "force_finalize_reason": str(force_finalize_reason or "").strip() or None,
         },
+        "round_history": normalized_round_history,
         "artifacts": {
             "metrics_path": normalize_artifact_path(final_path or candidate_path or incumbent_path),
             "output_paths": normalized_output_paths[:16],
@@ -1921,6 +1942,7 @@ def _derive_metric_loop_state_from_legacy(
         continue_round=_coerce_optional_bool(state.get("ml_improvement_continue")),
         force_finalize_reason=str(state.get("ml_improvement_force_finalize_reason") or "").strip() or None,
         selection=state.get("opt_incumbent_selection") if isinstance(state.get("opt_incumbent_selection"), dict) else {},
+        round_history=state.get("ml_improvement_round_history"),
     )
 
 
@@ -1994,8 +2016,11 @@ def _sync_metric_loop_legacy_fields(
     controller = _metric_loop_controller(loop_state)
     artifacts = _metric_loop_artifacts(loop_state)
     selection = loop_state.get("selection") if isinstance(loop_state.get("selection"), dict) else {}
+    round_history = _normalize_metric_round_history(loop_state.get("round_history"))
 
     state["metric_loop_state"] = copy.deepcopy(loop_state)
+    if "round_history" in loop_state:
+        state["ml_improvement_round_history"] = round_history
     state["ml_improvement_primary_metric_name"] = str(target.get("name") or "").strip()
     state["ml_improvement_primary_metric_source"] = str(target.get("source") or "").strip()
     state["ml_improvement_higher_is_better"] = _resolve_metric_loop_higher_is_better(
@@ -28920,6 +28945,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         review_mode=_resolve_metric_round_review_mode(contract),
         continue_round=False,
         force_finalize_reason="",
+        round_history=round_history,
         selection={
             "selected_label": "incumbent",
             "reason": "round_bootstrap",
@@ -30065,6 +30091,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         review_mode=controller.get("review_mode") or state.get("ml_improvement_review_mode"),
         continue_round=None,
         force_finalize_reason=force_finalize_reason if force_finalize else "",
+        round_history=round_history,
     )
     hypothesis_packet_for_round = (
         state.get("ml_improvement_hypothesis_packet")
@@ -30159,6 +30186,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     state["ml_improvement_pareto_frontier"] = updated_frontier
     round_history.append(round_record)
     state["ml_improvement_round_history"] = round_history[-24:]
+    finalized_metric_loop_state["round_history"] = _normalize_metric_round_history(
+        state.get("ml_improvement_round_history")
+    )
     state["ml_improvement_no_improve_streak"] = int(no_improve_streak)
     _append_attempt_cycle(
         state,

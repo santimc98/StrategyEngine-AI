@@ -1089,6 +1089,41 @@ def _build_metric_progress_summary(
     return summary
 
 
+def _build_business_objective_summary(
+    business_objective: Any,
+    *,
+    strategy_title: str = "",
+    hypothesis: str = "",
+    max_chars: int = 260,
+) -> str:
+    text = re.sub(r"\s+", " ", str(business_objective or "")).strip()
+    if text:
+        parts = re.split(r"(?<=[\.\!\?])\s+", text)
+        summary_parts: List[str] = []
+        total = 0
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            proposed = total + len(part) + (1 if summary_parts else 0)
+            if summary_parts and proposed > max_chars:
+                break
+            summary_parts.append(part)
+            total = proposed
+            if total >= max_chars:
+                break
+        summary = " ".join(summary_parts).strip()
+        if summary:
+            if len(summary) > max_chars:
+                return summary[: max_chars - 3].rstrip() + "..."
+            return summary
+    fallback_parts = [str(strategy_title or "").strip(), str(hypothesis or "").strip()]
+    fallback = " - ".join([part for part in fallback_parts if part]).strip()
+    if not fallback:
+        return "Business objective available in detailed context."
+    return fallback[: max_chars - 3].rstrip() + "..." if len(fallback) > max_chars else fallback
+
+
 def _resolve_authoritative_data_adequacy_report(
     run_summary: Dict[str, Any],
     raw_report: Dict[str, Any],
@@ -3369,6 +3404,11 @@ class BusinessTranslatorAgent:
                 "no_improve_streak": _round.get("no_improve_streak"),
                 "patience": _round.get("patience"),
             }
+            persisted_round_history = _mls.get("round_history")
+            if isinstance(persisted_round_history, list) and persisted_round_history:
+                metric_loop_context["round_history"] = _compact_metric_round_history_for_translator(
+                    persisted_round_history
+                )
         round_history = state.get("ml_improvement_round_history")
         if isinstance(round_history, list) and round_history:
             metric_loop_context["round_history"] = _compact_metric_round_history_for_translator(round_history)
@@ -3814,6 +3854,11 @@ class BusinessTranslatorAgent:
             preferred_language = None
         target_language_code = _detect_primary_language(business_objective, preferred_language=preferred_language)
         target_language_name = "Spanish" if target_language_code == "es" else "English"
+        business_objective_summary = _build_business_objective_summary(
+            business_objective,
+            strategy_title=strategy_title,
+            hypothesis=hypothesis,
+        )
 
         decision_discrepancy = None
         if run_outcome_token and derived_decision_label and run_outcome_token != derived_decision_label:
@@ -3983,14 +4028,25 @@ reflect this analysis, not just list data.
      accepted interventions, rejected experiments, and the concrete effect each
      had on data readiness, model quality, or deployment trust.
 
-3. EXPLAIN WHY
+3. ATTRIBUTE ENGINEERING IMPACT
+   - Ask internally which engineering interventions actually changed the system state.
+   - Compress the work into the few accepted data-engineering and model-engineering
+     moves that changed readiness, incumbent quality, or deployment trust.
+   - If experiments were rejected, mention them only when they explain why the
+     final incumbent was kept or why deployment remains limited.
+   - Do not mention agents as workflow theater. Give credit to data engineering
+     or model engineering work only when it materially changed the outcome.
+
+4. EXPLAIN WHY
    - Connect results to causes. If the metric improved, what technique
      drove it? If it degraded, what went wrong?
    - If there are contradictions between reviewers, governance outputs, and metrics, flag them.
-   - Give explicit credit to engineering work when it changed the outcome.
-     Do not narrate the run as a flat chronological list of steps.
+   - Explain how the problem was solved or partially solved through those
+     engineering decisions, not as a flat chronological list of steps.
+   - Start with the business problem briefly, then spend most of the narrative
+     on how the team changed the data or model state.
 
-4. RECOMMEND ACTIONS
+5. RECOMMEND ACTIONS
    - Be specific: "retry with X", "investigate Y in artifact Z",
      "deploy with caveat W" — not generic advice.
 
@@ -4001,6 +4057,7 @@ $facts_block_json
 $run_narrative_section
 
 === REFERENCE CONTEXT ===
+Business Objective Summary: $business_objective_summary
 Business Objective: $business_objective
 Strategy: $strategy_title
 Hypothesis: $hypothesis
@@ -4076,6 +4133,8 @@ Rules:
 - Do NOT emit raw HTML tables or markdown image syntax inside text blocks.
 - The Evidence trail will be rendered from the "evidence" array; do not add a separate evidence heading block.
 - If the Outline Plan is non-empty, use it as a starting skeleton but adapt freely.
+- Keep problem framing concise. Use the report to explain how the problem was solved,
+  partially solved, or blocked by engineering decisions grounded in the run context.
 - Not every artifact must be used. Select and place only those that
   strengthen the narrative. Skip artifacts that add no decision value.
 """)
@@ -4108,6 +4167,7 @@ $execution_results
             "target_language_code": target_language_code,
             "facts_block_json": json.dumps(facts_block, ensure_ascii=False),
             "run_narrative_section": run_narrative_section,
+            "business_objective_summary": business_objective_summary,
             "business_objective": business_objective,
             "strategy_title": strategy_title,
             "hypothesis": hypothesis,
