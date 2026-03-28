@@ -78,6 +78,16 @@ def _safe_load_json(path: str):
         return None
 
 
+def _safe_load_json_candidates(*paths: Optional[str]):
+    for path in paths:
+        if not path:
+            continue
+        payload = _safe_load_json(str(path))
+        if payload not in (None, {}, []):
+            return payload
+    return None
+
+
 def _load_authoritative_metrics_payload() -> Dict[str, Any]:
     for candidate in (
         "artifacts/ml/cv_metrics.json",
@@ -1220,17 +1230,59 @@ def _sanitize_evidence_value(value: str) -> str:
     text = str(value).replace("\n", " ").replace("\r", " ").strip()
     return text.replace('"', "'")
 
-def _build_evidence_items(evidence_paths: List[str], min_items: int = 3, max_items: int = 6):
+
+def _report_language_pack(target_language_code: Optional[str]) -> Dict[str, str]:
+    language = str(target_language_code or "").strip().lower()
+    if language == "es":
+        return {
+            "executive_decision": "Decisión Ejecutiva",
+            "risks": "Riesgos",
+            "evidence": "Evidencia usada",
+            "uncertainty_placeholder": "No verificable con artifacts actuales",
+            "confirmed_artifact": "Artefacto confirmado presente",
+        }
+    return {
+        "executive_decision": "Executive Decision",
+        "risks": "Risks",
+        "evidence": "Evidence Used",
+        "uncertainty_placeholder": "Not verifiable from current artifacts",
+        "confirmed_artifact": "Confirmed artifact present",
+    }
+
+
+def _evidence_section_heading(target_language_code: Optional[str]) -> str:
+    return f"## {_report_language_pack(target_language_code).get('evidence', 'Evidence Used')}"
+
+
+def _contains_evidence_heading(text: str) -> bool:
+    return bool(re.search(r"(?im)^\s*##\s+(evidencia usada|evidence used)\s*$", str(text or "")))
+
+
+def _build_evidence_items(
+    evidence_paths: List[str],
+    min_items: int = 3,
+    max_items: int = 6,
+    *,
+    target_language_code: str = "es",
+):
     items = []
+    placeholder = _report_language_pack(target_language_code).get(
+        "uncertainty_placeholder",
+        "No verificable con artifacts actuales",
+    )
+    confirmed_artifact_label = _report_language_pack(target_language_code).get(
+        "confirmed_artifact",
+        "Confirmed artifact present",
+    )
     for path in evidence_paths or []:
         if not path:
             continue
         if len(items) >= max_items:
             break
         clean_path = _sanitize_evidence_value(path)
-        items.append({"claim": f"Confirmed artifact present: {clean_path}", "source": clean_path})
+        items.append({"claim": f"{confirmed_artifact_label}: {clean_path}", "source": clean_path})
     while len(items) < min_items:
-        items.append({"claim": "No verificable con artifacts actuales", "source": "missing"})
+        items.append({"claim": placeholder, "source": "missing"})
     return items
 
 
@@ -1289,7 +1341,7 @@ def _is_valid_evidence_source(source: str) -> bool:
 
 def _is_placeholder_evidence_claim(claim: str) -> bool:
     normalized = str(claim or "").strip().lower()
-    return normalized.startswith("no verificable con artifacts actuales")
+    return normalized.startswith("no verificable con artifacts actuales") or normalized.startswith("not verifiable from current artifacts")
 
 def _normalize_evidence_sources(report: str) -> str:
     if not report:
@@ -1318,7 +1370,7 @@ def _normalize_evidence_sources(report: str) -> str:
 def _parse_evidence_items_from_report(report: str) -> List[Dict[str, str]]:
     if not report:
         return []
-    header = re.search(r"(?im)^\s*##\s+evidencia usada\s*$", report)
+    header = re.search(r"(?im)^\s*##\s+(evidencia usada|evidence used)\s*$", report)
     if not header:
         return []
     section = report[header.end():]
@@ -1339,8 +1391,17 @@ def _parse_evidence_items_from_report(report: str) -> List[Dict[str, str]]:
     return items
 
 
-def _canonical_evidence_section(evidence_paths: List[str], llm_items: Optional[List[Dict[str, str]]] = None) -> str:
+def _canonical_evidence_section(
+    evidence_paths: List[str],
+    llm_items: Optional[List[Dict[str, str]]] = None,
+    *,
+    target_language_code: str = "es",
+) -> str:
     validated_llm_items: List[Dict[str, str]] = []
+    placeholder = _report_language_pack(target_language_code).get(
+        "uncertainty_placeholder",
+        "No verificable con artifacts actuales",
+    )
     for item in (llm_items or []):
         if not isinstance(item, dict):
             continue
@@ -1354,7 +1415,12 @@ def _canonical_evidence_section(evidence_paths: List[str], llm_items: Optional[L
 
     if validated_llm_items:
         items = validated_llm_items[:6]
-        generic = _build_evidence_items(evidence_paths, min_items=0, max_items=6)
+        generic = _build_evidence_items(
+            evidence_paths,
+            min_items=0,
+            max_items=6,
+            target_language_code=target_language_code,
+        )
         for item in generic:
             if len(items) >= 6:
                 break
@@ -1362,9 +1428,9 @@ def _canonical_evidence_section(evidence_paths: List[str], llm_items: Optional[L
                 continue
             items.append(item)
         while len(items) < 3:
-            items.append({"claim": "No verificable con artifacts actuales", "source": "missing"})
+            items.append({"claim": placeholder, "source": "missing"})
     else:
-        items = _build_evidence_items(evidence_paths)
+        items = _build_evidence_items(evidence_paths, target_language_code=target_language_code)
 
     evidence_lines: List[str] = ["evidence:"]
     for item in items:
@@ -1382,20 +1448,24 @@ def _canonical_evidence_section(evidence_paths: List[str], llm_items: Optional[L
     return "\n".join(evidence_lines + ["", "**Artifacts:**", ""] + path_lines)
 
 
-def _ensure_evidence_section(report: str, evidence_paths: List[str]) -> str:
+def _ensure_evidence_section(report: str, evidence_paths: List[str], *, target_language_code: str = "es") -> str:
     if not report:
         return report
     report = sanitize_text(report)
     llm_items = _parse_evidence_items_from_report(report)
-    evidence_block = _canonical_evidence_section(evidence_paths, llm_items=llm_items)
+    evidence_block = _canonical_evidence_section(
+        evidence_paths,
+        llm_items=llm_items,
+        target_language_code=target_language_code,
+    )
 
-    header_match = re.search(r"(?im)^\s*##\s+evidencia usada\s*$", report)
+    header_match = re.search(r"(?im)^\s*##\s+(evidencia usada|evidence used)\s*$", report)
     if header_match:
         prefix = report[:header_match.start()].rstrip()
     else:
         prefix = report.rstrip()
 
-    rebuilt = f"{prefix}\n\n## Evidencia usada\n\n{evidence_block}\n"
+    rebuilt = f"{prefix}\n\n{_evidence_section_heading(target_language_code)}\n\n{evidence_block}\n"
     return _normalize_evidence_sources(rebuilt)
 
 def _extract_numeric_metrics(metrics: Dict[str, Any], max_items: int = 8):
@@ -1580,8 +1650,12 @@ def _validate_report_structure(content: str, expected_language: str) -> List[str
         issues.append("missing_evidence_section")
     if not risk_signal:
         issues.append("missing_risks_section")
+    content_head = content[:1200]
     if expected_language == "es":
-        if re.search(r"(?i)\b(the|therefore|however)\b", content[:600]):
+        if re.search(r"(?i)(\bthe\b|\btherefore\b|\bhowever\b|evidence used|executive decision|\brisks?\b)", content_head):
+            issues.append("possible_language_mix")
+    elif expected_language == "en":
+        if re.search(r"(?im)(^\s*##\s+decisi|^\s*##\s+riesgos|^\s*##\s+evidencia usada|\bel\b|\bla\b|\blos\b|\blas\b|hallazgos)", content_head):
             issues.append("possible_language_mix")
     return issues
 
@@ -1679,6 +1753,8 @@ def _build_repair_prompt(
     issues = validation.get("critical_issues", []) + validation.get("structure_issues", [])
     issues_text = "\n".join(f"- {issue}" for issue in issues) or "- unknown_issue"
     evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths[:8]) or "- missing"
+    language_pack = _report_language_pack(target_language_code)
+    placeholder = language_pack.get("uncertainty_placeholder", "No verificable con artifacts actuales")
     return render_prompt(
         """
         Repair the executive report below without discarding useful content.
@@ -1692,9 +1768,9 @@ def _build_repair_prompt(
         - Keep the report evidence-based and avoid inventing metrics.
         - The executive decision must exactly match the required decision label.
         - Do not present a substantive claim with source "missing".
-        - Only use source "missing" for explicit uncertainty placeholders such as "No verificable con artifacts actuales".
-        - Ensure sections exist: Decisión Ejecutiva, Riesgos, Evidencia Usada.
-        - Keep "## Evidencia usada" with evidence:{claim,source} and artifact bullets.
+        - Only use source "missing" for explicit uncertainty placeholders such as "$placeholder".
+        - Ensure sections exist: $executive_decision_heading, $risks_heading, $evidence_heading.
+        - Keep "$evidence_section_heading" with evidence:{claim,source} and artifact bullets.
         - Use these artifact paths when citing evidence:
         $evidence_paths
 
@@ -1708,8 +1784,139 @@ def _build_repair_prompt(
         issues=issues_text,
         evidence_paths=evidence_paths_text,
         report=report or "(empty)",
+        placeholder=placeholder,
+        executive_decision_heading=language_pack.get("executive_decision"),
+        risks_heading=language_pack.get("risks"),
+        evidence_heading=language_pack.get("evidence"),
+        evidence_section_heading=_evidence_section_heading(target_language_code),
     )
 
+
+def _build_structured_repair_prompt(
+    *,
+    report: str,
+    validation: Dict[str, Any],
+    expected_decision: str,
+    evidence_paths: List[str],
+    target_language_code: str,
+    artifact_registry_prompt_json: str,
+) -> str:
+    issues = validation.get("critical_issues", []) + validation.get("structure_issues", [])
+    issues_text = "\n".join(f"- {issue}" for issue in issues) or "- unknown_issue"
+    evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths[:8]) or "- missing"
+    placeholder = _report_language_pack(target_language_code).get(
+        "uncertainty_placeholder",
+        "No verificable con artifacts actuales",
+    )
+    return render_prompt(
+        """
+        Repair the executive report response below.
+        Convert it into a valid structured payload.
+
+        Target language: $lang
+        Required decision label: $decision
+
+        Issues to fix:
+        $issues
+
+        Hard constraints:
+        - Return ONLY valid JSON. No markdown, no commentary, no code fences.
+        - Keep the report evidence-based and avoid inventing metrics.
+        - The executive decision must exactly match the required decision label.
+        - Use only artifact_key values that exist in the artifact registry below.
+        - Do not emit a separate evidence heading block. Use the "evidence" array only.
+        - If a claim is uncertain, express that uncertainty in the narrative and use the placeholder "$placeholder" only inside the evidence array when needed.
+        - Charts and tables are optional. Use them only if they materially improve clarity or trust.
+
+        Artifact registry:
+        $artifact_registry
+
+        Available evidence paths:
+        $evidence_paths
+
+        Required schema:
+        {
+          "title": "...",
+          "blocks": [
+            {"type": "heading", "level": 1, "text": "..."},
+            {"type": "paragraph", "text": "..."},
+            {"type": "bullet_list", "items": ["...", "..."]},
+            {"type": "numbered_list", "items": ["...", "..."]},
+            {
+              "type": "artifact",
+              "artifact_key": "chart_1",
+              "lead_in": "One short contextual sentence before the artifact.",
+              "analysis": ["Sentence 1 interpreting the artifact.", "Sentence 2 explaining business impact."]
+            }
+          ],
+          "evidence": [
+            {"claim": "...", "source": "artifact_path -> key"}
+          ]
+        }
+
+        Previous invalid response:
+        ---
+        $report
+        ---
+        """,
+        lang=target_language_code,
+        decision=expected_decision,
+        issues=issues_text,
+        artifact_registry=artifact_registry_prompt_json or "[]",
+        evidence_paths=evidence_paths_text,
+        placeholder=placeholder,
+        report=report or "(empty)",
+    )
+
+
+def _materialize_structured_report(
+    *,
+    content: str,
+    artifact_registry: Dict[str, Dict[str, Any]],
+    evidence_paths: List[str],
+    target_language_code: str,
+) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]], List[str]]:
+    structured_payload = _extract_first_json_object(content)
+    if structured_payload is None:
+        return None, None, None, ["payload_parse_failed"]
+
+    structured_payload_issues = _validate_structured_report_payload(structured_payload, artifact_registry)
+    if structured_payload_issues:
+        return None, None, structured_payload, structured_payload_issues
+
+    hydrated_blocks = _hydrate_report_blocks(structured_payload, artifact_registry)
+    if not hydrated_blocks:
+        return None, None, structured_payload, ["hydrated_blocks_empty"]
+
+    llm_evidence_items = (
+        structured_payload.get("evidence")
+        if isinstance(structured_payload.get("evidence"), list)
+        else None
+    )
+    content_markdown = _render_report_blocks_to_markdown(
+        hydrated_blocks,
+        title=sanitize_text(str(structured_payload.get("title") or "")).strip(),
+        evidence_paths=evidence_paths,
+        llm_evidence_items=llm_evidence_items,
+        target_language_code=target_language_code,
+    )
+    evidence_markdown = (
+        f"{_evidence_section_heading(target_language_code)}\n\n"
+        + _canonical_evidence_section(
+            evidence_paths,
+            llm_items=llm_evidence_items,
+            target_language_code=target_language_code,
+        )
+    )
+    blocks_out = list(hydrated_blocks)
+    if not any(
+        isinstance(block, dict)
+        and block.get("type") == "markdown"
+        and _contains_evidence_heading(str(block.get("content") or ""))
+        for block in blocks_out
+    ):
+        blocks_out.append({"type": "markdown", "content": evidence_markdown})
+    return content_markdown, blocks_out, structured_payload, []
 
 
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -1808,6 +2015,8 @@ def _build_embeddable_artifacts_catalog(
             desc = f"  description: {title}"
             if facts:
                 desc += f"\n  key_facts: {facts}"
+            else:
+                desc += "\n  key_facts: Use this chart only if it supports a concrete cleaning, stability, or business-priority claim."
             entries.append(
                 f"- type: chart\n"
                 f"  embed: ![{title}]({p})\n"
@@ -1914,6 +2123,7 @@ def _build_embeddable_artifact_registry(
         facts = summary.get("key_facts") or summary.get("facts") or ""
         if isinstance(facts, list):
             facts = "; ".join(str(f) for f in facts[:4])
+        summary_text = str(facts).strip() if str(facts or "").strip() else f"{title}. Chart artifact available for inline interpretation near the finding it supports."
         guidance = str(
             summary.get("guidance")
             or "Use inline near the specific finding it supports, then interpret the business implication."
@@ -1923,7 +2133,7 @@ def _build_embeddable_artifact_registry(
             "artifact_type": "chart",
             "title": title,
             "path": normalized_path,
-            "summary": _summarize_prompt_text(facts or f"Chart available at {normalized_path}"),
+            "summary": _summarize_prompt_text(summary_text),
             "guidance": guidance,
         }
 
@@ -2121,6 +2331,7 @@ def _render_report_blocks_to_markdown(
     title: str,
     evidence_paths: List[str],
     llm_evidence_items: Optional[List[Dict[str, str]]] = None,
+    target_language_code: str = "es",
 ) -> str:
     parts: List[str] = []
     has_h1 = any(
@@ -2173,9 +2384,20 @@ def _render_report_blocks_to_markdown(
             if analysis_items:
                 parts.append("\n\n".join(analysis_items))
 
-    if not any(isinstance(block, dict) and block.get("type") == "markdown" and "## Evidencia usada" in str(block.get("content") or "") for block in (blocks or [])):
-        parts.append("## Evidencia usada")
-        parts.append(_canonical_evidence_section(evidence_paths, llm_items=llm_evidence_items))
+    if not any(
+        isinstance(block, dict)
+        and block.get("type") == "markdown"
+        and _contains_evidence_heading(str(block.get("content") or ""))
+        for block in (blocks or [])
+    ):
+        parts.append(_evidence_section_heading(target_language_code))
+        parts.append(
+            _canonical_evidence_section(
+                evidence_paths,
+                llm_items=llm_evidence_items,
+                target_language_code=target_language_code,
+            )
+        )
     return _normalize_evidence_sources("\n\n".join(part for part in parts if str(part or "").strip()).strip() + "\n")
 
 
@@ -2433,6 +2655,7 @@ class BusinessTranslatorAgent:
             if isinstance(col, dict) and col.get("name")
         ]
         decisioning_columns_text = ", ".join(decisioning_columns) if decisioning_columns else "None requested."
+        work_dir = str(state.get("work_dir") or ".").strip() if isinstance(state, dict) else "."
         
         # Load optional artifacts for context
         integrity_audit = _safe_load_json("data/integrity_audit_report.json") or {}
@@ -2440,7 +2663,13 @@ class BusinessTranslatorAgent:
         case_alignment_report = _safe_load_json("data/case_alignment_report.json") or {}
         data_adequacy_report = _safe_load_json("data/data_adequacy_report.json") or {}
         alignment_check_report = _safe_load_json("data/alignment_check.json") or {}
-        plot_insights = _safe_load_json("data/plot_insights.json") or {}
+        plot_insights = (
+            _safe_load_json_candidates(
+                "data/plot_insights.json",
+                os.path.join(work_dir, "data", "plot_insights.json"),
+            )
+            or {}
+        )
         insights = _safe_load_json("data/insights.json") or {}
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
         data_profile = (
@@ -2449,7 +2678,17 @@ class BusinessTranslatorAgent:
             or {}
         )
         dataset_semantics = _safe_load_json("data/dataset_semantics.json") or {}
-        cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
+        cleaning_manifest = (
+            state.get("cleaning_manifest")
+            if isinstance(state.get("cleaning_manifest"), dict)
+            else _safe_load_json_candidates(
+                "data/cleaning_manifest.json",
+                "artifacts/clean/cleaning_manifest.json",
+                os.path.join(work_dir, "data", "cleaning_manifest.json"),
+                os.path.join(work_dir, "artifacts", "clean", "cleaning_manifest.json"),
+                os.path.join("work", "artifacts", "clean", "cleaning_manifest.json"),
+            )
+        ) or {}
         run_summary = _safe_load_json("data/run_summary.json") or {}
         recommendations_preview = _safe_load_json("reports/recommendations_preview.json") or {}
         metrics_payload = _load_authoritative_metrics_payload()
@@ -2810,6 +3049,14 @@ class BusinessTranslatorAgent:
                     {"id": slot_id, "sources": slot.get("sources", []), "insights_key": insights_key}
                 )
         plot_summaries = state.get("plot_summaries") if isinstance(state.get("plot_summaries"), list) else None
+        if not isinstance(plot_summaries, list):
+            plot_summaries = _safe_load_json_candidates(
+                os.path.join(work_dir, "static", "plots", "plot_summaries.json"),
+                os.path.join("work", "static", "plots", "plot_summaries.json"),
+                "static/plots/plot_summaries.json",
+            )
+            if not isinstance(plot_summaries, list):
+                plot_summaries = None
         slot_payloads, model_metrics_context, plot_summaries, metric_progress_summary = _prepare_translator_metric_views(
             metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
             slot_payloads=slot_payloads if isinstance(slot_payloads, dict) else {},
@@ -3308,37 +3555,24 @@ $execution_results
             }
 
             if structured_layout_enabled and not is_echo_response:
-                structured_payload = _extract_first_json_object(content)
-                if structured_payload is None:
-                    structured_payload_issues = ["payload_parse_failed"]
-                else:
-                    structured_payload_issues = _validate_structured_report_payload(structured_payload, artifact_registry)
-                    if not structured_payload_issues:
-                        hydrated_blocks = _hydrate_report_blocks(structured_payload, artifact_registry)
-                        if hydrated_blocks:
-                            llm_evidence_items = (
-                                structured_payload.get("evidence")
-                                if isinstance(structured_payload.get("evidence"), list)
-                                else None
-                            )
-                            evidence_markdown = (
-                                "## Evidencia usada\n\n"
-                                + _canonical_evidence_section(evidence_paths, llm_items=llm_evidence_items)
-                            )
-                            content = _render_report_blocks_to_markdown(
-                                hydrated_blocks,
-                                title=sanitize_text(str(structured_payload.get("title") or "")).strip(),
-                                evidence_paths=evidence_paths,
-                                llm_evidence_items=llm_evidence_items,
-                            )
-                            self.last_report_blocks = hydrated_blocks + [{"type": "markdown", "content": evidence_markdown}]
-                            self.last_report_payload = structured_payload
-                        else:
-                            structured_payload_issues = ["hydrated_blocks_empty"]
+                materialized_content, materialized_blocks, structured_payload, structured_payload_issues = _materialize_structured_report(
+                    content=content,
+                    artifact_registry=artifact_registry,
+                    evidence_paths=evidence_paths,
+                    target_language_code=target_language_code,
+                )
+                if materialized_content is not None and materialized_blocks is not None:
+                    content = materialized_content
+                    self.last_report_blocks = materialized_blocks
+                    self.last_report_payload = structured_payload
 
             content = _sanitize_report_text(content)
             if self.last_report_blocks is None:
-                content = _ensure_evidence_section(content, evidence_paths)
+                content = _ensure_evidence_section(
+                    content,
+                    evidence_paths,
+                    target_language_code=target_language_code,
+                )
             content = sanitize_text(content)
 
             validation = {
@@ -3387,16 +3621,51 @@ $execution_results
                         if not validation.get("has_critical"):
                             # Quality is low but no critical — add hint
                             all_issues = list(all_issues) + ["low_quality_score"]
-                        repair_prompt = _build_repair_prompt(
-                            report=content,
-                            validation={**validation, "critical_issues": all_issues, "has_critical": True},
-                            expected_decision=executive_decision_label,
-                            evidence_paths=evidence_paths,
-                            target_language_code=target_language_code,
-                        )
+                        if structured_layout_enabled:
+                            repair_prompt = _build_structured_repair_prompt(
+                                report=content,
+                                validation={**validation, "critical_issues": all_issues, "has_critical": True},
+                                expected_decision=executive_decision_label,
+                                evidence_paths=evidence_paths,
+                                target_language_code=target_language_code,
+                                artifact_registry_prompt_json=artifact_registry_prompt_json,
+                            )
+                        else:
+                            repair_prompt = _build_repair_prompt(
+                                report=content,
+                                validation={**validation, "critical_issues": all_issues, "has_critical": True},
+                                expected_decision=executive_decision_label,
+                                evidence_paths=evidence_paths,
+                                target_language_code=target_language_code,
+                            )
                         repaired = self._call_llm(repair_prompt)
-                        repaired = _sanitize_report_text(repaired)
-                        repaired = _ensure_evidence_section(repaired, evidence_paths)
+                        if structured_layout_enabled:
+                            repaired_content, repaired_blocks, repaired_payload, repaired_structured_issues = _materialize_structured_report(
+                                content=repaired,
+                                artifact_registry=artifact_registry,
+                                evidence_paths=evidence_paths,
+                                target_language_code=target_language_code,
+                            )
+                            if repaired_content is not None and repaired_blocks is not None:
+                                repaired = repaired_content
+                                self.last_report_blocks = repaired_blocks
+                                self.last_report_payload = repaired_payload
+                                structured_payload_issues = repaired_structured_issues
+                            else:
+                                structured_payload_issues = repaired_structured_issues
+                                repaired = _sanitize_report_text(repaired)
+                                repaired = _ensure_evidence_section(
+                                    repaired,
+                                    evidence_paths,
+                                    target_language_code=target_language_code,
+                                )
+                        else:
+                            repaired = _sanitize_report_text(repaired)
+                            repaired = _ensure_evidence_section(
+                                repaired,
+                                evidence_paths,
+                                target_language_code=target_language_code,
+                            )
                         repaired = sanitize_text(repaired)
                         repair_validation = _validate_report(
                             content=repaired,
@@ -3534,6 +3803,21 @@ $execution_results
                 f"## Evidencia Usada\n\n"
             )
             error_report += _canonical_evidence_section(evidence_paths)
+            language_pack = _report_language_pack(target_language_code)
+            error_report = (
+                f"# Executive Report\n\n"
+                f"## {language_pack.get('executive_decision')}\n\n"
+                f"**{executive_decision_label}**\n\n"
+                f"Report generation encountered an error: {e}\n\n"
+                f"## {language_pack.get('risks')}\n\n"
+                f"- Report could not be fully generated due to: {e}\n"
+                f"- Review artifacts directly for complete analysis.\n\n"
+                f"{_evidence_section_heading(target_language_code)}\n\n"
+            )
+            error_report += _canonical_evidence_section(
+                evidence_paths,
+                target_language_code=target_language_code,
+            )
             _persist_quality_audit(
                 {
                     "prompt_estimated_tokens": est_tokens,
