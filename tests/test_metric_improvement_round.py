@@ -12,6 +12,7 @@ from src.graph.graph import (
     _build_metric_round_contract_lock,
     _build_hybrid_bundle_signature,
     _metric_round_has_deterministic_blockers,
+    _resolve_metric_loop_higher_is_better,
     _promote_best_attempt,
     _resolve_metric_round_hybrid_policy,
     _restore_metric_round_baseline_state,
@@ -67,6 +68,17 @@ def test_should_run_metric_improvement_round_accepts_ml_review_stack_fallback() 
         "ml_improvement_attempted": False,
     }
     assert _should_run_metric_improvement_round(state, {}) is True
+
+
+def test_metric_loop_prefers_explicit_optimization_direction_over_metric_heuristics() -> None:
+    assert _resolve_metric_loop_higher_is_better(
+        "mae",
+        metric_target={"optimization_direction": "maximize"},
+    ) is True
+    assert _resolve_metric_loop_higher_is_better(
+        "roc_auc",
+        metric_target={"optimization_direction": "minimize"},
+    ) is False
 
 
 def test_should_run_metric_improvement_round_ignores_nonblocking_needs_improvement_when_no_structured_blockers() -> None:

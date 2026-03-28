@@ -12,6 +12,7 @@ from src.agents.execution_planner import (
     _apply_planner_structural_support,
     parse_derive_from_expression,
 )
+from src.utils.contract_validator import validate_contract_minimal_readonly
 from src.utils.contract_accessors import get_cleaning_gates
 
 
@@ -1263,5 +1264,85 @@ def test_semantic_guard_allows_pre_decision_role_refinement_into_structural_buck
     assert not any(
         issue.get("rule") == "semantic_guard.column_roles_changed"
         for issue in (result.get("issues") or [])
+        if isinstance(issue, dict)
+    )
+
+
+def test_contract_validation_accepts_explicit_optimization_direction_and_tie_breakers():
+    planner = ExecutionPlannerAgent(api_key=None)
+    contract = {
+        "contract_version": "5.0",
+        "scope": "full_pipeline",
+        "strategy_title": "Metric-aware optimization",
+        "business_objective": "Predict target while preferring stable challengers.",
+        "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
+        "canonical_columns": ["id", "feature_a", "target"],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "decision": [],
+            "outcome": ["target"],
+            "post_decision_audit_only": [],
+            "unknown": [],
+            "identifiers": ["id"],
+            "time_columns": [],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature_a"],
+            "segmentation_features": [],
+            "forbidden_features": ["target"],
+            "audit_only_features": ["id"],
+        },
+        "task_semantics": {
+            "problem_family": "regression",
+            "objective_type": "regression",
+            "primary_target": "target",
+            "target_columns": ["target"],
+        },
+        "active_workstreams": {"cleaning": True, "feature_engineering": True, "model_training": True},
+        "model_features": ["feature_a"],
+        "required_outputs": [{"path": "artifacts/ml/cv_metrics.json", "required": True}],
+        "cleaning_gates": [],
+        "qa_gates": [],
+        "reviewer_gates": [],
+        "data_engineer_runbook": {"steps": ["load"]},
+        "ml_engineer_runbook": {"steps": ["train"]},
+        "evaluation_spec": {
+            "objective_type": "regression",
+            "primary_target": "target",
+            "primary_metric": "mae",
+            "label_columns": ["target"],
+        },
+        "validation_requirements": {
+            "method": "cross_validation",
+            "primary_metric": "mae",
+            "metrics_to_report": ["mae"],
+        },
+        "optimization_policy": {
+            "enabled": True,
+            "max_rounds": 4,
+            "quick_eval_folds": 2,
+            "full_eval_folds": 5,
+            "min_delta": 0.001,
+            "patience": 2,
+            "optimization_direction": "minimize",
+            "tie_breakers": [
+                {"field": "cv_std", "direction": "minimize", "reason": "Prefer more stable challengers."},
+                {"field": "generalization_gap_abs", "direction": "minimize"},
+            ],
+            "allow_model_switch": True,
+            "allow_ensemble": False,
+            "allow_hpo": True,
+            "allow_feature_engineering": True,
+            "allow_calibration": False,
+        },
+    }
+
+    diagnostics = validate_contract_minimal_readonly(contract)
+
+    issues = diagnostics.get("issues") or []
+    assert not any(
+        issue.get("rule") == "contract.optimization_policy_value"
+        and str(issue.get("severity") or "").lower() in {"error", "fail"}
+        for issue in issues
         if isinstance(issue, dict)
     )

@@ -135,6 +135,7 @@ from src.utils.contract_validator import (
     derive_contract_scope_from_workstreams,
     get_default_optimization_policy,
     normalize_optimization_policy,
+    normalize_optimization_direction,
     collect_contract_operational_dependency_columns,
 )
 from src.utils.contract_views import (
@@ -1062,6 +1063,7 @@ def _resolve_metric_from_entry(entry: Any, source: str) -> Dict[str, Any] | None
         raw = entry.get(key)
         metric_name = ""
         higher_is_better: bool | None = None
+        optimization_direction = "unspecified"
         if isinstance(raw, dict):
             metric_name = str(
                 raw.get("name")
@@ -1075,6 +1077,9 @@ def _resolve_metric_from_entry(entry: Any, source: str) -> Dict[str, Any] | None
                 if raw.get("higher_is_better") is not None
                 else raw.get("maximize")
             )
+            optimization_direction = normalize_optimization_direction(
+                raw.get("optimization_direction") or raw.get("direction")
+            )
         elif isinstance(raw, str):
             metric_name = raw.strip()
         if not metric_name:
@@ -1083,10 +1088,16 @@ def _resolve_metric_from_entry(entry: Any, source: str) -> Dict[str, Any] | None
             higher_is_better = _coerce_optional_bool(entry.get(key + "_higher_is_better"))
         if higher_is_better is None and key == "primary_metric":
             higher_is_better = _coerce_optional_bool(entry.get("higher_is_better"))
+        if optimization_direction == "unspecified":
+            optimization_direction = normalize_optimization_direction(
+                entry.get(key + "_optimization_direction")
+                or (entry.get("optimization_direction") if key == "primary_metric" else None)
+            )
         return {
             "name": metric_name,
             "canonical_name": metric_eval_canonicalize_metric_name(metric_name),
             "higher_is_better": higher_is_better,
+            "optimization_direction": optimization_direction,
             "source": source + "." + key,
         }
     return None
@@ -1536,6 +1547,14 @@ def _resolve_metric_loop_higher_is_better(
     primary_metric_state = primary_metric_state if isinstance(primary_metric_state, dict) else {}
 
     for source in (metric_target, loop_target, primary_metric_state):
+        direction = normalize_optimization_direction(
+            source.get("optimization_direction") or source.get("direction")
+        )
+        if direction == "maximize":
+            return True
+        if direction == "minimize":
+            return False
+    for source in (metric_target, loop_target, primary_metric_state):
         higher_is_better = source.get("higher_is_better")
         if isinstance(higher_is_better, bool):
             return bool(higher_is_better)
@@ -1752,6 +1771,11 @@ def _build_metric_loop_state(
         "target": {
             "name": metric_name or None,
             "canonical_name": canonical_name or None,
+            "optimization_direction": normalize_optimization_direction(
+                metric_target.get("optimization_direction")
+                or prior_loop_target.get("optimization_direction")
+                or primary_metric_state.get("optimization_direction")
+            ),
             "higher_is_better": bool(higher_is_better),
             "min_delta": float(min_delta),
             "source": str(metric_target.get("source") or primary_metric_state.get("target_metric_source") or "metric_loop_state").strip(),
@@ -2161,14 +2185,25 @@ def _build_primary_metric_state(
         baseline = next((cand for cand in candidates if isinstance(cand, dict) and cand.get("is_baseline")), None)
 
     baseline_value = _coerce_float(baseline.get("value")) if isinstance(baseline, dict) else None
+    optimization_policy = contract.get("optimization_policy") if isinstance(contract, dict) else {}
+    optimization_direction = normalize_optimization_direction(
+        target.get("optimization_direction")
+        or (optimization_policy.get("optimization_direction") if isinstance(optimization_policy, dict) else None)
+    )
     higher_is_better = target.get("higher_is_better")
     if not isinstance(higher_is_better, bool):
-        higher_is_better = _metric_higher_is_better(str(primary.get("name") or target_name))
+        if optimization_direction == "maximize":
+            higher_is_better = True
+        elif optimization_direction == "minimize":
+            higher_is_better = False
+        else:
+            higher_is_better = _metric_higher_is_better(str(primary.get("name") or target_name))
 
     return {
         "target_metric_name": target_name or primary.get("name"),
         "target_metric_canonical_name": target_canonical_name or primary_canonical,
         "target_metric_source": str(target.get("source") or "unavailable"),
+        "optimization_direction": optimization_direction,
         "primary_metric_name": primary.get("name"),
         "primary_metric_canonical_name": primary_canonical,
         "primary_metric_value": float(primary.get("value")),
@@ -2186,10 +2221,16 @@ def _build_primary_metric_state(
 
 def _resolve_contract_metric_target(state: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str, Any]:
     candidates: List[Tuple[str, Any]] = []
+    policy_direction = "unspecified"
     if isinstance(contract, dict):
         candidates.append(("contract.validation_requirements", contract.get("validation_requirements")))
         candidates.append(("contract.evaluation_spec", contract.get("evaluation_spec")))
         candidates.append(("contract.root", contract))
+        optimization_policy = contract.get("optimization_policy")
+        if isinstance(optimization_policy, dict):
+            policy_direction = normalize_optimization_direction(
+                optimization_policy.get("optimization_direction")
+            )
     if isinstance(state, dict):
         candidates.append(("state.evaluation_spec", state.get("evaluation_spec")))
         eval_spec = state.get("evaluation_spec")
@@ -2198,8 +2239,19 @@ def _resolve_contract_metric_target(state: Dict[str, Any], contract: Dict[str, A
     for source, entry in candidates:
         resolved = _resolve_metric_from_entry(entry, source)
         if isinstance(resolved, dict) and resolved.get("name"):
+            if policy_direction != "unspecified" and normalize_optimization_direction(
+                resolved.get("optimization_direction")
+            ) == "unspecified":
+                resolved = dict(resolved)
+                resolved["optimization_direction"] = policy_direction
             return resolved
-    return {"name": None, "canonical_name": "", "higher_is_better": None, "source": "unavailable"}
+    return {
+        "name": None,
+        "canonical_name": "",
+        "higher_is_better": None,
+        "optimization_direction": policy_direction,
+        "source": "unavailable",
+    }
 
 
 def _resolve_contract_primary_metric_name(state: Dict[str, Any], contract: Dict[str, Any]) -> str | None:
@@ -10386,6 +10438,7 @@ def _extract_primary_metric_snapshot(
         "primary_metric_value": primary_state.get("primary_metric_value"),
         "primary_metric_source": primary_state.get("primary_metric_source"),
         "primary_metric_path": primary_state.get("primary_metric_path"),
+        "optimization_direction": primary_state.get("optimization_direction"),
         "baseline_metric_name": primary_state.get("baseline_metric_name"),
         "baseline_value": primary_state.get("baseline_value"),
         "lift": primary_state.get("lift"),

@@ -47,6 +47,8 @@ from src.utils.contract_validator import (
     _normalize_selector_entry,
     get_default_optimization_policy,
     normalize_optimization_policy,
+    normalize_optimization_direction,
+    normalize_optimization_tie_breakers,
 )
 from src.utils.contract_schema_registry import (
     build_contract_schema_examples_text,
@@ -198,9 +200,11 @@ FULL EXAMPLE (full_pipeline with model_training=true):
       "metrics_to_report": ["log_loss", "roc_auc", "accuracy"],
       "params": {"n_splits": 5, "stratify": true}
     },
-    "optimization_policy": {
+  "optimization_policy": {
       "enabled": true, "max_rounds": 4, "quick_eval_folds": 3, "full_eval_folds": 5,
       "min_delta": 0.001, "patience": 2,
+      "optimization_direction": "minimize",
+      "tie_breakers": [{"field": "cv_std", "direction": "minimize", "reason": "Prefer the more stable model when primary metric gains are similar."}],
       "allow_model_switch": false, "allow_ensemble": false, "allow_hpo": true,
       "allow_feature_engineering": true, "allow_calibration": false
     },
@@ -261,7 +265,9 @@ ML_ENGINEER section:
   evaluation_spec: {objective_type, primary_target, primary_metric, metric_definition_rule, label_columns}
   validation_requirements: {method, primary_metric, metrics_to_report, params}
     primary_metric MUST equal evaluation_spec.primary_metric.
-  optimization_policy: {enabled, max_rounds, quick_eval_folds, full_eval_folds, min_delta, patience, allow_*}
+  optimization_policy: {enabled, max_rounds, quick_eval_folds, full_eval_folds, min_delta, patience, optimization_direction, tie_breakers, allow_*}
+    - optimization_direction MUST be reasoned from the business objective and primary metric semantics, not guessed from defaults.
+    - tie_breakers should be an ordered list of secondary comparison preferences only when they are justified by the run context.
   artifact_requirements: model output paths
   plot_spec, visual_requirements, decisioning_requirements: (optional)
 
@@ -2360,7 +2366,32 @@ def _split_validation_issues_by_phase(validation_result: Dict[str, Any] | None) 
 def _ensure_optimization_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return contract
-    contract["optimization_policy"] = normalize_optimization_policy(contract.get("optimization_policy"))
+    optimization_policy = normalize_optimization_policy(contract.get("optimization_policy"))
+    validation_requirements = (
+        contract.get("validation_requirements")
+        if isinstance(contract.get("validation_requirements"), dict)
+        else {}
+    )
+    evaluation_spec = (
+        contract.get("evaluation_spec")
+        if isinstance(contract.get("evaluation_spec"), dict)
+        else {}
+    )
+    direction = _coerce_optimization_direction_from_contract(
+        optimization_policy,
+        validation_requirements,
+        evaluation_spec,
+    )
+    if direction != "unspecified":
+        optimization_policy["optimization_direction"] = direction
+    tie_breakers = _coerce_optimization_tie_breakers_from_contract(
+        optimization_policy,
+        validation_requirements,
+        evaluation_spec,
+    )
+    if tie_breakers:
+        optimization_policy["tie_breakers"] = tie_breakers
+    contract["optimization_policy"] = optimization_policy
     return contract
 
 
@@ -3579,6 +3610,58 @@ def _derive_metric_definition_rule(primary_metric: Any) -> str:
     ):
         return "Use a simple arithmetic mean unless the contract explicitly provides weights."
     return ""
+
+
+def _coerce_optimization_direction_from_contract(
+    optimization_policy: Any,
+    validation_requirements: Any,
+    evaluation_spec: Any,
+) -> str:
+    candidates: List[Any] = []
+    if isinstance(optimization_policy, dict):
+        candidates.extend(
+            [
+                optimization_policy.get("optimization_direction"),
+                optimization_policy.get("direction"),
+                optimization_policy.get("metric_direction"),
+            ]
+        )
+    if isinstance(validation_requirements, dict):
+        candidates.extend(
+            [
+                validation_requirements.get("optimization_direction"),
+                validation_requirements.get("direction"),
+                validation_requirements.get("metric_direction"),
+            ]
+        )
+    if isinstance(evaluation_spec, dict):
+        candidates.extend(
+            [
+                evaluation_spec.get("optimization_direction"),
+                evaluation_spec.get("direction"),
+                evaluation_spec.get("metric_direction"),
+            ]
+        )
+    for candidate in candidates:
+        normalized = normalize_optimization_direction(candidate)
+        if normalized != "unspecified":
+            return normalized
+    return "unspecified"
+
+
+def _coerce_optimization_tie_breakers_from_contract(
+    optimization_policy: Any,
+    validation_requirements: Any,
+    evaluation_spec: Any,
+) -> List[Dict[str, Any]]:
+    for source in (optimization_policy, validation_requirements, evaluation_spec):
+        if not isinstance(source, dict):
+            continue
+        for key in ("tie_breakers", "tie_breaker_policy", "secondary_ordering"):
+            normalized = normalize_optimization_tie_breakers(source.get(key))
+            if normalized:
+                return normalized
+    return []
 
 
 def _extract_json_object(text: str) -> Optional[str]:
@@ -7220,6 +7303,20 @@ def build_contract_min(
             "max_total_attempts": 4,
         }
     optimization_policy = normalize_optimization_policy(contract.get("optimization_policy"))
+    explicit_optimization_direction = _coerce_optimization_direction_from_contract(
+        optimization_policy,
+        validation_requirements,
+        evaluation_spec,
+    )
+    if explicit_optimization_direction != "unspecified":
+        optimization_policy["optimization_direction"] = explicit_optimization_direction
+    explicit_tie_breakers = _coerce_optimization_tie_breakers_from_contract(
+        optimization_policy,
+        validation_requirements,
+        evaluation_spec,
+    )
+    if explicit_tie_breakers:
+        optimization_policy["tie_breakers"] = explicit_tie_breakers
 
     active_workstreams = resolve_contract_active_workstreams(contract)
     scope = derive_contract_scope_from_workstreams({**contract, "active_workstreams": active_workstreams})
@@ -10179,6 +10276,7 @@ domain_expert_critique:
             "Semantic closure self-check:\n"
             "- If targets are declared, ml_engineer.evaluation_spec must name the primary target and label columns.\n"
             "- If a metric appears anywhere, it must match in ml_engineer.evaluation_spec.primary_metric and ml_engineer.validation_requirements.primary_metric.\n"
+            "- When model_training=true, ml_engineer.optimization_policy should state optimization_direction explicitly and only include tie_breakers that are justified by the run context.\n"
             "- If model_features imply ML input columns, data_engineer.artifact_requirements.cleaned_dataset.required_columns must cover them.\n"
             "- If anchor columns exist (outcome, identifiers, split, time), shared.column_dtype_targets must include entries for those anchors.\n"
             "- Do not create agent_interfaces — the v5 hierarchy replaces it.\n"

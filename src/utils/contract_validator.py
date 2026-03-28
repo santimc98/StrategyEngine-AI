@@ -117,6 +117,8 @@ OPTIMIZATION_POLICY_DEFAULTS: Dict[str, Any] = {
     "allow_hpo": True,
     "allow_feature_engineering": True,
     "allow_calibration": True,
+    "optimization_direction": "unspecified",
+    "tie_breakers": [],
 }
 
 OPTIMIZATION_POLICY_BOOL_KEYS = (
@@ -136,6 +138,14 @@ OPTIMIZATION_POLICY_INT_KEYS = (
 OPTIMIZATION_POLICY_FLOAT_KEYS = (
     "min_delta",
 )
+
+OPTIMIZATION_DIRECTION_VALUES = {
+    "minimize",
+    "maximize",
+    "target_band",
+    "pareto",
+    "unspecified",
+}
 
 # Role synonym mapping for normalization
 ROLE_SYNONYM_MAP = {
@@ -187,6 +197,74 @@ def _coerce_float_value(value: Any, default: float, minimum: float) -> float:
     return candidate
 
 
+def normalize_optimization_direction(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "unspecified"
+    aliases = {
+        "minimise": "minimize",
+        "minimum": "minimize",
+        "lower_is_better": "minimize",
+        "lower-is-better": "minimize",
+        "decrease": "minimize",
+        "maximise": "maximize",
+        "maximum": "maximize",
+        "higher_is_better": "maximize",
+        "higher-is-better": "maximize",
+        "increase": "maximize",
+        "closest_to_target": "target_band",
+        "target_range": "target_band",
+        "target range": "target_band",
+        "target-band": "target_band",
+        "band": "target_band",
+        "pareto_frontier": "pareto",
+        "pareto-frontier": "pareto",
+        "multi_objective": "pareto",
+        "multi-objective": "pareto",
+    }
+    normalized = aliases.get(text, text.replace("-", "_").replace(" ", "_"))
+    if normalized in OPTIMIZATION_DIRECTION_VALUES:
+        return normalized
+    return normalized
+
+
+def normalize_optimization_tie_breakers(value: Any) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    raw_items = value if isinstance(value, list) else [value]
+    normalized: List[Dict[str, Any]] = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            field = str(
+                item.get("field")
+                or item.get("metric")
+                or item.get("name")
+                or item.get("key")
+                or ""
+            ).strip()
+            if not field:
+                continue
+            direction = normalize_optimization_direction(
+                item.get("direction")
+                or item.get("order")
+                or item.get("preference")
+                or item.get("optimization_direction")
+            )
+            if direction not in {"minimize", "maximize", "target_band"}:
+                direction = "unspecified"
+            entry: Dict[str, Any] = {"field": field, "direction": direction}
+            reason = str(item.get("reason") or item.get("why") or "").strip()
+            if reason:
+                entry["reason"] = reason
+            normalized.append(entry)
+            continue
+        text = str(item or "").strip()
+        if not text:
+            continue
+        normalized.append({"field": text, "direction": "unspecified"})
+    return normalized
+
+
 def normalize_optimization_policy(policy: Any) -> Dict[str, Any]:
     defaults = get_default_optimization_policy()
     if not isinstance(policy, dict):
@@ -199,6 +277,12 @@ def normalize_optimization_policy(policy: Any) -> Dict[str, Any]:
         normalized[key] = _coerce_int_value(policy.get(key), defaults[key], minimum)
     for key in OPTIMIZATION_POLICY_FLOAT_KEYS:
         normalized[key] = _coerce_float_value(policy.get(key), defaults[key], 0.0)
+    normalized["optimization_direction"] = normalize_optimization_direction(
+        policy.get("optimization_direction")
+    )
+    normalized["tie_breakers"] = normalize_optimization_tie_breakers(
+        policy.get("tie_breakers")
+    )
     for key, value in policy.items():
         if key in normalized:
             continue
@@ -2422,6 +2506,65 @@ def validate_contract_readonly(contract: Dict[str, Any]) -> Dict[str, Any]:
                         optimization_policy.get("min_delta"),
                     )
                 )
+        if "optimization_direction" in optimization_policy:
+            direction = normalize_optimization_direction(optimization_policy.get("optimization_direction"))
+            if direction not in OPTIMIZATION_DIRECTION_VALUES:
+                issues.append(
+                    _strict_issue(
+                        "contract.optimization_policy_value",
+                        "warning",
+                        "optimization_policy.optimization_direction should be one of minimize, maximize, target_band, pareto, or unspecified.",
+                        optimization_policy.get("optimization_direction"),
+                    )
+                )
+        elif bool(resolve_contract_active_workstreams(contract).get("model_training")):
+            issues.append(
+                _strict_issue(
+                    "contract.optimization_policy_missing_direction",
+                    "warning",
+                    "optimization_policy.optimization_direction missing; runtime may infer direction, but the planner should state it explicitly.",
+                    None,
+                )
+            )
+        if "tie_breakers" in optimization_policy:
+            tie_breakers = optimization_policy.get("tie_breakers")
+            if not isinstance(tie_breakers, list):
+                issues.append(
+                    _strict_issue(
+                        "contract.optimization_policy_value",
+                        "warning",
+                        "optimization_policy.tie_breakers should be a list when present.",
+                        tie_breakers,
+                    )
+                )
+            else:
+                for item in tie_breakers:
+                    if isinstance(item, dict):
+                        field = str(
+                            item.get("field")
+                            or item.get("metric")
+                            or item.get("name")
+                            or item.get("key")
+                            or ""
+                        ).strip()
+                        if not field:
+                            issues.append(
+                                _strict_issue(
+                                    "contract.optimization_policy_value",
+                                    "warning",
+                                    "optimization_policy.tie_breakers entries should declare a field.",
+                                    item,
+                                )
+                            )
+                    elif not isinstance(item, str):
+                        issues.append(
+                            _strict_issue(
+                                "contract.optimization_policy_value",
+                                "warning",
+                                "optimization_policy.tie_breakers entries should be strings or objects.",
+                                item,
+                            )
+                        )
 
     gate_keys = ("qa_gates", "cleaning_gates", "reviewer_gates")
     for gate_key in gate_keys:
@@ -4899,6 +5042,65 @@ def validate_contract_minimal_readonly(
                         optimization_policy.get("min_delta"),
                     )
                 )
+        if "optimization_direction" in optimization_policy:
+            direction = normalize_optimization_direction(optimization_policy.get("optimization_direction"))
+            if direction not in OPTIMIZATION_DIRECTION_VALUES:
+                issues.append(
+                    _strict_issue(
+                        "contract.optimization_policy_value",
+                        "warning",
+                        "optimization_policy.optimization_direction should be one of minimize, maximize, target_band, pareto, or unspecified.",
+                        optimization_policy.get("optimization_direction"),
+                    )
+                )
+        elif bool(resolve_contract_active_workstreams(contract).get("model_training")):
+            issues.append(
+                _strict_issue(
+                    "contract.optimization_policy_missing_direction",
+                    "warning",
+                    "optimization_policy.optimization_direction missing; runtime may infer direction, but the planner should state it explicitly.",
+                    None,
+                )
+            )
+        if "tie_breakers" in optimization_policy:
+            tie_breakers = optimization_policy.get("tie_breakers")
+            if not isinstance(tie_breakers, list):
+                issues.append(
+                    _strict_issue(
+                        "contract.optimization_policy_value",
+                        "warning",
+                        "optimization_policy.tie_breakers should be a list when present.",
+                        tie_breakers,
+                    )
+                )
+            else:
+                for item in tie_breakers:
+                    if isinstance(item, dict):
+                        field = str(
+                            item.get("field")
+                            or item.get("metric")
+                            or item.get("name")
+                            or item.get("key")
+                            or ""
+                        ).strip()
+                        if not field:
+                            issues.append(
+                                _strict_issue(
+                                    "contract.optimization_policy_value",
+                                    "warning",
+                                    "optimization_policy.tie_breakers entries should declare a field.",
+                                    item,
+                                )
+                            )
+                    elif not isinstance(item, str):
+                        issues.append(
+                            _strict_issue(
+                                "contract.optimization_policy_value",
+                                "warning",
+                                "optimization_policy.tie_breakers entries should be strings or objects.",
+                                item,
+                            )
+                        )
 
     status = _status_from_issues(issues)
     error_count = sum(1 for issue in issues if str(issue.get("severity", "")).lower() in {"error", "fail"})

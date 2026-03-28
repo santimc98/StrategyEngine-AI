@@ -49,3 +49,52 @@ def test_normalize_optimization_policy_preserves_zero_rounds_for_disabled_cleani
     assert policy.get("quick_eval_folds") == 0
     assert policy.get("full_eval_folds") == 0
 
+
+def test_normalize_optimization_policy_normalizes_direction_and_tie_breakers():
+    policy = normalize_optimization_policy(
+        {
+            "enabled": True,
+            "optimization_direction": "lower_is_better",
+            "tie_breakers": [
+                {"metric": "cv_std", "order": "minimise", "reason": "Prefer lower variance."},
+                "generalization_gap_abs",
+            ],
+        }
+    )
+
+    assert policy.get("optimization_direction") == "minimize"
+    assert policy.get("tie_breakers") == [
+        {"field": "cv_std", "direction": "minimize", "reason": "Prefer lower variance."},
+        {"field": "generalization_gap_abs", "direction": "unspecified"},
+    ]
+
+
+def test_ensure_optimization_policy_lifts_semantics_from_validation_and_evaluation_spec():
+    contract = {
+        "validation_requirements": {
+            "primary_metric": "mae",
+            "optimization_direction": "minimize",
+            "tie_breakers": [{"field": "cv_std", "direction": "minimize"}],
+        },
+        "evaluation_spec": {"primary_metric": "mae"},
+        "optimization_policy": {
+            "enabled": True,
+            "max_rounds": 4,
+            "quick_eval_folds": 2,
+            "full_eval_folds": 5,
+            "min_delta": 0.001,
+            "patience": 2,
+            "allow_model_switch": True,
+            "allow_ensemble": False,
+            "allow_hpo": True,
+            "allow_feature_engineering": True,
+            "allow_calibration": False,
+        },
+    }
+
+    out = _ensure_optimization_policy(contract)
+    policy = out.get("optimization_policy") or {}
+
+    assert policy.get("optimization_direction") == "minimize"
+    assert policy.get("tie_breakers") == [{"field": "cv_std", "direction": "minimize"}]
+
