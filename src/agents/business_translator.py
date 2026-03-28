@@ -1191,6 +1191,496 @@ def _build_cleaning_progress_summary(
     return progress_summary
 
 
+def _normalize_missingness_entries(missingness_payload: Any, limit: int = 5) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    if isinstance(missingness_payload, list):
+        for item in missingness_payload:
+            if not isinstance(item, dict):
+                continue
+            column = str(item.get("column") or item.get("feature") or item.get("name") or "").strip()
+            missing_frac = _coerce_float(
+                item.get("missing_frac")
+                if item.get("missing_frac") is not None
+                else item.get("missingness")
+            )
+            if not column or missing_frac is None:
+                continue
+            entries.append({"column": column, "missing_frac": float(missing_frac)})
+    elif isinstance(missingness_payload, dict):
+        for column, value in missingness_payload.items():
+            missing_frac = _coerce_float(value)
+            column_name = str(column or "").strip()
+            if not column_name or missing_frac is None:
+                continue
+            entries.append({"column": column_name, "missing_frac": float(missing_frac)})
+    entries.sort(key=lambda item: item.get("missing_frac") or 0.0, reverse=True)
+    return entries[:limit]
+
+
+def _normalize_high_cardinality_entries(high_cardinality_payload: Any, limit: int = 5) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    if not isinstance(high_cardinality_payload, list):
+        return entries
+    for item in high_cardinality_payload:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or item.get("feature") or item.get("name") or "").strip()
+        if not column:
+            continue
+        unique_ratio = _coerce_float(item.get("unique_ratio"))
+        n_unique = item.get("n_unique") if item.get("n_unique") is not None else item.get("unique")
+        entries.append(
+            {
+                "column": column,
+                "n_unique": n_unique,
+                "unique_ratio": float(unique_ratio) if unique_ratio is not None else None,
+            }
+        )
+    return entries[:limit]
+
+
+def _count_dtype_family(dtypes: Dict[str, Any], family: str) -> int:
+    count = 0
+    for raw_dtype in dtypes.values():
+        dtype = str(raw_dtype or "").strip().lower()
+        if not dtype:
+            continue
+        if family == "numeric":
+            if dtype.startswith(("int", "float", "uint", "bool", "decimal")):
+                count += 1
+        elif family == "datetime":
+            if "datetime" in dtype or dtype == "date":
+                count += 1
+        elif family == "categorical":
+            if dtype in {"object", "string", "category"}:
+                count += 1
+    return count
+
+
+def _extract_conversion_items(cleaning_manifest: Dict[str, Any], limit: int = 8) -> List[str]:
+    conversions_raw = cleaning_manifest.get("conversions") if isinstance(cleaning_manifest, dict) else None
+    items: List[str] = []
+    if isinstance(conversions_raw, list):
+        for item in conversions_raw:
+            text = str(item or "").strip()
+            if text:
+                items.append(text)
+    elif isinstance(conversions_raw, dict):
+        for key, value in conversions_raw.items():
+            label = str(key or "").strip()
+            if not label:
+                continue
+            if value in (None, "", {}):
+                items.append(label)
+            else:
+                items.append(f"{label}: {value}")
+    return items[:limit]
+
+
+def _build_eda_fact_pack(
+    *,
+    cleaning_manifest: Dict[str, Any],
+    data_profile: Dict[str, Any],
+    dataset_semantics: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(cleaning_manifest, dict):
+        cleaning_manifest = {}
+    if not isinstance(data_profile, dict):
+        data_profile = {}
+    if not isinstance(dataset_semantics, dict):
+        dataset_semantics = {}
+    if not cleaning_manifest and not data_profile and not dataset_semantics:
+        return None
+
+    row_counts = cleaning_manifest.get("row_counts") if isinstance(cleaning_manifest.get("row_counts"), dict) else {}
+    rows_before = (
+        row_counts.get("before")
+        or row_counts.get("original")
+        or row_counts.get("input")
+        or row_counts.get("rows_before")
+    )
+    rows_after = (
+        row_counts.get("after")
+        or row_counts.get("final")
+        or row_counts.get("output")
+        or row_counts.get("rows_after")
+    )
+    retained_fraction: Optional[float] = None
+    if isinstance(rows_before, (int, float)) and rows_before:
+        retained_fraction = float(rows_after) / float(rows_before) if isinstance(rows_after, (int, float)) else None
+
+    missingness_top = _normalize_missingness_entries(
+        data_profile.get("missingness_top30")
+        if data_profile.get("missingness_top30") not in (None, {})
+        else data_profile.get("missingness"),
+        limit=5,
+    )
+    missing_hotspots = [item for item in missingness_top if (item.get("missing_frac") or 0.0) > 0]
+
+    high_cardinality = _normalize_high_cardinality_entries(
+        data_profile.get("high_cardinality_columns")
+        if isinstance(data_profile.get("high_cardinality_columns"), list)
+        else data_profile.get("high_cardinality_columns_sample"),
+        limit=5,
+    )
+
+    dtypes = data_profile.get("dtypes") if isinstance(data_profile.get("dtypes"), dict) else {}
+    constant_columns = data_profile.get("constant_columns") if isinstance(data_profile.get("constant_columns"), list) else []
+    leakage_flags_raw = data_profile.get("leakage_flags") if isinstance(data_profile.get("leakage_flags"), list) else []
+    leakage_flags: List[str] = []
+    for item in leakage_flags_raw[:5]:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        severity = str(item.get("severity") or "").strip()
+        if not column:
+            continue
+        details = reason
+        if severity:
+            details = f"{details} [{severity}]" if details else f"[{severity}]"
+        leakage_flags.append(f"{column}: {details}".strip(": "))
+
+    cleaning_gates_status = cleaning_manifest.get("cleaning_gates_status") if isinstance(cleaning_manifest.get("cleaning_gates_status"), dict) else {}
+    quality_flags: List[str] = []
+    for gate_name, gate_status in cleaning_gates_status.items():
+        normalized_status = str(gate_status or "").strip().upper()
+        if not normalized_status or normalized_status == "PASSED":
+            continue
+        quality_flags.append(f"{gate_name}={gate_status}")
+    quality_flags.extend(f"leakage_flag:{flag}" for flag in leakage_flags[:3])
+    if constant_columns:
+        quality_flags.append(f"constant_columns={','.join(str(col) for col in constant_columns[:3])}")
+
+    target_analysis = dataset_semantics.get("target_analysis") if isinstance(dataset_semantics.get("target_analysis"), dict) else {}
+    pack: Dict[str, Any] = {
+        "row_retention": {
+            "rows_before": rows_before,
+            "rows_after": rows_after,
+            "retained_fraction": retained_fraction,
+        },
+        "primary_target": dataset_semantics.get("primary_target") or target_analysis.get("primary_target"),
+        "split_candidates": dataset_semantics.get("split_candidates", []) if isinstance(dataset_semantics.get("split_candidates"), list) else [],
+        "top_missing_columns": missing_hotspots,
+        "high_cardinality_columns": high_cardinality,
+        "constant_columns": constant_columns[:5],
+        "critical_type_conversions": _extract_conversion_items(cleaning_manifest, limit=8),
+        "quality_flags": quality_flags[:8],
+        "numeric_profile": {
+            "numeric_columns": _count_dtype_family(dtypes, "numeric"),
+            "datetime_columns": _count_dtype_family(dtypes, "datetime"),
+            "categorical_columns": _count_dtype_family(dtypes, "categorical"),
+        },
+        "semantic_notes": dataset_semantics.get("notes", [])[:4] if isinstance(dataset_semantics.get("notes"), list) else [],
+    }
+    target_notes = target_analysis.get("notes", []) if isinstance(target_analysis.get("notes"), list) else []
+    if target_notes:
+        pack["target_notes"] = target_notes[:4]
+    return pack
+
+
+def _eda_plot_hints_from_fact_pack(eda_fact_pack: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(eda_fact_pack, dict) or not eda_fact_pack:
+        return {}
+
+    hints: Dict[str, Dict[str, Any]] = {}
+    missing_columns = eda_fact_pack.get("top_missing_columns") if isinstance(eda_fact_pack.get("top_missing_columns"), list) else []
+    if missing_columns:
+        facts = [f"columns_with_missing={len(missing_columns)}"]
+        for item in missing_columns[:3]:
+            if not isinstance(item, dict):
+                continue
+            column = str(item.get("column") or "").strip()
+            missing_frac = _coerce_float(item.get("missing_frac"))
+            if not column or missing_frac is None:
+                continue
+            facts.append(f"{column} missing={missing_frac * 100:.1f}%")
+        hints["missing_values"] = {
+            "title": "Missing values overview",
+            "facts": facts[:4],
+            "guidance": (
+                "Use when explaining where data-quality risk was concentrated and why categorical handling or "
+                "missing-value policy mattered for the final pipeline."
+            ),
+        }
+
+    numeric_profile = eda_fact_pack.get("numeric_profile") if isinstance(eda_fact_pack.get("numeric_profile"), dict) else {}
+    high_cardinality = eda_fact_pack.get("high_cardinality_columns") if isinstance(eda_fact_pack.get("high_cardinality_columns"), list) else []
+    constant_columns = eda_fact_pack.get("constant_columns") if isinstance(eda_fact_pack.get("constant_columns"), list) else []
+    numeric_facts: List[str] = []
+    numeric_count = numeric_profile.get("numeric_columns")
+    datetime_count = numeric_profile.get("datetime_columns")
+    if isinstance(numeric_count, int):
+        numeric_facts.append(f"numeric_columns={numeric_count}")
+    if isinstance(datetime_count, int):
+        numeric_facts.append(f"datetime_columns={datetime_count}")
+    if constant_columns:
+        numeric_facts.append(f"constant_columns={len(constant_columns)} ({', '.join(str(col) for col in constant_columns[:2])})")
+    if high_cardinality:
+        top_item = high_cardinality[0]
+        if isinstance(top_item, dict):
+            column = str(top_item.get("column") or "").strip()
+            unique_ratio = _coerce_float(top_item.get("unique_ratio"))
+            if column and unique_ratio is not None:
+                numeric_facts.append(f"{column} unique_ratio={unique_ratio * 100:.1f}%")
+    if numeric_facts:
+        hints["numeric_distributions"] = {
+            "title": "Numeric distributions overview",
+            "facts": numeric_facts[:4],
+            "guidance": (
+                "Use when discussing scale dispersion, constant columns, or why numeric normalization and feature "
+                "screening mattered before modeling."
+            ),
+        }
+    return hints
+
+
+def _enrich_plot_summaries_with_eda_fact_pack(
+    plot_summaries: Optional[List[Dict[str, Any]]],
+    plots: Optional[List[str]],
+    eda_fact_pack: Optional[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    hints = _eda_plot_hints_from_fact_pack(eda_fact_pack if isinstance(eda_fact_pack, dict) else {})
+    if not hints:
+        return copy.deepcopy(plot_summaries) if isinstance(plot_summaries, list) else plot_summaries
+
+    summaries: List[Dict[str, Any]] = copy.deepcopy(plot_summaries) if isinstance(plot_summaries, list) else []
+    summary_by_file: Dict[str, Dict[str, Any]] = {}
+    for item in summaries:
+        if not isinstance(item, dict):
+            continue
+        filename = os.path.basename(str(item.get("filename") or item.get("path") or "")).strip()
+        if filename:
+            summary_by_file[filename.lower()] = item
+
+    for raw_path in plots or []:
+        filename = os.path.basename(str(raw_path or "")).strip()
+        lower_name = filename.lower()
+        if not lower_name:
+            continue
+        hint: Optional[Dict[str, Any]] = None
+        if "missing" in lower_name:
+            hint = hints.get("missing_values")
+        elif "numeric_distributions" in lower_name or "eda_numeric" in lower_name:
+            hint = hints.get("numeric_distributions")
+        if not isinstance(hint, dict):
+            continue
+
+        target_item = summary_by_file.get(lower_name)
+        if not isinstance(target_item, dict):
+            target_item = {"filename": filename}
+            summaries.append(target_item)
+            summary_by_file[lower_name] = target_item
+
+        existing_facts = target_item.get("key_facts")
+        if not isinstance(existing_facts, list):
+            existing_facts = target_item.get("facts")
+        if not isinstance(existing_facts, list):
+            existing_facts = [str(existing_facts)] if existing_facts else []
+        existing_facts = [str(item).strip() for item in existing_facts if str(item or "").strip()]
+        if not existing_facts or all("chart available" in fact.lower() for fact in existing_facts):
+            target_item["facts"] = hint.get("facts", [])
+        target_item.setdefault("title", hint.get("title"))
+        if not str(target_item.get("guidance") or "").strip():
+            target_item["guidance"] = hint.get("guidance")
+
+    return summaries
+
+
+def _summarize_data_engineer_change_summary(
+    *,
+    cleaning_manifest: Dict[str, Any],
+    eda_fact_pack: Optional[Dict[str, Any]],
+    cleaning_progress_summary: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(cleaning_manifest, dict):
+        cleaning_manifest = {}
+    if not isinstance(eda_fact_pack, dict):
+        eda_fact_pack = {}
+    if not isinstance(cleaning_progress_summary, dict):
+        cleaning_progress_summary = {}
+    if not cleaning_manifest and not eda_fact_pack and not cleaning_progress_summary:
+        return None
+
+    initial_quality_signals: List[str] = []
+    for item in (eda_fact_pack.get("top_missing_columns") or [])[:3]:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or "").strip()
+        missing_frac = _coerce_float(item.get("missing_frac"))
+        if column and missing_frac is not None and missing_frac > 0:
+            initial_quality_signals.append(f"{column} had {missing_frac * 100:.1f}% missingness")
+    for item in (eda_fact_pack.get("high_cardinality_columns") or [])[:2]:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or "").strip()
+        unique_ratio = _coerce_float(item.get("unique_ratio"))
+        if column and unique_ratio is not None:
+            initial_quality_signals.append(f"{column} had {unique_ratio * 100:.1f}% uniqueness")
+    constant_columns = eda_fact_pack.get("constant_columns") if isinstance(eda_fact_pack.get("constant_columns"), list) else []
+    if constant_columns:
+        initial_quality_signals.append(
+            f"Constant columns detected: {', '.join(str(col) for col in constant_columns[:3])}"
+        )
+
+    accepted_interventions = cleaning_progress_summary.get("key_operations") if isinstance(cleaning_progress_summary.get("key_operations"), list) else []
+    contractual_resolutions = cleaning_manifest.get("contract_conflicts_resolved") if isinstance(cleaning_manifest.get("contract_conflicts_resolved"), list) else []
+    passed_gates = cleaning_progress_summary.get("passed_gates") if isinstance(cleaning_progress_summary.get("passed_gates"), list) else []
+    quality_flags = eda_fact_pack.get("quality_flags") if isinstance(eda_fact_pack.get("quality_flags"), list) else []
+    notes = cleaning_manifest.get("notes") if isinstance(cleaning_manifest.get("notes"), list) else []
+
+    row_retention = eda_fact_pack.get("row_retention") if isinstance(eda_fact_pack.get("row_retention"), dict) else {}
+    summary: Dict[str, Any] = {
+        "initial_quality_signals": initial_quality_signals[:6],
+        "accepted_interventions": [str(item) for item in accepted_interventions[:8]],
+        "row_retention": row_retention,
+        "gates_cleared": [str(item) for item in passed_gates[:8]],
+        "contractual_resolutions": [str(item) for item in contractual_resolutions[:4]],
+        "residual_risks": [str(item) for item in (quality_flags[:6] + [str(note) for note in notes[:2]])],
+        "output_dialect": cleaning_progress_summary.get("output_dialect", {}),
+    }
+    return summary
+
+
+def _metric_round_hypothesis_label(item: Dict[str, Any]) -> str:
+    hypothesis = item.get("hypothesis")
+    if isinstance(hypothesis, dict):
+        return str(
+            hypothesis.get("label")
+            or hypothesis.get("title")
+            or hypothesis.get("hypothesis")
+            or ""
+        ).strip()
+    return str(hypothesis or "").strip()
+
+
+def _summarize_ml_engineer_change_summary(
+    *,
+    metric_loop_context: Dict[str, Any],
+    canonical_metric_name: str,
+    canonical_metric_value: Optional[float],
+    review_board_verdict: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(metric_loop_context, dict):
+        metric_loop_context = {}
+    round_history = metric_loop_context.get("round_history")
+    if not isinstance(round_history, list) or not round_history:
+        return None
+
+    accepted_improvements: List[Dict[str, Any]] = []
+    rejected_experiments: List[Dict[str, Any]] = []
+    rejected_after_improvement: List[Dict[str, Any]] = []
+    incumbent_promotions: List[Dict[str, Any]] = []
+    for item in round_history:
+        if not isinstance(item, dict):
+            continue
+        entry = {
+            "round_id": item.get("round_id"),
+            "hypothesis_label": _metric_round_hypothesis_label(item),
+            "baseline_metric": item.get("baseline_metric"),
+            "candidate_metric": item.get("candidate_metric"),
+            "metric_improved": item.get("metric_improved"),
+            "governance_approved": item.get("governance_approved")
+            if isinstance(item.get("governance_approved"), bool)
+            else item.get("approved"),
+            "kept": item.get("kept"),
+        }
+        kept = str(item.get("kept") or "").strip().lower()
+        if kept == "improved":
+            accepted_improvements.append(entry)
+            incumbent_promotions.append(
+                {
+                    "round_id": entry["round_id"],
+                    "hypothesis_label": entry["hypothesis_label"],
+                    "new_incumbent_metric": entry["candidate_metric"],
+                }
+            )
+        else:
+            rejected_experiments.append(entry)
+            if entry.get("metric_improved") is True:
+                rejected_after_improvement.append(entry)
+
+    baseline_start = None
+    if isinstance(round_history[0], dict):
+        baseline_start = _coerce_float(round_history[0].get("baseline_metric"))
+    summary: Dict[str, Any] = {
+        "metric_name": canonical_metric_name or metric_loop_context.get("metric_name"),
+        "baseline_metric_start": baseline_start,
+        "selected_incumbent_metric": canonical_metric_value,
+        "accepted_improvements": accepted_improvements,
+        "rejected_experiments": rejected_experiments,
+        "rejected_after_metric_improvement": rejected_after_improvement,
+        "incumbent_promotions": incumbent_promotions,
+        "rounds_attempted": len(round_history),
+    }
+    if accepted_improvements:
+        summary["current_incumbent_basis"] = "last_accepted_improvement"
+    else:
+        summary["current_incumbent_basis"] = "original_approved_baseline"
+    if isinstance(review_board_verdict, dict) and review_board_verdict:
+        board_summary = str(review_board_verdict.get("summary") or "").strip()
+        required_actions = review_board_verdict.get("required_actions")
+        if board_summary:
+            summary["review_board_summary"] = board_summary[:600]
+        if isinstance(required_actions, list) and required_actions:
+            summary["review_board_required_actions"] = [str(item) for item in required_actions[:4]]
+    return summary
+
+
+def _summarize_run_causal_impact(
+    *,
+    data_engineer_change_summary: Optional[Dict[str, Any]],
+    ml_engineer_change_summary: Optional[Dict[str, Any]],
+    executive_decision_label: str,
+) -> Optional[Dict[str, Any]]:
+    data_summary = data_engineer_change_summary if isinstance(data_engineer_change_summary, dict) else {}
+    ml_summary = ml_engineer_change_summary if isinstance(ml_engineer_change_summary, dict) else {}
+    if not data_summary and not ml_summary:
+        return None
+
+    enablers: List[str] = []
+    residual_constraints: List[str] = []
+    if isinstance(data_summary.get("row_retention"), dict):
+        row_retention = data_summary.get("row_retention") or {}
+        before = row_retention.get("rows_before")
+        after = row_retention.get("rows_after")
+        if before is not None and after is not None:
+            enablers.append(f"Data engineering preserved {after} of {before} rows while standardizing the modeling table.")
+    accepted_interventions = data_summary.get("accepted_interventions") if isinstance(data_summary.get("accepted_interventions"), list) else []
+    if accepted_interventions:
+        enablers.append(f"Data engineering applied {len(accepted_interventions)} accepted cleaning interventions that materially improved dataset readiness.")
+    accepted_improvements = ml_summary.get("accepted_improvements") if isinstance(ml_summary.get("accepted_improvements"), list) else []
+    if accepted_improvements:
+        first = accepted_improvements[0]
+        enablers.append(
+            f"ML engineering promoted {len(accepted_improvements)} incumbent improvement(s), starting with round {first.get('round_id')}."
+        )
+    rejected_after_improvement = ml_summary.get("rejected_after_metric_improvement") if isinstance(ml_summary.get("rejected_after_metric_improvement"), list) else []
+    if rejected_after_improvement:
+        residual_constraints.append(
+            f"{len(rejected_after_improvement)} numerically improved challenger(s) were rejected by governance and did not replace the incumbent."
+        )
+    for item in (data_summary.get("residual_risks") or [])[:4]:
+        residual_constraints.append(str(item))
+    if isinstance(ml_summary.get("review_board_required_actions"), list):
+        residual_constraints.extend(str(item) for item in ml_summary.get("review_board_required_actions", [])[:3])
+
+    focus_points: List[str] = []
+    if accepted_interventions:
+        focus_points.append("Explain which cleaning interventions changed dataset readiness or reduced modeling risk.")
+    if accepted_improvements:
+        focus_points.append("Show which accepted ML hypothesis became the new incumbent and why later challengers did not replace it.")
+    if rejected_after_improvement:
+        focus_points.append("Make clear that some challengers improved the metric numerically but were rejected for business or governance reasons.")
+
+    return {
+        "executive_decision_label": executive_decision_label,
+        "engineering_enablers": enablers[:5],
+        "residual_constraints": residual_constraints[:6],
+        "narrative_focus_points": focus_points[:4],
+    }
+
+
 def _prepare_translator_metric_views(
     *,
     metrics_payload: Dict[str, Any],
@@ -2780,6 +3270,11 @@ class BusinessTranslatorAgent:
         output_contract_report = _safe_load_json("data/output_contract_report.json") or {}
         case_alignment_report = _safe_load_json("data/case_alignment_report.json") or {}
         data_adequacy_report = _safe_load_json("data/data_adequacy_report.json") or {}
+        review_board_verdict = _safe_load_json_candidates(
+            "data/review_board_verdict.json",
+            os.path.join(work_dir, "data", "review_board_verdict.json"),
+            os.path.join("work", "data", "review_board_verdict.json"),
+        ) or {}
         alignment_check_report = _safe_load_json("data/alignment_check.json") or {}
         plot_insights = (
             _safe_load_json_candidates(
@@ -2792,10 +3287,17 @@ class BusinessTranslatorAgent:
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
         data_profile = (
             _safe_load_json("data/data_profile.json")
+            or _safe_load_json(os.path.join(work_dir, "data", "data_profile.json"))
+            or _safe_load_json(os.path.join("work", "data", "data_profile.json"))
             or _safe_load_json(os.path.join("work", "artifacts", "data_profile.json"))
             or {}
         )
-        dataset_semantics = _safe_load_json("data/dataset_semantics.json") or {}
+        dataset_semantics = (
+            _safe_load_json("data/dataset_semantics.json")
+            or _safe_load_json(os.path.join(work_dir, "data", "dataset_semantics.json"))
+            or _safe_load_json(os.path.join("work", "data", "dataset_semantics.json"))
+            or {}
+        )
         cleaning_manifest = (
             state.get("cleaning_manifest")
             if isinstance(state.get("cleaning_manifest"), dict)
@@ -3115,6 +3617,16 @@ class BusinessTranslatorAgent:
             strategy_title=strategy_title,
             hypothesis=hypothesis,
         )
+        eda_fact_pack = _build_eda_fact_pack(
+            cleaning_manifest=cleaning_manifest if isinstance(cleaning_manifest, dict) else {},
+            data_profile=data_profile if isinstance(data_profile, dict) else {},
+            dataset_semantics=dataset_semantics if isinstance(dataset_semantics, dict) else {},
+        )
+        data_engineer_change_summary = _summarize_data_engineer_change_summary(
+            cleaning_manifest=cleaning_manifest if isinstance(cleaning_manifest, dict) else {},
+            eda_fact_pack=eda_fact_pack,
+            cleaning_progress_summary=cleaning_progress_summary,
+        )
         facts_context = _facts_from_insights(insights) or _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
         artifacts_context = view_inventory if view_inventory else []
         raw_evidence_paths = []
@@ -3169,6 +3681,11 @@ class BusinessTranslatorAgent:
             )
             if not isinstance(plot_summaries, list):
                 plot_summaries = None
+        plot_summaries = _enrich_plot_summaries_with_eda_fact_pack(
+            plot_summaries,
+            plots,
+            eda_fact_pack,
+        )
         slot_payloads, model_metrics_context, plot_summaries, metric_progress_summary = _prepare_translator_metric_views(
             metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
             slot_payloads=slot_payloads if isinstance(slot_payloads, dict) else {},
@@ -3177,6 +3694,12 @@ class BusinessTranslatorAgent:
             metric_loop_context=metric_loop_context if isinstance(metric_loop_context, dict) else {},
             canonical_metric_name=_canonical_metric_name,
             canonical_metric_value=_canonical_metric_value,
+        )
+        ml_engineer_change_summary = _summarize_ml_engineer_change_summary(
+            metric_loop_context=metric_loop_context if isinstance(metric_loop_context, dict) else {},
+            canonical_metric_name=_canonical_metric_name,
+            canonical_metric_value=_canonical_metric_value,
+            review_board_verdict=review_board_verdict if isinstance(review_board_verdict, dict) else {},
         )
         final_incumbent_metric_records = []
         if isinstance(slot_payloads, dict):
@@ -3217,6 +3740,11 @@ class BusinessTranslatorAgent:
             decisioning_columns,
             executive_decision_label,
         )
+        run_causal_impact_summary = _summarize_run_causal_impact(
+            data_engineer_change_summary=data_engineer_change_summary,
+            ml_engineer_change_summary=ml_engineer_change_summary,
+            executive_decision_label=executive_decision_label,
+        )
         run_timeline_context = _load_run_timeline_tail(str(run_id) if run_id else None, max_events=12)
         try:
             os.makedirs("data", exist_ok=True)
@@ -3233,6 +3761,14 @@ class BusinessTranslatorAgent:
                     indent=2,
                     ensure_ascii=False,
                 )
+            with open("data/eda_fact_pack.json", "w", encoding="utf-8") as f_eda:
+                json.dump(eda_fact_pack or {}, f_eda, indent=2, ensure_ascii=False)
+            with open("data/data_engineer_change_summary.json", "w", encoding="utf-8") as f_de:
+                json.dump(data_engineer_change_summary or {}, f_de, indent=2, ensure_ascii=False)
+            with open("data/ml_engineer_change_summary.json", "w", encoding="utf-8") as f_ml:
+                json.dump(ml_engineer_change_summary or {}, f_ml, indent=2, ensure_ascii=False)
+            with open("data/run_causal_impact_summary.json", "w", encoding="utf-8") as f_causal:
+                json.dump(run_causal_impact_summary or {}, f_causal, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
@@ -3303,6 +3839,8 @@ class BusinessTranslatorAgent:
                 "recommendations": (data_adequacy_report or {}).get("recommendations", [])[:3],
             },
             "cleaning_progress_summary": cleaning_progress_summary,
+            "eda_fact_pack": eda_fact_pack,
+            "data_engineer_change_summary": data_engineer_change_summary,
             "artifacts_summary": manifest.get("summary", {}) if isinstance(manifest, dict) else {},
             "decisioning_columns": decisioning_columns,
             "metrics_preview": final_incumbent_metric_records[:14] if isinstance(final_incumbent_metric_records, list) else [],
@@ -3312,6 +3850,8 @@ class BusinessTranslatorAgent:
                 "source": "primary_metric_state (authoritative)",
             } if _canonical_metric_name and _canonical_metric_value is not None else None,
             "ml_progress_summary": metric_progress_summary,
+            "ml_engineer_change_summary": ml_engineer_change_summary,
+            "run_causal_impact_summary": run_causal_impact_summary,
         }
 
         context_appendix = {
@@ -3323,11 +3863,15 @@ class BusinessTranslatorAgent:
             "steward_context": steward_context,
             "cleaning_context": cleaning_context,
             "cleaning_progress_summary": cleaning_progress_summary,
+            "eda_fact_pack": eda_fact_pack,
+            "data_engineer_change_summary": data_engineer_change_summary,
             "run_summary_context": run_summary_context,
             "artifact_manifest": manifest,
             "data_adequacy_report_json": data_adequacy_report,
+            "review_board_verdict_json": review_board_verdict if isinstance(review_board_verdict, dict) else {},
             "alignment_check": alignment_check_context,
             "model_metrics_context": model_metrics_context,
+            "ml_engineer_change_summary": ml_engineer_change_summary,
             "case_summary_context": case_summary_context,
             "scored_rows_context": scored_rows_context,
             "plot_insights_json": plot_insights,
@@ -3336,6 +3880,7 @@ class BusinessTranslatorAgent:
             "run_timeline_context": run_timeline_context,
             "metric_loop_context": metric_loop_context if metric_loop_context else None,
             "metric_progress_summary": metric_progress_summary,
+            "run_causal_impact_summary": run_causal_impact_summary,
         }
 
         # ── Pipeline scope awareness ─────────────────────────────────
@@ -3431,11 +3976,19 @@ reflect this analysis, not just list data.
      compliance failures, and risks that affect production readiness.
    - If cleaning work materially enabled the final result, surface the
      most important data-engineering operations and explain why they mattered.
+   - If an EDA Fact Pack exists, use it to identify the few missingness,
+     cardinality, constant-column, or type-conversion signals that genuinely
+     explain model readiness or residual risk.
+   - If engineering change summaries exist, distinguish clearly between
+     accepted interventions, rejected experiments, and the concrete effect each
+     had on data readiness, model quality, or deployment trust.
 
 3. EXPLAIN WHY
    - Connect results to causes. If the metric improved, what technique
      drove it? If it degraded, what went wrong?
    - If there are contradictions between reviewers, governance outputs, and metrics, flag them.
+   - Give explicit credit to engineering work when it changed the outcome.
+     Do not narrate the run as a flat chronological list of steps.
 
 4. RECOMMEND ACTIONS
    - Be specific: "retry with X", "investigate Y in artifact Z",
@@ -3465,6 +4018,10 @@ Scored Rows Sample: $scored_sample_table_text
 Artifact Headers: $artifact_headers_table_text
 Recommendations: $recommendations_table_text
 Cleaning Progress Summary: $cleaning_progress_summary_json
+EDA Fact Pack: $eda_fact_pack_json
+Data Engineer Change Summary: $data_engineer_change_summary_json
+ML Engineer Change Summary: $ml_engineer_change_summary_json
+Run Causal Impact Summary: $run_causal_impact_summary_json
 Visuals: $visuals_context_json
 Decisioning: $decisioning_context_json
 Decisioning Columns: $decisioning_columns_text
@@ -3571,6 +4128,10 @@ $execution_results
             "artifact_headers_table_text": artifact_headers_table_text,
             "recommendations_table_text": recommendations_table_text,
             "cleaning_progress_summary_json": json.dumps(cleaning_progress_summary, ensure_ascii=False),
+            "eda_fact_pack_json": json.dumps(eda_fact_pack, ensure_ascii=False),
+            "data_engineer_change_summary_json": json.dumps(data_engineer_change_summary, ensure_ascii=False),
+            "ml_engineer_change_summary_json": json.dumps(ml_engineer_change_summary, ensure_ascii=False),
+            "run_causal_impact_summary_json": json.dumps(run_causal_impact_summary, ensure_ascii=False),
             "context_appendix_json": json.dumps(context_appendix, ensure_ascii=False),
             "pipeline_scope_section": pipeline_scope_section,
             "embeddable_artifacts_registry_json": artifact_registry_prompt_json,

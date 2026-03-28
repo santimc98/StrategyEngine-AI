@@ -390,6 +390,267 @@ def test_translator_prompt_includes_cleaning_progress_summary(tmp_path, monkeypa
     assert '"passed_gates": ["target_is_numeric", "routing_column_valid"]' in prompt
 
 
+def test_translator_prompt_includes_deterministic_eda_fact_pack(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+    with open(os.path.join("data", "cleaning_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "row_counts": {"input": 20096, "output": 20096},
+                "conversions": [
+                    "Parsed Score to numeric float",
+                    "Parsed Importe to numeric float",
+                    "Validated Score FEC to Rango FEC using observed mapping family with mismatch diagnostics",
+                ],
+                "cleaning_gates_status": {
+                    "numeric_parsing_integrity": "PASSED",
+                    "score_fec_mapping_consistency": "WARNING_481_mismatches",
+                },
+            },
+            f,
+        )
+    with open(os.path.join("data", "data_profile.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "dtypes": {
+                    "FechaObs": "datetime64",
+                    "Score": "float64",
+                    "Sector": "object",
+                    "CodPartidaAbierta": "object",
+                },
+                "missingness_top30": {
+                    "Sector": 0.2828,
+                    "TipoSegmento": 0.2581,
+                    "Score": 0.0,
+                },
+                "constant_columns": ["FechaObs"],
+                "high_cardinality_columns": [
+                    {"column": "CodPartidaAbierta", "n_unique": 20077, "unique_ratio": 0.9991}
+                ],
+                "leakage_flags": [
+                    {"column": "Score FEC", "reason": "name_contains_outcome:score", "severity": "SOFT"}
+                ],
+            },
+            f,
+        )
+    with open(os.path.join("data", "dataset_semantics.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "primary_target": "Score",
+                "split_candidates": ["FE", "Sector"],
+                "notes": [
+                    "Sector and TipoSegmento have material missingness and require explicit handling.",
+                    "FechaObs is constant and should be excluded from modeling.",
+                ],
+            },
+            f,
+        )
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Prioritize invoices by calibrated collection score.",
+        }
+    )
+
+    assert "EDA Fact Pack:" in prompt
+    assert '"top_missing_columns": [{"column": "Sector", "missing_frac": 0.2828}' in prompt
+    assert '"high_cardinality_columns": [{"column": "CodPartidaAbierta", "n_unique": 20077, "unique_ratio": 0.9991}]' in prompt
+    assert '"quality_flags": ["score_fec_mapping_consistency=WARNING_481_mismatches", "leakage_flag:Score FEC: name_contains_outcome:score [SOFT]", "constant_columns=FechaObs"]' in prompt
+    assert '"semantic_notes": ["Sector and TipoSegmento have material missingness and require explicit handling.", "FechaObs is constant and should be excluded from modeling."]' in prompt
+
+    with open(os.path.join("data", "eda_fact_pack.json"), "r", encoding="utf-8") as f:
+        eda_fact_pack = json.load(f)
+    assert eda_fact_pack["row_retention"]["rows_after"] == 20096
+    assert eda_fact_pack["numeric_profile"]["numeric_columns"] == 1
+
+
+def test_translator_enriches_generic_eda_plot_summaries_from_fact_pack(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+    with open(os.path.join("data", "cleaning_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"row_counts": {"input": 100, "output": 100}}, f)
+    with open(os.path.join("data", "data_profile.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "dtypes": {
+                    "FechaObs": "datetime64",
+                    "Score": "float64",
+                    "Sector": "object",
+                    "Importe": "float64",
+                },
+                "missingness_top30": {"Sector": 0.2828, "TipoSegmento": 0.2581},
+                "constant_columns": ["FechaObs"],
+                "high_cardinality_columns": [
+                    {"column": "CodPartidaAbierta", "n_unique": 999, "unique_ratio": 0.999}
+                ],
+            },
+            f,
+        )
+    with open(os.path.join("data", "dataset_semantics.json"), "w", encoding="utf-8") as f:
+        json.dump({"primary_target": "Score"}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Prioritize invoices by calibrated collection score.",
+        },
+        plots=[
+            "static/plots/missing_values.png",
+            "static/plots/numeric_distributions.png",
+        ],
+    )
+
+    assert "Missing values overview" in prompt
+    assert "Sector missing=28.3%" in prompt
+    assert "Numeric distributions overview" in prompt
+    assert "numeric_columns=2" in prompt
+    assert "constant_columns=1 (FechaObs)" in prompt
+
+
+def test_translator_loads_eda_fact_inputs_from_work_data_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs(os.path.join("work", "data"), exist_ok=True)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+    with open(os.path.join("work", "data", "data_profile.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "dtypes": {"Score": "float64", "Sector": "object"},
+                "missingness_top30": {"Sector": 0.31},
+            },
+            f,
+        )
+    with open(os.path.join("work", "data", "dataset_semantics.json"), "w", encoding="utf-8") as f:
+        json.dump({"primary_target": "Score", "notes": ["Sector requires explicit missing handling."]}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Prioritize invoices by calibrated collection score.",
+        },
+        plots=["static/plots/missing_values.png"],
+    )
+
+    assert "EDA Fact Pack:" in prompt
+    assert '"top_missing_columns": [{"column": "Sector", "missing_frac": 0.31}]' in prompt
+    assert '"primary_target": "Score"' in prompt
+
+
+def test_translator_prompt_includes_engineering_change_summaries(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+    with open(os.path.join("data", "review_board_verdict.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "summary": "The final challenger was rejected because it violated case coverage constraints.",
+                "required_actions": [
+                    "Restore full case coverage before rollout.",
+                    "Keep the approved incumbent until governance blockers are resolved.",
+                ],
+            },
+            f,
+        )
+    with open(os.path.join("data", "cleaning_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "row_counts": {"input": 352, "output": 352},
+                "conversions": [
+                    "Parsed 1stYearAmount from currency-like strings to float64",
+                    "Parsed Debtors from numeric-like strings to Float64",
+                ],
+                "cleaning_gates_status": {"target_is_numeric": "PASSED"},
+                "contract_conflicts_resolved": ["Relaxed a strict mapping gate using observed valid families."],
+                "notes": ["No deduplication was performed because identity rules were absent."],
+            },
+            f,
+        )
+    with open(os.path.join("data", "data_profile.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "dtypes": {"FechaObs": "datetime64", "Debtors": "float64", "Sector": "object"},
+                "missingness_top30": {"Sector": 0.22},
+                "constant_columns": ["FechaObs"],
+            },
+            f,
+        )
+    with open(os.path.join("data", "dataset_semantics.json"), "w", encoding="utf-8") as f:
+        json.dump({"primary_target": "1stYearAmount"}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Build a pricing recommendation model.",
+            "primary_metric_state": {
+                "primary_metric_name": "MAE",
+                "primary_metric_value": 1410.2794030184425,
+            },
+            "ml_improvement_round_history": [
+                {
+                    "round_id": 1,
+                    "baseline_metric": 2088.3858989698074,
+                    "candidate_metric": 1564.31726834445,
+                    "kept": "improved",
+                    "hypothesis": {"label": "catboost"},
+                    "metric_improved": True,
+                    "governance_approved": True,
+                },
+                {
+                    "round_id": 2,
+                    "baseline_metric": 1564.31726834445,
+                    "candidate_metric": 1489.6658896856218,
+                    "kept": "baseline",
+                    "hypothesis": {"label": "optuna_challenger"},
+                    "metric_improved": True,
+                    "governance_approved": False,
+                },
+            ],
+        }
+    )
+
+    assert "Data Engineer Change Summary:" in prompt
+    assert "ML Engineer Change Summary:" in prompt
+    assert "Run Causal Impact Summary:" in prompt
+    assert '"accepted_interventions": ["Parsed 1stYearAmount from currency-like strings to float64", "Parsed Debtors from numeric-like strings to Float64"]' in prompt
+    assert '"accepted_improvements": [{"round_id": 1, "hypothesis_label": "catboost"' in prompt
+    assert '"rejected_after_metric_improvement": [{"round_id": 2, "hypothesis_label": "optuna_challenger"' in prompt
+    assert "numerically improved challenger(s) were rejected by governance" in prompt
+
+    with open(os.path.join("data", "data_engineer_change_summary.json"), "r", encoding="utf-8") as f:
+        data_summary = json.load(f)
+    with open(os.path.join("data", "ml_engineer_change_summary.json"), "r", encoding="utf-8") as f:
+        ml_summary = json.load(f)
+    with open(os.path.join("data", "run_causal_impact_summary.json"), "r", encoding="utf-8") as f:
+        causal_summary = json.load(f)
+
+    assert data_summary["gates_cleared"] == ["target_is_numeric"]
+    assert ml_summary["current_incumbent_basis"] == "last_accepted_improvement"
+    assert causal_summary["executive_decision_label"] == "GO_WITH_LIMITATIONS"
+
+
 def test_translator_structure_validation_accepts_risk_semantics_without_heading():
     report = """
 # Reporte Ejecutivo
