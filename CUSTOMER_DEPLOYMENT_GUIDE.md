@@ -1,300 +1,300 @@
-# StrategyEngine AI - Customer Deployment Guide
+# StrategyEngine AI - Guía de Despliegue para Cliente
 
-## Purpose
+## Propósito
 
-This guide is written for two audiences:
+Esta guía está escrita para dos audiencias:
 
-- the StrategyEngine team, so they know how to explain the product during sales and technical validation
-- the customer, so they understand how the product should be deployed inside their infrastructure
+- el equipo de StrategyEngine, para saber cómo explicar el producto durante ventas y validación técnica
+- el cliente, para que entienda cómo debe desplegar el producto dentro de su propia infraestructura
 
-It is intentionally practical.
+La guía es deliberadamente práctica.
 
-## One-Line Positioning
+## Posicionamiento en Una Línea
 
-StrategyEngine AI is a **self-hosted enterprise AI analytics appliance** that runs inside the customer's infrastructure, with:
+StrategyEngine AI es un **appliance enterprise de analítica con IA, self-hosted**, que corre dentro de la infraestructura del cliente y ofrece:
 
-- a web UI for operators
-- background execution for long runs
-- isolated code execution for ML and data engineering
-- customer-controlled secrets, storage, and sandbox compute
+- una UI web para operadores
+- ejecución en background para runs largas
+- ejecución aislada de código para ML y data engineering
+- secretos, almacenamiento y compute del sandbox bajo control del cliente
 
-## What To Say In A Sales Call
+## Qué Decir en una Llamada Comercial
 
-Use this framing:
+Usa este framing:
 
-1. The product is deployed in your environment, not ours.
-2. Your team configures API keys, models, and execution backend from the UI.
-3. Generated code runs in an isolated sandbox, ideally inside your own cloud or internal boundary.
-4. Datasets, runs, logs, reports, and artifacts remain under your control.
-5. We can start with a lightweight pilot deployment and later harden it into a standard production topology.
+1. El producto se despliega en vuestro entorno, no en el nuestro.
+2. Vuestro equipo configura API keys, modelos y backend de ejecución desde la UI.
+3. El código generado corre en un sandbox aislado, idealmente dentro de vuestra nube o perímetro interno.
+4. Datasets, runs, logs, informes y artefactos quedan bajo vuestro control.
+5. Podemos empezar con un piloto ligero y endurecerlo después hasta una topología estándar de producción.
 
-Do not lead with:
+No abras la conversación con frases como:
 
-- "It's just a Streamlit app"
-- "It's basically a Python tool"
-- "You'll run an `.exe`"
+- "Es solo una app de Streamlit"
+- "Es básicamente una herramienta Python"
+- "Ejecutáis un `.exe`"
 
-That language makes the product sound non-enterprise.
+Ese lenguaje hace que el producto parezca menos enterprise de lo que es.
 
-## The Correct Mental Model For The Customer
+## Modelo Mental Correcto para el Cliente
 
-The customer should think of StrategyEngine AI as:
-
-```text
-Web application
-  + background worker
-  + isolated execution backend
-  + persistent run storage
-  + encrypted configuration
-```
-
-Not as:
+El cliente debe pensar en StrategyEngine AI como:
 
 ```text
-desktop program
-  or
-single script
+Aplicación web
+  + worker en background
+  + backend de ejecución aislado
+  + almacenamiento persistente de runs
+  + configuración cifrada
 ```
 
-## Deployment Options
+No como:
 
-## Option A - Pilot Deployment
+```text
+programa de escritorio
+  o
+script suelto
+```
 
-Recommended when:
+## Opciones de Despliegue
 
-- this is the first paid pilot
-- there are only a few users
-- the customer wants something fast to validate
+## Opción A - Piloto
 
-Recommended shape:
+Recomendada cuando:
 
-- 1 host or VM
+- es el primer piloto de pago
+- hay pocos usuarios
+- el cliente quiere validar rápido
+
+Topología recomendada:
+
+- 1 host o VM
 - Docker Compose
-- 1 application container
-- mounted persistent volumes
-- local worker subprocess
-- local sandbox or remote sandbox gateway
+- 1 contenedor principal
+- volúmenes persistentes montados
+- worker local como subprocess
+- sandbox local o gateway remoto
 
-This is the fastest way to get to value.
+Es la forma más rápida de demostrar valor.
 
-## Option B - Production Self-Hosted
+## Opción B - Producción Self-Hosted
 
-Recommended when:
+Recomendada cuando:
 
-- the customer has IT or security review
-- several users need access
-- the system will be used repeatedly
+- hay revisión IT o seguridad
+- varios usuarios necesitan acceso
+- el sistema se va a usar de forma repetida
 
-Recommended shape:
+Topología recomendada:
 
-- web UI service
-- worker service
-- artifact storage
+- servicio de UI web
+- servicio worker
+- almacenamiento de artefactos
 - metadata store
-- secrets store
+- secret store
 - sandbox gateway
-- centralized logs
+- logging centralizado
 
-This is the correct enterprise target.
+Esta es la forma correcta de operar en enterprise.
 
-## Option C - Private Managed Deployment
+## Opción C - Private Managed Deployment
 
-Recommended when:
+Recomendada cuando:
 
-- the customer wants low operational burden
-- StrategyEngine is willing to operate dedicated customer environments
+- el cliente quiere poca carga operativa
+- StrategyEngine está dispuesto a operar un entorno dedicado por cliente
 
-Recommended shape:
+Topología recomendada:
 
-- same architecture as production self-hosted
-- but operated in a dedicated tenant or cloud account
+- misma arquitectura que producción self-hosted
+- operada por StrategyEngine en un tenant o cuenta cloud dedicada
 
-## What The Customer Must Provide
+## Qué Debe Aportar el Cliente
 
-At minimum:
+Como mínimo:
 
-- a host or cloud environment where the product can run
-- outbound access to allowed LLM providers, if required
-- a place to persist runs and artifacts
-- an admin owner for initial setup
+- un host o entorno cloud donde correr el producto
+- salida de red hacia los proveedores LLM autorizados, si aplica
+- un lugar donde persistir runs y artefactos
+- un administrador responsable del setup inicial
 
-For stronger deployments:
+Para despliegues más robustos:
 
-- a reverse proxy or load balancer
+- reverse proxy o load balancer
 - secret management
-- centralized logs
-- internal authentication or SSO
-- an isolated sandbox backend
+- logs centralizados
+- autenticación interna o SSO
+- backend aislado de sandbox
 
-## What The Customer Configures In The UI
+## Qué Configura el Cliente Desde la UI
 
-The customer should not need to edit internal files.
+El cliente no debería editar archivos internos.
 
-From the UI, they configure:
+Desde la UI configura:
 
 - API keys
-- model routing
-- sandbox mode
-- remote sandbox gateway settings
-- execution backend settings
+- routing de modelos
+- modo de sandbox
+- gateway remoto del sandbox
+- backend de ejecución
 
-That is the correct operating model.
+Ese es el modelo operativo correcto.
 
-## Recommended Customer Infrastructure Topology
+## Topología Recomendada en la Infraestructura del Cliente
 
 ```mermaid
 flowchart LR
-    U["Users"] --> LB["Load Balancer / Reverse Proxy"]
+    U["Usuarios"] --> LB["Load Balancer / Reverse Proxy"]
     LB --> UI["StrategyEngine UI"]
     UI --> W["Background Worker"]
-    UI --> S["Encrypted Config / Secrets"]
-    W --> A["Artifact Storage"]
+    UI --> S["Configuración Cifrada / Secretos"]
+    W --> A["Almacenamiento de Artefactos"]
     W --> G["Sandbox Gateway"]
-    G --> R["Execution Backend"]
-    W --> M["Approved LLM Providers"]
-    W --> L["Logs / Monitoring"]
+    G --> R["Backend de Ejecución"]
+    W --> M["Proveedores LLM Aprobados"]
+    W --> L["Logs / Monitorización"]
 ```
 
-## Sandbox Recommendation
+## Recomendación sobre el Sandbox
 
-This is the most important technical recommendation:
+Es la recomendación técnica más importante:
 
-**the code execution backend should live inside the customer's own infrastructure boundary**
+**el backend de ejecución del código debe vivir dentro del perímetro de infraestructura del cliente**
 
-That can mean:
+Eso puede significar:
 
-- local execution for low-risk pilots
-- a remote sandbox gateway inside their cloud or on-prem environment
+- ejecución local para pilotos de bajo riesgo
+- o un sandbox gateway remoto dentro de su cloud o entorno on-prem
 
-This answers the customer's biggest questions:
+Esto responde a las preguntas clave del cliente:
 
-- where does the code run?
-- where does the data live?
-- who controls the compute?
-- how is isolation handled?
+- dónde corre el código
+- dónde viven los datos
+- quién controla el compute
+- cómo se gestiona el aislamiento
 
-Reference:
+Referencia:
 
 - [SANDBOX_GATEWAY.md](C:/Users/santi/Projects/Hackathon_Gemini_Agents/SANDBOX_GATEWAY.md)
 
-## Practical Deployment Sequence
+## Secuencia Práctica de Despliegue
 
-### Step 1 - Pilot
+### Paso 1 - Piloto
 
-Use:
+Usar:
 
 - [Dockerfile](C:/Users/santi/Projects/Hackathon_Gemini_Agents/Dockerfile)
 - [docker-compose.yml](C:/Users/santi/Projects/Hackathon_Gemini_Agents/docker-compose.yml)
 
-Goal:
+Objetivo:
 
-- prove value
-- validate connectivity
-- verify sandbox choice
-- generate the first successful runs
+- demostrar valor
+- validar conectividad
+- confirmar el tipo de sandbox
+- generar las primeras runs exitosas
 
-### Step 2 - Security Review
+### Paso 2 - Revisión de Seguridad
 
-Review with the customer:
+Revisar con el cliente:
 
-- where secrets are stored
-- where artifacts are stored
-- where generated code executes
-- what outbound network access is required
-- what audit logs are retained
+- dónde se almacenan los secretos
+- dónde se guardan los artefactos
+- dónde se ejecuta el código generado
+- qué salida de red hace falta
+- qué logs de auditoría se conservan
 
-### Step 3 - Production Hardening
+### Paso 3 - Hardening de Producción
 
-Move toward:
+Evolucionar hacia:
 
-- separate UI and worker services
-- internal storage service or object storage
-- proper auth / SSO
-- operational monitoring
-- backup and retention policy
+- separación entre UI y worker
+- storage interno u object storage
+- auth / SSO adecuados
+- monitorización operativa
+- política de backup y retención
 
-## Questions To Ask The Customer Early
+## Preguntas que Debes Hacer al Cliente al Principio
 
-Ask these in the first technical session:
+Haz estas preguntas en la primera sesión técnica:
 
-1. Do you want the product fully inside your VPC/on-prem environment?
-2. Are you comfortable with outbound traffic to LLM providers, or do you require a private gateway/proxy?
-3. Do you want local execution for pilots, or must all execution be isolated from day one?
-4. Do you already have a preferred execution backend: Kubernetes, Cloud Run, VMs, Batch, internal sandbox?
-5. Do you require SSO from the start?
-6. What storage and retention policy do you require for datasets and generated artifacts?
+1. ¿Queréis el producto completamente dentro de vuestra VPC o entorno on-prem?
+2. ¿Aceptáis tráfico saliente hacia proveedores LLM o necesitáis gateway/proxy privado?
+3. ¿Os sirve ejecución local en piloto o todo debe ir aislado desde el día uno?
+4. ¿Ya tenéis backend preferido: Kubernetes, Cloud Run, VMs, Batch o sandbox interno?
+5. ¿Necesitáis SSO desde el principio?
+6. ¿Qué política de almacenamiento y retención exigís para datasets y artefactos?
 
-Those answers determine the right deployment shape quickly.
+Esas respuestas determinan muy rápido la forma correcta del despliegue.
 
-## Recommended Answers To Common Customer Questions
+## Respuestas Recomendadas a Preguntas Típicas
 
-### "Is this a desktop app?"
+### "¿Es una app de escritorio?"
 
-Recommended answer:
+Respuesta recomendada:
 
-No. It is a self-hosted web product with background execution and isolated sandboxing. It can run locally for a pilot, but the professional model is deployment inside your infrastructure.
+No. Es un producto web self-hosted con ejecución en background y sandbox aislado. Puede correr localmente para un piloto, pero el modelo profesional es desplegarlo dentro de vuestra infraestructura.
 
-### "Where does the data go?"
+### "¿Dónde van los datos?"
 
-Recommended answer:
+Respuesta recomendada:
 
-The system is designed to run inside your environment. Datasets, runs, artifacts, and reports remain under your control.
+El sistema está pensado para ejecutarse dentro de vuestro entorno. Datasets, runs, artefactos e informes quedan bajo vuestro control.
 
-### "Where does generated code execute?"
+### "¿Dónde se ejecuta el código generado?"
 
-Recommended answer:
+Respuesta recomendada:
 
-In an isolated execution backend. For enterprise deployments, we recommend that backend lives inside your own cloud or internal execution boundary.
+En un backend de ejecución aislado. Para despliegues enterprise, recomendamos que ese backend esté dentro de vuestra nube o perímetro interno.
 
-### "Do we need to edit config files?"
+### "¿Tenemos que editar archivos de configuración?"
 
-Recommended answer:
+Respuesta recomendada:
 
-No. The intended operating model is UI-first configuration for API keys, models, and sandbox/backend settings.
+No. El modelo operativo previsto es configuración desde la UI para API keys, modelos y sandbox/backend.
 
-### "Can we start small and harden later?"
+### "¿Podemos empezar pequeño y endurecer después?"
 
-Recommended answer:
+Respuesta recomendada:
 
-Yes. The recommended path is pilot on Docker Compose, then production hardening once value is validated.
+Sí. El camino recomendado es piloto con Docker Compose y, si valida valor, fase posterior de hardening a producción.
 
-## Responsibilities Matrix
+## Matriz de Responsabilidades
 
-### StrategyEngine Team
+### Equipo StrategyEngine
 
-- provide the application images and deployment guidance
-- define the sandbox integration contract
-- support initial configuration and validation
-- document upgrade paths and operational expectations
+- proporcionar imágenes de aplicación y guía de despliegue
+- definir el contrato de integración del sandbox
+- acompañar la configuración inicial y la validación
+- documentar upgrades y expectativas operativas
 
-### Customer IT / Platform Team
+### Equipo IT / Plataforma del Cliente
 
-- provide runtime infrastructure
-- provide network/security controls
-- provide secret ownership
-- decide where sandbox execution lives
-- own production operations if self-hosted
+- proporcionar infraestructura runtime
+- proporcionar controles de red y seguridad
+- gestionar los secretos
+- decidir dónde vive el sandbox
+- operar producción si el despliegue es self-hosted
 
-### Customer Business / Analytics Team
+### Equipo de Negocio / Analítica del Cliente
 
-- define use cases
-- upload data or configure approved sources
-- validate outputs and reports
-- decide operational usage of generated recommendations
+- definir casos de uso
+- subir datos o conectar fuentes aprobadas
+- validar outputs e informes
+- decidir cómo usar operativamente las recomendaciones generadas
 
-## Best First Enterprise Offer
+## Mejor Oferta Enterprise Inicial
 
-If a company is interested today, the best professional offer is:
+Si una empresa se interesa hoy, la mejor oferta profesional es:
 
-1. a pilot deployment using Docker Compose in their environment
-2. UI-based configuration of keys and execution backend
-3. either local sandbox for pilot or remote sandbox gateway in their cloud
-4. a later production hardening phase if the pilot succeeds
+1. un piloto con Docker Compose en su entorno
+2. configuración desde la UI de claves y backend de ejecución
+3. sandbox local para piloto o gateway remoto dentro de su cloud
+4. una fase posterior de hardening de producción si el piloto funciona
 
-That is realistic, defensible, and commercially credible.
+Es una propuesta realista, defendible y comercialmente sólida.
 
-## Bottom Line
+## Conclusión
 
-If the customer asks "how should we deploy this?", the short answer is:
+Si el cliente pregunta "¿cómo debemos desplegar esto?", la respuesta corta es:
 
-**Deploy it as a self-hosted web platform with background workers and isolated execution, ideally inside your own infrastructure. Start with Docker Compose for pilot, then evolve to a production topology once value is proven.**
+**Desplegadlo como una plataforma web self-hosted con workers en background y ejecución aislada, idealmente dentro de vuestra propia infraestructura. Empezad con Docker Compose para el piloto y evolucionad después a una topología de producción cuando el valor esté demostrado.**

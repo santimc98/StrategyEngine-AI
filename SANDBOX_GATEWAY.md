@@ -1,31 +1,31 @@
-# Guia de Integracion del Sandbox Gateway
+# Guía de Integración del Sandbox Gateway
 
 ## Objetivo
 
-Este documento explica como una empresa puede conectar su propio sandbox de ejecucion a StrategyEngine AI sin modificar el core del producto.
+Este documento explica cómo una empresa puede conectar su propio sandbox de ejecución a StrategyEngine AI sin modificar el core del producto.
 
-El producto soporta dos modos de ejecucion:
+El producto soporta dos modos de ejecución:
 
-- `local`: la run se ejecuta en la misma maquina donde corre la app
-- `remote`: la run se ejecuta a traves de un `sandbox gateway` HTTP alojado por la propia empresa
+- `local`: la run se ejecuta en la misma máquina donde corre la app
+- `remote`: la run se ejecuta a través de un `sandbox gateway` HTTP alojado por la propia empresa
 
-La configuracion recomendada para clientes enterprise es usar `remote` y desplegar ese gateway dentro de su propia nube o infraestructura interna. Asi, el coste de compute, almacenamiento, red y seguridad queda dentro del entorno del cliente.
+La configuración recomendada para clientes enterprise es usar `remote` y desplegar ese gateway dentro de su nube o infraestructura interna. Así, el coste de compute, almacenamiento, red y seguridad queda dentro del entorno del cliente.
 
-## Modelo de producto
+## Modelo de Producto
 
-La app **no** se integra por separado con Google Cloud, Azure, AWS ni con ningun sandbox especifico de proveedor.
+La app **no** se integra de forma específica con Google Cloud, Azure, AWS ni con un sandbox de proveedor concreto.
 
-En su lugar, se integra con un unico protocolo:
+En su lugar, se integra con un único protocolo:
 
-- un gateway HTTP de sandbox alojado por la empresa que implemente una API pequena y estable
+- un gateway HTTP de sandbox alojado por la empresa que implemente una API pequeña y estable
 
 Esto implica:
 
 - la UI es la misma para cualquier empresa
 - el grafo y los agentes no necesitan cambios por cliente
-- la empresa puede implementar ese gateway sobre Cloud Run, GKE, Batch, Kubernetes, VMs, contenedores o cualquier orquestador interno
+- la empresa puede implementar el gateway sobre Cloud Run, GKE, Batch, Kubernetes, VMs, contenedores o cualquier orquestador interno
 
-## Que configura el cliente en la UI
+## Qué Configura el Cliente en la UI
 
 La UI expone estos campos para el provider `remote`:
 
@@ -38,9 +38,9 @@ La UI expone estos campos para el provider `remote`:
 - `Hint de infraestructura`
 - `Timeout HTTP`
 
-Esa configuracion se guarda localmente y se pasa a cada run como `sandbox_config`.
+Esa configuración se guarda localmente y se pasa a cada run como `sandbox_config`.
 
-## API requerida del gateway
+## API Requerida del Gateway
 
 El gateway debe exponer los siguientes endpoints.
 
@@ -59,14 +59,14 @@ Respuesta esperada:
 }
 ```
 
-Cualquier respuesta `2xx` se considera saludable por el cliente actual.
+Cualquier respuesta `2xx` se considera saludable.
 
-### 2. Crear sesion
+### 2. Crear sesión
 
 `POST /sessions`
 
 Objetivo:
-- crear una sesion aislada de ejecucion para una run
+- crear una sesión aislada de ejecución para una run
 
 Cuerpo de la request:
 
@@ -99,7 +99,7 @@ Alternativa aceptada:
 Objetivo:
 - subir al sandbox archivos de entrada, scripts, manifests, contratos y artefactos auxiliares
 
-Cuerpo de la request:
+Cuerpo:
 
 ```json
 {
@@ -116,7 +116,7 @@ Respuesta esperada:
 }
 ```
 
-Si falla la escritura:
+Si falla:
 
 ```json
 {
@@ -130,7 +130,7 @@ Si falla la escritura:
 `GET /sessions/{session_id}/files/read?path=/home/user/run/abc/data/output.csv`
 
 Objetivo:
-- descargar desde el sandbox los artefactos generados por la run
+- descargar artefactos generados dentro del sandbox
 
 Respuesta requerida:
 
@@ -145,9 +145,9 @@ Respuesta requerida:
 `POST /sessions/{session_id}/commands/run`
 
 Objetivo:
-- ejecutar comandos shell dentro de la sesion del sandbox
+- ejecutar comandos shell dentro de la sesión del sandbox
 
-Cuerpo de la request:
+Cuerpo:
 
 ```json
 {
@@ -166,12 +166,12 @@ Respuesta requerida:
 }
 ```
 
-### 6. Cerrar sesion
+### 6. Cerrar sesión
 
 `POST /sessions/{session_id}/close`
 
 Objetivo:
-- liberar los recursos del sandbox cuando termina la run
+- liberar recursos cuando termina la run
 
 Respuesta esperada:
 
@@ -181,9 +181,9 @@ Respuesta esperada:
 }
 ```
 
-## Autenticacion
+## Autenticación
 
-El cliente soporta autenticacion generica basada en cabeceras HTTP.
+El cliente soporta autenticación genérica basada en cabeceras HTTP.
 
 Campos de la UI:
 
@@ -199,101 +199,101 @@ Comportamiento:
 Authorization: Bearer <api_key>
 ```
 
-- si `Auth scheme = none`, la clave se envia directamente:
+- si `Auth scheme = none`, la clave se envía directamente:
 
 ```text
 <Auth header>: <api_key>
 ```
 
-Esto se ha hecho asi a proposito para que cada empresa pueda adaptarlo a su convencion de autenticacion sin cambiar el producto.
+Esto se ha diseñado así para que cada empresa pueda adaptarlo a su convención sin cambiar el producto.
 
-## Modelo de sesion
+## Modelo de Sesión
 
-Cada run debe mapearse a una sesion aislada.
+Cada run debe mapearse a una sesión aislada.
 
 Propiedades recomendadas:
 
-- aislamiento de filesystem por sesion
-- aislamiento de procesos por sesion
-- limpieza explicita en `/close`
+- aislamiento de filesystem por sesión
+- aislamiento de procesos por sesión
+- limpieza explícita en `/close`
 - enforcement de timeouts
 - cuotas de recursos
-- auditoria y logging
+- auditoría y logging
 
 El producto asume que puede:
 
 - subir archivos
-- ejecutar comandos varias veces dentro de la misma sesion
+- ejecutar comandos varias veces dentro de la misma sesión
 - descargar artefactos
-- cerrar la sesion cuando termina
+- cerrar la sesión al terminar
 
-## Semantica de archivos
+## Semántica de Archivos
 
 La app escribe archivos usando rutas de sandbox como:
 
 - `/home/user/run/<run_id>/...`
 
-Tu gateway no necesita conservar esa ruta literalmente en disco, pero si debe conservar su identidad logica dentro de la sesion.
+El gateway no necesita conservar esa ruta literal en disco, pero sí debe mantener su identidad lógica dentro de la sesión.
 
-En la practica:
+En la práctica:
 
-- mapea la ruta entrante a tu propio layout interno
-- mantén estable el contrato de rutas dentro de la sesion
+- mapea la ruta entrante a tu layout interno
+- mantén estable el contrato de rutas dentro de la sesión
 
-## Requisitos de manejo de errores
+## Requisitos de Manejo de Errores
 
-Para que el sistema funcione bien, el gateway deberia:
+Para que el sistema funcione bien, el gateway debería:
 
 - devolver respuestas JSON deterministas
 - preservar `stdout`, `stderr` y `exit_code`
-- devolver `non-2xx` o `ok=false` estructurado cuando falle una operacion
+- devolver `non-2xx` o `ok=false` estructurado cuando falle una operación
 - aplicar timeouts del lado servidor
 - evitar truncar inesperadamente la salida de comandos
 
 Recomendado:
 
-- incluir request IDs en los logs del gateway
+- incluir request IDs en los logs
 - incluir session IDs en todos los logs internos
-- conservar logs de ejecucion para auditoria
+- conservar logs de ejecución para auditoría
 
-## Recomendaciones de seguridad
+## Recomendaciones de Seguridad
 
-Controles minimos recomendados:
+Controles mínimos recomendados:
 
 - TLS habilitado
 - credenciales de vida corta si es posible
 - allowlisting de red si el gateway es privado
-- aislamiento estricto por sesion
+- aislamiento estricto por sesión
 - no persistir credenciales dentro de las sesiones
-- politica de retencion de artefactos
-- limpieza explicita de sesiones
+- política de retención de artefactos
+- limpieza explícita de sesiones
 
 Muy recomendable:
 
 - desplegar el gateway en la cuenta cloud del cliente
-- ejecutar los workers reales del sandbox dentro del mismo boundary de seguridad
+- ejecutar los workers reales del sandbox dentro del mismo perímetro de seguridad
 - no exponer directamente APIs de VM, Kubernetes o infraestructura al producto
 
-## Despliegue de referencia en Google Cloud
+## Despliegue de Referencia en Google Cloud
 
-Si el cliente usa Google Cloud, el patron recomendado es:
+Si el cliente usa Google Cloud, el patrón recomendado es:
 
-1. desplegar un servicio HTTP pequeno que haga de gateway
+1. desplegar un pequeño servicio HTTP como gateway
 2. autenticar las requests de StrategyEngine AI hacia ese gateway
-3. dejar que el gateway cree y gestione el backend real de ejecucion
+3. hacer que el gateway gestione el backend real de ejecución
 
-Backends posibles detras del gateway:
+Backends posibles detrás del gateway:
 
 - Cloud Run Jobs
 - GKE
 - Batch
 - Compute Engine
-- un servicio interno de sandbox que ya opere el cliente
+- un servicio interno de sandbox ya existente
 
 Punto de partida recomendado en GCP:
 
 - gateway en Cloud Run
-- backend de ejecucion en Cloud Run Jobs o GKE
+- backend de ejecución en Cloud Run Jobs o GKE
 - logs en Cloud Logging
 - artefactos en Cloud Storage si hace falta
 
@@ -302,70 +302,69 @@ Con ese modelo:
 - la empresa paga el compute y el storage en su propia cuenta GCP
 - StrategyEngine AI solo consume el gateway del cliente
 
-## Ejemplo minimo de gateway
+## Ejemplo Mínimo de Gateway
 
-El gateway puede implementarse en cualquier lenguaje. El unico requisito es respetar el contrato de API anterior.
+El gateway puede implementarse en cualquier lenguaje. El único requisito es respetar el contrato de API anterior.
 
 Flujo de alto nivel:
 
 1. recibir `/sessions`
-2. crear un contexto aislado de ejecucion
-3. guardar metadata de sesion
+2. crear un contexto aislado de ejecución
+3. guardar metadata de sesión
 4. aceptar subidas de archivos
 5. ejecutar comandos
 6. exponer archivos generados
 7. limpiar recursos en `/close`
 
-## Garantias del producto
+## Garantías del Producto
 
 Con este diseño:
 
-- las empresas pequenas pueden usar `local`
+- las empresas pequeñas pueden usar `local`
 - los clientes enterprise pueden usar `remote`
-- no hacen falta cambios por empresa dentro del grafo
-- no hay lock-in del producto con un proveedor cloud concreto
+- no hacen falta cambios por cliente dentro del grafo
+- no hay lock-in con un cloud provider concreto
 - el coste del sandbox queda en la infraestructura del cliente
 
-## Expectativas actuales del cliente remoto
+## Expectativas del Cliente Remoto
 
 El cliente remoto actual espera:
 
-- cuerpos request/response en JSON
+- request/response bodies en JSON
 - contenido de archivos codificado en base64
-- endpoints de ciclo de vida de sesion exactamente como se describen arriba
-- ejecucion de comandos que devuelva `stdout`, `stderr` y `exit_code`
+- endpoints de ciclo de vida de sesión exactamente como se describen arriba
+- ejecución de comandos que devuelva `stdout`, `stderr` y `exit_code`
 
 Si una empresa ya tiene un sandbox interno, tiene dos opciones:
 
-- hacer que ese sandbox exponga directamente este protocolo
+- hacer que exponga directamente este protocolo
 - construir un adaptador fino delante de su sandbox actual
 
-## Checklist de integracion
+## Checklist de Integración
 
-Antes de activar `remote` en produccion, verifica:
+Antes de activar `remote` en producción, verifica:
 
 1. `/health` responde `2xx`
 2. `/sessions` devuelve `session_id`
 3. la subida de archivos funciona con payloads base64
-4. la ejecucion de comandos devuelve `stdout/stderr/exit_code` completos
-5. la descarga de archivos devuelve base64 valido
+4. la ejecución de comandos devuelve `stdout`, `stderr` y `exit_code` completos
+5. la descarga de archivos devuelve base64 válido
 6. `/close` libera recursos
-7. el aislamiento por sesion esta garantizado
-8. la politica de timeouts esta aplicada
+7. el aislamiento por sesión está garantizado
+8. la política de timeouts está aplicada
 9. los logs pueden trazarse por `session_id`
 10. endpoint y credenciales funcionan desde el host donde corre StrategyEngine AI
 
 ## Resumen
 
-La empresa no necesita una integracion a medida dentro de la app.
+La empresa no necesita una integración a medida dentro de la app.
 
 Solo necesita:
 
 - un `sandbox gateway` que siga este protocolo
 - endpoint y credenciales configurados desde la UI
 
-Una vez existe eso, el mismo producto puede funcionar:
+Con eso, el mismo producto puede funcionar:
 
-- en local para clientes pequenos
-- en remoto dentro de la nube o infraestructura propia del cliente
-
+- en local para clientes pequeños
+- en remoto dentro de la nube o infraestructura del cliente

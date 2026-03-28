@@ -1,6 +1,6 @@
 # StrategyEngine AI
 
-### Autonomous Multi-Agent Data Science System
+### Sistema Autónomo Multiagente de Data Science
 
 ![OpenRouter](https://img.shields.io/badge/LLMs-OpenRouter-6366F1?style=for-the-badge)
 ![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-FF4B4B?style=for-the-badge)
@@ -11,21 +11,21 @@
 
 ---
 
-## What is StrategyEngine AI?
+## Qué es StrategyEngine AI
 
-**StrategyEngine AI** is an autonomous Data Science department powered by AI. Upload a CSV (or connect a CRM), describe your business objective, and a team of **13 specialized AI agents** — orchestrated by **LangGraph** and powered by **configurable LLMs via OpenRouter** — collaborates end-to-end to deliver production-grade ML models with optimized metrics.
+**StrategyEngine AI** es un departamento autónomo de Data Science impulsado por IA. Subes un CSV, o conectas un CRM, describes tu objetivo de negocio y un equipo de **13 agentes especializados** coordinados con **LangGraph** y alimentados por **LLMs configurables vía OpenRouter** colabora de extremo a extremo para entregar modelos de ML listos para producción con métricas optimizadas.
 
-The system audits your data, formulates analytical strategies, compiles an execution contract, generates and executes ML code in a sandboxed environment, validates results through multiple review gates, **iteratively improves model metrics through an optimization loop**, generates LLM-driven visualizations, and translates everything into an executive business report — all autonomously.
+El sistema audita los datos, formula estrategias analíticas, compila un contrato de ejecución, genera y ejecuta código de ML en un entorno aislado, valida resultados con múltiples puertas de revisión, **mejora iterativamente las métricas mediante un loop de optimización**, genera visualizaciones y traduce todo a un informe ejecutivo de negocio, todo ello de forma autónoma.
 
 ---
 
-## Architecture
+## Arquitectura
 
 ```mermaid
 graph LR
-    User["CSV + Business Goal"] --> Steward
+    User["CSV + Objetivo de Negocio"] --> Steward
 
-    subgraph Pipeline ["Core Pipeline"]
+    subgraph Pipeline ["Pipeline Principal"]
         Steward["Data Steward"] --> Strategist["Strategist"]
         Strategist --> ExecPlanner["Execution Planner"]
         ExecPlanner --> DataEng["Data Engineer"]
@@ -34,7 +34,7 @@ graph LR
         Reviewer --> QA["QA Gate"]
     end
 
-    subgraph OptLoop ["Metric Improvement Loop"]
+    subgraph OptLoop ["Loop de Mejora de Métricas"]
         QA --> ModelAnalyst["Model Analyst"]
         ModelAnalyst --> ResultsAdv["Results Advisor"]
         ResultsAdv --> MLEng
@@ -42,7 +42,7 @@ graph LR
 
     QA --> ReviewBoard["Review Board"]
     ReviewBoard --> Translator["Business Translator"]
-    Translator --> Report["Executive Report + Visualizations"]
+    Translator --> Report["Informe Ejecutivo + Visualizaciones"]
 
     style Strategist fill:#e1bee7,stroke:#6a1b9a,stroke-width:2px
     style ModelAnalyst fill:#fff9c4,stroke:#f9a825,stroke-width:2px
@@ -50,250 +50,248 @@ graph LR
     style OptLoop fill:#f3e5f5,stroke:#7b1fa2,stroke-width:1px
 ```
 
-> The pipeline includes a **metric improvement loop** (up to 12 optimization rounds) with patience-based early stopping, monotonic degradation detection, and adaptive viability filtering.
+> El pipeline incluye un **loop de mejora de métricas** con hasta 12 rondas de optimización, parada temprana basada en paciencia, detección de degradación monotónica y filtrado adaptativo de viabilidad.
 
 ---
 
-## The Agent Team
+## El Equipo de Agentes
 
-**13 specialized agents**, each with a distinct role mirroring a high-performing data science organization:
+**13 agentes especializados**, cada uno con un rol equivalente al de una organización de Data Science de alto rendimiento.
 
-### Core Pipeline
+### Pipeline Principal
 
-| Agent | Role | LLM |
-|-------|------|-----|
-| **Data Steward** | Ingests, audits, and profiles raw data. Detects encoding issues, missing values, dialect quirks, and anomalies. | Gemini |
-| **Strategist** | Formulates optimal analytical strategies with progressive optimization phases (baseline, feature engineering, HPO, variance reduction, stacking). | OpenRouter (configurable) |
-| **Execution Planner** | Compiles the execution contract: column roles, derived column rules, QA gates, artifact requirements, timeout budgets, and visualization plan. | Gemini |
-| **Data Engineer** | Generates cleaning and transformation scripts. Produces EDA visualizations with LLM-driven plot reasoning. | OpenRouter (configurable) |
-| **ML Engineer** | Writes production-ready ML code: feature engineering, model training, cross-validation, ensembling, and predictions. Generates model result visualizations. | OpenRouter (configurable) |
-| **Code Reviewer** | Static analysis and safety scanning of generated code before execution. | Gemini |
-| **QA Gate** | Enforces quality assertions with HARD/SOFT severity rules on outputs and metrics. | Gemini |
-| **Model Analyst** | Analyzes baseline model code and metrics to produce an optimization blueprint with concrete improvement actions. | OpenRouter (inherits Strategist model) |
-| **Results Advisor** | Generates critique packets analyzing metric improvements, stability, and generalization gaps. | Gemini |
-| **Review Board** | Final decision authority — approves, rejects, or flags results with limitations. | Gemini |
-| **Business Translator** | Converts technical metrics into ROI impact, business risks, and strategic recommendations. Interprets visualizations narratively for the executive report. | Gemini |
+| Agente | Rol | LLM |
+|-------|-----|-----|
+| **Data Steward** | Ingesta, audita y perfila los datos brutos. Detecta problemas de encoding, valores ausentes, dialectos CSV y anomalías. | Gemini |
+| **Strategist** | Formula estrategias analíticas óptimas con fases progresivas de optimización: baseline, feature engineering, HPO, reducción de varianza y stacking. | OpenRouter (configurable) |
+| **Execution Planner** | Compila el contrato de ejecución: roles de columnas, reglas de derivadas, QA gates, artefactos requeridos, presupuestos de timeout y plan de visualización. | Gemini |
+| **Data Engineer** | Genera scripts de limpieza y transformación. Produce visualizaciones EDA con razonamiento guiado por LLM. | OpenRouter (configurable) |
+| **ML Engineer** | Escribe código de ML listo para producción: features, entrenamiento, validación cruzada, ensembles y predicciones. Genera visualizaciones de resultados del modelo. | OpenRouter (configurable) |
+| **Code Reviewer** | Hace análisis estático y escaneo de seguridad del código generado antes de ejecutarlo. | Gemini |
+| **QA Gate** | Aplica validaciones de calidad con reglas HARD/SOFT sobre outputs y métricas. | Gemini |
+| **Model Analyst** | Analiza el baseline y sus métricas para generar un blueprint de optimización con acciones concretas de mejora. | OpenRouter (hereda el modelo del Strategist) |
+| **Results Advisor** | Genera críticas estructuradas sobre mejoras métricas, estabilidad y generalización. | Gemini |
+| **Review Board** | Autoridad final de decisión: aprueba, rechaza o valida con limitaciones. | Gemini |
+| **Business Translator** | Convierte métricas técnicas en impacto de negocio, riesgos y recomendaciones estratégicas. Interpreta visualizaciones de forma narrativa para el informe ejecutivo. | Gemini |
 
-### Support Agents
+### Agentes de Soporte
 
-| Agent | Role |
-|-------|------|
-| **Cleaning Reviewer** | Validates data transformation integrity after cleaning scripts run. |
-| **Failure Explainer** | Diagnoses runtime errors and proposes targeted fixes for retry iterations. |
+| Agente | Rol |
+|-------|-----|
+| **Cleaning Reviewer** | Valida la integridad de las transformaciones tras ejecutar scripts de limpieza. |
+| **Failure Explainer** | Diagnostica errores de runtime y propone fixes dirigidos para reintentos. |
 
 ---
 
-## Key Features
+## Funcionalidades Clave
 
-### Metric Improvement Loop
+### Loop de Mejora de Métricas
 
-The core differentiator: after the initial model is built, the system enters an **automated optimization loop**:
+El principal diferencial del producto: después de construir el modelo inicial, el sistema entra en un **loop de optimización automatizado**:
 
-1. **Model Analyst** analyzes the baseline code and generates an optimization blueprint with prioritized improvement actions
-2. **ML Engineer** implements each hypothesis, executes, and evaluates
-3. **Results Advisor** critiques the candidate vs incumbent metric
-4. System decides: keep improvement or restore baseline
+1. **Model Analyst** analiza el baseline y genera un blueprint de optimización con acciones priorizadas.
+2. **ML Engineer** implementa cada hipótesis, ejecuta y evalúa.
+3. **Results Advisor** critica el candidate frente al incumbent.
+4. El sistema decide si conserva la mejora o restaura el baseline.
 
-**Loop controls:**
-- **Patience**: configurable tolerance for consecutive non-improvements (default: 5)
-- **Monotonic degradation detection**: auto-stops after 2 consecutive rounds of metric regression
-- **Adaptive min_delta**: calibrates improvement threshold to the statistical noise floor of each dataset
-- **Budget-aware**: respects script timeout (7200s hard limit) with 50/50 HPO/final-model budget rule
+**Controles del loop**
+- **Patience**: tolerancia configurable a no-mejoras consecutivas.
+- **Detección de degradación monotónica**: detiene automáticamente cuando detecta regresión sostenida.
+- **`min_delta` adaptativo**: calibra el umbral de mejora según el ruido estadístico del dataset.
+- **Consciente del presupuesto**: respeta límites de tiempo y de ejecución durante la optimización.
 
-### Contract-Driven Execution
+### Ejecución Gobernada por Contrato
 
-An **Execution Contract** compiled by the Execution Planner governs every run: column role mapping, derived column rules, QA gate assertions (HARD/SOFT severity), reviewer gates, artifact requirements, visualization plan, and validation strategy. The contract is validated by a schema registry and auto-repair pipeline before any code is generated.
+Un **Execution Contract** compilado por el Execution Planner gobierna cada run: mapping de columnas, reglas de derivadas, QA gates, artefactos requeridos, plan de visualización y estrategia de validación. Ese contrato se valida y repara antes de que se genere código.
 
-### LLM-Driven Visualizations
+### Visualizaciones Guiadas por LLM
 
-Agents reason about which visualizations to create based on the data and strategy — no hardcoded charts. The Data Engineer creates EDA plots during cleaning; the ML Engineer generates model result plots (feature importance, confusion matrices, learning curves). Each agent writes factual `plot_summaries.json` metadata that the Business Translator interprets narratively in the executive report.
+Los agentes razonan qué gráficos deben crearse en función de los datos y de la estrategia. El Data Engineer genera EDA durante la limpieza y el ML Engineer crea gráficos de resultados del modelo. Cada agente produce `plot_summaries.json` con facts que el Business Translator interpreta narrativamente.
 
-### Sandboxed Code Execution
+### Ejecución de Código en Sandbox
 
-All generated code runs in an isolated sandbox. The system supports two execution modes through a **universal gateway protocol**:
-- **Local sandbox**: Direct local execution for development and testing
-- **Remote sandbox**: HTTP-based gateway to external execution environments (Cloud Run, etc.)
+Todo el código generado corre en un entorno aislado. El sistema soporta dos modos de ejecución mediante un **protocolo universal de gateway**:
+- **Sandbox local**: ejecución directa en local para desarrollo y pruebas.
+- **Sandbox remoto**: gateway HTTP hacia entornos externos de ejecución, por ejemplo Cloud Run.
 
-Both modes implement the same interface (`files.write`, `files.read`, `commands.run`), ensuring identical behavior. See [SANDBOX_GATEWAY.md](SANDBOX_GATEWAY.md) for the gateway specification.
+Ambos modos implementan la misma interfaz (`files.write`, `files.read`, `commands.run`). Consulta [SANDBOX_GATEWAY.md](SANDBOX_GATEWAY.md) para la especificación.
 
-### Self-Healing ML Pipelines
+### Pipelines de ML Autorreparables
 
-The ML Engineer operates in a **retry loop of up to 12 attempts**. When code fails execution or validation, the Failure Explainer diagnoses the issue and the engineer generates a corrected version — autonomously.
+El ML Engineer funciona en un **retry loop de hasta 12 intentos**. Cuando el código falla en ejecución o validación, el Failure Explainer diagnostica el problema y el ingeniero genera una versión corregida.
 
-### Configurable LLM Per Agent
+### LLM Configurable por Agente
 
-Select the optimal LLM for each agent role directly from the Streamlit UI:
+Desde la UI de Streamlit se puede seleccionar el LLM óptimo para cada rol.
 
-**Available presets:**
-- GLM-5 (default, cost-effective)
+**Presets disponibles**
+- GLM-5
 - Kimi K2.5
 - Minimax M-2.5
 - DeepSeek V3.2
-- Claude Opus 4.6 (premium reasoning)
-- GPT-5.3 Codex (premium code generation)
-- GPT-5.4 (latest)
-- Custom OpenRouter model ID
+- Claude Opus 4.6
+- GPT-5.3 Codex
+- GPT-5.4
+- Un `model ID` personalizado de OpenRouter
 
-Model overrides persist across sessions and apply to: **Strategist**, **Data Engineer**, **ML Engineer**, and **Model Analyst** (inherits Strategist model).
+Los overrides persisten entre sesiones y aplican a **Strategist**, **Data Engineer**, **ML Engineer** y **Model Analyst**.
 
-### Real-Time Execution Dashboard
+### Dashboard de Ejecución en Tiempo Real
 
-A live Streamlit dashboard shows:
-- **Pipeline progress** with stage tracker and elapsed time
-- **Execution Plan** tab with full contract details (problem type, metric, dependencies, runbook, gates)
-- **Metric improvement tracking** across optimization rounds
-- **Activity log** with timestamped agent messages
-- **Estimated cost** badge based on API call budget counters
-- **Model configuration panel** for per-agent LLM selection
-- **Run history** with downloadable artifacts and submissions
+La UI muestra en vivo:
+- Progreso del pipeline con tracker por etapas y tiempo transcurrido.
+- Pestaña de **Execution Plan** con el contrato completo.
+- Seguimiento de la mejora de métricas por ronda.
+- Log de actividad con mensajes fechados por agente.
+- Coste estimado según contadores de llamadas API.
+- Panel de configuración de modelos.
+- Historial de runs con artefactos descargables.
 
-### Data Connectors
+### Conectores de Datos
 
-Built-in connectors for ingesting data from external sources:
-- **Salesforce** — query objects via SOQL
-- **HubSpot** — contacts, deals, companies
-- **Dynamics 365** — OData entities
-- **Excel** — `.xlsx` / `.xls` file conversion
+Conectores integrados para ingestión desde fuentes externas:
+- **Salesforce**
+- **HubSpot**
+- **Dynamics 365**
+- **Excel**
 
-### Run History & Dataset Memory
+### Historial de Runs y Memoria de Dataset
 
-- Every run is persisted with full event logs, metrics, and artifacts
-- **Dataset memory** carries learnings across runs on the same dataset
-- Run events are auditable via `runs/<run_id>/events.jsonl`
+- Cada run se persiste con eventos, métricas y artefactos.
+- La **dataset memory** arrastra aprendizajes entre runs del mismo dataset.
+- Los eventos son auditables en `runs/<run_id>/events.jsonl`.
 
 ---
 
-## Installation & Usage
+## Instalación y Uso
 
-### 1. Clone the Repository
+### 1. Clonar el repositorio
 ```bash
 git clone https://github.com/your-org/strategy-engine-ai.git
 cd strategy-engine-ai
 ```
 
-### 2. Install Dependencies
+### 2. Instalar dependencias
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Bootstrap Environment
+### 3. Preparar el entorno
 
-Copy `.env.example` to `.env`.
+Copia `.env.example` a `.env`.
 
-The product is now **UI-first** for commercial deployment:
-- **API keys** are configured from the sidebar and stored in the encrypted local key store
-- **Agent models** are configured from the sidebar and persisted as runtime overrides
-- **Sandbox / execution backend** are configured from the sidebar and persisted in the sandbox config store
+El producto está pensado ya en modo **UI-first**:
+- Las **API keys** se configuran desde la barra lateral y se guardan en el almacén local cifrado.
+- Los **modelos de agentes** se configuran desde la barra lateral y se persisten como overrides.
+- El **sandbox / backend de ejecución** se configura desde la barra lateral y se persiste en el store de configuración del sandbox.
 
-`.env` is only a **bootstrap / fallback** file and should stay minimal:
+`.env` debe quedar como un archivo de bootstrap mínimo:
 
 ```env
 OPENROUTER_TIMEOUT_SECONDS=120
 RUN_EXECUTION_MODE=local
 ```
 
-Do not store production secrets in `.env` if the UI store is available.
+No guardes secretos de producción en `.env` si la UI ya está disponible.
 
-### 4. Run
+### 4. Arrancar la aplicación
 ```bash
 streamlit run app.py
 ```
 
-### 5. Configure the Runtime from the UI
+### 5. Configurar el runtime desde la UI
 
-In the Streamlit sidebar, configure:
+En la barra lateral de Streamlit configura:
 - **API Keys**
-- **Models**
-- **Sandbox de ejecucion**
-- **Backend de ejecucion**
+- **Modelos**
+- **Sandbox de ejecución**
+- **Backend de ejecución**
 
-Changes persist automatically and are used by the background worker on new runs.
-
----
-
-## How It Works
-
-```
- 1. Upload      Upload a CSV file (or connect a CRM) and describe your business goal
- 2. Audit       Data Steward profiles data, detects issues, samples intelligently
- 3. Strategize  Strategist generates strategy with progressive optimization phases
- 4. Plan        Execution Planner compiles the full execution contract
- 5. Clean       Data Engineer generates transformation scripts + EDA visualizations
- 6. Build       ML Engineer writes ML code (baseline model with CV) + result visualizations
- 7. Validate    Code Reviewer + QA Gate enforce quality standards
- 8. Optimize    Model Analyst generates optimization blueprint;
-                Improvement loop iterates: hypothesis > implement > evaluate > keep/revert
-                (up to 12 rounds with early stopping)
- 9. Finalize    Review Board approves; Business Translator generates executive report
-                with narrative interpretation of all visualizations
-10. Deliver     Submission CSV + metrics + executive PDF report
-```
+Los cambios persisten automáticamente y se usan en nuevas runs.
 
 ---
 
-## Project Structure
+## Cómo Funciona
 
+```text
+ 1. Subida       Subes un CSV o conectas un CRM y defines tu objetivo de negocio
+ 2. Auditoría    Data Steward perfila los datos y detecta incidencias
+ 3. Estrategia   Strategist genera la estrategia analítica
+ 4. Plan         Execution Planner compila el contrato de ejecución
+ 5. Limpieza     Data Engineer genera scripts de transformación y EDA
+ 6. Construcción ML Engineer escribe el baseline con CV y gráficos de resultados
+ 7. Validación   Code Reviewer + QA Gate validan calidad y seguridad
+ 8. Optimización Model Analyst propone mejoras; el loop itera:
+                 hipótesis > implementación > evaluación > conservar/revertir
+ 9. Cierre       Review Board aprueba y Business Translator genera el informe
+10. Entrega      CSV final + métricas + informe ejecutivo en PDF
 ```
+
+---
+
+## Estructura del Proyecto
+
+```text
 strategyengine-ai/
-  app.py                            # Streamlit frontend + run orchestration
+  app.py                            # Frontend Streamlit + orquestación
   src/
-    agents/                         # 13 specialized AI agents
-      steward.py                    # Data profiling and audit
-      strategist.py                 # Strategy generation + iteration dispatch
-      execution_planner.py          # Execution contract compilation
-      data_engineer.py              # Data cleaning code generation
-      ml_engineer.py                # ML code generation
-      model_analyst.py              # Optimization blueprint generation
-      reviewer.py                   # Code review
-      qa_reviewer.py                # Quality gate assertions
-      results_advisor.py            # Metric analysis and critique
-      review_board.py               # Final approval authority
-      business_translator.py        # Technical to business translation
-      cleaning_reviewer.py          # Data transformation validation
-      failure_explainer.py          # Runtime error diagnosis
+    agents/                         # 13 agentes especializados
+      steward.py                    # Perfilado y auditoría de datos
+      strategist.py                 # Generación de estrategia
+      execution_planner.py          # Compilación del contrato
+      data_engineer.py              # Generación de limpieza
+      ml_engineer.py                # Generación de ML
+      model_analyst.py              # Blueprint de optimización
+      reviewer.py                   # Revisión de código
+      qa_reviewer.py                # Puertas de calidad
+      results_advisor.py            # Análisis de métricas
+      review_board.py               # Aprobación final
+      business_translator.py        # Traducción técnica a negocio
+      cleaning_reviewer.py          # Validación de limpieza
+      failure_explainer.py          # Diagnóstico de errores
     graph/
-      graph.py                      # LangGraph workflow definition
-      steps/                        # Modular pipeline step helpers
-    connectors/                     # CRM and file connectors
-    utils/                          # 85+ utility modules
-      sandbox_provider.py           # Universal sandbox gateway (local/remote)
-      contract_validator.py         # Contract validation pipeline
-      contract_schema_registry.py   # Schema auto-repair
-      metric_eval.py                # Metric extraction and evaluation
-      llm_fallback.py               # Multi-model fallback chains
-      run_status.py                 # File-based run status protocol
-      background_worker.py          # Subprocess-based graph execution
+      graph.py                      # Definición del workflow LangGraph
+      steps/                        # Helpers modulares del pipeline
+    connectors/                     # Conectores CRM y de ficheros
+    utils/                          # Utilidades del sistema
+      sandbox_provider.py           # Gateway universal de sandbox
+      contract_validator.py         # Validación de contrato
+      contract_schema_registry.py   # Auto-reparación de esquema
+      metric_eval.py                # Extracción y evaluación de métricas
+      llm_fallback.py               # Cadenas de fallback multi-modelo
+      run_status.py                 # Protocolo de estado por ficheros
+      background_worker.py          # Ejecución en background
       ...
   cloudrun/
-    heavy_runner/                   # Remote sandbox execution service
-  tests/                            # 1300+ tests (252 test files)
-  .streamlit/config.toml            # Streamlit configuration
-  requirements.txt                  # Python dependencies
+    heavy_runner/                   # Servicio remoto de ejecución
+  tests/                            # Suite de tests
+  .streamlit/config.toml            # Configuración de Streamlit
+  requirements.txt                  # Dependencias Python
 ```
 
 ---
 
-## Configuration
+## Configuración
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `GOOGLE_API_KEY` | -- | Gemini API key (required) |
-| `OPENROUTER_API_KEY` | -- | OpenRouter API key (required) |
-| `SANDBOX_GATEWAY_URL` | -- | Remote sandbox gateway URL (optional, uses local execution if unset) |
-| `OPENROUTER_TIMEOUT_SECONDS` | `120` | Request timeout for OpenRouter calls |
+| Variable de entorno | Valor por defecto | Descripción |
+|---------------------|-------------------|-------------|
+| `GOOGLE_API_KEY` | -- | API key de Gemini |
+| `OPENROUTER_API_KEY` | -- | API key de OpenRouter |
+| `SANDBOX_GATEWAY_URL` | -- | URL del gateway remoto del sandbox |
+| `OPENROUTER_TIMEOUT_SECONDS` | `120` | Timeout de llamadas a OpenRouter |
 
 ---
 
 ## Testing
 
 ```bash
-# Run the full test suite
+# Suite completa
 python -m pytest tests/ -q
 
-# Run smoke tests only (no LLM calls)
+# Smoke tests sin llamadas LLM
 python -m pytest tests/test_agent_smoke_imports.py -q
 ```
 
 ---
 
-*Built for autonomous, production-grade ML pipeline automation.*
+*Construido para automatizar pipelines de ML de forma autónoma y orientada a producción.*

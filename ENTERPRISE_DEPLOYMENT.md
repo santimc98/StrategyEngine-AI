@@ -1,245 +1,245 @@
-# StrategyEngine AI - Enterprise Deployment Blueprint
+# StrategyEngine AI - Blueprint de Despliegue Enterprise
 
-## Objective
+## Objetivo
 
-This document describes the recommended deployment pattern for selling StrategyEngine AI to companies in a professional way.
+Este documento describe el patrón de despliegue recomendado para vender StrategyEngine AI a empresas de forma profesional.
 
-It answers:
+Responde a:
 
-- how the product should run inside customer infrastructure
-- what should be deployed first for pilots
-- what should be hardened for production
-- how to explain the architecture during a sales or technical validation process
+- cómo debe ejecutarse el producto dentro de la infraestructura del cliente
+- qué debe desplegarse primero en pilotos
+- qué debe endurecerse para producción
+- cómo explicar la arquitectura durante ventas o validación técnica
 
-## Commercial Positioning
+## Posicionamiento Comercial
 
-StrategyEngine AI should be sold as a:
+StrategyEngine AI debe venderse como:
 
-**self-hosted enterprise AI appliance for data-to-model workflows**
+**un appliance enterprise self-hosted para flujos de datos a modelo**
 
-The customer:
+El cliente:
 
-- deploys it in their environment
-- configures API keys and execution backends from the UI
-- keeps datasets, runs, logs, and artifacts under their control
+- lo despliega en su entorno
+- configura API keys y backends de ejecución desde la UI
+- mantiene datasets, runs, logs y artefactos bajo su control
 
-## Recommended Delivery Tiers
+## Niveles de Entrega Recomendados
 
-### Tier 1 - Pilot Deployment
+### Nivel 1 - Piloto
 
-Recommended for:
-- small and medium companies
-- first proof of value
-- short sales cycles
+Recomendado para:
+- pequeñas y medianas empresas
+- primer proof of value
+- ciclos de venta cortos
 
-Topology:
-- one app container
-- mounted persistent volumes
-- local worker subprocess
-- local sandbox or remote sandbox gateway
+Topología:
+- un contenedor principal
+- volúmenes persistentes montados
+- worker local como subprocess
+- sandbox local o gateway remoto
 
-Operational goal:
-- simplest possible deployment that still feels like a real product
+Objetivo operativo:
+- el despliegue más simple posible que ya se perciba como producto real
 
-### Tier 2 - Production Self-Hosted
+### Nivel 2 - Producción Self-Hosted
 
-Recommended for:
-- security-reviewed environments
-- multiple users
-- longer-term adoption
+Recomendado para:
+- entornos con revisión de seguridad
+- varios usuarios
+- adopción a medio y largo plazo
 
-Topology:
-- dedicated UI service
-- dedicated worker service
-- persistent metadata and artifact stores
-- isolated sandbox gateway
-- centralized logs and monitoring
+Topología:
+- servicio dedicado de UI
+- servicio dedicado de worker
+- stores persistentes de metadatos y artefactos
+- sandbox gateway aislado
+- logs y monitorización centralizados
 
-Operational goal:
-- production reliability, security review readiness, and auditability
+Objetivo operativo:
+- fiabilidad de producción, auditabilidad y preparación para revisión enterprise
 
-### Tier 3 - Managed Private Deployment
+### Nivel 3 - Despliegue Privado Gestionado
 
-Recommended for:
-- customers who do not want to operate the platform themselves
+Recomendado para:
+- clientes que no quieren operar la plataforma
 
-Topology:
-- same architecture as self-hosted
-- operated in a dedicated tenant or dedicated cloud account
+Topología:
+- misma arquitectura que el self-hosted
+- operada en un tenant o cuenta cloud dedicada
 
-Operational goal:
-- lower operational burden for the customer without weakening isolation
+Objetivo operativo:
+- reducir carga operativa sin sacrificar aislamiento
 
-## Minimal Deployable Components
+## Componentes Mínimos Desplegables
 
-### 1. UI / Control Plane
+### 1. UI / Plano de Control
 
-Current basis:
+Base actual:
 - [app.py](C:/Users/santi/Projects/Hackathon_Gemini_Agents/app.py)
 
-Responsibilities:
-- accept inputs
-- render reports
-- configure providers and models
-- show run history and live progress
+Responsabilidades:
+- aceptar inputs
+- renderizar informes
+- configurar proveedores y modelos
+- mostrar historial y progreso de runs
 
-### 2. Worker / Orchestrator
+### 2. Worker / Orquestador
 
-Current basis:
+Base actual:
 - [src/utils/background_worker.py](C:/Users/santi/Projects/Hackathon_Gemini_Agents/src/utils/background_worker.py)
 - [src/graph/graph.py](C:/Users/santi/Projects/Hackathon_Gemini_Agents/src/graph/graph.py)
 
-Responsibilities:
-- execute runs independently from browser sessions
-- coordinate the multi-agent pipeline
-- persist status, logs, and final outputs
+Responsabilidades:
+- ejecutar runs fuera de la sesión del navegador
+- coordinar el pipeline multiagente
+- persistir estado, logs y outputs finales
 
-### 3. Sandbox Execution Backend
+### 3. Backend de Ejecución en Sandbox
 
-Responsibilities:
-- isolate user-generated code
-- enforce timeout and resource boundaries
-- return files, logs, and exit status
+Responsabilidades:
+- aislar el código generado
+- aplicar límites de tiempo y recursos
+- devolver ficheros, logs y estado de salida
 
-Recommended customer-facing model:
-- a standard sandbox gateway contract
+Modelo recomendado de cara al cliente:
+- un contrato estándar de sandbox gateway
 
-Reference:
+Referencia:
 - [SANDBOX_GATEWAY.md](C:/Users/santi/Projects/Hackathon_Gemini_Agents/SANDBOX_GATEWAY.md)
 
-### 4. Persistent Storage
+### 4. Almacenamiento Persistente
 
-Used for:
+Usado para:
 - runs
-- artifacts
+- artefactos
 - PDFs
-- intermediate reports
-- reproducibility
+- informes intermedios
+- reproducibilidad
 
-### 5. Config and Secrets
+### 5. Configuración y Secretos
 
-Used for:
-- LLM API keys
-- sandbox credentials
-- model routing
-- execution backend configuration
+Usado para:
+- API keys de LLM
+- credenciales del sandbox
+- routing de modelos
+- configuración del backend de ejecución
 
-Direction already aligned in product:
-- configured from the UI
-- not edited by end users in internal files
+Dirección ya alineada en el producto:
+- configuración desde la UI
+- sin edición manual de archivos internos por parte del cliente
 
-## Recommended Deployment Patterns
+## Patrones de Despliegue Recomendados
 
-## A. Pilot Using Docker Compose
+## A. Piloto con Docker Compose
 
-Use this when:
-- the customer wants something they can run quickly
-- security review is lightweight
-- the team is small
+Úsalo cuando:
+- el cliente quiere algo rápido de levantar
+- la revisión de seguridad es ligera
+- el equipo es pequeño
 
-Recommended shape:
+Forma recomendada:
 
 ```text
 docker-compose
   - strategyengine-ui-worker
-  - mounted ./runs
-  - mounted ./data
-  - mounted ./artifacts
+  - volumen ./runs
+  - volumen ./data
+  - volumen ./artifacts
 ```
 
-Notes:
-- acceptable for pilot
-- not the final shape for larger enterprise rollouts
-- background worker can remain subprocess-based at this stage
+Notas:
+- válido para piloto
+- no es la forma final para despliegues enterprise grandes
+- el worker puede seguir siendo subprocess en esta etapa
 
-## B. Production Inside Customer Infrastructure
+## B. Producción en la Infraestructura del Cliente
 
-Use this when:
-- the customer has IT/SecOps involvement
-- multiple users need access
-- data governance matters
+Úsalo cuando:
+- el cliente tiene IT/SecOps implicado
+- hay varios usuarios
+- la gobernanza de datos importa
 
-Recommended shape:
+Forma recomendada:
 
 ```text
 Load Balancer
-  -> UI / Control Plane service
-  -> Worker service
-  -> Artifact storage
-  -> Metadata DB
-  -> Secret store
-  -> Sandbox gateway
+  -> servicio UI / Control Plane
+  -> servicio Worker
+  -> almacenamiento de artefactos
+  -> base de datos de metadatos
+  -> almacén de secretos
+  -> sandbox gateway
 ```
 
-Benefits:
-- cleaner scaling
-- easier observability
-- better separation of concerns
-- easier security review
+Beneficios:
+- escalado más limpio
+- mejor observabilidad
+- mejor separación de responsabilidades
+- revisión de seguridad más sencilla
 
-## Security Boundary Recommendation
+## Recomendación de Límite de Seguridad
 
-The most important professional recommendation is:
+La recomendación más importante es:
 
-**run the sandbox inside the customer's own infrastructure boundary**
+**ejecutar el sandbox dentro del perímetro de infraestructura del cliente**
 
-That means:
-- local execution for low-sensitivity use cases
-- or remote sandbox gateway hosted by the customer
+Eso significa:
+- ejecución local para casos de baja sensibilidad
+- o gateway remoto de sandbox alojado por el cliente
 
-This is the clean answer when a customer asks:
-- where the code runs
-- where the data lives
-- who pays for compute
+Es la respuesta correcta cuando un cliente pregunta:
+- dónde corre el código
+- dónde viven los datos
+- quién paga y controla el compute
 
-## Reference Answer For Customers
+## Respuesta de Referencia para Clientes
 
-If a customer asks "how would this integrate with our infrastructure?", the professional answer is:
+Si el cliente pregunta "¿cómo se integraría esto con nuestra infraestructura?", la respuesta profesional es:
 
-1. StrategyEngine AI is deployed inside your environment as a web application plus worker.
-2. Your team configures API keys and execution backend from the UI.
-3. The generated code runs in an isolated sandbox, preferably inside your own cloud or internal compute boundary.
-4. All runs, artifacts, and reports remain under your control.
-5. The product can operate in pilot mode on Docker Compose and later evolve to a more standard production topology without changing the core product logic.
+1. StrategyEngine AI se despliega dentro de vuestro entorno como aplicación web más worker.
+2. Vuestro equipo configura API keys y backend de ejecución desde la UI.
+3. El código generado corre en un sandbox aislado, preferiblemente dentro de vuestra nube o perímetro interno.
+4. Todos los runs, artefactos e informes permanecen bajo vuestro control.
+5. El producto puede empezar en modo piloto con Docker Compose y evolucionar después a una topología de producción sin cambiar la lógica principal.
 
-## What To Avoid In Sales Positioning
+## Qué Evitar en Ventas
 
-Avoid presenting it as:
-- "just a Streamlit app"
-- "just a desktop tool"
-- "just an `.exe`"
+Evita presentarlo como:
+- "solo una app de Streamlit"
+- "solo una herramienta de escritorio"
+- "solo un `.exe`"
 
-Those framings make enterprise buyers worry about:
-- maintainability
-- security
-- supportability
-- lack of auditability
+Esos framings hacen que el comprador enterprise piense en:
+- poca mantenibilidad
+- dudas de seguridad
+- problemas de soporte
+- falta de auditabilidad
 
-## What To Say Instead
+## Qué Decir en Su Lugar
 
-Prefer this language:
+Usa este lenguaje:
 
-- "self-hosted AI analytics appliance"
-- "customer-controlled execution boundary"
-- "UI-first configuration with encrypted secrets"
-- "isolated runtime for generated ML code"
-- "deployable in Docker, Kubernetes, or private cloud"
+- "appliance de analítica con IA self-hosted"
+- "límite de ejecución controlado por el cliente"
+- "configuración UI-first con secretos cifrados"
+- "runtime aislado para código generado"
+- "desplegable en Docker, Kubernetes o private cloud"
 
-## Immediate Productization Recommendation
+## Recomendación Inmediata de Productización
 
-For the next sales-ready step, the most practical sequence is:
+La secuencia más práctica para estar listos para ventas es:
 
-1. keep the current app as the pilot appliance
-2. document Docker Compose deployment clearly
-3. document sandbox gateway integration clearly
-4. prepare a production reference architecture diagram
-5. later split UI and worker into separately deployable services
+1. mantener la app actual como pilot appliance
+2. documentar bien el despliegue con Docker Compose
+3. documentar bien la integración del sandbox gateway
+4. preparar un diagrama de arquitectura de producción
+5. más adelante separar UI y worker en servicios distintos
 
-## Bottom Line
+## Conclusión
 
-The correct professional deployment model is:
+El modelo profesional correcto de despliegue es:
 
-- **not** a desktop `.exe` as the main offering
-- **yes** a self-hosted web product with background execution and isolated sandboxing
+- **no** un `.exe` como oferta principal
+- **sí** un producto web self-hosted con ejecución en background y sandbox aislado
 
-That is the model that enterprise customers will understand, validate, and approve more easily.
+Ese es el modelo que un cliente enterprise entenderá, validará y aprobará con mucha más facilidad.
