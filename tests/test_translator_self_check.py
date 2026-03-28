@@ -5,6 +5,7 @@ from src.agents.business_translator import (
     BusinessTranslatorAgent,
     _build_metric_progress_summary,
     _score_report_quality,
+    _validate_report,
     _validate_report_structure,
 )
 
@@ -124,6 +125,25 @@ def test_translator_prompt_keeps_layout_flexible_without_legacy_markdown_scaffol
     assert "Executive decision with clear rationale (always first)" not in prompt
 
 
+def test_translator_prompt_encourages_fact_inference_and_recommendation_distinction(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {"execution_output": "OK", "business_objective": "Prioritize invoices based on calibrated collection risk."}
+    )
+
+    assert "Distinguish clearly between supported facts, cautious inference, and recommended action." in prompt
+    assert "If you recommend a timeline, threshold, governance gate, or rollout policy" in prompt
+    assert "Do not present inferred rollout policies, exact remediation windows, or governance gates as established facts" in prompt
+
+
 def test_translator_prompt_separates_final_incumbent_from_rejected_challenger(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)
@@ -209,6 +229,37 @@ def test_translator_prompt_separates_final_incumbent_from_rejected_challenger(tm
     assert '"improvement_history_scope": "historical_progress_only"' in prompt
     assert '"selected_incumbent_metric": 1410.2794030184425' in prompt
     assert '"final_incumbent":' not in prompt
+
+
+def test_validate_report_flags_overconfident_operational_claims():
+    report = """
+## Executive Decision
+GO_WITH_LIMITATIONS
+
+Deployment is approved for a controlled pilot with a defined 30-day remediation roadmap.
+
+## Risks
+Residual risk remains in edge cases.
+
+## Evidence Used
+evidence:
+{claim: "Confirmed artifact present: data/run_summary.json", source: "data/run_summary.json"}
+- data/run_summary.json
+""".strip()
+
+    validation = _validate_report(
+        content=report,
+        expected_decision="GO_WITH_LIMITATIONS",
+        facts_context=[],
+        metrics_payload={},
+        plots=[],
+        expected_language="en",
+    )
+
+    assert validation["reasoning_warnings"]
+    assert "30-day remediation roadmap" in validation["reasoning_warnings"][0]
+    assert "overconfident_operational_claims" in validation["context_warnings"]
+    assert _score_report_quality(validation) < 100
 
 
 def test_metric_progress_summary_tracks_rejected_metric_gains_separately():

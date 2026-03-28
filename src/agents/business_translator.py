@@ -2260,6 +2260,58 @@ def _value_matches_references(value: float, refs: List[float], relative_toleranc
     return False
 
 
+def _split_report_sentences(content: str) -> List[str]:
+    text = re.sub(r"\s+", " ", str(content or "")).strip()
+    if not text:
+        return []
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+
+
+def _detect_overconfident_operational_claims(content: str) -> List[str]:
+    warnings: List[str] = []
+    for sentence in _split_report_sentences(content):
+        normalized = " ".join(sentence.split())
+        lower = normalized.lower()
+        if len(normalized) < 24:
+            continue
+        has_precise_policy = bool(
+            re.search(
+                r"(?i)\b\d+\s*(?:day|days|week|weeks|month|months|quarter|quarters)\b",
+                normalized,
+            )
+        ) or any(
+            token in lower
+            for token in (
+                "roadmap",
+                "review gate",
+                "go-live gate",
+                "rollout gate",
+                "remediation window",
+                "deployment window",
+            )
+        )
+        if not has_precise_policy:
+            continue
+        has_assertive_action = bool(
+            re.search(
+                r"(?i)\b(is approved|is required|is defined|is mandated|will be|must be|must remain|remains approved|set a hard review gate|deploy for|deployment is approved)\b",
+                normalized,
+            )
+        )
+        if not has_assertive_action:
+            continue
+        has_hedge = bool(
+            re.search(
+                r"(?i)\b(recommend|recommended|should|could|may|might|consider|propose|proposed|suggest|suggested|option|optional|if adopted|for a pilot)\b",
+                normalized,
+            )
+        )
+        if has_hedge:
+            continue
+        warnings.append(normalized[:220])
+    return warnings
+
+
 def _validate_report_structure(content: str, expected_language: str) -> List[str]:
     issues: List[str] = []
     if not content:
@@ -2345,6 +2397,7 @@ def _validate_report(
         normalized = str(path).strip().replace("\\", "/")
         if allowed_plots and normalized not in allowed_plots:
             invalid_plots.append(normalized)
+    reasoning_warnings = _detect_overconfident_operational_claims(content)
 
     critical_issues: List[str] = []
     for issue in structure_issues:
@@ -2361,6 +2414,8 @@ def _validate_report(
     context_warnings: List[str] = []
     if isinstance(decision_discrepancy, dict) and decision_discrepancy:
         context_warnings.append("decision_discrepancy_authoritative_vs_derived")
+    if reasoning_warnings:
+        context_warnings.append("overconfident_operational_claims")
 
     return {
         "structure_issues": structure_issues,
@@ -2368,6 +2423,7 @@ def _validate_report(
         "unverified_metrics": unverified_metrics,
         "unsupported_evidence_claims": unsupported_evidence_claims,
         "invalid_plots": invalid_plots,
+        "reasoning_warnings": reasoning_warnings,
         "context_warnings": context_warnings,
         "decision_discrepancy": decision_discrepancy if isinstance(decision_discrepancy, dict) else None,
         "critical_issues": critical_issues,
@@ -2382,6 +2438,7 @@ def _score_report_quality(validation: Dict[str, Any]) -> int:
     score -= 5 * min(4, len(validation.get("unverified_metrics", [])))
     score -= 10 * min(3, len(validation.get("unsupported_evidence_claims", [])))
     score -= 6 * len(validation.get("invalid_plots", []))
+    score -= 7 * min(3, len(validation.get("reasoning_warnings", [])))
     score -= 15 * min(1, len(validation.get("context_warnings", [])))
     return max(0, min(100, score))
 
@@ -2393,7 +2450,11 @@ def _build_repair_prompt(
     evidence_paths: List[str],
     target_language_code: str,
 ) -> str:
-    issues = validation.get("critical_issues", []) + validation.get("structure_issues", [])
+    issues = (
+        validation.get("critical_issues", [])
+        + validation.get("structure_issues", [])
+        + [f"reasoning_warning: {item}" for item in validation.get("reasoning_warnings", [])[:4]]
+    )
     issues_text = "\n".join(f"- {issue}" for issue in issues) or "- unknown_issue"
     evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths[:8]) or "- missing"
     language_pack = _report_language_pack(target_language_code)
@@ -2410,6 +2471,9 @@ def _build_repair_prompt(
         Hard constraints:
         - Keep the report evidence-based and avoid inventing metrics.
         - The executive decision must exactly match the required decision label.
+        - Distinguish supported facts, cautious inference, and recommended actions.
+        - Use assertive language only for supported facts.
+        - If you mention timelines, thresholds, gates, rollout policies, or remediation windows that are not explicit in the artifacts, frame them as recommendations or scenarios, not as established facts.
         - Do not present a substantive claim with source "missing".
         - Only use source "missing" for explicit uncertainty placeholders such as "$placeholder".
         - Ensure sections exist: $executive_decision_heading, $risks_heading, $evidence_heading.
@@ -2444,7 +2508,11 @@ def _build_structured_repair_prompt(
     target_language_code: str,
     artifact_registry_prompt_json: str,
 ) -> str:
-    issues = validation.get("critical_issues", []) + validation.get("structure_issues", [])
+    issues = (
+        validation.get("critical_issues", [])
+        + validation.get("structure_issues", [])
+        + [f"reasoning_warning: {item}" for item in validation.get("reasoning_warnings", [])[:4]]
+    )
     issues_text = "\n".join(f"- {issue}" for issue in issues) or "- unknown_issue"
     evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths[:8]) or "- missing"
     placeholder = _report_language_pack(target_language_code).get(
@@ -2466,6 +2534,9 @@ def _build_structured_repair_prompt(
         - Return ONLY valid JSON. No markdown, no commentary, no code fences.
         - Keep the report evidence-based and avoid inventing metrics.
         - The executive decision must exactly match the required decision label.
+        - Distinguish supported facts, cautious inference, and recommended actions.
+        - Use assertive language only for supported facts.
+        - If you mention timelines, thresholds, gates, rollout policies, or remediation windows that are not explicit in the artifacts, frame them as recommendations or scenarios, not as established facts.
         - Use only artifact_key values that exist in the artifact registry below.
         - Do not emit a separate evidence heading block. Use the "evidence" array only.
         - If a claim is uncertain, express that uncertainty in the narrative and use the placeholder "$placeholder" only inside the evidence array when needed.
@@ -4001,6 +4072,11 @@ what to do next.
    claims, and deployment recommendations must be grounded in the final incumbent only.
 6. If a challenger was rejected, mention it only as rejected exploration history.
    Never present rejected challenger metrics or charts as the final model state.
+7. Distinguish clearly between supported facts, cautious inference, and recommended action.
+   Use assertive language only for facts supported by artifacts or deterministic context.
+   If you introduce timelines, thresholds, rollout gates, remediation windows, or
+   operating policies not explicit in the artifacts, frame them as recommendations
+   or scenarios, not as established run facts.
 
 === TRANSLATION DECISION WORKFLOW (MANDATORY) ===
 Before writing, reason through these steps internally. Your report should
@@ -4056,6 +4132,10 @@ reflect this analysis, not just list data.
 5. RECOMMEND ACTIONS
    - Be specific: "retry with X", "investigate Y in artifact Z",
      "deploy with caveat W" — not generic advice.
+
+   - If you recommend a timeline, threshold, governance gate, or rollout policy
+     that is not explicit in the artifacts, make it clear that it is your
+     recommendation rather than an established outcome of the run.
 
 === FACTS (do not alter values) ===
 $facts_block_json
@@ -4135,6 +4215,8 @@ Rules:
 - Make the authoritative executive decision and its rationale clear early.
 - Structure and section order are yours to determine based on what matters most.
 - Use artifact blocks only when they materially improve clarity or trust.
+- Distinguish supported facts, cautious inference, and recommended actions in the wording.
+- Do not present inferred rollout policies, exact remediation windows, or governance gates as established facts unless they appear explicitly in the run evidence.
 - Do NOT create a separate "Visual Analysis" or "Análisis Visual" section.
 - Charts, data previews, and summary tables belong inline next to the finding they support.
 - Do NOT emit raw HTML tables or markdown image syntax inside text blocks.
@@ -4352,18 +4434,18 @@ $execution_results
                 repair_history.append({
                     "attempt": 0,
                     "score": best_score,
-                    "issues": validation.get("critical_issues", []) + validation.get("structure_issues", []),
+                    "issues": validation.get("critical_issues", []) + validation.get("structure_issues", []) + validation.get("reasoning_warnings", []),
                 })
 
                 for repair_attempt in range(max_repair_attempts):
-                    if not validation.get("has_critical") and best_score >= int(os.getenv("TRANSLATOR_MIN_QUALITY_SCORE", "60")):
+                    if not validation.get("has_critical") and not validation.get("reasoning_warnings") and best_score >= int(os.getenv("TRANSLATOR_MIN_QUALITY_SCORE", "60")):
                         break  # Report is good enough
                     try:
                         if self.last_report_blocks is not None:
                             self.last_report_blocks = None
                             self.last_report_payload = None
-                        all_issues = validation.get("critical_issues", []) + validation.get("structure_issues", [])
-                        if not validation.get("has_critical"):
+                        all_issues = validation.get("critical_issues", []) + validation.get("structure_issues", []) + [f"reasoning_warning: {item}" for item in validation.get("reasoning_warnings", [])[:4]]
+                        if not validation.get("has_critical") and not validation.get("reasoning_warnings"):
                             # Quality is low but no critical — add hint
                             all_issues = list(all_issues) + ["low_quality_score"]
                         if structured_layout_enabled:
