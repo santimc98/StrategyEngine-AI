@@ -50,6 +50,7 @@ from src.utils.run_status import (
     request_run_abort as _request_run_abort,
     write_worker_input as _write_worker_input,
 )
+from src.utils.csv_preview import load_csv_preview as _load_csv_preview
 
 # Auto-heal cwd when prior run crashed inside runs/<run_id>/work.
 recover_orphaned_workspace_cwd(project_root=APP_ROOT)
@@ -1209,14 +1210,7 @@ with st.sidebar:
         for agent_key in PRIMARY_MODEL_KEYS
         if str(active_models.get(agent_key) or "").strip()
     )
-    advanced_model_lines = "".join(
-        f"<div><strong>{MODEL_SETTING_LABELS[agent_key]}:</strong> {active_models.get(agent_key, 'N/A')}</div>"
-        for agent_key in ADVANCED_MODEL_KEYS
-        if str(active_models.get(agent_key) or "").strip()
-    )
     active_model_lines = f"<div><strong>Principales</strong></div>{primary_model_lines}"
-    if advanced_model_lines:
-        active_model_lines += f"<div style='margin-top:0.45rem;'><strong>Avanzados</strong></div>{advanced_model_lines}"
     st.markdown(
         f"""
         <div class="sidebar-settings-panel">
@@ -2238,19 +2232,15 @@ if data_path is None:
 if data_path is not None:
     if not st.session_state["analysis_complete"] and not start_btn:
         try:
-            df_preview = pd.read_csv(data_path, nrows=50)
+            preview_payload = _load_csv_preview(data_path, max_rows=50)
         except Exception:
-            df_preview = None
+            preview_payload = {}
 
-        # Fallback: try CSV with semicolon separator
-        if df_preview is None or (df_preview is not None and len(df_preview.columns) <= 1):
-            try:
-                df_preview = pd.read_csv(data_path, sep=';', nrows=50)
-            except Exception:
-                df_preview = None
+        df_preview = preview_payload.get("df") if isinstance(preview_payload, dict) else None
 
         if df_preview is not None and len(df_preview.columns) > 1:
-            n_rows, n_cols = df_preview.shape
+            n_rows = int(preview_payload.get("row_count_total") or len(df_preview))
+            n_cols = int(preview_payload.get("col_count") or len(df_preview.columns))
             dtypes_summary = df_preview.dtypes.value_counts()
             dtype_parts = [f"{count} {str(dtype)}" for dtype, count in dtypes_summary.items()]
 
@@ -2777,12 +2767,13 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
         _csv_path = result.get("csv_path", "")
         if _csv_path and os.path.isfile(_csv_path):
             try:
-                _init_df = pd.read_csv(_csv_path, nrows=10)
-                _init_shape = pd.read_csv(_csv_path, nrows=0)
+                _preview_payload = _load_csv_preview(_csv_path, max_rows=10)
+                _init_df = _preview_payload.get("df")
+                if _init_df is None or len(_init_df.columns) == 0:
+                    raise ValueError("No se pudo inferir el dialecto del CSV")
                 # Show dataset dimensions
-                import csv as _csv_mod
-                _total_rows = sum(1 for _ in open(_csv_path, encoding="utf-8", errors="ignore")) - 1
-                _total_cols = len(_init_shape.columns)
+                _total_rows = int(_preview_payload.get("row_count_total") or len(_init_df))
+                _total_cols = int(_preview_payload.get("col_count") or len(_init_df.columns))
                 _dim_cols = st.columns(3)
                 with _dim_cols[0]:
                     st.markdown(f'<div class="card fade-in" style="text-align:center;">'
