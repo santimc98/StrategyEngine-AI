@@ -1089,6 +1089,51 @@ def _build_metric_progress_summary(
     return summary
 
 
+def _resolve_authoritative_data_adequacy_report(
+    run_summary: Dict[str, Any],
+    raw_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    authoritative = (
+        copy.deepcopy(run_summary.get("data_adequacy"))
+        if isinstance(run_summary, dict) and isinstance(run_summary.get("data_adequacy"), dict)
+        else {}
+    )
+    raw = copy.deepcopy(raw_report) if isinstance(raw_report, dict) else {}
+    if not authoritative:
+        return raw
+    if not raw:
+        return authoritative
+    merged = raw
+    for key, value in authoritative.items():
+        if value is not None and value != "":
+            merged[key] = value
+    return merged
+
+
+def _compact_metric_round_history_for_translator(round_history: Any) -> List[Dict[str, Any]]:
+    if not isinstance(round_history, list):
+        return []
+    compacted: List[Dict[str, Any]] = []
+    for record in round_history:
+        if not isinstance(record, dict):
+            continue
+        compacted.append(
+            {
+                "round_id": record.get("round_id"),
+                "baseline_metric": record.get("baseline_metric"),
+                "candidate_metric": record.get("candidate_metric"),
+                "kept": record.get("kept"),
+                "hypothesis": record.get("hypothesis"),
+                "metric_improved": record.get("metric_improved"),
+                "improved_by_metric": record.get("improved_by_metric"),
+                "governance_approved": record.get("governance_approved"),
+                "approved": record.get("approved"),
+                "review_signal_approved": record.get("review_signal_approved"),
+            }
+        )
+    return compacted
+
+
 def _build_cleaning_progress_summary(
     cleaning_manifest: Dict[str, Any],
     *,
@@ -2765,6 +2810,10 @@ class BusinessTranslatorAgent:
         run_summary = _safe_load_json("data/run_summary.json") or {}
         recommendations_preview = _safe_load_json("reports/recommendations_preview.json") or {}
         metrics_payload = _load_authoritative_metrics_payload()
+        data_adequacy_report = _resolve_authoritative_data_adequacy_report(
+            run_summary if isinstance(run_summary, dict) else {},
+            data_adequacy_report if isinstance(data_adequacy_report, dict) else {},
+        )
 
         # ── Canonical metric correction ──────────────────────────────
         # After metric loop baseline restoration, insights.json and
@@ -2820,17 +2869,7 @@ class BusinessTranslatorAgent:
             }
         round_history = state.get("ml_improvement_round_history")
         if isinstance(round_history, list) and round_history:
-            metric_loop_context["round_history"] = [
-                {
-                    "round_id": r.get("round_id"),
-                    "baseline_metric": r.get("baseline_metric"),
-                    "candidate_metric": r.get("candidate_metric"),
-                    "kept": r.get("kept"),
-                    "hypothesis": r.get("hypothesis"),
-                }
-                for r in round_history
-                if isinstance(r, dict)
-            ]
+            metric_loop_context["round_history"] = _compact_metric_round_history_for_translator(round_history)
 
         steward_signal_pack = _extract_steward_signal_pack(
             steward_summary=steward_summary,

@@ -199,6 +199,100 @@ def test_metric_progress_summary_tracks_rejected_metric_gains_separately():
     assert summary["rejected_after_metric_improvement"][0]["candidate_metric"] == 0.0005509950045063333
 
 
+def test_translator_prompt_prefers_run_summary_data_adequacy_over_stale_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "data_adequacy_report.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "status": "insufficient_signal",
+                "reasons": ["pipeline_aborted_before_metrics"],
+                "recommendations": ["Investigate metrics pipeline"],
+                "signals": {"raw_status": "stale"},
+            },
+            f,
+        )
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "run_outcome": "GO_WITH_LIMITATIONS",
+                "data_adequacy": {
+                    "status": "ok",
+                    "reasons": [],
+                    "recommendations": [],
+                    "quality_gates_alignment": {"status": "partial"},
+                },
+            },
+            f,
+        )
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Prioritize invoices based on calibrated collection risk.",
+        }
+    )
+
+    assert '"status": "ok"' in prompt
+    assert '"pipeline_aborted_before_metrics"' not in prompt
+
+    with open(os.path.join("data", "report_visual_tables.json"), "r", encoding="utf-8") as f:
+        tables = json.load(f)
+    assert "Data Adequacy Status</td><td>ok</td>" in tables.get("kpi_snapshot_table_html", "")
+
+
+def test_translator_prompt_preserves_metric_round_governance_flags(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Prioritize invoices based on calibrated collection risk.",
+            "primary_metric_state": {
+                "primary_metric_name": "ordinal_alignment_and_mae",
+                "primary_metric_value": 0.5855711331482671,
+            },
+            "ml_improvement_round_history": [
+                {
+                    "round_id": 1,
+                    "baseline_metric": 1.531444082519,
+                    "candidate_metric": 0.5855711331482671,
+                    "kept": "improved",
+                    "hypothesis": {"label": "piecewise_monotonic_case_offset_calibration"},
+                    "metric_improved": True,
+                    "governance_approved": True,
+                    "approved": True,
+                },
+                {
+                    "round_id": 2,
+                    "baseline_metric": 0.5855711331482671,
+                    "candidate_metric": 58.660708782334915,
+                    "kept": "baseline",
+                    "hypothesis": {"label": "constrained_case_aware_weight_optimization"},
+                    "metric_improved": False,
+                    "governance_approved": False,
+                    "approved": False,
+                },
+            ],
+        }
+    )
+
+    assert '"metric_improved": true' in prompt
+    assert '"governance_approved": true' in prompt
+    assert '"governance_approved": false' in prompt
+
+
 def test_translator_kpi_snapshot_uses_canonical_final_metric_only(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)
