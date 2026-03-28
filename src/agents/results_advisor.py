@@ -308,6 +308,17 @@ class ResultsAdvisorAgent:
             return deterministic
 
         llm_packet = self._generate_critique_packet_llm(context)
+        if not llm_packet:
+            self.last_critique_meta = {
+                "mode": mode,
+                "source": "llm_transport_failure",
+                "provider": self.critique_provider,
+                "model": self.critique_model_name,
+            }
+            if self.last_critique_error:
+                self.last_critique_meta["llm_error"] = dict(self.last_critique_error)
+            self.last_critique_packet = {}
+            return {}
         valid_packet, validation_errors = validate_advisor_critique_packet(llm_packet)
         if valid_packet:
             self.last_critique_meta = {
@@ -833,6 +844,9 @@ class ResultsAdvisorAgent:
                 ],
                 "temperature": 0.0,
             }
+            max_tokens = int(self._generation_config.get("max_tokens", 0) or 0)
+            if max_tokens > 0:
+                call_kwargs["max_tokens"] = max_tokens
             if self._use_response_schema:
                 call_kwargs["response_format"] = self._openai_response_format_for_critique()
             try:

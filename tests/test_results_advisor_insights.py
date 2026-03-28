@@ -3,6 +3,42 @@ import os
 from src.agents.results_advisor import ResultsAdvisorAgent
 
 
+class _CaptureChatCompletions:
+    def __init__(self, *, should_raise: Exception | None = None):
+        self.should_raise = should_raise
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.should_raise:
+            raise self.should_raise
+
+        class _Msg:
+            content = (
+                '{"packet_type":"advisor_critique_packet","packet_version":"1.0",'
+                '"run_id":"r1","iteration":1,"timestamp_utc":"2026-03-28T00:00:00Z",'
+                '"primary_metric_name":"mae","higher_is_better":false,'
+                '"metric_comparison":{"baseline_value":1.0,"candidate_value":0.9,"delta_abs":-0.1,"delta_rel":-0.1,'
+                '"min_delta_required":0.0005,"meets_min_delta":true},'
+                '"validation_signals":{"validation_mode":"unknown"},'
+                '"error_modes":[],"risk_flags":[],"active_gates_context":[],'
+                '"analysis_summary":"Candidate meets min delta.","strictly_no_code_advice":true}'
+            )
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+
+class _CaptureClient:
+    def __init__(self, *, should_raise: Exception | None = None):
+        self.chat = type("Chat", (), {"completions": _CaptureChatCompletions(should_raise=should_raise)})()
+
+
 def test_results_advisor_insights_minimal():
     advisor = ResultsAdvisorAgent(api_key="")
     insights = advisor.generate_insights({"artifact_index": []})
@@ -138,3 +174,58 @@ def test_results_advisor_insights_prefers_context_metrics_payload(tmp_path, monk
     assert insights.get("metrics_summary")
     assert "Metrics artifact missing or empty" not in " ".join(insights.get("risks", []))
     assert "artifacts/ml/evaluation_summary.json" in (insights.get("artifacts_used") or [])
+
+
+def test_results_advisor_critique_openrouter_call_uses_configured_max_tokens():
+    advisor = ResultsAdvisorAgent(api_key="")
+    advisor.critique_mode = "llm"
+    advisor.critique_provider = "openrouter"
+    advisor.critique_model_name = "openai/gpt-5.4"
+    advisor._generation_config["max_tokens"] = 8192
+    client = _CaptureClient()
+    advisor.critique_client = client
+
+    packet = advisor.generate_critique_packet(
+        {
+            "run_id": "r1",
+            "iteration": 1,
+            "phase": "candidate_review",
+            "primary_metric_name": "mae",
+            "higher_is_better": False,
+            "min_delta": 0.0005,
+            "baseline_metrics": {"primary_metric_value": 1.0},
+            "candidate_metrics": {"primary_metric_value": 0.9},
+        }
+    )
+
+    calls = client.chat.completions.calls
+    assert packet.get("packet_type") == "advisor_critique_packet"
+    assert calls
+    assert calls[0]["max_tokens"] == 8192
+
+
+def test_results_advisor_transport_failure_does_not_report_schema_errors():
+    advisor = ResultsAdvisorAgent(api_key="")
+    advisor.critique_mode = "llm"
+    advisor.critique_provider = "openrouter"
+    advisor.critique_model_name = "openai/gpt-5.4"
+    advisor._generation_config["max_tokens"] = 8192
+    advisor.critique_client = _CaptureClient(should_raise=RuntimeError("402 credits exceeded"))
+
+    packet = advisor.generate_critique_packet(
+        {
+            "run_id": "r1",
+            "iteration": 1,
+            "phase": "candidate_review",
+            "primary_metric_name": "mae",
+            "higher_is_better": False,
+            "min_delta": 0.0005,
+            "baseline_metrics": {"primary_metric_value": 1.0},
+            "candidate_metrics": {"primary_metric_value": 0.9},
+        }
+    )
+
+    assert packet == {}
+    assert advisor.last_critique_meta.get("source") == "llm_transport_failure"
+    assert "validation_errors" not in advisor.last_critique_meta
+    assert advisor.last_critique_meta.get("llm_error", {}).get("stage") == "api_call_exception"
