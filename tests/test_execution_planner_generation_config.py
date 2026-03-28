@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 
-from src.agents.execution_planner import ExecutionPlannerAgent, _OpenRouterAdapter
+from src.agents.execution_planner import (
+    ExecutionPlannerAgent,
+    _OpenRouterAdapter,
+    _synthesize_task_semantics,
+)
 from src.utils.contract_response_schema import EXECUTION_CONTRACT_CANONICAL_REQUIRED_KEYS
 
 
@@ -93,6 +97,31 @@ def test_execution_planner_defaults_to_openrouter_json_generation_stack(monkeypa
     assert agent.provider == "openrouter"
     assert agent.model_name == "google/gemini-3.1-pro-preview"
     assert agent.compiler_model_name == "google/gemini-3-flash-preview"
+
+
+def test_synthesize_task_semantics_prefers_authoritative_evaluation_target_over_outcome_column():
+    contract = {
+        "outcome_columns": ["Score"],
+        "column_roles": {
+            "outcome": ["Score"],
+            "identifiers": ["invoice_id"],
+        },
+        "task_semantics": {
+            "problem_family": "ranking_calibration",
+            "objective_type": "ranking_calibration",
+            "primary_target": "Score",
+            "target_columns": ["Score"],
+        },
+        "evaluation_spec": {
+            "primary_target": "ref_score",
+            "label_columns": ["ref_score"],
+        },
+    }
+
+    semantics = _synthesize_task_semantics(contract)
+
+    assert semantics["primary_target"] == "ref_score"
+    assert semantics["target_columns"] == ["ref_score"]
 
 
 def test_execution_planner_allows_explicit_compiler_model_override(monkeypatch):

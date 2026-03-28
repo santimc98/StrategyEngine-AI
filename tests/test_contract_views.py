@@ -117,6 +117,28 @@ def test_v5_ml_view_has_shared_plus_ml_fields():
     assert ml["evaluation_spec"]["primary_metric"] == "log_loss"
 
 
+def test_v5_ml_view_normalizes_task_target_from_evaluation_spec():
+    contract = _v5_contract()
+    contract["shared"]["task_semantics"] = {
+        "problem_family": "ranking_calibration",
+        "objective_type": "ranking_calibration",
+        "primary_target": "Score",
+        "target_columns": ["Score"],
+    }
+    contract["ml_engineer"]["evaluation_spec"] = {
+        "primary_metric": "mean_absolute_error",
+        "primary_target": "ref_score",
+        "label_columns": ["ref_score"],
+    }
+
+    views = build_contract_views_projection(contract)
+
+    assert views["ml_view"]["task_semantics"]["primary_target"] == "ref_score"
+    assert views["ml_view"]["task_semantics"]["target_columns"] == ["ref_score"]
+    assert views["reviewer_view"]["task_semantics"]["primary_target"] == "ref_score"
+    assert views["qa_view"]["task_semantics"]["primary_target"] == "ref_score"
+
+
 def test_v5_cleaning_view_merges_de_and_cleaning_reviewer():
     views = build_contract_views_projection(_v5_contract())
     cv = views["cleaning_view"]

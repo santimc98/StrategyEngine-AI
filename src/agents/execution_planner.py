@@ -1609,6 +1609,155 @@ def _extract_required_output_descriptor(item: Any) -> Dict[str, Any]:
     }
 
 
+def _semantic_descriptor_token_parts(values: Any) -> set[str]:
+    if isinstance(values, (str, bytes)):
+        values = [values]
+    elif not isinstance(values, (list, tuple, set)):
+        values = [values]
+    ignored = {
+        "output",
+        "outputs",
+        "path",
+        "paths",
+        "file",
+        "files",
+        "artifact",
+        "artifacts",
+        "required",
+        "requireds",
+        "for",
+        "and",
+    }
+    tokens: set[str] = set()
+    for value in values:
+        normalized = _normalize_semantic_token(value)
+        if not normalized:
+            continue
+        for part in normalized.split("_"):
+            token = str(part or "").strip().lower()
+            if not token or token in ignored or token.isdigit():
+                continue
+            tokens.add(token)
+    return tokens
+
+
+def _expanded_semantic_capability_tokens(tokens: set[str]) -> set[str]:
+    expanded = set(tokens)
+    synonym_map = {
+        "manifest": {"report", "validation", "audit", "provenance", "lineage"},
+        "report": {"manifest", "summary", "note", "audit", "validation"},
+        "summary": {"report", "table"},
+        "table": {"summary"},
+        "dataset": {"data", "rows"},
+        "rows": {"dataset", "row"},
+        "row": {"rows"},
+        "scoring": {"score", "ranked", "prediction", "predictions"},
+        "score": {"scoring", "ranked", "prediction", "predictions"},
+        "ranked": {"scoring", "score"},
+        "prediction": {"predictions", "scoring", "score"},
+        "predictions": {"prediction", "scoring", "score"},
+        "weight": {"weights", "spec", "configuration"},
+        "weights": {"weight", "spec", "configuration"},
+        "spec": {"weight", "weights", "configuration"},
+        "configuration": {"spec", "weight", "weights"},
+        "validation": {"report", "manifest", "audit"},
+        "audit": {"report", "manifest", "validation"},
+    }
+    for token in list(tokens):
+        expanded.update(synonym_map.get(token, set()))
+    return expanded
+
+
+def _collect_compiled_output_capability_tokens(
+    compiled_contract: Dict[str, Any] | None,
+    compiled_output_descriptors: List[Dict[str, Any]],
+) -> set[str]:
+    capability_tokens: set[str] = set()
+
+    def _ingest(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                capability_tokens.update(_semantic_descriptor_token_parts(key))
+                _ingest(nested)
+            return
+        if isinstance(value, list):
+            for nested in value:
+                _ingest(nested)
+            return
+        if isinstance(value, str):
+            capability_tokens.update(_semantic_descriptor_token_parts(value))
+
+    for descriptor in compiled_output_descriptors:
+        capability_tokens.update(_semantic_descriptor_token_parts(descriptor.get("semantic_norms") or []))
+    if isinstance(compiled_contract, dict):
+        for key in (
+            "required_output_artifacts",
+            "required_outputs",
+            "artifact_requirements",
+            "evaluation_spec",
+            "validation_requirements",
+            "decisioning_requirements",
+            "visual_requirements",
+        ):
+            _ingest(compiled_contract.get(key))
+        for section in ("data_engineer", "ml_engineer", "business_translator"):
+            payload = compiled_contract.get(section)
+            if isinstance(payload, dict):
+                for key in (
+                    "required_output_artifacts",
+                    "required_outputs",
+                    "artifact_requirements",
+                    "evaluation_spec",
+                    "validation_requirements",
+                    "decisioning_requirements",
+                    "visual_requirements",
+                ):
+                    _ingest(payload.get(key))
+    return _expanded_semantic_capability_tokens(capability_tokens)
+
+
+def _semantic_output_descriptor_matches_compiled_capabilities(
+    semantic_descriptor: Dict[str, Any],
+    compiled_output_descriptors: List[Dict[str, Any]],
+    compiled_capability_tokens: set[str],
+) -> bool:
+    semantic_aliases = {
+        str(token)
+        for token in (semantic_descriptor.get("semantic_norms") or [])
+        if str(token or "").strip()
+    }
+    semantic_tokens = _expanded_semantic_capability_tokens(_semantic_descriptor_token_parts(semantic_aliases))
+    if not semantic_tokens:
+        return False
+
+    if semantic_tokens and semantic_tokens.issubset(compiled_capability_tokens):
+        return True
+    if len(semantic_tokens & compiled_capability_tokens) >= 2:
+        return True
+
+    for compiled_descriptor in compiled_output_descriptors:
+        compiled_aliases = {
+            str(token)
+            for token in (compiled_descriptor.get("semantic_norms") or [])
+            if str(token or "").strip()
+        }
+        if semantic_aliases and not semantic_aliases.isdisjoint(compiled_aliases):
+            return True
+        compiled_tokens = _expanded_semantic_capability_tokens(_semantic_descriptor_token_parts(compiled_aliases))
+        overlap = semantic_tokens & compiled_tokens
+        if not overlap:
+            continue
+        if overlap == semantic_tokens:
+            return True
+        if len(overlap) >= 2:
+            return True
+        if len(semantic_tokens) <= 2 and overlap == semantic_tokens:
+            return True
+        if len(overlap) / max(1, len(semantic_tokens)) >= 0.67:
+            return True
+    return False
+
+
 def _build_semantic_guard_validation(
     semantic_core: Dict[str, Any] | None,
     compiled_contract: Dict[str, Any] | None,
@@ -1658,6 +1807,70 @@ def _build_semantic_guard_validation(
         if isinstance(extras, dict):
             issue.update(extras)
         issues.append(issue)
+
+    def _resolved_compiled_role_bucket(bucket: str, compiled_roles_payload: Dict[str, Any]) -> set[str]:
+        bucket = str(bucket or "").strip().lower()
+        direct = set(x.lower() for x in _canonicalize_string_list(compiled_roles_payload.get(bucket)))
+        if bucket != "pre_decision":
+            return direct
+        refined_union: set[str] = set()
+        for refined_bucket in (
+            "pre_decision",
+            "identifiers",
+            "time_columns",
+            "post_decision_audit_only",
+            "unknown",
+        ):
+            refined_union.update(
+                x.lower() for x in _canonicalize_string_list(compiled_roles_payload.get(refined_bucket))
+            )
+        return refined_union
+
+    def _semantic_pre_decision_anchor_columns() -> set[str]:
+        anchors: set[str] = set()
+
+        for source in (
+            semantic_core.get("model_features"),
+            (semantic_core.get("allowed_feature_sets") or {}).get("model_features")
+            if isinstance(semantic_core.get("allowed_feature_sets"), dict)
+            else None,
+            (semantic_core.get("column_roles") or {}).get("operational_dependencies")
+            if isinstance(semantic_core.get("column_roles"), dict)
+            else None,
+            (semantic_core.get("task_semantics") or {}).get("target_columns")
+            if isinstance(semantic_core.get("task_semantics"), dict)
+            else None,
+            (semantic_core.get("task_semantics") or {}).get("primary_target")
+            if isinstance(semantic_core.get("task_semantics"), dict)
+            else None,
+            (semantic_core.get("future_ml_handoff") or {}).get("target_columns")
+            if isinstance(semantic_core.get("future_ml_handoff"), dict)
+            else None,
+            (semantic_core.get("future_ml_handoff") or {}).get("primary_target")
+            if isinstance(semantic_core.get("future_ml_handoff"), dict)
+            else None,
+            (semantic_core.get("evaluation_spec") or {}).get("label_columns")
+            if isinstance(semantic_core.get("evaluation_spec"), dict)
+            else None,
+            (semantic_core.get("evaluation_spec") or {}).get("primary_target")
+            if isinstance(semantic_core.get("evaluation_spec"), dict)
+            else None,
+            (semantic_core.get("validation_requirements") or {}).get("target_columns")
+            if isinstance(semantic_core.get("validation_requirements"), dict)
+            else None,
+            (semantic_core.get("validation_requirements") or {}).get("target_column")
+            if isinstance(semantic_core.get("validation_requirements"), dict)
+            else None,
+            (semantic_core.get("validation_requirements") or {}).get("split_column")
+            if isinstance(semantic_core.get("validation_requirements"), dict)
+            else None,
+            ((semantic_core.get("validation_requirements") or {}).get("params") or {}).get("split_column")
+            if isinstance((semantic_core.get("validation_requirements") or {}).get("params"), dict)
+            else None,
+        ):
+            anchors.update(x.lower() for x in _canonicalize_string_list(source))
+
+        return anchors
 
     semantic_resolved_workstreams = resolve_contract_active_workstreams(semantic_core)
     compiled_resolved_workstreams = resolve_contract_active_workstreams(compiled_contract)
@@ -1775,6 +1988,10 @@ def _build_semantic_guard_validation(
         for token in desc.get("semantic_norms") or []:
             if token:
                 compiled_output_intents.add(str(token))
+    compiled_output_capability_tokens = _collect_compiled_output_capability_tokens(
+        compiled_contract,
+        compiled_output_descriptors,
+    )
     missing_output_paths: List[str] = []
     missing_output_intents: List[str] = []
     for descriptor in semantic_output_descriptors:
@@ -1791,9 +2008,20 @@ def _build_semantic_guard_validation(
             continue
         if semantic_aliases:
             if semantic_aliases.isdisjoint(compiled_output_intents):
-                missing_output_intents.append(descriptor.get("intent") or descriptor.get("raw") or "")
+                if not _semantic_output_descriptor_matches_compiled_capabilities(
+                    descriptor,
+                    compiled_output_descriptors,
+                    compiled_output_capability_tokens,
+                ):
+                    missing_output_intents.append(descriptor.get("intent") or descriptor.get("raw") or "")
             continue
         if semantic_intent and semantic_intent not in compiled_output_intents:
+            if _semantic_output_descriptor_matches_compiled_capabilities(
+                descriptor,
+                compiled_output_descriptors,
+                compiled_output_capability_tokens,
+            ):
+                continue
             missing_output_intents.append(descriptor.get("intent") or descriptor.get("raw") or "")
     if missing_output_paths:
         _record_conflict(
@@ -1804,11 +2032,13 @@ def _build_semantic_guard_validation(
     if missing_output_intents:
         _record_conflict(
             "semantic_guard.required_outputs_dropped",
-            "Compiled contract did not preserve the semantic intent of required_outputs declared by semantic_core.",
+            "Compiled contract could not be deterministically proven to preserve every semantic required_output intent from semantic_core.",
             {
                 "missing_semantic_outputs": missing_output_intents,
                 "compiled_required_outputs": copy.deepcopy(compiled_outputs_raw),
+                "compiled_capability_tokens_sample": sorted(list(compiled_output_capability_tokens))[:40],
             },
+            severity="warning",
             extras={
                 "adjudicable": True,
                 "ambiguity_type": "required_output_materialization",
@@ -1817,6 +2047,7 @@ def _build_semantic_guard_validation(
 
     semantic_roles = semantic_core.get("column_roles")
     compiled_roles = compiled_contract.get("column_roles")
+    semantic_pre_decision_anchors = _semantic_pre_decision_anchor_columns()
     if isinstance(semantic_roles, dict):
         if not isinstance(compiled_roles, dict):
             _record_conflict(
@@ -1834,7 +2065,9 @@ def _build_semantic_guard_validation(
                 "time_columns",
             ):
                 semantic_bucket = set(x.lower() for x in _canonicalize_string_list(semantic_roles.get(bucket)))
-                compiled_bucket = set(x.lower() for x in _canonicalize_string_list(compiled_roles.get(bucket)))
+                if bucket == "pre_decision" and semantic_pre_decision_anchors:
+                    semantic_bucket = semantic_bucket.intersection(semantic_pre_decision_anchors)
+                compiled_bucket = _resolved_compiled_role_bucket(bucket, compiled_roles)
                 if semantic_bucket and not semantic_bucket.issubset(compiled_bucket):
                     _record_conflict(
                         "semantic_guard.column_roles_changed",
@@ -2691,6 +2924,50 @@ def _collect_contract_target_candidates(contract: Dict[str, Any], data_profile: 
                 if isinstance(key, str):
                     _append(key)
     return candidates
+
+
+def _collect_authoritative_target_columns(contract: Dict[str, Any] | None) -> List[str]:
+    authoritative: List[str] = []
+
+    if not isinstance(contract, dict):
+        return authoritative
+
+    def _append(values: Any) -> None:
+        if isinstance(values, list):
+            for item in values:
+                _append(item)
+            return
+        if isinstance(values, (str, int, float)):
+            token = str(values).strip()
+            if token and token not in authoritative:
+                authoritative.append(token)
+
+    for scope_key in ("evaluation_spec", "validation_requirements", "objective_analysis"):
+        scope = contract.get(scope_key)
+        if not isinstance(scope, dict):
+            continue
+        for key in (
+            "target_columns",
+            "primary_targets",
+            "label_columns",
+            "primary_target",
+            "target_column",
+            "label_column",
+        ):
+            _append(scope.get(key))
+        params = scope.get("params")
+        if isinstance(params, dict):
+            for key in (
+                "target_columns",
+                "primary_targets",
+                "label_columns",
+                "primary_target",
+                "target_column",
+                "label_column",
+            ):
+                _append(params.get(key))
+
+    return authoritative
 
 
 def _collect_profile_discrete_target_values(data_profile: Dict[str, Any], target_col: str) -> List[str]:
@@ -4789,16 +5066,21 @@ def _synthesize_task_semantics(contract: Dict[str, Any] | None) -> Dict[str, Any
     if not isinstance(contract, dict):
         return {}
 
-    outcome_columns = _collect_targetish_columns(contract.get("outcome_columns"))
-    target_columns = list(outcome_columns)
-    for col in _collect_contract_target_candidates(contract):
-        if col not in target_columns:
-            target_columns.append(col)
+    authoritative_target_columns = _collect_authoritative_target_columns(contract)
+    if authoritative_target_columns:
+        target_columns = list(authoritative_target_columns)
+    else:
+        outcome_columns = _collect_targetish_columns(contract.get("outcome_columns"))
+        target_columns = list(outcome_columns)
+        for col in _collect_contract_target_candidates(contract):
+            if col not in target_columns:
+                target_columns.append(col)
     primary_target = ""
     for source in (
+        authoritative_target_columns,
+        (contract.get("task_semantics") or {}).get("primary_target") if isinstance(contract.get("task_semantics"), dict) else None,
         contract.get("primary_target"),
         contract.get("target_column"),
-        (contract.get("task_semantics") or {}).get("primary_target") if isinstance(contract.get("task_semantics"), dict) else None,
         target_columns,
     ):
         values = _collect_targetish_columns(source)
@@ -6873,9 +7155,15 @@ def build_contract_min(
         evaluation_spec = dict(evaluation_spec)
         evaluation_spec["objective_type"] = str(objective_type or "unspecified").strip() or "unspecified"
 
-    resolved_target_columns = list(dict.fromkeys([col for col in outcome_cols if str(col).strip()]))
+    authoritative_target_columns = _collect_authoritative_target_columns(contract)
+    resolved_target_columns = list(
+        dict.fromkeys([col for col in authoritative_target_columns if str(col).strip()])
+    )
+    if not resolved_target_columns:
+        resolved_target_columns = list(dict.fromkeys([col for col in outcome_cols if str(col).strip()]))
     resolved_primary_target = None
     for source in (
+        authoritative_target_columns,
         contract.get("target_column"),
         contract.get("primary_target"),
         strategy_dict.get("target_column"),

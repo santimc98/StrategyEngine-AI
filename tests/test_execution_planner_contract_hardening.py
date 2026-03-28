@@ -698,6 +698,136 @@ def test_semantic_guard_accepts_semantic_required_outputs_with_artifact_only_ali
     assert "semantic_guard.required_outputs_dropped" not in rules
 
 
+def test_semantic_guard_accepts_required_outputs_materialized_via_semantic_overlap():
+    semantic_core = {
+        "scope": "cleaning_only",
+        "active_workstreams": {
+            "data_cleaning": True,
+            "feature_engineering": True,
+            "model_training": False,
+        },
+        "task_semantics": {
+            "problem_family": "data_preparation",
+            "objective_type": "descriptive",
+            "primary_target": "ref_score",
+            "target_columns": ["ref_score"],
+        },
+        "model_features": ["feature_a"],
+        "required_outputs": [
+            "cleaned_scoring_dataset",
+            "ranked_scoring_output_for_FE_2025_10_31",
+            "optimized_weight_spec",
+        ],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "decision": [],
+            "outcome": ["ref_score"],
+            "post_decision_audit_only": [],
+            "unknown": [],
+            "identifiers": ["case_id"],
+            "time_columns": ["FE"],
+        },
+    }
+    compiled = {
+        "scope": "cleaning_only",
+        "active_workstreams": {
+            "cleaning": True,
+            "feature_engineering": True,
+            "model_training": False,
+        },
+        "task_semantics": semantic_core["task_semantics"],
+        "model_features": ["feature_a"],
+        "required_outputs": [
+            {
+                "intent": "cleaned_dataset",
+                "path": "artifacts/clean/scoring_dataset_cleaned.csv",
+                "required": True,
+                "owner": "data_engineer",
+            },
+            {
+                "intent": "ranked_scoring_output",
+                "path": "artifacts/ml/final_scores_2025_10_31.csv",
+                "required": True,
+                "owner": "ml_engineer",
+            },
+            {
+                "intent": "optimized_weight_spec",
+                "path": "artifacts/ml/weights.json",
+                "required": True,
+                "owner": "ml_engineer",
+            },
+        ],
+        "column_roles": semantic_core["column_roles"],
+    }
+
+    result = _build_semantic_guard_validation(semantic_core, compiled)
+
+    assert result.get("accepted") is True
+    rules = {issue.get("rule") for issue in (result.get("issues") or []) if isinstance(issue, dict)}
+    assert "semantic_guard.required_outputs_dropped" not in rules
+
+
+def test_semantic_guard_keeps_ambiguous_semantic_required_outputs_as_nonblocking_warning():
+    semantic_core = {
+        "scope": "cleaning_only",
+        "active_workstreams": {
+            "data_cleaning": True,
+            "feature_engineering": True,
+            "model_training": False,
+        },
+        "task_semantics": {
+            "problem_family": "data_preparation",
+            "objective_type": "descriptive",
+            "primary_target": "ref_score",
+            "target_columns": ["ref_score"],
+        },
+        "model_features": ["feature_a"],
+        "required_outputs": [
+            "case_summary_table",
+            "risk_register_and_bucket_improvement_note",
+        ],
+        "column_roles": {
+            "pre_decision": ["feature_a"],
+            "decision": [],
+            "outcome": ["ref_score"],
+            "post_decision_audit_only": [],
+            "unknown": [],
+            "identifiers": ["case_id"],
+            "time_columns": ["FE"],
+        },
+    }
+    compiled = {
+        "scope": "cleaning_only",
+        "active_workstreams": {
+            "cleaning": True,
+            "feature_engineering": True,
+            "model_training": False,
+        },
+        "task_semantics": semantic_core["task_semantics"],
+        "model_features": ["feature_a"],
+        "required_outputs": [
+            {
+                "intent": "cleaned_dataset",
+                "path": "artifacts/clean/scoring_dataset_cleaned.csv",
+                "required": True,
+            }
+        ],
+        "column_roles": semantic_core["column_roles"],
+    }
+
+    result = _build_semantic_guard_validation(semantic_core, compiled)
+
+    assert result.get("accepted") is True
+    matching_issues = [
+        issue
+        for issue in (result.get("issues") or [])
+        if isinstance(issue, dict) and issue.get("rule") == "semantic_guard.required_outputs_dropped"
+    ]
+    assert matching_issues
+    assert all(str(issue.get("severity") or "").lower() == "warning" for issue in matching_issues)
+    assert all(issue.get("adjudicable") is True for issue in matching_issues)
+
+
 def test_apply_validation_adjudication_can_clear_ambiguous_required_output_issue():
     validation_result = {
         "status": "error",
@@ -1098,3 +1228,40 @@ def test_execution_planner_records_llm_call_trace_for_main_stages(monkeypatch):
     assert llm_trace
     assert llm_trace[0].get("stage") == "semantic_core"
     assert all(entry.get("prompt_fingerprint") for entry in llm_trace)
+
+
+def test_semantic_guard_allows_pre_decision_role_refinement_into_structural_buckets():
+    semantic_core = {
+        "model_features": ["Importe Norm", "RIIM10 Norm"],
+        "column_roles": {
+            "pre_decision": [
+                "EntityId",
+                "CodPartidaAbierta",
+                "FE",
+                "FV",
+                "DaysToDue",
+                "Sector",
+                "Importe Norm",
+                "RIIM10 Norm",
+            ],
+            "operational_dependencies": ["EntityId", "CodPartidaAbierta", "FE"],
+            "outcome": ["Score"],
+        }
+    }
+    compiled_contract = {
+        "column_roles": {
+            "pre_decision": ["Importe Norm", "RIIM10 Norm"],
+            "identifiers": ["EntityId", "CodPartidaAbierta"],
+            "time_columns": ["FE", "FV"],
+            "unknown": ["Sector", "DaysToDue"],
+            "outcome": ["Score"],
+        }
+    }
+
+    result = _build_semantic_guard_validation(semantic_core, compiled_contract)
+
+    assert not any(
+        issue.get("rule") == "semantic_guard.column_roles_changed"
+        for issue in (result.get("issues") or [])
+        if isinstance(issue, dict)
+    )

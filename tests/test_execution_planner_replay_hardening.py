@@ -35,6 +35,22 @@ def test_replay_deb6da59_semantic_guard_accepts_filename_like_required_outputs_m
     assert "semantic_guard.required_outputs_dropped" not in rules
 
 
+def test_replay_569fff4a_semantic_guard_keeps_refined_required_outputs_nonblocking():
+    semantic_core = _load_run_json("569fff4a", "semantic_core.json")
+    contract_canonical = _load_run_json("569fff4a", "contract_canonical.json")
+
+    result = _build_semantic_guard_validation(semantic_core, contract_canonical)
+
+    assert result.get("accepted") is True
+    issues = [issue for issue in (result.get("issues") or []) if isinstance(issue, dict)]
+    assert not any(issue.get("rule") == "semantic_guard.column_roles_changed" for issue in issues)
+    assert not any(
+        issue.get("rule") == "semantic_guard.required_outputs_dropped"
+        and str(issue.get("severity") or "").lower() in {"error", "fail"}
+        for issue in issues
+    )
+
+
 def test_replay_2a1e9a11_truncated_contract_response_is_structurally_recoverable():
     response_path = _REPO_ROOT / "runs" / "2a1e9a11" / "agents" / "execution_planner" / "response_attempt_1.txt"
     semantic_core = _load_run_json("2a1e9a11", "semantic_core.json")

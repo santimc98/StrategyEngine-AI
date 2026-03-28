@@ -45,6 +45,67 @@ _PRESERVE_KEYS = {
 }
 
 
+def _collect_authoritative_target_columns(*scopes: Any) -> List[str]:
+    targets: List[str] = []
+
+    def _append(values: Any) -> None:
+        if isinstance(values, list):
+            for item in values:
+                _append(item)
+            return
+        if isinstance(values, (str, int, float)):
+            token = str(values).strip()
+            if token and token not in targets:
+                targets.append(token)
+
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        for key in (
+            "target_columns",
+            "primary_targets",
+            "label_columns",
+            "primary_target",
+            "target_column",
+            "label_column",
+        ):
+            _append(scope.get(key))
+        params = scope.get("params")
+        if isinstance(params, dict):
+            for key in (
+                "target_columns",
+                "primary_targets",
+                "label_columns",
+                "primary_target",
+                "target_column",
+                "label_column",
+            ):
+                _append(params.get(key))
+
+    return targets
+
+
+def _normalize_view_task_semantics(view: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(view, dict):
+        return view
+
+    targets = _collect_authoritative_target_columns(
+        view.get("evaluation_spec"),
+        view.get("validation_requirements"),
+        view.get("objective_analysis"),
+    )
+    if not targets:
+        return view
+
+    normalized = dict(view)
+    semantics = copy.deepcopy(view.get("task_semantics")) if isinstance(view.get("task_semantics"), dict) else {}
+    semantics["primary_target"] = targets[0]
+    semantics["target_columns"] = list(targets)
+    semantics["multi_target"] = len(targets) > 1
+    normalized["task_semantics"] = semantics
+    return normalized
+
+
 def _truncate_text(value: str, max_len: int) -> str:
     if not isinstance(value, str) or len(value) <= max_len:
         return value
@@ -131,7 +192,7 @@ def _build_views_v5(contract: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     qa = contract.get("qa_reviewer") or {}
     bt = contract.get("business_translator") or {}
 
-    return {
+    views = {
         "de_view": {**shared, **de, "role": "data_engineer"},
         "ml_view": {**shared, **ml, "role": "ml_engineer"},
         "cleaning_view": {**shared, **de, **cr, "role": "cleaning_reviewer"},
@@ -140,6 +201,7 @@ def _build_views_v5(contract: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         "translator_view": {**shared, **bt, "role": "translator"},
         "results_advisor_view": {**shared, "role": "results_advisor"},
     }
+    return {name: _normalize_view_task_semantics(payload) for name, payload in views.items()}
 
 
 def build_contract_views_projection(
