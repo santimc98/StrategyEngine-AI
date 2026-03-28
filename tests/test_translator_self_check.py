@@ -163,10 +163,65 @@ def test_translator_prompt_separates_final_incumbent_from_rejected_challenger(tm
     prompt = agent.generate_report(state, plots=["static/plots/cv_folds.png"])
 
     assert "Metrics: No data available." not in prompt
-    assert '"metric": "mean_mae", "value": 1410.2794030184425' in prompt
+    assert '"metric": "MAE", "value": 1410.2794030184425, "source": "canonical_primary_metric"' in prompt
     assert "Rejected challenger from round 3" in prompt
     assert "Metric Progress Summary:" in prompt
     assert '"baseline_start": 2088.3858989698074' in prompt
+    assert '"improvement_history_scope": "historical_progress_only"' in prompt
+    assert '"selected_incumbent_metric": 1410.2794030184425' in prompt
+    assert '"final_incumbent":' not in prompt
+
+
+def test_translator_kpi_snapshot_uses_canonical_final_metric_only(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.join("artifacts", "ml"), exist_ok=True)
+
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "metrics_summary": [
+                    {"metric": "mae_all", "value": 0.05851280962074632},
+                ]
+            },
+            f,
+        )
+    with open(os.path.join("artifacts", "ml", "cv_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "mae_all": 0.05851280962074632,
+                "model_performance": {
+                    "mae_all": 0.05851280962074632,
+                },
+            },
+            f,
+        )
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Pricing objective in English",
+            "primary_metric_state": {
+                "primary_metric_name": "violation_reduction",
+                "primary_metric_value": 3.0,
+            },
+            "data_adequacy_report": {"status": "sufficient_signal"},
+        }
+    )
+
+    with open(os.path.join("data", "report_visual_tables.json"), "r", encoding="utf-8") as f:
+        tables = json.load(f)
+    kpi_html = tables.get("kpi_snapshot_table_html", "")
+    prompt = agent.last_prompt or ""
+
+    assert "metric:violation_reduction" in kpi_html
+    assert "3" in kpi_html
+    assert "mae_all" not in kpi_html
+    assert '"metric": "violation_reduction", "value": 3.0, "source": "canonical_primary_metric"' in prompt
 
 
 def test_translator_prompt_includes_cleaning_progress_summary(tmp_path, monkeypatch):

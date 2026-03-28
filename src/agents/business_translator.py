@@ -590,7 +590,9 @@ def _build_artifact_compliance_table_html(
 
 
 def _build_kpi_snapshot_table_html(
-    metrics_payload: Dict[str, Any],
+    final_metric_records: Any,
+    canonical_metric_name: str,
+    canonical_metric_value: Optional[float],
     data_adequacy_report: Dict[str, Any],
     decisioning_columns: List[str],
     executive_decision_label: str,
@@ -602,14 +604,28 @@ def _build_kpi_snapshot_table_html(
         rows.append(["Data Adequacy Status", str(data_adequacy_report.get("status") or "unknown")])
     if decisioning_columns:
         rows.append(["Decisioning Columns", ", ".join([str(col) for col in decisioning_columns[:6]])])
-    flat = _flatten_metrics(metrics_payload if isinstance(metrics_payload, dict) else {})
+    if canonical_metric_name and canonical_metric_value is not None:
+        rows.append([f"metric:{canonical_metric_name}", f"{float(canonical_metric_value):.6g}"])
+        return render_table_html(
+            ["KPI / Signal", "Value"],
+            rows,
+            max_rows=14,
+            table_class="exec-table kpi-snapshot",
+        )
+    if isinstance(final_metric_records, dict):
+        final_metric_records = _build_metric_records(final_metric_records)
     metric_count = 0
-    for key, value in flat:
+    for item in final_metric_records if isinstance(final_metric_records, list) else []:
         if metric_count >= max_metric_rows:
             break
-        if _is_number(value):
-            rows.append([f"metric:{key}", f"{float(value):.6g}"])
-            metric_count += 1
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("metric") or "").strip()
+        value = _coerce_float(item.get("value"))
+        if value is None or not key:
+            continue
+        rows.append([f"metric:{key}", f"{float(value):.6g}"])
+        metric_count += 1
     return render_table_html(
         ["KPI / Signal", "Value"],
         rows,
@@ -806,6 +822,25 @@ def _metrics_table(metrics_payload: Dict[str, Any], max_items: int = 10) -> str:
     rows = [[metric, val] for metric, val in items[:max_items]]
     return render_table_text(["metric", "value"], rows, max_rows=max_items)
 
+
+def _metrics_table_from_records(records: Any, max_items: int = 10) -> str:
+    if isinstance(records, dict):
+        records = _build_metric_records(records)
+    if not isinstance(records, list):
+        return "No data available."
+    rows: List[List[str]] = []
+    for item in records[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        metric = str(item.get("metric") or "").strip()
+        value = _coerce_float(item.get("value"))
+        if not metric or value is None:
+            continue
+        rows.append([metric, f"{float(value):.6g}"])
+    if not rows:
+        return "No data available."
+    return render_table_text(["metric", "value"], rows, max_rows=max_items)
+
 def _recommendations_table(preview: Dict[str, Any], max_rows: int = 3) -> str:
     if not isinstance(preview, dict):
         return "No data available."
@@ -904,6 +939,23 @@ def _build_metric_records(metrics_payload: Dict[str, Any], max_items: int = 24) 
         if len(records) >= max_items:
             break
     return records
+
+
+def _build_final_incumbent_metric_records(
+    metrics_payload: Dict[str, Any],
+    canonical_metric_name: str,
+    canonical_metric_value: Optional[float],
+    max_items: int = 24,
+) -> List[Dict[str, Any]]:
+    if canonical_metric_name and canonical_metric_value is not None:
+        return [
+            {
+                "metric": str(canonical_metric_name).strip(),
+                "value": float(canonical_metric_value),
+                "source": "canonical_primary_metric",
+            }
+        ]
+    return _build_metric_records(metrics_payload, max_items=max_items)
 
 
 def _extract_primary_metric_value_from_records(records: Any, metric_name: str) -> Optional[float]:
@@ -1010,7 +1062,8 @@ def _build_metric_progress_summary(
     summary: Dict[str, Any] = {
         "metric_name": canonical_metric_name or metric_loop_context.get("metric_name"),
         "baseline_start": baseline_start,
-        "final_incumbent": canonical_metric_value,
+        "improvement_history_scope": "historical_progress_only",
+        "selected_incumbent_metric": canonical_metric_value,
         "accepted_rounds": accepted,
         "rejected_rounds": rejected,
         "rounds_attempted": len(rounds),
@@ -1095,7 +1148,11 @@ def _prepare_translator_metric_views(
         canonical_metric_name,
         canonical_metric_value,
     )
-    final_metric_records = _build_metric_records(metrics_payload)
+    final_metric_records = _build_final_incumbent_metric_records(
+        metrics_payload,
+        canonical_metric_name,
+        canonical_metric_value,
+    )
 
     observed_slot_value = _extract_primary_metric_value_from_records(
         slot_payloads_out.get("model_metrics"),
@@ -3066,6 +3123,9 @@ class BusinessTranslatorAgent:
             canonical_metric_name=_canonical_metric_name,
             canonical_metric_value=_canonical_metric_value,
         )
+        final_incumbent_metric_records = []
+        if isinstance(slot_payloads, dict):
+            final_incumbent_metric_records = slot_payloads.get("model_metrics") or []
         slot_coverage_context = {
             "slot_payloads": slot_payloads,
             "missing_required_slots": missing_required_slots,
@@ -3095,7 +3155,9 @@ class BusinessTranslatorAgent:
             run_summary if isinstance(run_summary, dict) else {},
         )
         kpi_snapshot_table_html = _build_kpi_snapshot_table_html(
-            metrics_payload if isinstance(metrics_payload, dict) else {},
+            final_incumbent_metric_records,
+            _canonical_metric_name,
+            _canonical_metric_value,
             data_adequacy_report if isinstance(data_adequacy_report, dict) else {},
             decisioning_columns,
             executive_decision_label,
@@ -3147,7 +3209,7 @@ class BusinessTranslatorAgent:
                 max_cell_len=80,
             )
 
-        metrics_table_text = _metrics_table(metrics_payload, max_items=10)
+        metrics_table_text = _metrics_table_from_records(final_incumbent_metric_records, max_items=10)
         recommendations_table_text = _recommendations_table(recommendations_preview, max_rows=3)
         evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths) if evidence_paths else "No data available."
 
@@ -3188,7 +3250,7 @@ class BusinessTranslatorAgent:
             "cleaning_progress_summary": cleaning_progress_summary,
             "artifacts_summary": manifest.get("summary", {}) if isinstance(manifest, dict) else {},
             "decisioning_columns": decisioning_columns,
-            "metrics_preview": _flatten_metrics(metrics_payload)[:14] if isinstance(metrics_payload, dict) else [],
+            "metrics_preview": final_incumbent_metric_records[:14] if isinstance(final_incumbent_metric_records, list) else [],
             "canonical_primary_metric": {
                 "name": _canonical_metric_name,
                 "value": _canonical_metric_value,
