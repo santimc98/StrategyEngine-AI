@@ -685,6 +685,72 @@ def test_finalize_round_refreshes_output_contract_after_baseline_restore(tmp_pat
     assert persisted.get("overall_status") != "error"
 
 
+def test_finalize_round_restores_baseline_when_review_board_rejects_candidate(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    metrics_path = Path("artifacts/ml/cv_metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline = {"roc_auc": 0.8000}
+    metrics_path.write_text(json.dumps(baseline), encoding="utf-8")
+    snapshot_dir = Path("work/ml_baseline_snapshot")
+    output_paths = ["artifacts/ml/cv_metrics.json"]
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    metrics_path.write_text(json.dumps({"roc_auc": 0.8100}), encoding="utf-8")
+    board_payload = {
+        "status": "REJECTED",
+        "final_review_verdict": "NEEDS_IMPROVEMENT",
+        "candidate_assessment_status": "REJECTED",
+        "summary": "Candidate violates the business contract.",
+    }
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path("data/review_board_verdict.json").write_text(json.dumps(board_payload), encoding="utf-8")
+
+    state = {
+        "review_verdict": "NEEDS_IMPROVEMENT",
+        "execution_contract": {
+            "iteration_policy": {"metric_round_review_mode": "hybrid_guarded", "metric_min_delta": 0.0005},
+            "artifact_requirements": {"required_files": [{"path": "artifacts/ml/cv_metrics.json"}]},
+            "required_outputs": ["artifacts/ml/cv_metrics.json"],
+        },
+        "output_contract_report": {"overall_status": "ok", "missing": []},
+        "ml_improvement_round_active": True,
+        "ml_improvement_primary_metric_name": "roc_auc",
+        "ml_improvement_round_baseline_metric": 0.8000,
+        "ml_improvement_baseline_metric": 0.8000,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": True,
+        "ml_improvement_output_paths": output_paths,
+        "ml_improvement_snapshot_dir": str(snapshot_dir),
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "ml_improvement_review_mode": "hybrid_guarded",
+        "review_board_verdict": board_payload,
+        "ml_improvement_round_baseline_board_payload": {
+            "status": "APPROVED",
+            "final_review_verdict": "APPROVED",
+            "summary": "Baseline approved.",
+        },
+        "ml_improvement_round_baseline_gate_context": {
+            "status": "APPROVED",
+            "failed_gates": [],
+            "hard_failures": [],
+            "feedback": "baseline approved",
+        },
+        "ml_improvement_round_baseline_reviewer_packet": {"status": "APPROVED"},
+        "ml_improvement_round_baseline_qa_packet": {"status": "APPROVED"},
+        "last_gate_context": {"status": "NEEDS_IMPROVEMENT", "failed_gates": [], "hard_failures": []},
+        "feedback_history": [],
+    }
+
+    route = check_evaluation(state)
+
+    assert route == "approved"
+    assert state["ml_improvement_kept"] == "baseline"
+    assert state["review_verdict"] == "APPROVED"
+    assert state["review_board_verdict"]["final_review_verdict"] == "APPROVED"
+    assert state["review_board_verdict"]["candidate_assessment_status"] == "REJECTED"
+    assert json.loads(metrics_path.read_text(encoding="utf-8"))["roc_auc"] == pytest.approx(0.8000, abs=1e-12)
+
+
 def test_finalize_round_keeps_canonical_candidate_when_advisor_delta_signal_is_wrong(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     report_path = Path("artifacts/ml/evaluation_summary.json")

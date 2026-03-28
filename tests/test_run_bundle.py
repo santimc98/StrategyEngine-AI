@@ -192,6 +192,31 @@ def test_run_manifest_includes_metric_round_records(tmp_path, monkeypatch):
     assert rounds[-1].get("hypothesis", {}).get("technique") == "rare_grouping"
 
 
+def test_run_manifest_marks_metric_improvement_attempted_when_round_history_exists(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run_id = "run_trace_rounds_attempted_01"
+    state = {
+        "run_id": run_id,
+        "run_start_ts": "2026-02-20T00:00:00",
+        "ml_improvement_round_count": 2,
+        "ml_improvement_attempted": False,
+        "ml_improvement_kept": "improved",
+        "ml_improvement_round_history": [
+            {"round_id": 1, "kept": "improved"},
+            {"round_id": 2, "kept": "improved"},
+        ],
+    }
+
+    run_dir = init_run_bundle(run_id, state, base_dir=str(tmp_path / "runs"), enable_tee=False)
+    Path(run_dir, "contracts").mkdir(parents=True, exist_ok=True)
+    manifest_path = write_run_manifest(run_id, state)
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    trace = manifest.get("iteration_trace", {})
+
+    assert trace.get("metric_improvement_attempted") is True
+    assert trace.get("metric_rounds_count") == 2
+
+
 def test_run_manifest_gates_summary_prefers_run_summary_status_over_legacy_review_verdict(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     run_id = "run_status_authority_01"

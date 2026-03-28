@@ -627,6 +627,11 @@ def write_run_manifest(
     except Exception:
         entries_count = _count_jsonl_rows(trace_journal_path)
     metric_rounds = _compact_metric_rounds(state, trace_summary)
+    metric_improvement_attempted = bool(state.get("ml_improvement_attempted"))
+    if not metric_improvement_attempted:
+        metric_improvement_attempted = bool(metric_rounds) or bool(
+            int(state.get("ml_improvement_round_count", 0) or 0)
+        )
     iteration_trace = {
         "journal_exists": os.path.exists(trace_journal_path),
         "journal_relative_path": "report/governance/ml_iteration_journal.jsonl",
@@ -636,7 +641,7 @@ def write_run_manifest(
         "stages_count": trace_summary.get("stages_count", {}) if isinstance(trace_summary.get("stages_count"), dict) else {},
         "last_entry": trace_summary.get("last_entry", {}) if isinstance(trace_summary.get("last_entry"), dict) else {},
         "metric_improvement_round_count": int(state.get("ml_improvement_round_count", 0) or 0),
-        "metric_improvement_attempted": bool(state.get("ml_improvement_attempted")),
+        "metric_improvement_attempted": bool(metric_improvement_attempted),
         "metric_improvement_kept": state.get("ml_improvement_kept"),
         "metric_rounds_count": len(metric_rounds),
         "metric_rounds": metric_rounds,

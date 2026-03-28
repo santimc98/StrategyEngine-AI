@@ -29684,15 +29684,27 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         if isinstance(state.get("review_board_verdict"), dict)
         else {}
     )
-    board_verdict_raw = (
+    board_candidate_raw = (
+        board_verdict_payload.get("candidate_assessment_status")
+        or board_verdict_payload.get("status")
+        or board_verdict_payload.get("final_review_verdict")
+        or ""
+    )
+    board_candidate_status = normalize_review_status(board_candidate_raw)
+    board_candidate_approved = bool(str(board_candidate_raw).strip()) and _is_approved_review_status(board_candidate_status)
+    board_final_raw = (
         board_verdict_payload.get("final_review_verdict")
         or board_verdict_payload.get("status")
         or ""
     )
-    board_verdict_status = normalize_review_status(board_verdict_raw)
-    board_verdict_approved = bool(str(board_verdict_raw).strip()) and _is_approved_review_status(board_verdict_status)
+    board_final_status = normalize_review_status(board_final_raw)
+    board_final_approved = bool(str(board_final_raw).strip()) and _is_approved_review_status(board_final_status)
     advisor_veto_applied = False
-    if isinstance(meets_min_delta_packet, bool) and not meets_min_delta_packet and not board_verdict_approved:
+    board_veto_applied = False
+    if bool(str(board_candidate_raw).strip()) and not board_candidate_approved:
+        board_veto_applied = True
+        selected_candidate_eligible = False
+    if isinstance(meets_min_delta_packet, bool) and not meets_min_delta_packet and not board_candidate_approved:
         advisor_veto_applied = True
         selected_candidate_eligible = False
         selection_metric_improved = False
@@ -29716,13 +29728,21 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 else None
             ),
             "advisor_veto_applied": bool(advisor_veto_applied),
-            "review_board_approved": bool(board_verdict_approved),
+            "review_board_approved": bool(board_candidate_approved),
+            "review_board_candidate_status": board_candidate_status,
+            "review_board_candidate_approved": bool(board_candidate_approved),
+            "review_board_final_verdict_approved": bool(board_final_approved),
+            "review_board_veto_applied": bool(board_veto_applied),
         }
     )
     improved_by_metric = bool(selection_metric_improved)
     improved = bool(selected_candidate_eligible)
     state["opt_incumbent_selection"] = incumbent_selection
     if not improved:
+        if isinstance(state.get("review_board_verdict"), dict):
+            state["ml_improvement_round_candidate_board_payload"] = copy.deepcopy(
+                state.get("review_board_verdict")
+            )
         _restore_ml_outputs(snapshot_dir, output_paths)
         _refresh_output_contract_state(
             state,
@@ -30364,6 +30384,17 @@ def _sync_review_board_verdict_after_metric_round(
     force_finalize_reason = str(controller.get("force_finalize_reason") or selection.get("force_finalize_reason") or "")
 
     payload = copy.deepcopy(board_payload)
+    candidate_board_payload = (
+        state.get("ml_improvement_round_candidate_board_payload")
+        if isinstance(state.get("ml_improvement_round_candidate_board_payload"), dict)
+        else board_payload
+    )
+    original_candidate_assessment_status = normalize_review_status(
+        candidate_board_payload.get("candidate_assessment_status")
+        or candidate_board_payload.get("status")
+        or candidate_board_payload.get("final_review_verdict")
+        or state.get("review_verdict")
+    )
     if kept == "baseline":
         baseline_board_payload = (
             state.get("ml_improvement_round_baseline_board_payload")
@@ -30373,8 +30404,12 @@ def _sync_review_board_verdict_after_metric_round(
         if baseline_board_payload:
             payload = copy.deepcopy(baseline_board_payload)
     final_verdict = normalize_review_status(payload.get("final_review_verdict") or state.get("review_verdict"))
-    candidate_assessment_status = normalize_review_status(
-        payload.get("candidate_assessment_status") or payload.get("status") or final_verdict
+    candidate_assessment_status = (
+        original_candidate_assessment_status
+        if kept == "baseline"
+        else normalize_review_status(
+            payload.get("candidate_assessment_status") or payload.get("status") or final_verdict
+        )
     )
     summary_line = (
         "METRIC_IMPROVEMENT_FINAL: "
