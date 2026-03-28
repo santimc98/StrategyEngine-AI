@@ -859,6 +859,111 @@ def test_finalize_round_keeps_canonical_candidate_when_advisor_delta_signal_is_w
     assert finalization.get("final_metric") == pytest.approx(0.330041811925438, abs=1e-12)
 
 
+def test_finalize_round_preserves_metric_improvement_when_board_rejects_candidate(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    report_path = Path("artifacts/ml/evaluation_summary.json")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_payload = {
+        "primary_metric": "mean_multi_horizon_log_loss",
+        "primary_metric_value": 0.40341051810159645,
+        "mean_multi_horizon_log_loss": 0.40341051810159645,
+    }
+    report_path.write_text(json.dumps(baseline_payload), encoding="utf-8")
+    snapshot_dir = Path("work/ml_incumbent_snapshot_r1")
+    output_paths = ["artifacts/ml/evaluation_summary.json"]
+    _snapshot_ml_outputs(output_paths, snapshot_dir)
+
+    candidate_payload = {
+        "primary_metric": "mean_multi_horizon_log_loss",
+        "primary_metric_value": 0.330041811925438,
+        "mean_multi_horizon_log_loss": 0.330041811925438,
+    }
+    report_path.write_text(json.dumps(candidate_payload), encoding="utf-8")
+    board_payload = {
+        "status": "NEEDS_IMPROVEMENT",
+        "final_review_verdict": "NEEDS_IMPROVEMENT",
+        "candidate_assessment_status": "REJECTED",
+        "summary": "Candidate improved the metric but violates business governance.",
+    }
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path("data/review_board_verdict.json").write_text(json.dumps(board_payload), encoding="utf-8")
+
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_critique_packet",
+        lambda _ctx: {
+            "metric_comparison": {
+                "baseline_value": 0.40341051810159645,
+                "candidate_value": 0.330041811925438,
+                "meets_min_delta": False,
+            },
+            "validation_signals": {"validation_mode": "cv"},
+            "error_modes": [],
+            "analysis_summary": "Advisor incorrectly believes there is no material delta.",
+        },
+    )
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "last_critique_meta",
+        {"mode": "deterministic", "source": "deterministic", "provider": "none", "model": None},
+    )
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod, "append_hypothesis_memory", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod, "log_run_event", lambda *args, **kwargs: None)
+
+    contract = {
+        "validation_requirements": {"primary_metric": "mean_multi_horizon_log_loss"},
+        "iteration_policy": {"metric_improvement_rounds": 3, "metric_improvement_patience": 2},
+        "artifact_requirements": {
+            "required_files": [{"path": "artifacts/ml/evaluation_summary.json"}],
+        },
+        "required_outputs": ["artifacts/ml/evaluation_summary.json"],
+        "column_roles": {},
+    }
+    state = {
+        "review_verdict": "APPROVED",
+        "execution_contract": contract,
+        "ml_improvement_round_active": True,
+        "ml_improvement_round_count": 1,
+        "ml_improvement_current_round_id": 1,
+        "ml_improvement_primary_metric_name": "mean_multi_horizon_log_loss",
+        "ml_improvement_round_baseline_metric": 0.40341051810159645,
+        "ml_improvement_baseline_metric": 0.40341051810159645,
+        "ml_improvement_min_delta": 0.0005,
+        "ml_improvement_higher_is_better": False,
+        "ml_improvement_output_paths": output_paths,
+        "ml_improvement_snapshot_dir": str(snapshot_dir),
+        "ml_improvement_baseline_review_verdict": "APPROVED",
+        "ml_improvement_rounds_allowed": 3,
+        "ml_improvement_patience": 2,
+        "ml_improvement_no_improve_streak": 0,
+        "review_board_verdict": board_payload,
+        "feedback_history": [],
+    }
+
+    route = check_evaluation(state)
+
+    assert route == "approved"
+    assert state.get("ml_improvement_kept") == "baseline"
+    loop_state = state.get("metric_loop_state") if isinstance(state.get("metric_loop_state"), dict) else {}
+    selection = loop_state.get("selection") if isinstance(loop_state.get("selection"), dict) else {}
+    final_entry = loop_state.get("final") if isinstance(loop_state.get("final"), dict) else {}
+    assert selection.get("selected_label") == "baseline"
+    assert selection.get("metric_improved") is True
+    assert selection.get("improved_by_metric") is True
+    assert selection.get("advisor_meets_min_delta") is False
+    assert selection.get("review_signal_approved") is True
+    assert selection.get("governance_approved") is False
+    assert final_entry.get("label") == "baseline"
+    assert final_entry.get("metric_value") == pytest.approx(0.40341051810159645, abs=1e-12)
+    synced_payload = state.get("review_board_verdict") if isinstance(state.get("review_board_verdict"), dict) else {}
+    finalization = synced_payload.get("metric_round_finalization") if isinstance(synced_payload.get("metric_round_finalization"), dict) else {}
+    assert finalization.get("kept") == "baseline"
+    assert finalization.get("metric_improved") is True
+    assert finalization.get("governance_approved") is False
+    assert finalization.get("approved") is False
+
+
 def test_check_evaluation_logs_metric_improvement_round_completion(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     events = []

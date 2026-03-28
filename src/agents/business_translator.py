@@ -1045,20 +1045,35 @@ def _build_metric_progress_summary(
     baseline_start = _coerce_float(rounds[0].get("baseline_metric")) if isinstance(rounds[0], dict) else None
     accepted: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
+    rejected_after_metric_improvement: List[Dict[str, Any]] = []
     for item in rounds:
         if not isinstance(item, dict):
             continue
+        metric_improved = (
+            item.get("metric_improved")
+            if isinstance(item.get("metric_improved"), bool)
+            else item.get("improved_by_metric")
+        )
+        governance_approved = (
+            item.get("governance_approved")
+            if isinstance(item.get("governance_approved"), bool)
+            else item.get("approved")
+        )
         entry = {
             "round_id": item.get("round_id"),
             "baseline_metric": item.get("baseline_metric"),
             "candidate_metric": item.get("candidate_metric"),
             "kept": item.get("kept"),
             "hypothesis": item.get("hypothesis"),
+            "metric_improved": metric_improved,
+            "governance_approved": governance_approved,
         }
         if str(item.get("kept") or "").strip().lower() == "improved":
             accepted.append(entry)
         else:
             rejected.append(entry)
+            if metric_improved:
+                rejected_after_metric_improvement.append(entry)
     summary: Dict[str, Any] = {
         "metric_name": canonical_metric_name or metric_loop_context.get("metric_name"),
         "baseline_start": baseline_start,
@@ -1066,6 +1081,7 @@ def _build_metric_progress_summary(
         "selected_incumbent_metric": canonical_metric_value,
         "accepted_rounds": accepted,
         "rejected_rounds": rejected,
+        "rejected_after_metric_improvement": rejected_after_metric_improvement,
         "rounds_attempted": len(rounds),
     }
     if baseline_start is not None and canonical_metric_value is not None:

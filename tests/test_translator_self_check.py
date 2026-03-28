@@ -3,6 +3,7 @@ import os
 
 from src.agents.business_translator import (
     BusinessTranslatorAgent,
+    _build_metric_progress_summary,
     _score_report_quality,
     _validate_report_structure,
 )
@@ -170,6 +171,32 @@ def test_translator_prompt_separates_final_incumbent_from_rejected_challenger(tm
     assert '"improvement_history_scope": "historical_progress_only"' in prompt
     assert '"selected_incumbent_metric": 1410.2794030184425' in prompt
     assert '"final_incumbent":' not in prompt
+
+
+def test_metric_progress_summary_tracks_rejected_metric_gains_separately():
+    summary = _build_metric_progress_summary(
+        {
+            "round_history": [
+                {
+                    "round_id": 1,
+                    "baseline_metric": 8.679845364749,
+                    "candidate_metric": 0.0005509950045063333,
+                    "kept": "baseline",
+                    "metric_improved": True,
+                    "governance_approved": False,
+                    "hypothesis": {"label": "piecewise_linear_case_model"},
+                }
+            ]
+        },
+        "mean_absolute_error",
+        8.679845364749,
+    )
+
+    assert summary is not None
+    assert summary["accepted_rounds"] == []
+    assert summary["rejected_rounds"][0]["metric_improved"] is True
+    assert summary["rejected_rounds"][0]["governance_approved"] is False
+    assert summary["rejected_after_metric_improvement"][0]["candidate_metric"] == 0.0005509950045063333
 
 
 def test_translator_kpi_snapshot_uses_canonical_final_metric_only(tmp_path, monkeypatch):

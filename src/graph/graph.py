@@ -29706,7 +29706,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         or state.get("runtime_fix_terminal")
         or state.get("sandbox_failed")
     )
-    approved = (
+    review_signal_approved = (
         (not deterministic_blockers)
         if advisory_review_mode
         else (_is_approved_review_status(verdict) and (not deterministic_blockers))
@@ -29746,7 +29746,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             {
                 "label": "candidate",
                 "metric_value": improved_value,
-                "stability_ok": bool(approved and stability_ok),
+                "stability_ok": bool(review_signal_approved and stability_ok),
                 "cv_std": candidate_tradeoff.get("cv_std"),
                 "generalization_gap_abs": candidate_tradeoff.get("generalization_gap_abs"),
                 "cost": float(round_id if round_id > 0 else 1),
@@ -29796,6 +29796,10 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     )
     board_final_status = normalize_review_status(board_final_raw)
     board_final_approved = bool(str(board_final_raw).strip()) and _is_approved_review_status(board_final_status)
+    governance_approved = bool(
+        review_signal_approved
+        and (board_candidate_approved if bool(str(board_candidate_raw).strip()) else True)
+    )
     advisor_veto_applied = False
     board_veto_applied = False
     if bool(str(board_candidate_raw).strip()) and not board_candidate_approved:
@@ -29804,13 +29808,16 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     if isinstance(meets_min_delta_packet, bool) and not meets_min_delta_packet and not board_candidate_approved:
         advisor_veto_applied = True
         selected_candidate_eligible = False
-        selection_metric_improved = False
     incumbent_selection.update(
         {
             "metric_name": metric_name,
             "higher_is_better": bool(higher_is_better),
             "min_delta": float(min_delta),
-            "approved": bool(approved),
+            "metric_preferred_label": selected_label,
+            "approved": bool(governance_approved),
+            "review_signal_approved": bool(review_signal_approved),
+            "governance_approved": bool(governance_approved),
+            "metric_improved": bool(selection_metric_improved),
             "improved_by_metric": bool(selection_metric_improved),
             "stability_ok": bool(stability_ok),
             "deterministic_blockers": bool(deterministic_blockers),
@@ -29832,8 +29839,11 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             "review_board_veto_applied": bool(board_veto_applied),
         }
     )
+    approved = bool(governance_approved)
     improved_by_metric = bool(selection_metric_improved)
     improved = bool(selected_candidate_eligible)
+    if not improved:
+        incumbent_selection["selected_label"] = "baseline"
     state["opt_incumbent_selection"] = incumbent_selection
     if not improved:
         if isinstance(state.get("review_board_verdict"), dict):
@@ -30043,6 +30053,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         if baseline_value is None or improved_value is None
         else float(improved_value - baseline_value),
         "approved": bool(approved),
+        "review_signal_approved": bool(review_signal_approved),
+        "governance_approved": bool(governance_approved),
+        "metric_improved": bool(improved_by_metric),
         "improved_by_metric": bool(improved_by_metric),
         "stability_ok": bool(stability_ok),
         "deterministic_blockers": bool(deterministic_blockers),
@@ -30115,6 +30128,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         details={
             "round_id": int(round_id or 0),
             "approved": bool(approved),
+            "review_signal_approved": bool(review_signal_approved),
+            "governance_approved": bool(governance_approved),
+            "metric_improved": bool(improved_by_metric),
             "improved_by_metric": bool(improved_by_metric),
             "stability_ok": bool(stability_ok),
             "runtime_failed": bool(runtime_failed),
@@ -30181,7 +30197,8 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     decision_note = (
         f"METRIC_IMPROVEMENT_ROUND: round={round_id}/{rounds_allowed} metric={metric_name} baseline={baseline_value} "
         f"improved={improved_value} min_delta={min_delta} "
-        f"meets_min_delta={improved_by_metric} stability_ok={stability_ok} "
+        f"metric_improved={improved_by_metric} governance_approved={governance_approved} "
+        f"review_signal_approved={review_signal_approved} stability_ok={stability_ok} "
         f"deterministic_blockers={deterministic_blockers} "
         f"advisory_review_mode={advisory_review_mode} "
         f"forced_finalize={force_finalize} "
@@ -30221,7 +30238,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 "action": hypothesis_packet.get("action"),
                 "deterministic_blockers": bool(deterministic_blockers),
                 "runtime_failed": bool(runtime_failed),
-                "advisor_meets_min_delta": bool(improved_by_metric),
+                "advisor_meets_min_delta": meets_min_delta_packet,
+                "metric_improved": bool(improved_by_metric),
+                "governance_approved": bool(governance_approved),
                 "stability_ok": bool(stability_ok),
                 "pareto_frontier_improved": bool(round_record.get("pareto_frontier_improved")),
                 "no_improve_streak": int(no_improve_streak),
@@ -30262,6 +30281,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                 "signature": tracker_context.get("signature"),
                 "action": hypothesis_packet.get("action"),
                 "approved": bool(approved),
+                "review_signal_approved": bool(review_signal_approved),
+                "governance_approved": bool(governance_approved),
+                "metric_improved": bool(improved_by_metric),
                 "improved_by_metric": bool(improved_by_metric),
                 "deterministic_blockers": bool(deterministic_blockers),
                 "runtime_failed": bool(runtime_failed),
@@ -30284,7 +30306,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                         "provider": critique_meta.get("provider"),
                         "model": critique_meta.get("model"),
                         "analysis_summary": str(critique_packet.get("analysis_summary") or "")[:280],
-                        "meets_min_delta": bool(improved_by_metric),
+                        "meets_min_delta": meets_min_delta_packet,
+                        "metric_improved": bool(improved_by_metric),
+                        "governance_approved": bool(governance_approved),
                         "packet_present": bool(critique_packet),
                         "validation_errors": (
                             critique_meta.get("validation_errors")[:3]
@@ -30312,6 +30336,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
                         "min_delta": float(min_delta),
                     "higher_is_better": bool(higher_is_better),
                     "approved": bool(approved),
+                    "review_signal_approved": bool(review_signal_approved),
+                    "governance_approved": bool(governance_approved),
+                    "metric_improved": bool(improved_by_metric),
                     "improved": bool(improved),
                         "improved_by_metric": bool(improved_by_metric),
                         "stability_ok": bool(stability_ok),
@@ -30483,7 +30510,22 @@ def _sync_review_board_verdict_after_metric_round(
     candidate_metric = _coerce_float(candidate.get("metric_value"))
     final_metric = _coerce_float(final_entry.get("metric_value"))
     min_delta = float(_coerce_float(target.get("min_delta")) or 0.0)
-    approved = bool(selection.get("approved"))
+    approved = bool(
+        selection.get("governance_approved")
+        if isinstance(selection.get("governance_approved"), bool)
+        else selection.get("approved")
+    )
+    review_signal_approved = bool(
+        selection.get("review_signal_approved")
+        if isinstance(selection.get("review_signal_approved"), bool)
+        else approved
+    )
+    governance_approved = bool(approved)
+    metric_improved = bool(
+        selection.get("metric_improved")
+        if isinstance(selection.get("metric_improved"), bool)
+        else selection.get("improved_by_metric")
+    )
     improved_by_metric = bool(selection.get("improved_by_metric"))
     stability_ok = bool(selection.get("stability_ok"))
     deterministic_blockers = bool(selection.get("deterministic_blockers"))
@@ -30549,6 +30591,9 @@ def _sync_review_board_verdict_after_metric_round(
         "final_metric": final_metric,
         "min_delta": float(min_delta),
         "approved": bool(approved),
+        "review_signal_approved": bool(review_signal_approved),
+        "governance_approved": bool(governance_approved),
+        "metric_improved": bool(metric_improved),
         "improved_by_metric": bool(improved_by_metric),
         "stability_ok": bool(stability_ok),
         "deterministic_blockers": bool(deterministic_blockers),
