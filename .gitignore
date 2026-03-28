@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 *.pyd
 .pytest_cache/
+.pytest-local/
+.pytest-tmp/
+/tmp*/
 .mypy_cache/
 .pyre/
 .dmypy.json
