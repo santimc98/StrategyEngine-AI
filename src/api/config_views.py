@@ -58,6 +58,7 @@ MODEL_PRESET_OPTIONS: List[Tuple[str, str]] = [
     ("minimax/minimax-m2.7", "Minimax M-2.7"),
     ("deepseek/deepseek-chat-v3.2", "DeepSeek V3.2"),
     ("anthropic/claude-opus-4.6", "Claude Opus 4.6"),
+    ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),
     ("openai/chatgpt-5.2", "ChatGPT 5.2"),
     ("openai/gpt-5.3-codex", "GPT-5.3 Codex"),
     ("openai/gpt-5.4-mini", "GPT-5.4 Mini"),

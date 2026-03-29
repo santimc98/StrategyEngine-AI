@@ -105,6 +105,11 @@ export function SettingsWorkspace({
     };
   }, [modelsState.agents]);
 
+  const customModelOption = modelsState.custom_option || "__custom_model__";
+  const presetModels = useMemo(() => {
+    return new Map(modelsState.presets.map((preset) => [preset.id, preset.label]));
+  }, [modelsState.presets]);
+
   const selectedProviderSpec = useMemo(() => {
     return sandboxState.providers.find((item) => item.name === provider) || sandboxState.providers[0];
   }, [provider, sandboxState.providers]);
@@ -135,6 +140,27 @@ export function SettingsWorkspace({
   function refreshServerState(): void {
     startTransition(() => {
       router.refresh();
+    });
+  }
+
+  function resolveModelSelectValue(agentKey: string): string {
+    const currentValue = String(modelInputs[agentKey] || "").trim();
+    if (!currentValue) {
+      return "";
+    }
+    return presetModels.has(currentValue) ? currentValue : customModelOption;
+  }
+
+  function updateModelPreset(agentKey: string, nextValue: string): void {
+    setModelInputs((current) => {
+      const currentValue = String(current[agentKey] || "").trim();
+      if (!nextValue) {
+        return { ...current, [agentKey]: "" };
+      }
+      if (nextValue === customModelOption) {
+        return { ...current, [agentKey]: presetModels.has(currentValue) ? "" : currentValue };
+      }
+      return { ...current, [agentKey]: nextValue };
     });
   }
 
@@ -446,16 +472,31 @@ export function SettingsWorkspace({
 
             <div className="settings-form-grid">
               {groupedAgents.primary.map((agent) => (
-                <label className="field" key={agent.key}>
+                <div className="field" key={agent.key}>
                   <span>{agent.label}</span>
-                  <input
-                    list="model-presets"
-                    value={modelInputs[agent.key] || ""}
-                    onChange={(event) =>
-                      setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
-                    }
-                  />
-                </label>
+                  <select
+                    value={resolveModelSelectValue(agent.key)}
+                    onChange={(event) => updateModelPreset(agent.key, event.target.value)}
+                  >
+                    <option value="">Sin configurar</option>
+                    {modelsState.presets.map((preset) => (
+                      <option key={preset.id} value={preset.id}>
+                        {preset.label}
+                      </option>
+                    ))}
+                    <option value={customModelOption}>Modelo personalizado</option>
+                  </select>
+                  {resolveModelSelectValue(agent.key) === customModelOption ? (
+                    <input
+                      type="text"
+                      value={modelInputs[agent.key] || ""}
+                      placeholder="anthropic/claude-sonnet-4.6"
+                      onChange={(event) =>
+                        setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
+                      }
+                    />
+                  ) : null}
+                </div>
               ))}
             </div>
 
@@ -463,27 +504,34 @@ export function SettingsWorkspace({
               <summary>Modelos avanzados</summary>
               <div className="settings-form-grid">
                 {groupedAgents.advanced.map((agent) => (
-                  <label className="field" key={agent.key}>
+                  <div className="field" key={agent.key}>
                     <span>{agent.label}</span>
-                    <input
-                      list="model-presets"
-                      value={modelInputs[agent.key] || ""}
-                      onChange={(event) =>
-                        setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
-                      }
-                    />
-                  </label>
+                    <select
+                      value={resolveModelSelectValue(agent.key)}
+                      onChange={(event) => updateModelPreset(agent.key, event.target.value)}
+                    >
+                      <option value="">Sin configurar</option>
+                      {modelsState.presets.map((preset) => (
+                        <option key={preset.id} value={preset.id}>
+                          {preset.label}
+                        </option>
+                      ))}
+                      <option value={customModelOption}>Modelo personalizado</option>
+                    </select>
+                    {resolveModelSelectValue(agent.key) === customModelOption ? (
+                      <input
+                        type="text"
+                        value={modelInputs[agent.key] || ""}
+                        placeholder="anthropic/claude-sonnet-4.6"
+                        onChange={(event) =>
+                          setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
+                        }
+                      />
+                    ) : null}
+                  </div>
                 ))}
               </div>
             </details>
-
-            <datalist id="model-presets">
-              {modelsState.presets.map((preset) => (
-                <option key={preset.id} value={preset.id}>
-                  {preset.label}
-                </option>
-              ))}
-            </datalist>
           </div>
         ) : null}
 

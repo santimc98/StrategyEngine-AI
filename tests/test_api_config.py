@@ -39,6 +39,7 @@ def test_get_model_settings_returns_effective_runtime_view(client, monkeypatch):
     assert payload["base_models"]["steward"] == "openai/gpt-5.4"
     assert payload["effective_models"]["translator"] == "anthropic/claude-opus-4.6"
     assert any(agent["key"] == "ml_engineer" for agent in payload["agents"])
+    assert any(preset["id"] == "anthropic/claude-sonnet-4.6" for preset in payload["presets"])
 
 
 def test_put_model_settings_applies_and_persists_models(client, monkeypatch):
