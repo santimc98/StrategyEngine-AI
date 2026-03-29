@@ -33,6 +33,8 @@ shap
 
 # --- Visualization & UI ---
 streamlit
+fastapi
+uvicorn
 matplotlib
 seaborn
 plotly
