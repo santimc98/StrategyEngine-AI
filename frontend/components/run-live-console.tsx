@@ -94,8 +94,8 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
   const isRunning = String(status.status || "").toLowerCase() === "running";
 
   return (
-    <section className="panel">
-      <div className="panel-heading">
+    <div className="stack-lg">
+      <div className="section-head">
         <div>
           <p className="eyebrow">Seguimiento en vivo</p>
           <h2>Estado operativo y últimos logs</h2>
@@ -111,7 +111,7 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
       </div>
 
       <div className="overview-grid live-grid">
-        <article className="panel nested">
+        <article className="stack-sm">
           <div className="stack-sm">
             <div className="metric-row">
               <span>Stage</span>
@@ -134,8 +134,8 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
           </div>
         </article>
 
-        <article className="panel nested">
-          <div className="panel-heading">
+        <article className="stack-sm">
+          <div className="section-head">
             <div>
               <p className="eyebrow">Steps completados</p>
               <h2>Pipeline visible</h2>
@@ -170,6 +170,6 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
           <p className="muted-copy">{loading ? "Cargando logs..." : "Todavía no hay logs visibles."}</p>
         )}
       </div>
-    </section>
+    </div>
   );
 }

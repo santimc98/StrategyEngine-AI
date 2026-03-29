@@ -22,20 +22,27 @@ export default async function SettingsPage() {
       fetchApiJson<ConnectorSpecsResponse>("/integrations/connectors"),
     ]);
   } catch (error) {
-    loadError = error instanceof Error ? error.message : "No se pudo cargar la configuración";
+    loadError = error instanceof Error ? error.message : "No se pudo cargar la configuracion";
   }
 
   return (
     <div className="stack-xl">
-      <section className="hero compact">
-        <div className="hero-copy">
+      <section className="page-intro">
+        <div className="page-intro-copy">
           <p className="eyebrow">Settings</p>
-          <h1>Configuración operativa del producto.</h1>
+          <h1>Configuracion operativa del producto.</h1>
           <p className="hero-text">
-            Esta vista resume el estado efectivo de modelos, sandbox, proveedores y conectores sin
-            depender del sidebar de Streamlit.
+            Controla modelos por agente, sandbox, credenciales e integraciones desde una vista
+            unica pensada como superficie de producto y no como consola auxiliar.
           </p>
         </div>
+        {models && apiKeys ? (
+          <div className="page-intro-side">
+            <span className="page-kpi-label">Agentes configurables</span>
+            <strong>{models.agents.length}</strong>
+            <p>{apiKeys.items.filter((item) => item.configured).length} credenciales ya configuradas.</p>
+          </div>
+        ) : null}
       </section>
 
       {loadError ? (

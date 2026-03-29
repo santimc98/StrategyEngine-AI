@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -125,6 +126,22 @@ def test_create_run_launches_background_worker(client, monkeypatch, tmp_path):
 
     assert response.status_code == 201
     assert response.json()["run_id"] == "newrun01"
+
+
+def test_upload_dataset_persists_csv_to_data_dir(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(api_main, "DATA_DIR", str(tmp_path))
+
+    response = client.post(
+        "/datasets/upload",
+        headers={"x-filename": "ventas.csv", "content-type": "text/csv"},
+        content=b"a,b\n1,2\n",
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["filename"].endswith(".csv")
+    assert payload["size_bytes"] == len(b"a,b\n1,2\n")
+    assert Path(payload["csv_path"]).exists()
 
 
 def test_abort_run_requests_abort_and_optional_kill(client, monkeypatch, tmp_path):

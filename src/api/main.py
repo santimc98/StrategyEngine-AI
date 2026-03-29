@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse
 
@@ -12,7 +15,7 @@ from src.api import config_views
 from src.api import integration_views
 from src.api import run_views
 from src.utils import run_history, run_launcher, run_status
-from src.utils.paths import PROJECT_ROOT, RUNS_DIR, run_dir
+from src.utils.paths import DATA_DIR, PROJECT_ROOT, RUNS_DIR, run_dir
 
 app = FastAPI(
     title="StrategyEngine AI API",
@@ -104,6 +107,17 @@ def _manifest_path(run_id: str) -> str:
 
 def _run_exists(run_id: str) -> bool:
     return os.path.isdir(run_dir(run_id))
+
+
+def _sanitize_upload_filename(filename: str) -> str:
+    candidate = Path(str(filename or "").strip()).name
+    if not candidate:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing filename")
+    if Path(candidate).suffix.lower() != ".csv":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only CSV uploads are supported")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(candidate).stem).strip("._-") or "dataset"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    return f"{stem}_{timestamp}.csv"
 
 
 def _build_run_detail(run_id: str) -> Optional[Dict[str, Any]]:
@@ -220,6 +234,26 @@ def create_run(payload: RunCreateRequest) -> Dict[str, Any]:
         "pid": launched["pid"],
         "replaced_run_id": launched["replaced_run_id"],
         "worker_stdout_path": launched["worker_stdout_path"],
+    }
+
+
+@app.post("/datasets/upload", status_code=status.HTTP_201_CREATED)
+async def upload_dataset(request: Request) -> Dict[str, Any]:
+    filename = _sanitize_upload_filename(request.headers.get("x-filename") or "")
+    content = await request.body()
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty upload body")
+
+    uploads_dir = os.path.join(DATA_DIR, "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
+    csv_path = os.path.abspath(os.path.join(uploads_dir, filename))
+    with open(csv_path, "wb") as handle:
+        handle.write(content)
+
+    return {
+        "filename": filename,
+        "csv_path": csv_path,
+        "size_bytes": len(content),
     }
 
 

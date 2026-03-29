@@ -23,6 +23,15 @@ type MessageState = {
   text: string;
 } | null;
 
+type SettingsTabKey = "models" | "sandbox" | "keys" | "connectors";
+
+const settingsTabs: Array<{ key: SettingsTabKey; label: string }> = [
+  { key: "models", label: "Modelos" },
+  { key: "sandbox", label: "Sandbox" },
+  { key: "keys", label: "Credenciales" },
+  { key: "connectors", label: "Conectores CRM" },
+];
+
 function sanitizeObject(payload: Record<string, unknown>): Record<string, string> {
   const cleaned: Record<string, string> = {};
   Object.entries(payload).forEach(([key, value]) => {
@@ -45,6 +54,7 @@ export function SettingsWorkspace({
 }: SettingsWorkspaceProps) {
   const router = useRouter();
   const [isRefreshing, startTransition] = useTransition();
+  const [activeTab, setActiveTab] = useState<SettingsTabKey>("models");
 
   const [modelsState, setModelsState] = useState(initialModels);
   const [sandboxState, setSandboxState] = useState(initialSandbox);
@@ -68,9 +78,7 @@ export function SettingsWorkspace({
     sanitizeObject((initialSandbox.execution_backend as Record<string, unknown>) || {}),
   );
   const [apiKeyInputs, setApiKeyInputs] = useState<Record<string, string>>({});
-  const [selectedConnectorId, setSelectedConnectorId] = useState(
-    initialConnectors.items[0]?.id || "",
-  );
+  const [selectedConnectorId, setSelectedConnectorId] = useState(initialConnectors.items[0]?.id || "");
   const [selectedAuthModeId, setSelectedAuthModeId] = useState(
     initialConnectors.items[0]?.auth_modes[0]?.id || "",
   );
@@ -116,6 +124,14 @@ export function SettingsWorkspace({
     );
   }, [selectedAuthModeId, selectedConnector]);
 
+  const configuredRequiredKeys = useMemo(() => {
+    return apiKeysState.items.filter((item) => item.required && item.configured).length;
+  }, [apiKeysState.items]);
+
+  const totalRequiredKeys = useMemo(() => {
+    return apiKeysState.items.filter((item) => item.required).length;
+  }, [apiKeysState.items]);
+
   function refreshServerState(): void {
     startTransition(() => {
       router.refresh();
@@ -142,7 +158,7 @@ export function SettingsWorkspace({
       };
       setModelsState(nextState);
       setModelInputs(nextState.effective_models);
-      setModelsMessage({ tone: "success", text: "Configuración de modelos guardada." });
+      setModelsMessage({ tone: "success", text: "Configuracion de modelos guardada." });
       refreshServerState();
     } catch (error) {
       setModelsMessage({
@@ -158,9 +174,7 @@ export function SettingsWorkspace({
     setSavingModels(true);
     setModelsMessage(null);
     try {
-      const response = await fetch("/api/config/models/reset", {
-        method: "POST",
-      });
+      const response = await fetch("/api/config/models/reset", { method: "POST" });
       if (!response.ok) {
         throw new Error(await response.text());
       }
@@ -296,9 +310,7 @@ export function SettingsWorkspace({
     }
   }
 
-  async function runConnectorAction(
-    action: "test" | "objects" | "fetch",
-  ): Promise<void> {
+  async function runConnectorAction(action: "test" | "objects" | "fetch"): Promise<void> {
     if (!selectedConnector || !selectedAuthMode) {
       return;
     }
@@ -334,7 +346,7 @@ export function SettingsWorkspace({
       if (action === "test") {
         setConnectorMessage({
           tone: payload.ok ? "success" : "warning",
-          text: payload.message || "Conexión verificada.",
+          text: payload.message || "Conexion verificada.",
         });
       } else if (action === "objects") {
         const items = Array.isArray(payload.items)
@@ -375,45 +387,65 @@ export function SettingsWorkspace({
   }
 
   return (
-    <div className="stack-xl">
-      <section className="settings-grid">
-        <article className="panel nested">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">Modelos</p>
-              <h2>Slots configurables</h2>
+    <div className="stack-lg">
+      <div className="summary-strip">
+        <div className="summary-chip">
+          <span>Slots principales</span>
+          <strong>{groupedAgents.primary.length}</strong>
+        </div>
+        <div className="summary-chip">
+          <span>Sandbox</span>
+          <strong>{provider}</strong>
+        </div>
+        <div className="summary-chip">
+          <span>Credenciales listas</span>
+          <strong>
+            {configuredRequiredKeys}/{totalRequiredKeys}
+          </strong>
+        </div>
+        <div className="summary-chip">
+          <span>Conectores CRM</span>
+          <strong>{initialConnectors.count}</strong>
+        </div>
+      </div>
+
+      <section className="workspace-panel">
+        <div className="tab-strip" role="tablist" aria-label="Settings">
+          {settingsTabs.map((tab) => (
+            <button
+              key={tab.key}
+              className={`tab-button${activeTab === tab.key ? " active" : ""}`}
+              onClick={() => setActiveTab(tab.key)}
+              type="button"
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === "models" ? (
+          <div className="stack-lg">
+            <div className="section-head">
+              <div>
+                <p className="eyebrow">Modelos</p>
+                <h2>Configuracion de modelos por agente</h2>
+              </div>
+              <div className="panel-actions">
+                <button className="secondary-button" onClick={resetModels} disabled={savingModels}>
+                  Reset
+                </button>
+                <button className="primary-button" onClick={saveModels} disabled={savingModels}>
+                  {savingModels ? "Guardando..." : "Guardar modelos"}
+                </button>
+              </div>
             </div>
-            <div className="panel-actions">
-              <button className="secondary-button" onClick={resetModels} disabled={savingModels}>
-                Reset
-              </button>
-              <button className="primary-button" onClick={saveModels} disabled={savingModels}>
-                {savingModels ? "Guardando..." : "Guardar modelos"}
-              </button>
-            </div>
-          </div>
 
-          {modelsMessage ? <p className={`inline-message ${modelsMessage.tone}`}>{modelsMessage.text}</p> : null}
+            {modelsMessage ? (
+              <p className={`inline-message ${modelsMessage.tone}`}>{modelsMessage.text}</p>
+            ) : null}
 
-          <div className="settings-form-grid">
-            {groupedAgents.primary.map((agent) => (
-              <label className="field" key={agent.key}>
-                <span>{agent.label}</span>
-                <input
-                  list="model-presets"
-                  value={modelInputs[agent.key] || ""}
-                  onChange={(event) =>
-                    setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
-                  }
-                />
-              </label>
-            ))}
-          </div>
-
-          <details className="settings-details">
-            <summary>Modelos avanzados</summary>
             <div className="settings-form-grid">
-              {groupedAgents.advanced.map((agent) => (
+              {groupedAgents.primary.map((agent) => (
                 <label className="field" key={agent.key}>
                   <span>{agent.label}</span>
                   <input
@@ -426,305 +458,331 @@ export function SettingsWorkspace({
                 </label>
               ))}
             </div>
-          </details>
 
-          <datalist id="model-presets">
-            {modelsState.presets.map((preset) => (
-              <option key={preset.id} value={preset.id}>
-                {preset.label}
-              </option>
-            ))}
-          </datalist>
-        </article>
-
-        <article className="panel nested">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">Sandbox</p>
-              <h2>Proveedor y backend de ejecución</h2>
-            </div>
-            <button className="primary-button" onClick={saveSandbox} disabled={savingSandbox}>
-              {savingSandbox ? "Guardando..." : "Guardar sandbox"}
-            </button>
-          </div>
-
-          {sandboxMessage ? (
-            <p className={`inline-message ${sandboxMessage.tone}`}>{sandboxMessage.text}</p>
-          ) : null}
-
-          <div className="stack-sm">
-            <div className="metric-row">
-              <span>Estado actual</span>
-              <StatusPill value={String(sandboxState.provider_status?.severity || "neutral")} />
-            </div>
-            <div className="metric-row">
-              <span>Backend</span>
-              <strong>{String(sandboxState.execution_backend_status?.detail || "N/A")}</strong>
-            </div>
-          </div>
-
-          <div className="settings-form-grid">
-            <label className="field field-full">
-              <span>Proveedor</span>
-              <select
-                value={provider}
-                onChange={(event) => {
-                  setProvider(event.target.value);
-                  setProviderSettings({});
-                }}
-              >
-                {sandboxState.providers.map((item) => (
-                  <option key={item.name} value={item.name}>
-                    {item.label}
-                  </option>
+            <details className="settings-details">
+              <summary>Modelos avanzados</summary>
+              <div className="settings-form-grid">
+                {groupedAgents.advanced.map((agent) => (
+                  <label className="field" key={agent.key}>
+                    <span>{agent.label}</span>
+                    <input
+                      list="model-presets"
+                      value={modelInputs[agent.key] || ""}
+                      onChange={(event) =>
+                        setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
+                      }
+                    />
+                  </label>
                 ))}
-              </select>
-            </label>
+              </div>
+            </details>
 
-            {(selectedProviderSpec?.config_fields || []).map((field) => (
-              <label className="field" key={field.key}>
-                <span>{field.label}</span>
-                <input
-                  type={field.secret ? "password" : "text"}
-                  placeholder={field.placeholder || field.description || field.key}
-                  value={providerSettings[field.key] || ""}
-                  onChange={(event) =>
-                    setProviderSettings((current) => ({
-                      ...current,
-                      [field.key]: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-            ))}
+            <datalist id="model-presets">
+              {modelsState.presets.map((preset) => (
+                <option key={preset.id} value={preset.id}>
+                  {preset.label}
+                </option>
+              ))}
+            </datalist>
           </div>
+        ) : null}
 
-          <details className="settings-details" open>
-            <summary>Execution backend</summary>
+        {activeTab === "sandbox" ? (
+          <div className="stack-lg">
+            <div className="section-head">
+              <div>
+                <p className="eyebrow">Sandbox</p>
+                <h2>Proveedor y backend de ejecucion</h2>
+              </div>
+              <button className="primary-button" onClick={saveSandbox} disabled={savingSandbox}>
+                {savingSandbox ? "Guardando..." : "Guardar sandbox"}
+              </button>
+            </div>
+
+            {sandboxMessage ? (
+              <p className={`inline-message ${sandboxMessage.tone}`}>{sandboxMessage.text}</p>
+            ) : null}
+
+            <div className="simple-info-list">
+              <div className="metric-row">
+                <span>Estado actual</span>
+                <StatusPill value={String(sandboxState.provider_status?.severity || "neutral")} />
+              </div>
+              <div className="metric-row">
+                <span>Backend</span>
+                <strong>{String(sandboxState.execution_backend_status?.detail || "N/A")}</strong>
+              </div>
+            </div>
+
             <div className="settings-form-grid">
-              <label className="field">
-                <span>Modo</span>
+              <label className="field field-full">
+                <span>Proveedor</span>
                 <select
-                  value={executionBackend.mode || "cloudrun"}
-                  onChange={(event) =>
-                    setExecutionBackend((current) => ({ ...current, mode: event.target.value }))
-                  }
+                  value={provider}
+                  onChange={(event) => {
+                    setProvider(event.target.value);
+                    setProviderSettings({});
+                  }}
                 >
-                  <option value="cloudrun">cloudrun</option>
-                  <option value="local">local</option>
+                  {sandboxState.providers.map((item) => (
+                    <option key={item.name} value={item.name}>
+                      {item.label}
+                    </option>
+                  ))}
                 </select>
               </label>
-              {["job", "region", "bucket", "project", "script_timeout_seconds"].map((key) => (
-                <label className="field" key={key}>
-                  <span>{key}</span>
+
+              {(selectedProviderSpec?.config_fields || []).map((field) => (
+                <label className="field" key={field.key}>
+                  <span>{field.label}</span>
                   <input
-                    value={executionBackend[key] || ""}
+                    type={field.secret ? "password" : "text"}
+                    placeholder={field.placeholder || field.description || field.key}
+                    value={providerSettings[field.key] || ""}
                     onChange={(event) =>
-                      setExecutionBackend((current) => ({
+                      setProviderSettings((current) => ({
                         ...current,
-                        [key]: event.target.value,
+                        [field.key]: event.target.value,
                       }))
                     }
                   />
                 </label>
               ))}
             </div>
-          </details>
-        </article>
-      </section>
 
-      <section className="settings-grid">
-        <article className="panel nested">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">Credenciales</p>
-              <h2>API keys</h2>
-            </div>
-          </div>
-
-          {apiKeysMessage ? <p className={`inline-message ${apiKeysMessage.tone}`}>{apiKeysMessage.text}</p> : null}
-
-          <div className="stack-sm">
-            {apiKeysState.items.map((item) => (
-              <div key={item.env_var} className="credential-card">
-                <div className="credential-top">
-                  <div>
-                    <strong>{item.label}</strong>
-                    <p>{item.description}</p>
-                  </div>
-                  <StatusPill value={item.configured ? "ok" : item.required ? "warning" : "neutral"} />
-                </div>
-                <div className="settings-form-grid">
-                  <label className="field field-full">
-                    <span>{item.env_var}</span>
+            <details className="settings-details" open>
+              <summary>Execution backend</summary>
+              <div className="settings-form-grid">
+                <label className="field">
+                  <span>Modo</span>
+                  <select
+                    value={executionBackend.mode || "cloudrun"}
+                    onChange={(event) =>
+                      setExecutionBackend((current) => ({ ...current, mode: event.target.value }))
+                    }
+                  >
+                    <option value="cloudrun">cloudrun</option>
+                    <option value="local">local</option>
+                  </select>
+                </label>
+                {["job", "region", "bucket", "project", "script_timeout_seconds"].map((key) => (
+                  <label className="field" key={key}>
+                    <span>{key}</span>
                     <input
-                      type="password"
-                      placeholder={item.masked_value || item.placeholder}
-                      value={apiKeyInputs[item.env_var] || ""}
+                      value={executionBackend[key] || ""}
                       onChange={(event) =>
-                        setApiKeyInputs((current) => ({
+                        setExecutionBackend((current) => ({
                           ...current,
-                          [item.env_var]: event.target.value,
+                          [key]: event.target.value,
                         }))
                       }
                     />
                   </label>
-                </div>
-                <div className="panel-actions">
-                  <button
-                    className="secondary-button"
-                    onClick={() => testApiKey(item.env_var)}
-                    disabled={savingApiKey === item.env_var}
-                  >
-                    Test
-                  </button>
-                  <button
-                    className="primary-button"
-                    onClick={() => updateApiKey(item.env_var)}
-                    disabled={savingApiKey === item.env_var}
-                  >
-                    {savingApiKey === item.env_var ? "Guardando..." : "Actualizar"}
-                  </button>
-                </div>
+                ))}
               </div>
-            ))}
+            </details>
           </div>
-        </article>
+        ) : null}
 
-        <article className="panel nested">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">Conectores CRM</p>
-              <h2>Test y preview de extracción</h2>
+        {activeTab === "keys" ? (
+          <div className="stack-lg">
+            <div className="section-head">
+              <div>
+                <p className="eyebrow">Credenciales</p>
+                <h2>API keys operativas</h2>
+              </div>
+            </div>
+
+            {apiKeysMessage ? (
+              <p className={`inline-message ${apiKeysMessage.tone}`}>{apiKeysMessage.text}</p>
+            ) : null}
+
+            <div className="stack-sm">
+              {apiKeysState.items.map((item) => (
+                <div key={item.env_var} className="credential-card">
+                  <div className="credential-top">
+                    <div>
+                      <strong>{item.label}</strong>
+                      <p>{item.description}</p>
+                    </div>
+                    <StatusPill value={item.configured ? "ok" : item.required ? "warning" : "neutral"} />
+                  </div>
+                  <div className="settings-form-grid">
+                    <label className="field field-full">
+                      <span>{item.env_var}</span>
+                      <input
+                        type="password"
+                        placeholder={item.masked_value || item.placeholder}
+                        value={apiKeyInputs[item.env_var] || ""}
+                        onChange={(event) =>
+                          setApiKeyInputs((current) => ({
+                            ...current,
+                            [item.env_var]: event.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                  <div className="panel-actions">
+                    <button
+                      className="secondary-button"
+                      onClick={() => testApiKey(item.env_var)}
+                      disabled={savingApiKey === item.env_var}
+                    >
+                      Test
+                    </button>
+                    <button
+                      className="primary-button"
+                      onClick={() => updateApiKey(item.env_var)}
+                      disabled={savingApiKey === item.env_var}
+                    >
+                      {savingApiKey === item.env_var ? "Guardando..." : "Actualizar"}
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
+        ) : null}
 
-          {connectorMessage ? (
-            <p className={`inline-message ${connectorMessage.tone}`}>{connectorMessage.text}</p>
-          ) : null}
+        {activeTab === "connectors" ? (
+          <div className="stack-lg">
+            <div className="section-head">
+              <div>
+                <p className="eyebrow">Conectores CRM</p>
+                <h2>Test y preview de extraccion</h2>
+              </div>
+            </div>
 
-          <div className="settings-form-grid">
-            <label className="field">
-              <span>Conector</span>
-              <select
-                value={selectedConnectorId}
-                onChange={(event) => {
-                  const connectorId = event.target.value;
-                  setSelectedConnectorId(connectorId);
-                  const connector = initialConnectors.items.find((item) => item.id === connectorId);
-                  setSelectedAuthModeId(connector?.auth_modes[0]?.id || "");
-                  setConnectorCredentials({});
-                  setConnectorObjects([]);
-                  setConnectorPreview([]);
-                  setConnectorObjectName("");
-                  setConnectorCsvPath("");
-                }}
-              >
-                {initialConnectors.items.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {connectorMessage ? (
+              <p className={`inline-message ${connectorMessage.tone}`}>{connectorMessage.text}</p>
+            ) : null}
 
-            <label className="field">
-              <span>Modo auth</span>
-              <select
-                value={selectedAuthModeId}
-                onChange={(event) => setSelectedAuthModeId(event.target.value)}
-              >
-                {(selectedConnector?.auth_modes || []).map((mode) => (
-                  <option key={mode.id} value={mode.id}>
-                    {mode.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            {(selectedAuthMode?.fields || []).map((field) => (
-              <label className="field" key={field.key}>
-                <span>{field.label}</span>
-                <input
-                  type={field.secret ? "password" : "text"}
-                  value={connectorCredentials[field.key] || ""}
-                  onChange={(event) =>
-                    setConnectorCredentials((current) => ({
-                      ...current,
-                      [field.key]: event.target.value,
-                    }))
-                  }
-                />
+            <div className="settings-form-grid">
+              <label className="field">
+                <span>Conector</span>
+                <select
+                  value={selectedConnectorId}
+                  onChange={(event) => {
+                    const connectorId = event.target.value;
+                    setSelectedConnectorId(connectorId);
+                    const connector = initialConnectors.items.find((item) => item.id === connectorId);
+                    setSelectedAuthModeId(connector?.auth_modes[0]?.id || "");
+                    setConnectorCredentials({});
+                    setConnectorObjects([]);
+                    setConnectorPreview([]);
+                    setConnectorObjectName("");
+                    setConnectorCsvPath("");
+                  }}
+                >
+                  {initialConnectors.items.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
               </label>
-            ))}
 
-            <label className="field field-full">
-              <span>Objeto CRM</span>
-              <input
-                list="connector-objects"
-                value={connectorObjectName}
-                onChange={(event) => setConnectorObjectName(event.target.value)}
-                placeholder="Selecciona o escribe el objeto a extraer"
-              />
-              <datalist id="connector-objects">
-                {connectorObjects.map((item) => (
-                  <option key={item} value={item} />
-                ))}
-              </datalist>
-            </label>
-          </div>
+              <label className="field">
+                <span>Modo auth</span>
+                <select
+                  value={selectedAuthModeId}
+                  onChange={(event) => setSelectedAuthModeId(event.target.value)}
+                >
+                  {(selectedConnector?.auth_modes || []).map((mode) => (
+                    <option key={mode.id} value={mode.id}>
+                      {mode.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
 
-          <div className="panel-actions">
-            <button
-              className="secondary-button"
-              onClick={() => runConnectorAction("test")}
-              disabled={connectorBusyAction !== null}
-            >
-              {connectorBusyAction === "test" ? "Probando..." : "Probar conexión"}
-            </button>
-            <button
-              className="secondary-button"
-              onClick={() => runConnectorAction("objects")}
-              disabled={connectorBusyAction !== null}
-            >
-              {connectorBusyAction === "objects" ? "Cargando..." : "Listar objetos"}
-            </button>
-            <button
-              className="primary-button"
-              onClick={() => runConnectorAction("fetch")}
-              disabled={connectorBusyAction !== null || !connectorObjectName}
-            >
-              {connectorBusyAction === "fetch" ? "Extrayendo..." : "Preview y guardar CSV"}
-            </button>
-          </div>
+              {(selectedAuthMode?.fields || []).map((field) => (
+                <label className="field" key={field.key}>
+                  <span>{field.label}</span>
+                  <input
+                    type={field.secret ? "password" : "text"}
+                    value={connectorCredentials[field.key] || ""}
+                    onChange={(event) =>
+                      setConnectorCredentials((current) => ({
+                        ...current,
+                        [field.key]: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+              ))}
 
-          {connectorCsvPath ? (
-            <p className="helper-copy">CSV generado en: <strong>{connectorCsvPath}</strong></p>
-          ) : null}
+              <label className="field field-full">
+                <span>Objeto CRM</span>
+                <input
+                  list="connector-objects"
+                  value={connectorObjectName}
+                  onChange={(event) => setConnectorObjectName(event.target.value)}
+                  placeholder="Selecciona o escribe el objeto a extraer"
+                />
+                <datalist id="connector-objects">
+                  {connectorObjects.map((item) => (
+                    <option key={item} value={item} />
+                  ))}
+                </datalist>
+              </label>
+            </div>
 
-          {connectorPreview.length ? (
-            <div className="table-wrap">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    {Object.keys(connectorPreview[0]).map((column) => (
-                      <th key={column}>{column}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {connectorPreview.map((row, index) => (
-                    <tr key={index}>
+            <div className="panel-actions">
+              <button
+                className="secondary-button"
+                onClick={() => runConnectorAction("test")}
+                disabled={connectorBusyAction !== null}
+              >
+                {connectorBusyAction === "test" ? "Probando..." : "Probar conexion"}
+              </button>
+              <button
+                className="secondary-button"
+                onClick={() => runConnectorAction("objects")}
+                disabled={connectorBusyAction !== null}
+              >
+                {connectorBusyAction === "objects" ? "Cargando..." : "Listar objetos"}
+              </button>
+              <button
+                className="primary-button"
+                onClick={() => runConnectorAction("fetch")}
+                disabled={connectorBusyAction !== null || !connectorObjectName}
+              >
+                {connectorBusyAction === "fetch" ? "Extrayendo..." : "Preview y guardar CSV"}
+              </button>
+            </div>
+
+            {connectorCsvPath ? (
+              <p className="helper-copy">
+                CSV generado en: <strong>{connectorCsvPath}</strong>
+              </p>
+            ) : null}
+
+            {connectorPreview.length ? (
+              <div className="table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
                       {Object.keys(connectorPreview[0]).map((column) => (
-                        <td key={column}>{String(row[column] ?? "")}</td>
+                        <th key={column}>{column}</th>
                       ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : null}
-        </article>
+                  </thead>
+                  <tbody>
+                    {connectorPreview.map((row, index) => (
+                      <tr key={index}>
+                        {Object.keys(connectorPreview[0]).map((column) => (
+                          <td key={column}>{String(row[column] ?? "")}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </section>
 
       {isRefreshing ? <p className="helper-copy">Sincronizando estado del frontend...</p> : null}

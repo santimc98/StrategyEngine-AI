@@ -1,3 +1,4 @@
+import React from "react";
 import type { RunReportResponse } from "@/types/api";
 
 type RunReportProps = {
@@ -6,56 +7,124 @@ type RunReportProps = {
 };
 
 export function RunReport({ runId, report }: RunReportProps) {
-  return (
-    <div className="stack-lg">
-      <section className="panel">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">Informe ejecutivo</p>
-            <h2>Reporte final de la run</h2>
-          </div>
-          {report.pdf_available && report.pdf_url ? (
-            <a className="secondary-button" href={`/api${report.pdf_url}`} target="_blank" rel="noreferrer">
-              Abrir PDF
-            </a>
-          ) : null}
-        </div>
-        <div className="markdown-frame">
-          <pre>{report.markdown || "No hay reporte disponible."}</pre>
-        </div>
-      </section>
+  const renderBlock = (block: any, idx: number) => {
+    switch (block.type) {
+      case "heading":
+        const HTag = `h${block.level || 2}` as keyof React.JSX.IntrinsicElements;
+        const fontSizes: Record<number, string> = { 1: "2.5rem", 2: "1.8rem", 3: "1.4rem" };
+        const fs = fontSizes[block.level] || "1.2rem";
+        return React.createElement(HTag, { 
+          key: idx, 
+          style: { marginTop: "32px", marginBottom: "16px", fontSize: fs, fontWeight: 700, color: "var(--text)" } 
+        }, block.text);
+      
+      case "paragraph":
+        return <p key={idx} style={{ lineHeight: 1.7, marginBottom: "20px", fontSize: "1.05rem", color: "var(--text)" }}>{block.text}</p>;
+      
+      case "bullet_list":
+        return (
+          <ul key={idx} style={{ marginBottom: "24px", paddingLeft: "24px", color: "var(--text)", fontSize: "1.05rem" }}>
+            {block.items.map((item: string, i: number) => (
+              <li key={i} style={{ marginBottom: "8px", lineHeight: 1.6 }}>{item}</li>
+            ))}
+          </ul>
+        );
+      
+      case "numbered_list":
+        return (
+          <ol key={idx} style={{ marginBottom: "24px", paddingLeft: "24px", color: "var(--text)", fontSize: "1.05rem" }}>
+            {block.items.map((item: string, i: number) => (
+              <li key={i} style={{ marginBottom: "8px", lineHeight: 1.6 }}>{item}</li>
+            ))}
+          </ol>
+        );
 
-      <section className="panel">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">Plots curados</p>
-            <h2>Artefactos visuales de la run</h2>
-          </div>
-        </div>
-        <div className="plot-grid">
-          {report.plots.map((plot) => (
-            <article key={plot.filename} className="plot-card">
-              <img
-                src={`/api/runs/${runId}/report/plots/${plot.filename}`}
-                alt={plot.title}
-                className="plot-image"
+      case "artifact":
+        if (block.artifact_type === "html_table") {
+          return (
+            <div key={idx} style={{ margin: "32px 0 40px 0" }}>
+              <h4 style={{ fontSize: "1.2rem", marginBottom: "8px", fontWeight: 700 }}>{block.title}</h4>
+              <p className="muted-copy" style={{ marginBottom: "16px", fontStyle: "italic" }}>{block.lead_in}</p>
+              
+              <div 
+                className="table-wrap report-table" 
+                style={{ overflow: "hidden", marginBottom: "16px" }}
+                dangerouslySetInnerHTML={{ __html: block.content_html || "" }} 
               />
-              <div className="plot-card-body">
-                <h3>{plot.title}</h3>
-                {plot.facts.length ? (
-                  <ul className="fact-list">
-                    {plot.facts.slice(0, 4).map((fact) => (
-                      <li key={fact}>{fact}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="muted-copy">Plot disponible sin facts resumidos.</p>
-                )}
-              </div>
-            </article>
-          ))}
+              
+              {block.analysis && block.analysis.length > 0 && (
+                <div style={{ paddingLeft: "16px", borderLeft: "4px solid var(--accent)", color: "var(--muted)", fontStyle: "italic", fontSize: "0.95rem" }}>
+                   <ul style={{ margin: 0, paddingLeft: "20px" }}>
+                     {block.analysis.map((a: string, i: number) => <li key={i} style={{ marginBottom: "4px" }}>{a}</li>)}
+                   </ul>
+                </div>
+              )}
+            </div>
+          );
+        }
+        
+        if (block.artifact_type === "chart" || block.artifact_type === "image") {
+          const filename = block.path ? block.path.split('/').pop() : "";
+          return (
+            <div key={idx} style={{ margin: "40px 0 48px 0" }}>
+              <h4 style={{ fontSize: "1.2rem", marginBottom: "8px", fontWeight: 700 }}>{block.title}</h4>
+              <p className="muted-copy" style={{ marginBottom: "24px", fontStyle: "italic" }}>{block.lead_in}</p>
+              
+              <figure style={{ margin: "0 0 16px 0" }}>
+                 <img 
+                   src={`/api/runs/${runId}/report/plots/${filename}`} 
+                   alt={block.title} 
+                   style={{ maxWidth: "100%", maxHeight: "500px", objectFit: "contain", borderRadius: "8px", border: "1px solid var(--border)" }}
+                 />
+              </figure>
+
+              {block.analysis && block.analysis.length > 0 && (
+                <div style={{ paddingLeft: "16px", borderLeft: "4px solid var(--accent-2)", color: "var(--muted)", fontStyle: "italic", fontSize: "0.95rem" }}>
+                   <ul style={{ margin: 0, paddingLeft: "20px" }}>
+                     {block.analysis.map((a: string, i: number) => <li key={i} style={{ marginBottom: "4px" }}>{a}</li>)}
+                   </ul>
+                </div>
+              )}
+            </div>
+          );
+        }
+        return null;
+
+      case "markdown":
+        // For 'markdown' block we shouldn't necessarily put it in a huge code frame, just a pre block that blends.
+        return (
+          <div key={idx} style={{ marginTop: "40px", padding: "24px", background: "var(--bg-soft)", borderRadius: "12px", border: "1px solid var(--border)" }}>
+            <pre style={{ whiteSpace: "pre-wrap", color: "var(--text)", fontSize: "0.9rem", fontFamily: "var(--font-body)", lineHeight: 1.6, margin: 0 }}>
+              {block.content}
+            </pre>
+          </div>
+        );
+
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className="animate-fade-in" style={{ maxWidth: "860px", color: "var(--text)" }}>
+      {/* Off-canvas PDF button so it doesn't interrupt the doc */}
+      {report.pdf_available && report.pdf_url && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "24px" }}>
+          <a className="history-link" href={`/api${report.pdf_url}`} target="_blank" rel="noreferrer" style={{ background: "var(--bg-soft)", color: "var(--accent)", border: "1px solid var(--border-strong)" }}>
+            + Descargar PDF Original
+          </a>
         </div>
-      </section>
+      )}
+
+      <div style={{ background: "#ffffff", padding: "64px 80px", borderRadius: "8px", border: "1px solid var(--border)", boxShadow: "0 4px 20px rgba(0,0,0,0.03)" }}>
+        {report.blocks && report.blocks.length > 0 ? (
+          report.blocks.map((block, idx) => renderBlock(block, idx))
+        ) : (
+          <div className="markdown-frame">
+            <pre>{report.markdown || "No hay reporte estructurado disponible."}</pre>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

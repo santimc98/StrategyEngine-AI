@@ -24,6 +24,13 @@ export interface ActiveRunResponse {
   status: JsonRecord | null;
 }
 
+export interface HealthResponse {
+  status: string;
+  service: string;
+  project_root: string;
+  runs_dir: string;
+}
+
 export interface RunDetailResponse {
   run_id: string;
   has_final_state: boolean;
@@ -66,6 +73,27 @@ export interface RunReportResponse {
   artifact_manifest_summary: JsonRecord;
   run_summary: JsonRecord;
   visual_tables: JsonRecord;
+}
+
+export interface ArtifactManifestItem {
+  path: string;
+  artifact_type: string;
+  required: boolean;
+  present: boolean;
+  status: string;
+  size_bytes: number | null;
+  updated_at_utc: string | null;
+  row_count: number | null;
+  column_count: number | null;
+  matched_paths?: string[];
+}
+
+export interface ArtifactManifestResponse {
+  run_id: string;
+  generated_at_utc?: string;
+  summary?: JsonRecord;
+  items?: ArtifactManifestItem[];
+  governance_snapshot?: JsonRecord;
 }
 
 export interface ModelsConfigResponse {
