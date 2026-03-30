@@ -1,5 +1,6 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
 import { StatusPill } from "@/components/status-pill";
@@ -13,15 +14,18 @@ type RunLiveConsoleProps = {
 type LogEntry = RunLogsResponse["entries"][number];
 
 export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
+  const router = useRouter();
   const [status, setStatus] = useState<JsonRecord>(initialStatus || {});
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [aborting, setAborting] = useState(false);
   const nextAfterLineRef = useRef(0);
+  const finishedRef = useRef(false);
 
   useEffect(() => {
     async function poll(): Promise<void> {
+      if (finishedRef.current) return;
       try {
         const [statusResponse, logsResponse] = await Promise.all([
           fetch(`/api/runs/${runId}/status`, { cache: "no-store" }),
@@ -46,6 +50,13 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
         }
 
         setError(null);
+
+        const currentIsRunning = String(statusPayload.status || "").toLowerCase() === "running";
+        if (!currentIsRunning && !finishedRef.current) {
+          finishedRef.current = true;
+          router.refresh();
+        }
+
       } catch (err) {
         setError(err instanceof Error ? err.message : "Error refrescando la run");
       } finally {
@@ -59,7 +70,7 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
     void poll();
 
     return () => window.clearInterval(interval);
-  }, [runId]);
+  }, [runId, router]);
 
   async function handleAbort(): Promise<void> {
     setAborting(true);
@@ -95,7 +106,7 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
 
   return (
     <div className="stack-lg">
-      <div className="section-head">
+      <div className="section-head" style={{ marginBottom: "16px" }}>
         <div>
           <p className="eyebrow">Seguimiento en vivo</p>
           <h2>Estado operativo y últimos logs</h2>
@@ -108,6 +119,18 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
             </button>
           ) : null}
         </div>
+      </div>
+      
+      {/* ProgressBar Element */}
+      <div style={{ width: "100%", height: "6px", background: "var(--border)", borderRadius: "4px", overflow: "hidden", marginBottom: "8px" }}>
+        <div 
+          style={{ 
+            height: "100%", 
+            width: `${Math.min(100, Math.max(0, Number(status.progress) || 0))}%`, 
+            background: "linear-gradient(90deg, var(--accent), var(--accent-2))", 
+            transition: "width 0.4s cubic-bezier(0.4, 0, 0.2, 1)" 
+          }} 
+        />
       </div>
 
       <div className="overview-grid live-grid">

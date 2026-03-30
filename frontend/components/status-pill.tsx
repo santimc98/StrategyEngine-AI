@@ -22,5 +22,25 @@ function resolveStatusTone(rawValue: string): string {
 export function StatusPill({ value }: StatusPillProps) {
   const text = String(value || "N/A").trim() || "N/A";
   const tone = resolveStatusTone(text);
-  return <span className={`pill pill-${tone}`}>{text.replaceAll("_", " ")}</span>;
+  const isRunning = text.toLowerCase() === "running";
+  
+  return (
+    <span className={`pill pill-${tone}`} style={isRunning ? { animation: "pulseOpacity 2s infinite ease-in-out" } : {}}>
+      {isRunning && (
+        <span 
+          style={{ 
+            display: "inline-block", 
+            width: "6px", 
+            height: "6px", 
+            background: "currentcolor", 
+            borderRadius: "50%", 
+            marginRight: "6px", 
+            verticalAlign: "middle",
+            animation: "pulseOpacity 1s infinite alternate" 
+          }} 
+        />
+      )}
+      {text.replaceAll("_", " ")}
+    </span>
+  );
 }

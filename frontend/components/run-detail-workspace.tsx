@@ -213,6 +213,7 @@ export function RunDetailWorkspace({
             <p className="eyebrow" style={{ marginBottom: "16px" }}>Pipeline de Agentes</p>
           </div>
           {agentSteps.map((step) => {
+            if (isRunning && step.key !== "initial") return null;
             const isActive = activeStep === step.key;
             return (
               <button
