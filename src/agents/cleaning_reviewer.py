@@ -1725,6 +1725,10 @@ def _build_cleaning_quality_summary(
     summary: Dict[str, Any] = {"cleaned_rows": len(cleaned), "columns": {}}
     if raw is not None:
         summary["raw_rows"] = len(raw)
+        if len(raw) > 0:
+            summary["row_drop_pct"] = round(
+                (1 - len(cleaned) / len(raw)) * 100, 1
+            )
 
     for col in cleaned.columns:
         is_null = cleaned[col].isna() | (cleaned[col].str.strip() == "")
@@ -1793,7 +1797,7 @@ def _build_llm_prompt(
         "REVIEW DECISION WORKFLOW (MANDATORY)\n"
         "1. Understand the contract first: what gates were requested, what columns matter, and what would count as a real violation.\n"
         "2. Read the available evidence pack: artifact_obligations, facts, column_resolution_context, data_profile, cleaning_quality_summary, cleaning_code, and deterministic_gate_results.\n"
-        "3. For each gate, reason about the gate's intent before deciding pass/fail.\n"
+        "3. For each gate, reason about the gate's intent AND its params scope before deciding pass/fail. If a gate specifies params.column, your evaluation for that gate must be grounded in that column — do not fail a gate based on evidence from a different column.\n"
         "4. Reject only when you have contract-relevant evidence of a real violation.\n"
         "5. If evidence is ambiguous or incomplete, prefer PASSED or PASSED_WITH_WARNING reasoning over unsupported failure.\n"
         "6. Keep feedback tied to this dataset and this code path, not generic cleaning advice.\n\n"
@@ -1803,11 +1807,12 @@ def _build_llm_prompt(
         "- leakage_exclusion: reason from direct evidence of the cleaned artifact. If forbidden columns are absent from cleaned_header and/or explicitly listed as dropped in the manifest, that supports PASS. Do not treat missing_required_columns as evidence that forbidden columns are still present.\n\n"
         "NULL INFLATION DETECTION (CRITICAL)\n"
         "- The payload may include 'cleaning_quality_summary' with per-column null rates before (raw) and after (cleaned) cleaning.\n"
-        "- If any column shows null_inflation_pp > 35, the Data Engineer's parsing likely destroyed valid data.\n"
-        "  Common cause: single-pass datetime parsing (e.g., dayfirst=True destroying ISO dates, or dayfirst=False destroying DD-MM-YYYY dates).\n"
-        "- Check 'notable_columns' for columns flagged with 'possible_datetime_parsing_failure'.\n"
-        "- A broken parser that inflates nulls from ~24% to ~94% is a HARD failure — require multi-stage parsing.\n"
-        "- Expected null inflation from placeholders/impossible dates is ~25-30pp, not 70pp.\n\n"
+        "- 'null_inflation_pp' = cleaned_null_pct − raw_null_pct. It measures how much the null rate increased, but it does NOT distinguish between two very different causes:\n"
+        "  (a) ROW EXCLUSION: the DE dropped rows where a column had non-null values. This legitimately increases null_pct for that column in the surviving rows. Check: if row_drop_pct > 0 and the gate contract explicitly requests row exclusion on that column (e.g., exclude_debug_records), the inflation is expected — not a failure.\n"
+        "  (b) VALUE DESTRUCTION: a broken parser or incorrect transformation converted valid values to null/NaT within the same rows. This is a real failure.\n"
+        "- To distinguish (a) from (b): compare row_drop_pct with null_inflation_pp for the column in question. If the dataset lost rows AND the inflated column is the exclusion criterion (or strongly correlated with it), the inflation is a natural consequence of correct row filtering — not data destruction. Also check the cleaning_code for evidence of df.drop/filtering vs value-level nulling.\n"
+        "- For datetime columns: check 'notable_columns' for 'possible_datetime_parsing_failure' warnings. A broken parser that inflates nulls from ~24% to ~94% is a HARD failure — require multi-stage parsing. But first verify the gate's params.column scope: only evaluate the column specified in the gate definition, not all date columns.\n"
+        "- Expected null inflation from placeholder cleanup or impossible-date quarantine is ~25-30pp, not 70pp.\n\n"
         "DECISION RULES\n"
         "- If any HARD gate fails, status must be REJECTED.\n"
         "- If only SOFT gates fail, status must be APPROVE_WITH_WARNINGS.\n"

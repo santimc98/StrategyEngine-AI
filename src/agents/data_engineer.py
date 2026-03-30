@@ -1164,6 +1164,16 @@ class DataEngineerAgent:
         #
         # 1. LOAD & VALIDATE: Read CSV with dtype=str. Verify required columns exist.
         #
+        # 1b. ROW-LEVEL EXCLUSION (IMMEDIATELY after load, BEFORE any normalization):
+        #    Scan the cleaning gates for any that require row exclusion (e.g.,
+        #    exclude_debug_records, quarantine_invalid, filter_synthetic).
+        #    These filters must run on the RAW loaded data — before placeholder
+        #    normalization, null handling, or type conversion. Why: if you normalize
+        #    a flag column first (e.g., replace sentinel values with NaN), the
+        #    evidence needed to identify excludable rows is destroyed, and the
+        #    filter silently misses them. Reason about which columns carry
+        #    exclusion signals and apply row drops while those signals are intact.
+        #
         # 2. NULL HANDLING (BEFORE type conversion):
         #    For each cleaning gate with impute/null semantics, handle nulls NOW.
         #    CRITICAL: After reading with dtype=str, null cells are real NaN objects
@@ -1274,8 +1284,11 @@ class DataEngineerAgent:
         ===================================================================
         Think like a senior engineer reviewing your own cleaning code before merge:
 
-        - The operation order matters: null handling → type conversion → validation.
+        - The operation order matters: row exclusion → null handling → type conversion → validation.
           Getting this wrong silently corrupts data. Reason about dependencies.
+          In particular, row-level filters (dropping debug/synthetic/quarantined rows)
+          must execute on raw loaded data before any normalization or placeholder
+          replacement — normalizing first can erase the signal those filters depend on.
         - ARTIFACT_OBLIGATIONS_CONTEXT is a contract extraction layer, not new authority.
           Use it to reconcile exact per-artifact bindings. Do not treat it as permission
           to add undeclared columns, outputs, or extension policies.
