@@ -64,3 +64,23 @@ def test_output_contract_ignores_concepts(tmp_path) -> None:
     report = check_required_outputs([str(metrics_path), "Priority ranking"])
 
     assert "Priority ranking" not in report.get("missing", [])
+
+
+def test_get_required_outputs_skips_inactive_ml_owner_for_cleaning_only_scope() -> None:
+    contract = {
+        "scope": "cleaning_only",
+        "active_workstreams": {
+            "cleaning": True,
+            "feature_engineering": True,
+            "model_training": False,
+        },
+        "required_outputs": [
+            {"path": "artifacts/clean/clean_base.csv", "owner": "data_engineer", "required": True},
+            {"path": "artifacts/ml/handoff_note.json", "owner": "ml_engineer", "required": True},
+        ],
+    }
+
+    outputs = get_required_outputs(contract)
+
+    assert "artifacts/clean/clean_base.csv" in outputs
+    assert "artifacts/ml/handoff_note.json" not in outputs

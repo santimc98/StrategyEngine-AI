@@ -333,6 +333,34 @@ class TestBuildOutputContractReport:
         assert "missing" in report
         assert "overall_status" in report
 
+    def test_cleaning_only_report_ignores_inactive_ml_required_outputs(self, tmp_path):
+        data_dir = tmp_path / "artifacts" / "clean"
+        data_dir.mkdir(parents=True)
+        (data_dir / "clean_base.csv").write_text("id\n1\n", encoding="utf-8")
+
+        contract = {
+            "scope": "cleaning_only",
+            "active_workstreams": {
+                "cleaning": True,
+                "feature_engineering": True,
+                "model_training": False,
+            },
+            "required_outputs": [
+                {"path": "artifacts/clean/clean_base.csv", "owner": "data_engineer", "required": True},
+                {"path": "artifacts/ml/handoff_note.json", "owner": "ml_engineer", "required": True},
+            ],
+        }
+
+        original_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            report = build_output_contract_report(contract, work_dir=".")
+        finally:
+            os.chdir(original_cwd)
+
+        assert report["missing"] == []
+        assert report["overall_status"] == "ok"
+
 
 class TestRealWorldScenarios:
     """Test realistic scenarios that previously failed."""

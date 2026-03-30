@@ -1175,6 +1175,27 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     
     if not isinstance(contract, dict):
         return []
+
+    if _is_v5(contract):
+        active_workstreams = _v5_get(contract, "active_workstreams")
+    else:
+        active_workstreams = contract.get("active_workstreams")
+    if not isinstance(active_workstreams, dict):
+        active_workstreams = {}
+
+    def _is_active_required_output(entry: Any) -> bool:
+        if not isinstance(entry, dict):
+            return True
+        owner = str(entry.get("owner") or _infer_owner_from_path(str(entry.get("path") or ""))).strip().lower()
+        cleaning_declared = ("cleaning" in active_workstreams) or ("feature_engineering" in active_workstreams)
+        ml_declared = "model_training" in active_workstreams
+        cleaning_active = bool(active_workstreams.get("cleaning")) or bool(active_workstreams.get("feature_engineering"))
+        ml_active = bool(active_workstreams.get("model_training"))
+        if owner == "data_engineer" and cleaning_declared and not cleaning_active:
+            return False
+        if owner == "ml_engineer" and ml_declared and not ml_active:
+            return False
+        return True
     
     outputs = []
 
@@ -1240,6 +1261,8 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
     top_level = contract.get("required_outputs")
     if isinstance(top_level, list):
         for entry in top_level:
+            if not _is_active_required_output(entry):
+                continue
             if isinstance(entry, dict):
                 candidate = entry.get("path")
                 _append_if_path(candidate if isinstance(candidate, str) else "")

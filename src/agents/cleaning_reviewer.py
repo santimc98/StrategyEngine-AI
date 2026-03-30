@@ -165,6 +165,14 @@ def _parse_legacy_context(context: Dict[str, Any]) -> Dict[str, Any]:
                 cleaning_view["input_dialect"] = legacy_dialect
     if not cleaning_view.get("column_roles") and isinstance(context.get("column_roles"), dict):
         cleaning_view["column_roles"] = context.get("column_roles")
+    if not cleaning_view.get("outlier_policy") and isinstance(context.get("outlier_policy"), dict):
+        cleaning_view["outlier_policy"] = context.get("outlier_policy")
+    if not cleaning_view.get("column_dtype_targets") and isinstance(context.get("column_dtype_targets"), dict):
+        cleaning_view["column_dtype_targets"] = context.get("column_dtype_targets")
+    if not cleaning_view.get("dataset_profile") and isinstance(context.get("dataset_profile"), dict):
+        cleaning_view["dataset_profile"] = context.get("dataset_profile")
+    if not cleaning_view.get("cleaning_code") and isinstance(context.get("cleaning_code"), str):
+        cleaning_view["cleaning_code"] = context.get("cleaning_code")
 
     cleaned_csv_path = (
         context.get("cleaned_csv_path")
@@ -391,6 +399,7 @@ def _review_cleaning_impl(
         outlier_policy=outlier_policy,
         outlier_report=outlier_report,
         outlier_report_path=outlier_report_path,
+        column_dtype_targets=view.get("column_dtype_targets") if isinstance(view.get("column_dtype_targets"), dict) else {},
     )
     warnings.extend(dialect_warnings)
     deterministic_result = _assemble_result(
@@ -1326,6 +1335,7 @@ def _build_facts(
     if isinstance(outlier_policy, dict) and outlier_policy:
         policy_enabled = _outlier_policy_enabled(outlier_policy)
         report_present = isinstance(outlier_report, dict) and bool(outlier_report)
+        report_columns_touched = _extract_outlier_report_columns(outlier_report)
         policy_summary: Dict[str, Any] = {
             "enabled": policy_enabled,
             "apply_stage": outlier_policy.get("apply_stage"),
@@ -1334,8 +1344,8 @@ def _build_facts(
             "report_present": report_present,
         }
         if report_present:
-            if outlier_report.get("columns_touched") is not None:
-                policy_summary["columns_touched"] = outlier_report.get("columns_touched")
+            if report_columns_touched:
+                policy_summary["columns_touched"] = report_columns_touched
             if outlier_report.get("rows_affected") is not None:
                 policy_summary["rows_affected"] = outlier_report.get("rows_affected")
             if outlier_report.get("flags_created") is not None:
@@ -1438,6 +1448,7 @@ def _evaluate_gates_deterministic(
     outlier_policy: Optional[Dict[str, Any]] = None,
     outlier_report: Optional[Dict[str, Any]] = None,
     outlier_report_path: Optional[str] = None,
+    column_dtype_targets: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     hard_failures: List[str] = []
     soft_failures: List[str] = []
@@ -1452,6 +1463,7 @@ def _evaluate_gates_deterministic(
         model_features = _list_str(allowed_feature_sets.get("model_features"))
     outlier_policy = outlier_policy if isinstance(outlier_policy, dict) else {}
     outlier_report = outlier_report if isinstance(outlier_report, dict) else {}
+    column_dtype_targets = column_dtype_targets if isinstance(column_dtype_targets, dict) else {}
 
     for gate in gates:
         name = gate["name"]
@@ -1588,6 +1600,19 @@ def _evaluate_gates_deterministic(
                 if null_frac is None or null_frac < warn_threshold_val:
                     continue
                 warnings.append(f"NULLS_OUTSIDE_GATE: {col} null_frac={null_frac:.4f}")
+        elif gate_key == "boolean_normalization":
+            issues, evidence = _check_boolean_normalization(
+                cleaned_csv_path=cleaned_csv_path,
+                cleaned_header=cleaned_header,
+                sample_str=sample_str,
+                raw_sample=raw_sample,
+                params=params,
+                column_dtype_targets=column_dtype_targets,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    f"boolean_normalization skipped: {evidence.get('skip_reason', 'not_applicable')}"
+                )
         elif gate_key == "outlier_policy_applied":
             issues, evidence = _check_outlier_policy_applied(
                 outlier_policy=outlier_policy,
@@ -2556,11 +2581,7 @@ def _check_outlier_policy_applied(
     policy_targets = _list_str(policy.get("target_columns")) or _list_str(params.get("target_columns"))
     evidence["policy_target_columns"] = policy_targets
 
-    report_columns = _list_str(report.get("columns_touched"))
-    if not report_columns:
-        report_columns = _list_str(report.get("target_columns"))
-    if not report_columns and isinstance(report.get("columns"), list):
-        report_columns = _list_str(report.get("columns"))
+    report_columns = _extract_outlier_report_columns(report)
     evidence["report_columns_touched"] = report_columns
 
     if policy_targets:
@@ -2591,6 +2612,292 @@ def _check_outlier_policy_applied(
     evidence["manifest_policy_applied"] = manifest_applied
     if strict and manifest_outlier and manifest_applied is False:
         issues.append("manifest_outlier_treatment_policy_applied_false")
+
+    return issues, evidence
+
+
+def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
+    if not isinstance(report, dict):
+        return []
+    report_columns = _list_str(report.get("columns_touched"))
+    if not report_columns:
+        report_columns = _list_str(report.get("target_columns"))
+    raw_columns = report.get("columns")
+    if not report_columns and isinstance(raw_columns, list):
+        report_columns = _list_str(raw_columns)
+    if not report_columns and isinstance(raw_columns, dict):
+        report_columns = [str(key).strip() for key in raw_columns.keys() if str(key).strip()]
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for column in report_columns:
+        token = str(column).strip()
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(token)
+    return deduped
+
+
+_BOOLEAN_TRUE_TOKENS = {"1", "1.0", "true", "t", "yes", "y", "si", "sí", "on"}
+_BOOLEAN_FALSE_TOKENS = {"0", "0.0", "false", "f", "no", "n", "off"}
+_BOOLEAN_NULL_TOKENS = {"", "nan", "null", "none", "<na>", "na", "nat"}
+
+
+def _normalize_boolean_value_token(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        if value is pd.NA:
+            return None
+    except Exception:
+        pass
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in _BOOLEAN_NULL_TOKENS:
+        return None
+    if lowered in _BOOLEAN_TRUE_TOKENS:
+        return "1"
+    if lowered in _BOOLEAN_FALSE_TOKENS:
+        return "0"
+    return f"INVALID::{text}"
+
+
+def _is_int_like_target_dtype(target_dtype: str) -> bool:
+    token = str(target_dtype or "").strip().lower()
+    return token.startswith("int") or token in {"integer", "nullable_int", "nullable_integer", "bool", "boolean"}
+
+
+def _read_csv_unique_string_values(csv_path: str, columns: List[str]) -> Dict[str, List[str]]:
+    requested = [str(col).strip() for col in columns if str(col).strip()]
+    if not csv_path or not os.path.exists(csv_path) or not requested:
+        return {col: [] for col in requested}
+
+    encoding = _infer_encoding(csv_path)
+    delimiter = _infer_delimiter_from_file(csv_path) or ","
+    seen_by_column: Dict[str, List[str]] = {col: [] for col in requested}
+    seen_tokens: Dict[str, set[str]] = {col: set() for col in requested}
+
+    try:
+        with open(csv_path, "r", encoding=encoding, errors="replace", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter=delimiter)
+            if not reader.fieldnames:
+                return seen_by_column
+            available = {str(name).strip(): name for name in reader.fieldnames if isinstance(name, str)}
+            effective = [col for col in requested if col in available]
+            if not effective:
+                return seen_by_column
+            for row in reader:
+                for col in effective:
+                    raw = row.get(available[col])
+                    if raw is None:
+                        continue
+                    text = str(raw).strip()
+                    if not text or text.lower() in _BOOLEAN_NULL_TOKENS:
+                        continue
+                    lowered = text.lower()
+                    if lowered in seen_tokens[col]:
+                        continue
+                    seen_tokens[col].add(lowered)
+                    if len(seen_by_column[col]) < 20:
+                        seen_by_column[col].append(text)
+    except Exception:
+        return {col: [] for col in requested}
+
+    return seen_by_column
+
+
+def _resolve_boolean_normalization_targets(params: Dict[str, Any]) -> set[str]:
+    allowed: set[str] = set()
+    for raw in params.get("target_values", []) if isinstance(params.get("target_values"), list) else []:
+        normalized = _normalize_boolean_value_token(raw)
+        if normalized in {"0", "1"}:
+            allowed.add(normalized)
+    return allowed or {"0", "1"}
+
+
+def _resolve_allowed_cleaned_boolean_tokens(params: Dict[str, Any]) -> set[str]:
+    allowed: set[str] = set()
+    raw_values = params.get("target_values", []) if isinstance(params.get("target_values"), list) else []
+    for raw in raw_values:
+        if raw is None:
+            continue
+        if isinstance(raw, bool):
+            allowed.add("true" if raw else "false")
+            continue
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            if float(raw) in {0.0, 1.0}:
+                token = str(int(float(raw)))
+                allowed.add(token)
+                allowed.add(f"{token}.0")
+            continue
+        token = str(raw).strip().lower()
+        if not token or token in _BOOLEAN_NULL_TOKENS:
+            continue
+        allowed.add(token)
+    return allowed or {"0", "1", "0.0", "1.0"}
+
+
+def _looks_boolean_like_observation(values: List[str]) -> bool:
+    normalized_present = False
+    for value in values:
+        normalized = _normalize_boolean_value_token(value)
+        if normalized in {"0", "1"}:
+            normalized_present = True
+            continue
+        if normalized and normalized.startswith("INVALID::"):
+            return False
+    return normalized_present
+
+
+def _resolve_boolean_normalization_candidates(
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+    column_dtype_targets: Dict[str, Any],
+    raw_sample: Optional[pd.DataFrame],
+    sample_str: Optional[pd.DataFrame],
+) -> Tuple[List[str], Dict[str, Any]]:
+    evidence: Dict[str, Any] = {"applies_if": True}
+    header_lookup = {str(col).strip().lower(): str(col) for col in (cleaned_header or []) if str(col).strip()}
+
+    explicit_candidates: List[str] = []
+    for key in ("columns", "target_columns", "boolean_columns"):
+        for column in _list_str(params.get(key)):
+            canonical = header_lookup.get(str(column).strip().lower())
+            if canonical and canonical not in explicit_candidates:
+                explicit_candidates.append(canonical)
+
+    raw_candidates: List[str] = []
+    raw_observed_values: Dict[str, List[str]] = {}
+    for sample in (raw_sample, sample_str):
+        if sample is None:
+            continue
+        for column in sample.columns:
+            values = _string_values(sample, str(column))
+            if not values:
+                continue
+            if _looks_boolean_like_observation(values):
+                canonical = header_lookup.get(str(column).strip().lower())
+                if canonical:
+                    if canonical not in raw_candidates:
+                        raw_candidates.append(canonical)
+                    raw_observed_values.setdefault(canonical, values[:12])
+
+    dtype_candidates: List[str] = []
+    for column, spec in column_dtype_targets.items():
+        if not isinstance(spec, dict):
+            continue
+        canonical = header_lookup.get(str(column).strip().lower())
+        if not canonical:
+            continue
+        target_dtype = str(spec.get("target_dtype") or "").strip().lower()
+        if not _is_int_like_target_dtype(target_dtype):
+            continue
+        observed = raw_observed_values.get(canonical) or _string_values(sample_str, canonical)
+        if observed:
+            if _looks_boolean_like_observation(observed):
+                dtype_candidates.append(canonical)
+        else:
+            role = str(spec.get("role") or "").strip().lower()
+            if any(token in role for token in ("outcome", "decision", "pre_decision")):
+                dtype_candidates.append(canonical)
+
+    candidates: List[str] = []
+    for source_columns in (explicit_candidates, raw_candidates, dtype_candidates):
+        for column in source_columns:
+            if column not in candidates:
+                candidates.append(column)
+
+    evidence["explicit_columns"] = explicit_candidates
+    evidence["raw_boolean_like_columns"] = raw_candidates
+    evidence["dtype_hint_columns"] = dtype_candidates
+    evidence["raw_boolean_like_values"] = {key: values[:8] for key, values in raw_observed_values.items()}
+
+    if not candidates:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "no_boolean_like_columns_detected"
+
+    return candidates, evidence
+
+
+def _check_boolean_normalization(
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    sample_str: Optional[pd.DataFrame],
+    raw_sample: Optional[pd.DataFrame],
+    params: Dict[str, Any],
+    column_dtype_targets: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    candidates, evidence = _resolve_boolean_normalization_candidates(
+        cleaned_header=cleaned_header,
+        params=params,
+        column_dtype_targets=column_dtype_targets,
+        raw_sample=raw_sample,
+        sample_str=sample_str,
+    )
+    evidence["allowed_normalized_values"] = sorted(_resolve_boolean_normalization_targets(params))
+    evidence["columns_checked"] = candidates
+
+    explicit_missing = [
+        column
+        for column in (_list_str(params.get("columns")) + _list_str(params.get("target_columns")))
+        if str(column).strip() and str(column).strip() not in (cleaned_header or [])
+    ]
+    if explicit_missing:
+        issues.append("boolean_normalization_missing_columns: " + ", ".join(explicit_missing[:10]))
+        evidence["missing_explicit_columns"] = explicit_missing
+
+    if not bool(evidence.get("applies_if", True)):
+        return issues, evidence
+
+    allowed_values = _resolve_boolean_normalization_targets(params)
+    allowed_cleaned_tokens = _resolve_allowed_cleaned_boolean_tokens(params)
+    cleaned_values = _read_csv_unique_string_values(cleaned_csv_path, candidates)
+    cleaned_samples = {column: _string_values(sample_str, column)[:12] for column in candidates if sample_str is not None}
+    evidence["allowed_cleaned_tokens"] = sorted(allowed_cleaned_tokens)
+    evidence["cleaned_unique_values"] = {
+        column: (cleaned_values.get(column) or cleaned_samples.get(column) or [])[:10]
+        for column in candidates
+    }
+
+    invalid_by_column: Dict[str, List[str]] = {}
+    for column in candidates:
+        values = cleaned_values.get(column) or cleaned_samples.get(column) or []
+        invalid_tokens: List[str] = []
+        for value in values:
+            literal = str(value).strip().lower()
+            if literal in allowed_cleaned_tokens:
+                continue
+            normalized = _normalize_boolean_value_token(value)
+            if normalized is None:
+                continue
+            if normalized in allowed_values:
+                rendered = str(value)
+                if rendered not in invalid_tokens:
+                    invalid_tokens.append(rendered)
+                continue
+            rendered = normalized.split("::", 1)[1] if normalized.startswith("INVALID::") else str(value)
+            if rendered not in invalid_tokens:
+                invalid_tokens.append(rendered)
+        if invalid_tokens:
+            invalid_by_column[column] = invalid_tokens[:8]
+            issues.append(
+                f"{column} contains non-normalized boolean values: {', '.join(invalid_tokens[:5])}"
+            )
+
+    if invalid_by_column:
+        evidence["invalid_values"] = invalid_by_column
 
     return issues, evidence
 

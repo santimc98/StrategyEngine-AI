@@ -316,3 +316,26 @@ class TestLegacyContextRemoval:
 
         # required_columns should NOT be copied from legacy context
         assert "required_columns" not in cleaning_view or cleaning_view.get("required_columns") != ["legacy_col_a", "legacy_col_b"]
+
+    def test_parse_legacy_context_preserves_review_evidence_fields(self):
+        from src.agents.cleaning_reviewer import _parse_legacy_context
+
+        context = {
+            "cleaning_view": {},
+            "column_roles": {"pre_decision": ["flag_a"]},
+            "outlier_policy": {"enabled": True, "target_columns": ["revenue"]},
+            "column_dtype_targets": {
+                "flag_a": {"target_dtype": "int64", "nullable": True, "role": "pre_decision"}
+            },
+            "dataset_profile": {"numeric_summary": {"revenue": {"min": 1, "max": 9}}},
+            "cleaning_code": "df['flag_a'] = 1",
+        }
+
+        parsed = _parse_legacy_context(context)
+        cleaning_view = parsed["cleaning_view"]
+
+        assert cleaning_view.get("column_roles") == {"pre_decision": ["flag_a"]}
+        assert cleaning_view.get("outlier_policy", {}).get("target_columns") == ["revenue"]
+        assert cleaning_view.get("column_dtype_targets", {}).get("flag_a", {}).get("target_dtype") == "int64"
+        assert cleaning_view.get("dataset_profile", {}).get("numeric_summary", {}).get("revenue", {}).get("max") == 9
+        assert cleaning_view.get("cleaning_code") == "df['flag_a'] = 1"
