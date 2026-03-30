@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 
 import { RunLiveConsole } from "@/components/run-live-console";
 import { RunReport } from "@/components/run-report";
@@ -8,6 +9,7 @@ import { StatusPill } from "@/components/status-pill";
 import { formatDate, formatNumber, formatShortText } from "@/lib/format";
 import type {
   ArtifactManifestResponse,
+  JsonRecord,
   RunDetailResponse,
   RunReportResponse,
 } from "@/types/api";
@@ -44,12 +46,62 @@ export function RunDetailWorkspace({
   report,
   manifest,
 }: RunDetailWorkspaceProps) {
+  const router = useRouter();
   const [activeStep, setActiveStep] = useState<AgentStepKey>("initial");
 
   const result = detail.result || {};
   const input = detail.input || {};
-  const status = detail.status || {};
+  const serverStatus = detail.status || {};
   const runSummary = (report?.run_summary || {}) as Record<string, unknown>;
+
+  // --------------- Live status polling ---------------
+  // The server component loads detail.status once. To track a running run in
+  // real-time we poll /status independently so isRunning stays accurate even
+  // if the page was rendered before the worker wrote its first status file.
+  const initialIsRunning = String(serverStatus.status || "").toLowerCase() === "running";
+  const [liveStatus, setLiveStatus] = useState<JsonRecord | null>(
+    initialIsRunning ? serverStatus : null,
+  );
+  const [isRunning, setIsRunning] = useState(initialIsRunning);
+  const wasRunningRef = useRef(initialIsRunning);
+
+  const pollStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/runs/${runId}/status`, { cache: "no-store" });
+      if (!res.ok) return;
+      const payload = (await res.json()) as JsonRecord;
+      const running = String(payload.status || "").toLowerCase() === "running";
+      setLiveStatus(payload);
+      setIsRunning(running);
+
+      if (wasRunningRef.current && !running) {
+        // Run just finished — refresh server data so the page shows final results
+        wasRunningRef.current = false;
+        router.refresh();
+      }
+      if (running) {
+        wasRunningRef.current = true;
+      }
+    } catch {
+      // Silently ignore — next poll will retry
+    }
+  }, [runId, router]);
+
+  useEffect(() => {
+    // Always do an initial status check to catch race conditions where the
+    // server-rendered page loaded before worker_status.json existed.
+    void pollStatus();
+
+    // Keep polling while running (or until we confirm it's not running).
+    // We poll at a slower cadence here (5s) because RunLiveConsole does its
+    // own fast polling (3s) for logs + status when visible.
+    const id = window.setInterval(() => { void pollStatus(); }, 5000);
+    return () => window.clearInterval(id);
+  }, [pollStatus]);
+
+  // Derive the display status: prefer live-polled status, fall back to server
+  const displayStatus = liveStatus || serverStatus;
+  const runStatus = String(displayStatus.status || "N/A");
 
   const businessObjective = String(result.business_objective || input.business_objective || "");
   const dataSummary = String(result.data_summary || "No hay summary generado.");
@@ -59,7 +111,7 @@ export function RunDetailWorkspace({
   const generatedCode = String(result.generated_code || result.last_generated_code || "").trim();
   const executionOutput = String(result.execution_output || "").trim();
   const reviewBoardVerdict = (result.review_board_verdict || {}) as Record<string, unknown>;
-  
+
   const requiredActions = Array.isArray(reviewBoardVerdict.required_actions)
     ? reviewBoardVerdict.required_actions.map(String)
     : [];
@@ -115,8 +167,7 @@ export function RunDetailWorkspace({
     }
   }, [activeStep, input.csv_path, dynamicRawPreview.length]);
 
-  const runStatus = String(detail.status?.status || "N/A");
-  const isRunning = runStatus.toLowerCase() === "running";
+  // runStatus and isRunning are now derived from live polling above
 
   const renderTable = (rows: Array<Record<string, unknown>>) => {
     if (!rows || rows.length === 0) return <p className="muted-copy">Vista previa no disponible en este momento.</p>;
@@ -247,7 +298,7 @@ export function RunDetailWorkspace({
           
           {isRunning && (
             <div style={{ marginBottom: "32px" }}>
-              <RunLiveConsole runId={runId} initialStatus={status} />
+              <RunLiveConsole runId={runId} initialStatus={displayStatus} />
             </div>
           )}
 
