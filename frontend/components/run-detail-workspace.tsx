@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
+import { CopyableFrame } from "@/components/copy-button";
 import { RunLiveConsole } from "@/components/run-live-console";
 import { RunReport } from "@/components/run-report";
 import { StatusPill } from "@/components/status-pill";
@@ -336,9 +337,17 @@ export function RunDetailWorkspace({
               </article>
               <article className="stack-sm">
                 <p className="eyebrow">Objetivo de Negocio</p>
-                <div style={{ padding: "24px", background: "var(--panel)", borderRadius: "16px", border: "1px solid var(--border)", whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
-                  {businessObjective || "No se especificó un objetivo de negocio para esta ejecución."}
-                </div>
+                {businessObjective ? (
+                  <CopyableFrame copyText={businessObjective} variant="light" copyLabel="Copiar">
+                    <div style={{ padding: "24px", paddingTop: "40px", background: "var(--panel)", borderRadius: "16px", border: "1px solid var(--border)", whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+                      {businessObjective}
+                    </div>
+                  </CopyableFrame>
+                ) : (
+                  <div style={{ padding: "24px", background: "var(--panel)", borderRadius: "16px", border: "1px solid var(--border)", whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+                    No se especificó un objetivo de negocio para esta ejecución.
+                  </div>
+                )}
               </article>
             </div>
           )}
@@ -349,9 +358,11 @@ export function RunDetailWorkspace({
               <h2 style={{ fontSize: "2rem" }}>Auditoría del Data Steward</h2>
               <article className="stack-sm">
                 <p className="eyebrow">Data Summary & Profile</p>
-                <div style={{ padding: "32px", background: "var(--panel)", borderRadius: "16px", border: "1px solid var(--border)", whiteSpace: "pre-wrap", lineHeight: 1.6, fontSize: "0.95rem" }}>
-                  {dataSummary}
-                </div>
+                <CopyableFrame copyText={dataSummary} variant="light" copyLabel="Copiar">
+                  <div style={{ padding: "32px", paddingTop: "40px", background: "var(--panel)", borderRadius: "16px", border: "1px solid var(--border)", whiteSpace: "pre-wrap", lineHeight: 1.6, fontSize: "0.95rem" }}>
+                    {dataSummary}
+                  </div>
+                </CopyableFrame>
               </article>
             </div>
           )}
@@ -403,9 +414,11 @@ export function RunDetailWorkspace({
               </article>
               <article className="stack-sm">
                 <p className="eyebrow">Raw Contract (JSON Object)</p>
-                <div className="code-frame">
-                   <pre>{JSON.stringify(executionContract, null, 2)}</pre>
-                </div>
+                <CopyableFrame copyText={JSON.stringify(executionContract, null, 2)} variant="dark" copyLabel="Copiar">
+                  <div className="code-frame" style={{ paddingTop: "36px" }}>
+                    <pre>{JSON.stringify(executionContract, null, 2)}</pre>
+                  </div>
+                </CopyableFrame>
               </article>
             </div>
           )}
@@ -432,9 +445,11 @@ export function RunDetailWorkspace({
               <article className="stack-sm" style={{ marginTop: "16px" }}>
                 <p className="eyebrow">Script de Limpieza Autogenerado</p>
                 {cleaningCode ? (
-                   <div className="code-frame">
-                     <pre>{cleaningCode}</pre>
-                   </div>
+                  <CopyableFrame copyText={cleaningCode} variant="dark" copyLabel="Copiar">
+                    <div className="code-frame" style={{ paddingTop: "36px" }}>
+                      <pre>{cleaningCode}</pre>
+                    </div>
+                  </CopyableFrame>
                 ) : (
                    <p className="muted-copy">No se encontró el script cleaning_code.</p>
                 )}
@@ -472,14 +487,16 @@ export function RunDetailWorkspace({
               <article className="stack-sm">
                 <p className="eyebrow">Script Final Elegido (Tras Iteraciones)</p>
                 {generatedCode ? (
-                   <details style={{ background: "#0d1530", borderRadius: "12px", overflow: "hidden" }}>
-                     <summary style={{ padding: "16px 24px", color: "#edf2ff", cursor: "pointer", fontWeight: 600 }}>
-                       Ver código fuente completo ({generatedCode.split("\\n").length} líneas)
-                     </summary>
-                     <div className="code-frame" style={{ margin: 0, border: "none", borderRadius: 0, background: "transparent" }}>
-                       <pre style={{ margin: 0, padding: "24px", color: "#b4bfdc" }}>{generatedCode}</pre>
-                     </div>
-                   </details>
+                  <CopyableFrame copyText={generatedCode} variant="dark" copyLabel="Copiar">
+                    <details style={{ background: "#0d1530", borderRadius: "12px", overflow: "hidden" }}>
+                      <summary style={{ padding: "16px 24px", color: "#edf2ff", cursor: "pointer", fontWeight: 600 }}>
+                        Ver código fuente completo ({generatedCode.split("\\n").length} líneas)
+                      </summary>
+                      <div className="code-frame" style={{ margin: 0, border: "none", borderRadius: 0, background: "transparent" }}>
+                        <pre style={{ margin: 0, padding: "24px", color: "#b4bfdc" }}>{generatedCode}</pre>
+                      </div>
+                    </details>
+                  </CopyableFrame>
                 ) : (
                    <p className="muted-copy">No se encontró script generado.</p>
                 )}
@@ -488,9 +505,11 @@ export function RunDetailWorkspace({
               {executionOutput && (
                 <article className="stack-sm">
                   <p className="eyebrow">Salida Stdout Final</p>
-                  <div className="code-frame">
-                     <pre>{executionOutput}</pre>
-                  </div>
+                  <CopyableFrame copyText={executionOutput} variant="dark" copyLabel="Copiar">
+                    <div className="code-frame" style={{ paddingTop: "36px" }}>
+                      <pre>{executionOutput}</pre>
+                    </div>
+                  </CopyableFrame>
                 </article>
               )}
             </div>

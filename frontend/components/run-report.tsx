@@ -1,4 +1,7 @@
+"use client";
+
 import React from "react";
+import { CopyButton } from "@/components/copy-button";
 import type { RunReportResponse } from "@/types/api";
 
 type RunReportProps = {
@@ -93,7 +96,10 @@ export function RunReport({ runId, report }: RunReportProps) {
       case "markdown":
         // For 'markdown' block we shouldn't necessarily put it in a huge code frame, just a pre block that blends.
         return (
-          <div key={idx} style={{ marginTop: "40px", padding: "24px", background: "var(--bg-soft)", borderRadius: "12px", border: "1px solid var(--border)" }}>
+          <div key={idx} style={{ position: "relative", marginTop: "40px", padding: "24px", paddingTop: "36px", background: "var(--bg-soft)", borderRadius: "12px", border: "1px solid var(--border)" }}>
+            <div style={{ position: "absolute", top: "8px", right: "8px", zIndex: 2 }}>
+              <CopyButton text={block.content || ""} variant="light" />
+            </div>
             <pre style={{ whiteSpace: "pre-wrap", color: "var(--text)", fontSize: "0.9rem", fontFamily: "var(--font-body)", lineHeight: 1.6, margin: 0 }}>
               {block.content}
             </pre>
@@ -105,16 +111,53 @@ export function RunReport({ runId, report }: RunReportProps) {
     }
   };
 
+  // Build full report text for the "copy all" button
+  const fullReportText = React.useMemo(() => {
+    if (!report.blocks || report.blocks.length === 0) {
+      return report.markdown || "";
+    }
+    return report.blocks
+      .map((block: any) => {
+        switch (block.type) {
+          case "heading":
+            return `${"#".repeat(block.level || 2)} ${block.text || ""}`;
+          case "paragraph":
+            return block.text || "";
+          case "bullet_list":
+            return (block.items || []).map((item: string) => `- ${item}`).join("\n");
+          case "numbered_list":
+            return (block.items || []).map((item: string, i: number) => `${i + 1}. ${item}`).join("\n");
+          case "markdown":
+            return block.content || "";
+          case "artifact":
+            if (block.artifact_type === "html_table") {
+              return `[Tabla: ${block.title || ""}]\n${block.lead_in || ""}`;
+            }
+            if (block.artifact_type === "chart" || block.artifact_type === "image") {
+              return `[Figura: ${block.title || ""}]\n${block.lead_in || ""}`;
+            }
+            return "";
+          default:
+            return "";
+        }
+      })
+      .filter(Boolean)
+      .join("\n\n");
+  }, [report.blocks, report.markdown]);
+
   return (
     <div className="animate-fade-in" style={{ maxWidth: "860px", color: "var(--text)" }}>
-      {/* Off-canvas PDF button so it doesn't interrupt the doc */}
-      {report.pdf_available && report.pdf_url && (
-        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "24px" }}>
+      {/* Action bar: PDF + Copy report */}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px", marginBottom: "24px", flexWrap: "wrap" }}>
+        {report.pdf_available && report.pdf_url && (
           <a className="history-link" href={`/api${report.pdf_url}`} target="_blank" rel="noreferrer" style={{ background: "var(--bg-soft)", color: "var(--accent)", border: "1px solid var(--border-strong)" }}>
             + Descargar PDF Original
           </a>
-        </div>
-      )}
+        )}
+        {fullReportText && (
+          <CopyButton text={fullReportText} variant="light" label="Copiar Reporte" />
+        )}
+      </div>
 
       <div style={{ background: "#ffffff", padding: "64px 80px", borderRadius: "8px", border: "1px solid var(--border)", boxShadow: "0 4px 20px rgba(0,0,0,0.03)" }}>
         {report.blocks && report.blocks.length > 0 ? (
