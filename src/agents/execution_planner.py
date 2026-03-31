@@ -512,6 +512,7 @@ Gates must be grounded in actual data risk, not template completeness.
 - HARD: failure makes the output corrupt, unsafe, or silently wrong (leakage surviving, target missing, schema violation).
 - SOFT: quality degraded but output remains usable (null rate above threshold, optional format).
 - Do not create gates for impossible conditions. Each gate must address a plausible risk visible in the data.
+- Semantic closure for row-filtering rules: if you define a training_rows_rule, scoring_rows_rule, or any condition that partitions which rows belong in the output, ask yourself whether that condition will actually be enforced. Downstream agents treat cleaning_gates as the authoritative enforcement mechanism — a rule declared only in task_semantics or runbook may be treated as advisory and skipped. If a row-filtering condition is important enough to define, it is important enough to have a corresponding HARD cleaning gate that ensures enforcement.
 
 RUNBOOK AND TECHNIQUE HANDLING — CRITICAL
 The downstream agents (data_engineer, ml_engineer) are senior engineers who reason about method selection given data context. Your runbooks must give them freedom to reason.
@@ -608,6 +609,7 @@ GATE PRINCIPLES
 - SOFT: quality degraded but output remains usable.
 - Each gate must address a distinct, plausible risk grounded in the data. 5 well-reasoned gates beat 15 templated ones.
 - Place cleaning_gates in data_engineer section, qa_gates and reviewer_gates in ml_engineer section.
+- Cross-check row-filtering rules against gates: if the semantic core defines a training_rows_rule or scoring_rows_rule that excludes certain rows, verify that a corresponding cleaning gate enforces that exclusion. Downstream agents treat cleaning_gates as the authoritative enforcement mechanism — a rule present only in task_semantics or runbook may be treated as advisory and not enforced. If the semantic core did not include a matching gate but the row-filtering rule implies one, add it during compilation.
 
 SCOPE-CONDITIONAL LOGIC
 - When model_training=false: do not invent evaluation_spec, validation_requirements, or training sections in ml_engineer. Compile a handoff-ready cleaning/feature-prep contract.
