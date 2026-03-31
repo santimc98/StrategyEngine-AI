@@ -20078,6 +20078,35 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 f_local.write(outlier_content)
                             if os.path.exists(remote_outlier_rel):
                                 downloaded_paths.append(remote_outlier_rel)
+
+                    # Download DE-generated plots (EDA, distributions, etc.)
+                    try:
+                        remote_plots_dir = f"{run_root}/static/plots"
+                        ls_plots_proc = sandbox.commands.run(f"ls {remote_plots_dir}/*.png 2>/dev/null")
+                        if ls_plots_proc.exit_code == 0 and ls_plots_proc.stdout.strip():
+                            plot_files = [p.strip() for p in ls_plots_proc.stdout.strip().split('\n') if p.strip()]
+                            if plot_files:
+                                os.makedirs(os.path.join("static", "plots"), exist_ok=True)
+                                for remote_plot in plot_files:
+                                    plot_content = safe_download_bytes(sandbox, remote_plot)
+                                    if plot_content:
+                                        local_name = os.path.basename(remote_plot)
+                                        local_plot_path = os.path.join("static", "plots", local_name)
+                                        with open(local_plot_path, "wb") as f_plot:
+                                            f_plot.write(plot_content)
+                                        downloaded_paths.append(local_plot_path)
+                                        print(f"Downloaded DE plot: {local_name}")
+                                # Also download plot_summaries.json if present
+                                summaries_content = safe_download_bytes(
+                                    sandbox, f"{remote_plots_dir}/plot_summaries.json"
+                                )
+                                if summaries_content:
+                                    with open(os.path.join("static", "plots", "plot_summaries.json"), "wb") as f_ps:
+                                        f_ps.write(summaries_content)
+                                    print("Downloaded DE plot_summaries.json")
+                    except Exception as plot_dl_err:
+                        print(f"Warning: failed to download DE plots from sandbox: {plot_dl_err}")
+
                     try:
                         os.makedirs("artifacts", exist_ok=True)
                         with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
@@ -21158,6 +21187,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
         work_dir = state.get("work_dir", ".")
         dataset_scale_hints = get_dataset_scale_hints(work_dir, local_cleaned_path)
 
+        # Collect DE-generated plots (EDA, distributions, missing-value charts)
+        de_plots_local = glob.glob("static/plots/*.png")
+        if de_plots_local:
+            print(f"DE plots collected: {len(de_plots_local)} ({[os.path.basename(p) for p in de_plots_local]})")
+
         if run_id:
             log_run_event(
                 run_id,
@@ -21167,6 +21201,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     "columns": len(df_final.columns),
                     "dataset_scale": dataset_scale_hints.get("scale"),
                     "dataset_file_mb": dataset_scale_hints.get("file_mb"),
+                    "plots_count": len(de_plots_local),
                 },
             )
 
@@ -21185,6 +21220,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "outlier_report_path": de_outlier_report_path,
             "cleaned_data_summary_min": cleaned_data_summary_min,
             "cleaned_data_summary_min_path": cleaned_data_summary_min_path,
+            "plots_local": de_plots_local,
             "error_message": None,
         }
         merged_state = dict(state or {})
@@ -31134,6 +31170,13 @@ def run_translator(state: AgentState) -> AgentState:
     has_partial_visuals = state.get("has_partial_visuals", False)
     plots_local = state.get("plots_local", [])
     fallback_plots = state.get("fallback_plots", [])
+
+    # Safety net: if plots_local is empty but plots exist on disk, collect them
+    if not plots_local:
+        disk_plots = glob.glob("static/plots/*.png")
+        if disk_plots:
+            plots_local = disk_plots
+            print(f"Translator safety net: recovered {len(disk_plots)} plots from disk")
 
     report_state = dict(state)
     summary = None
