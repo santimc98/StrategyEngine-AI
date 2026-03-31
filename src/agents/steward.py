@@ -708,6 +708,10 @@ YOUR REASONING TASK:
 3. Examine the split candidates and their unique values. Do any columns define a natural train/test partition?
 4. Use the evidence_bundle as your source of truth. If it conflicts with sample rows, trust the evidence_bundle.
 5. Design column_sets using compact selectors (prefix_numeric_range, regex, all_numeric_except, all_columns_except) — do NOT enumerate full column lists.
+6. Reason about column classification with senior-level rigor:
+   - Every column should land in a deliberate set. If you use an all_columns_except catch-all, review what falls into it — columns with extreme missingness (>50%), free-text with very low cardinality, or columns you flagged as risky in notes should not silently land in a modeling set without explicit justification.
+   - Ensure consistency between your notes and your column_sets: if you flag a column as a leakage risk or post-decision indicator in notes, that column must be reflected in a leakage/exclusion set, not left in a modeling catch-all.
+   - Columns that serve as row-filtering signals (debug flags, synthetic markers, import batch identifiers) should be explicitly classified so downstream agents know their operational role.
 
 CONSTRAINTS:
 - primary_target must match the value provided above exactly.
