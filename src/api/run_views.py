@@ -183,6 +183,63 @@ def get_artifact_manifest(run_id: str) -> Dict[str, Any]:
     return payload
 
 
+def build_artifacts_zip(run_id: str) -> Optional[Path]:
+    """Create a temporary ZIP of the run's key artifacts and return the path."""
+    import tempfile
+    import zipfile
+
+    work_dir = _run_work_dir(run_id)
+    report_dir = _run_report_dir(run_id)
+
+    # Collect files worth including in the zip
+    targets: list[tuple[Path, str]] = []  # (absolute_path, archive_name)
+
+    # 1. Artifacts directory (CSVs, manifests, dictionaries)
+    artifacts_dir = work_dir / "artifacts"
+    if artifacts_dir.is_dir():
+        for fpath in artifacts_dir.rglob("*"):
+            if fpath.is_file():
+                arc_name = f"artifacts/{fpath.relative_to(artifacts_dir)}"
+                targets.append((fpath, arc_name))
+
+    # 2. Plots
+    plots_dir = _run_plots_dir(run_id)
+    if plots_dir.is_dir():
+        for fpath in plots_dir.rglob("*"):
+            if fpath.is_file():
+                arc_name = f"plots/{fpath.name}"
+                targets.append((fpath, arc_name))
+
+    # 3. PDF report
+    pdf_path = _resolve_pdf_path(run_id)
+    if pdf_path and pdf_path.exists():
+        targets.append((pdf_path, f"report/{pdf_path.name}"))
+
+    # 4. Contracts
+    contracts_dir = _run_root(run_id) / "contracts"
+    if contracts_dir.is_dir():
+        for fpath in contracts_dir.rglob("*"):
+            if fpath.is_file():
+                arc_name = f"contracts/{fpath.relative_to(contracts_dir)}"
+                targets.append((fpath, arc_name))
+
+    if not targets:
+        return None
+
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".zip", prefix=f"run_{run_id}_"
+    )
+    tmp.close()
+    zip_path = Path(tmp.name)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for abs_path, arc_name in targets:
+            try:
+                zf.write(abs_path, arc_name)
+            except Exception:
+                continue  # skip unreadable files
+    return zip_path
+
+
 def get_report_visual_tables(run_id: str) -> Dict[str, Any]:
     tables_path = _run_data_dir(run_id) / "report_visual_tables.json"
     payload = _load_json_safe(tables_path) or {}

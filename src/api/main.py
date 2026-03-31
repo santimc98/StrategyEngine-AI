@@ -334,6 +334,25 @@ def get_run_artifact_manifest(run_id: str) -> Dict[str, Any]:
     }
 
 
+@app.get("/runs/{run_id}/artifacts/zip")
+def download_run_artifacts_zip(run_id: str):
+    """Download a ZIP archive of the run's artifacts, plots, report, and contracts."""
+    if not _run_exists(run_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+    zip_path = run_views.build_artifacts_zip(run_id)
+    if zip_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No artifacts found for this run",
+        )
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"run_{run_id}_artifacts.zip",
+        background=None,  # keep file until response is sent
+    )
+
+
 @app.get("/config/models")
 def get_model_settings() -> Dict[str, Any]:
     return config_views.get_model_settings_view()

@@ -253,6 +253,18 @@ export function RunDetailWorkspace({
             </span>
           </div>
         </div>
+        {!isRunning && (
+          <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+            <a
+              className="secondary-button"
+              href={`/api/runs/${runId}/artifacts/zip`}
+              download
+              style={{ fontSize: "0.85rem", whiteSpace: "nowrap" }}
+            >
+              Descargar Artefactos (.zip)
+            </a>
+          </div>
+        )}
       </header>
 
       {/* AGENT TIMELINE / WORKFLOW REVIEW UI */}
