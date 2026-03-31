@@ -584,7 +584,16 @@ class QAReviewerAgent:
                 "- If 'cleaning_quality_summary' is present in QA context, inspect 'notable_columns' for null inflation.\n"
                 "  A column with null_inflation_pp > 35 likely indicates a broken parser (e.g., datetime parsing "
                 "destroying valid dates). This is a HARD quality failure requiring a multi-stage parsing fix.\n"
-                "- If 'cleaning_manifest' is present, cross-check declared transformations against the actual code."
+                "- If 'cleaning_manifest' is present, cross-check declared transformations against the actual code.\n"
+                "PROACTIVE CONTRACT COMPLIANCE (report as warnings, not gate failures):\n"
+                "Beyond the active gates, a senior QA review should surface contract compliance gaps as warnings. "
+                "These do not block approval but add audit value:\n"
+                "- If the contract defines a training_rows_rule or scoring_rows_rule, verify whether the code actually "
+                "applies it. If the rule is not enforced in the code, report it as a warning with evidence.\n"
+                "- If the cleaning_manifest is present, check whether it documents all material operations the code performed "
+                "(row filtering, imputation, type conversions, column drops). Undocumented operations reduce traceability.\n"
+                "- If the contract specifies constraints (e.g., 'date parsing failures must generate flags'), check whether "
+                "the code honors them. Report unmet constraints as warnings."
             )
         else:
             subject_specific_guidance = (

@@ -22585,10 +22585,21 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                 _csv_enc = (state.get("csv_encoding") or "utf-8")
                 _csv_sep = (state.get("csv_sep") or ",")
                 _raw_path = state.get("csv_path") or "data/raw.csv"
-                _cleaned_path = (
-                    state.get("cleaned_csv_path")
-                    or "artifacts/clean/dataset_cleaned.csv"
-                )
+                _cleaned_path = state.get("cleaned_csv_path") or ""
+                if not _cleaned_path or not os.path.exists(_cleaned_path):
+                    # Resolve from contract using the robust accessor
+                    _qa_contract = state.get("execution_contract") or {}
+                    _cleaned_path = get_clean_dataset_output_path(_qa_contract) if _qa_contract else ""
+                if not _cleaned_path or not os.path.exists(_cleaned_path):
+                    # Last-resort: try common naming variants
+                    for _candidate in (
+                        "artifacts/clean/dataset_clean.csv",
+                        "artifacts/clean/dataset_cleaned.csv",
+                        "artifacts/clean/cleaned_dataset.csv",
+                    ):
+                        if os.path.exists(_candidate):
+                            _cleaned_path = _candidate
+                            break
                 if os.path.exists(_cleaned_path) and os.path.exists(_raw_path):
                     import pandas as _pd_qa
                     _raw_df = _pd_qa.read_csv(_raw_path, dtype=str, sep=_csv_sep, encoding=_csv_enc, nrows=2000)
