@@ -380,6 +380,7 @@ def _review_cleaning_impl(
         outlier_policy=outlier_policy,
         outlier_report=outlier_report,
         outlier_report_path=outlier_report_path,
+        cleaned_csv_path=cleaned_csv_path,
     )
 
     deterministic = _evaluate_gates_deterministic(
@@ -1274,6 +1275,7 @@ def _build_facts(
     outlier_policy: Optional[Dict[str, Any]] = None,
     outlier_report: Optional[Dict[str, Any]] = None,
     outlier_report_path: Optional[str] = None,
+    cleaned_csv_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     facts: Dict[str, Any] = {}
     facts["cleaned_header"] = cleaned_header[:200]
@@ -1285,9 +1287,10 @@ def _build_facts(
         manifest_removed = _collect_manifest_removed_columns(manifest)
         manifest_removed_norm = {str(col).strip().lower(): str(col) for col in manifest_removed if str(col).strip()}
         facts["forbidden_columns"] = forbidden_columns
-        facts["forbidden_columns_present_in_cleaned_header"] = [
+        forbidden_in_cleaned = [
             col for col in forbidden_columns if str(col).strip().lower() in cleaned_header_norm
         ]
+        facts["forbidden_columns_present_in_cleaned_header"] = forbidden_in_cleaned
         facts["forbidden_columns_absent_in_cleaned_header"] = [
             col for col in forbidden_columns if str(col).strip().lower() not in cleaned_header_norm
         ]
@@ -1298,6 +1301,26 @@ def _build_facts(
             "missing_required_columns tracks columns expected in the cleaned artifact scope; "
             "it does not imply that those columns are still present in the cleaned header."
         )
+        # If forbidden columns appear in the cleaned CSV but an enriched CSV
+        # exists that correctly excludes them, the DE has properly separated
+        # the full-fidelity cleaned output from the ML-ready enriched output.
+        # Record this so the LLM doesn't penalise a correct two-file strategy.
+        if forbidden_in_cleaned and cleaned_csv_path:
+            enriched_header = _read_enriched_csv_header(cleaned_csv_path)
+            if enriched_header is not None:
+                enriched_norm = {str(c).strip().lower() for c in enriched_header if str(c).strip()}
+                forbidden_in_enriched = [
+                    col for col in forbidden_columns if str(col).strip().lower() in enriched_norm
+                ]
+                facts["enriched_csv_exists"] = True
+                facts["forbidden_columns_present_in_enriched_header"] = forbidden_in_enriched
+                facts["forbidden_columns_excluded_from_enriched"] = not bool(forbidden_in_enriched)
+                if not forbidden_in_enriched:
+                    facts["leakage_exclusion_note"] = (
+                        "Forbidden columns are present in the cleaned CSV (full-fidelity archive) "
+                        "but correctly excluded from the enriched CSV (ML-ready deliverable). "
+                        "This is a valid two-file strategy — do NOT fail the leakage gate."
+                    )
 
     row_counts = manifest.get("row_counts") or {}
     facts["row_counts"] = {
@@ -1360,6 +1383,33 @@ def _build_facts(
     return facts
 
 
+def _read_enriched_csv_header(cleaned_csv_path: str) -> Optional[List[str]]:
+    """Try to find and read the header of an enriched CSV next to the cleaned one.
+
+    DE scripts often produce both a cleaned (full-fidelity) CSV and an enriched
+    (ML-ready) CSV in the same directory.  Common naming patterns:
+      - dataset_enriched.csv
+      - enriched_dataset.csv
+      - dataset_clean_enriched.csv
+    """
+    if not cleaned_csv_path:
+        return None
+    parent = os.path.dirname(cleaned_csv_path)
+    candidates = [
+        os.path.join(parent, "dataset_enriched.csv"),
+        os.path.join(parent, "enriched_dataset.csv"),
+        os.path.join(parent, "dataset_clean_enriched.csv"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            try:
+                df = pd.read_csv(candidate, nrows=0)
+                return list(df.columns)
+            except Exception:
+                continue
+    return None
+
+
 def _collect_forbidden_columns_for_review(
     gates: List[Dict[str, Any]],
     column_roles: Dict[str, List[str]],
@@ -1368,7 +1418,8 @@ def _collect_forbidden_columns_for_review(
     for gate in gates:
         if not isinstance(gate, dict):
             continue
-        if _normalize_gate_name(gate.get("name")) != "leakage_exclusion":
+        gate_norm = _normalize_gate_name(gate.get("name"))
+        if "leakage" not in gate_norm and "exclude" not in gate_norm:
             continue
         params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
         for key in ("forbidden_columns", "forbidden_at_inference", "excluded_columns", "columns"):
@@ -2622,16 +2673,41 @@ def _check_outlier_policy_applied(
 
 
 def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
+    """Extract the list of columns treated in an outlier report.
+
+    DE scripts produce outlier reports in several formats:
+      - {"columns_touched": ["col1", ...]}              (canonical)
+      - {"target_columns": ["col1", ...]}               (list variant)
+      - {"target_columns": {"col1": {...}, ...}}         (dict-keyed variant)
+      - {"columns": ["col1", ...] | {"col1": {...}}}    (legacy)
+      - {"applied": [{"column": "col1", ...}, ...]}     (per-column detail variant)
+
+    This function must handle all of them to avoid false-positive gate failures.
+    """
     if not isinstance(report, dict):
         return []
     report_columns = _list_str(report.get("columns_touched"))
     if not report_columns:
-        report_columns = _list_str(report.get("target_columns"))
+        target_cols = report.get("target_columns")
+        if isinstance(target_cols, dict):
+            # dict-keyed variant: {"employees": {...}, "annual_revenue": {...}}
+            report_columns = [str(key).strip() for key in target_cols.keys() if str(key).strip()]
+        else:
+            report_columns = _list_str(target_cols)
     raw_columns = report.get("columns")
     if not report_columns and isinstance(raw_columns, list):
         report_columns = _list_str(raw_columns)
     if not report_columns and isinstance(raw_columns, dict):
         report_columns = [str(key).strip() for key in raw_columns.keys() if str(key).strip()]
+    # per-column detail variant: {"applied": [{"column": "employees", ...}, ...]}
+    if not report_columns:
+        applied = report.get("applied")
+        if isinstance(applied, list):
+            for entry in applied:
+                if isinstance(entry, dict):
+                    col = str(entry.get("column") or "").strip()
+                    if col:
+                        report_columns.append(col)
     deduped: List[str] = []
     seen: set[str] = set()
     for column in report_columns:
