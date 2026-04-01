@@ -1,3 +1,18 @@
+# StrategyEngine AI - Docker Compose
+#
+# Despliegue piloto en un solo host.
+# Para produccion enterprise ver CUSTOMER_DEPLOYMENT_GUIDE.md (Opcion B).
+#
+# Variables de entorno configurables (ver .env.example):
+#   RUNS_DIR  - directorio de almacenamiento de runs (default: /app/runs)
+#   DATA_DIR  - directorio de datos compartidos       (default: /app/data)
+#
+# Uso rapido:
+#   docker compose up -d
+#
+# Con almacenamiento externo (NAS, EFS, GCS FUSE, etc.):
+#   RUNS_VOLUME=/mnt/shared/runs DATA_VOLUME=/mnt/shared/data docker compose up -d
+
 services:
   app:
     build: .
@@ -5,9 +20,24 @@ services:
     ports:
       - "8501:8501"
     environment:
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_TIMEOUT_SECONDS=${OPENROUTER_TIMEOUT_SECONDS:-120}
+      - RUN_EXECUTION_MODE=${RUN_EXECUTION_MODE:-local}
+      # Rutas internas del contenedor — normalmente no se cambian.
+      # Si se montan volumenes en paths no estandar, ajustar aqui.
+      - RUNS_DIR=${CONTAINER_RUNS_DIR:-/app/runs}
+      - DATA_DIR=${CONTAINER_DATA_DIR:-/app/data}
     volumes:
-      # Persist runs and data across restarts
-      - ./runs:/app/runs
-      - ./data:/app/data
+      # Persistir runs y datos entre reinicios del contenedor.
+      # Por defecto monta directorios locales; para almacenamiento externo
+      # (NAS, NFS, EFS, GCS FUSE) apuntar RUNS_VOLUME / DATA_VOLUME
+      # al mount point correspondiente.
+      - ${RUNS_VOLUME:-./runs}:/app/runs
+      - ${DATA_VOLUME:-./data}:/app/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3

@@ -177,6 +177,57 @@ Referencia:
 
 - [SANDBOX_GATEWAY.md](C:/Users/santi/Projects/Hackathon_Gemini_Agents/SANDBOX_GATEWAY.md)
 
+## Variables de Entorno de Rutas
+
+El sistema resuelve todas sus rutas internas desde un módulo centralizado (`src/utils/paths.py`). Por defecto se auto-detectan relativas al directorio del proyecto, pero en despliegues enterprise se pueden sobreescribir con variables de entorno para apuntar a almacenamiento externo sin tocar código.
+
+| Variable | Default | Propósito |
+|----------|---------|-----------|
+| `PROJECT_ROOT` | Auto-detectado desde `paths.py` | Raíz del proyecto. Todos los demás paths se derivan de aquí si no se sobreescriben individualmente. |
+| `RUNS_DIR` | `{PROJECT_ROOT}/runs` | Directorio donde se almacenan todas las runs (workspace, logs, artefactos, reportes). Es el volumen con mayor crecimiento. |
+| `DATA_DIR` | `{PROJECT_ROOT}/data` | Directorio de datos compartidos: uploads de CSV, configuración cifrada de API keys, overrides de modelos. |
+
+Ejemplo de uso en un despliegue con almacenamiento externo:
+
+```bash
+export RUNS_DIR=/mnt/shared/strategyengine/runs
+export DATA_DIR=/mnt/shared/strategyengine/data
+```
+
+En Docker Compose, los volúmenes del host se configuran con las variables `RUNS_VOLUME` y `DATA_VOLUME`:
+
+```bash
+RUNS_VOLUME=/mnt/nas/runs DATA_VOLUME=/mnt/nas/data docker compose up -d
+```
+
+Importante: estas tres variables son las únicas que un equipo de IT necesita conocer para integrar el almacenamiento del producto con la infraestructura del cliente.
+
+## Consideraciones para Almacenamiento en Red (NAS / NFS / EFS)
+
+Si el cliente requiere almacenamiento compartido o persistente en red, el sistema es compatible pero hay que tener en cuenta:
+
+### Escrituras atómicas
+
+El sistema usa `os.replace()` para actualizar archivos de estado (`worker_status.json`) de forma atómica. Este patrón funciona correctamente en filesystems locales y en la mayoría de mounts NFS v4+. En mounts NFS v3 o SMB/CIFS antiguos, `os.replace()` puede no ser atómico, lo cual podría causar lecturas parciales del archivo de estado en condiciones de alta concurrencia.
+
+Recomendación: usar NFS v4+ o un filesystem POSIX-compliant (EFS, GCS FUSE, Azure Files con protocolo NFS).
+
+### Latencia de I/O
+
+El Data Engineer y ML Engineer generan artefactos de tamaño moderado (CSVs limpios, modelos, plots). En almacenamiento con latencia alta (>5ms por operación), las runs pueden ser más lentas. No hay riesgo de corrupción, solo de rendimiento.
+
+Recomendación para pilotos: usar disco local y copiar artefactos a red después. Para producción: mount NFS/EFS con throughput adecuado (>100 MB/s recomendado).
+
+### Permisos y ownership
+
+Los directorios de runs y datos deben ser escribibles por el proceso del contenedor (UID 0 por defecto en el Dockerfile actual, o el UID configurado si se usa `USER` en un Dockerfile custom).
+
+Recomendación: verificar que el mount point tenga permisos `rwx` para el UID del proceso antes del primer arranque.
+
+### Bloqueo de archivos
+
+El sistema no usa file locking (`flock`, `fcntl`). Cada run opera en su propio directorio aislado, por lo que no hay contención entre runs concurrentes. Sin embargo, no se recomienda que dos workers escriban en el mismo `run_id` simultáneamente.
+
 ## Secuencia Práctica de Despliegue
 
 ### Paso 1 - Piloto
