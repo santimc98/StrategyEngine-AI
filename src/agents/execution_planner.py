@@ -149,7 +149,7 @@ FULL EXAMPLE (full_pipeline with model_training=true):
   },
   "data_engineer": {
     "required_outputs": [
-      {"intent": "cleaned_dataset", "path": "artifacts/clean/dataset_cleaned.csv", "required": true, "kind": "dataset"},
+      {"intent": "primary_deliverable", "path": "artifacts/clean/<reasoned_name>.csv", "required": true, "kind": "dataset", "primary": true},
       {"intent": "cleaning_manifest", "path": "artifacts/clean/cleaning_manifest.json", "required": true, "kind": "manifest"},
       {"intent": "eda_plots", "path": "static/plots/*.png", "required": false, "kind": "visualization"}
     ],
@@ -163,7 +163,7 @@ FULL EXAMPLE (full_pipeline with model_training=true):
     },
     "artifact_requirements": {
       "cleaned_dataset": {
-        "output_path": "artifacts/clean/dataset_cleaned.csv",
+        "output_path": "artifacts/clean/<reasoned_name>.csv",
         "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
         "required_columns": ["id", "feature_a", "feature_b", "target"]
       }
@@ -576,6 +576,13 @@ When scope includes cleaning (cleaning_only or full_pipeline):
 - data_engineer.artifact_requirements.cleaned_dataset MUST include output_manifest_path (e.g., "artifacts/clean/cleaning_manifest.json"). The manifest is read by downstream reviewers and QA to verify cleaning provenance.
 - data_engineer.required_outputs MUST include a cleaning_manifest artifact with intent "cleaning_manifest" pointing to the same path.
 Omitting the manifest path causes downstream validation failures because the system cannot resolve the cleaning provenance chain.
+
+DE OUTPUT DESIGN — REASON, DO NOT TEMPLATE
+The number and naming of DE output datasets is YOUR decision, not a template:
+- Reason about what the business objective actually needs. Some objectives need a single ML-ready CSV. Others may benefit from multiple outputs (e.g., a full-fidelity archive + a leakage-free modeling set).
+- One of the required_outputs MUST be marked "primary": true. This is the deliverable that downstream agents (reviewer, QA, ML Engineer) will use as their primary input. Cleaning gates are verified against THIS file.
+- The output path and filename should be descriptive of what the file contains (e.g., "dataset_enriched.csv" for a feature-engineered set, "dataset_audit.csv" for a full-fidelity archive). Do not blindly use "dataset_cleaned.csv" — name it based on its actual purpose.
+- If you produce multiple datasets, document in the runbook which one is the primary deliverable and why.
 
 VISUALIZATION PLANNING
 Reason about what diagnostic visualizations would best represent the results of THIS specific strategy and assign them to the right agent:

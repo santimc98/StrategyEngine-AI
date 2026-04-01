@@ -1775,6 +1775,40 @@ def get_clean_dataset_output_path(contract: Dict[str, Any]) -> str:
     return get_cleaned_dataset_output_path(contract)
 
 
+def get_primary_de_output_path(contract: Dict[str, Any]) -> str:
+    """Resolve the primary DE deliverable — the dataset downstream agents should use.
+
+    Resolution order:
+      1. The required_output marked ``"primary": true`` in the DE section.
+      2. The enriched dataset path (if declared).
+      3. The cleaned dataset path (legacy fallback).
+
+    This allows the Planner to decide whether a single enriched CSV, a
+    separate audit + ML pair, or any other layout is the right choice for
+    the business objective, and guarantees that reviewers and ML Engineer
+    always receive the correct file.
+    """
+    # 1. Explicit primary flag in required_outputs
+    de_section = contract.get("data_engineer") if isinstance(contract, dict) else {}
+    if not isinstance(de_section, dict):
+        de_section = {}
+    req_outputs = de_section.get("required_outputs")
+    if isinstance(req_outputs, list):
+        for item in req_outputs:
+            if not isinstance(item, dict):
+                continue
+            if item.get("primary") is True and item.get("kind") == "dataset":
+                path = normalize_artifact_path(item.get("path"))
+                if path:
+                    return path
+    # 2. Enriched dataset (model-ready)
+    enriched = get_enriched_dataset_output_path(contract)
+    if enriched:
+        return enriched
+    # 3. Legacy cleaned dataset
+    return get_cleaned_dataset_output_path(contract)
+
+
 def get_enriched_dataset_output_path(contract: Dict[str, Any]) -> str:
     """Resolve the enriched/model-ready dataset output path declared by the contract."""
     enriched_cfg = get_dataset_artifact_binding(contract, "enriched_dataset")
