@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 from src.graph import graph as graph_mod
 
@@ -72,6 +73,31 @@ class _RuntimePathReviewer:
         raise AssertionError("evaluate_results must be skipped when runtime markers are present.")
 
 
+class _StubReviewerApproved:
+    def evaluate_results(self, *_args, **_kwargs):
+        return {"status": "APPROVED", "feedback": "review ok"}
+
+    def review_code(self, *_args, **_kwargs):
+        return {
+            "status": "APPROVED",
+            "feedback": "review ok",
+            "failed_gates": [],
+            "required_fixes": [],
+            "hard_failures": [],
+        }
+
+
+class _StubQAApproved:
+    def review_code(self, *_args, **_kwargs):
+        return {
+            "status": "APPROVED",
+            "feedback": "qa ok",
+            "failed_gates": [],
+            "required_fixes": [],
+            "hard_failures": [],
+        }
+
+
 def test_check_evaluation_terminal_runtime_stops():
     state = {
         "runtime_fix_terminal": True,
@@ -129,6 +155,100 @@ def test_run_result_evaluator_runtime_failure_builds_review_stack(tmp_path, monk
     assert result["ml_review_stack"]["result_evaluator"]["raw_status"] == "NEEDS_IMPROVEMENT"
     assert isinstance(result["ml_review_stack"].get("deterministic_facts"), dict)
     assert os.path.exists("data/ml_review_stack.json")
+
+
+def test_run_result_evaluator_restores_best_attempt_before_runtime_failure_review(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("data").mkdir(parents=True, exist_ok=True)
+    best_dir = Path("artifacts/best_attempt")
+    (best_dir / "data").mkdir(parents=True, exist_ok=True)
+
+    metrics_payload = {
+        "primary_metric_name": "auc",
+        "primary_metric_value": 0.8125,
+        "metrics": {"auc": 0.8125},
+    }
+    (best_dir / "data" / "metrics.json").write_text(json.dumps(metrics_payload), encoding="utf-8")
+    (best_dir / "data" / "scored_rows.csv").write_text("id,prediction,target\n1,0.9,1\n2,0.1,0\n", encoding="utf-8")
+    (best_dir / "data" / "submission.csv").write_text("id,prediction\n1,0.9\n2,0.1\n", encoding="utf-8")
+    metadata = {
+        "artifact_index": [
+            {"path": "data/metrics.json"},
+            {"path": "data/scored_rows.csv"},
+            {"path": "data/submission.csv"},
+        ],
+        "output_contract_report": {
+            "overall_status": "ok",
+            "missing": [],
+            "present": ["data/metrics.json", "data/scored_rows.csv", "data/submission.csv"],
+        },
+        "execution_output": "Recovered execution output",
+        "plots_local": [],
+        "generated_code": "print('best attempt')\n",
+        "metrics_payload": metrics_payload,
+        "metrics_path": "data/metrics.json",
+        "primary_metric_state": {
+            "primary_metric_name": "auc",
+            "primary_metric_canonical_name": "auc",
+            "primary_metric_value": 0.8125,
+            "primary_metric_source": "data/metrics.json",
+            "primary_metric_path": "primary_metric_value",
+            "higher_is_better": True,
+        },
+    }
+    (best_dir / "best_attempt.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    monkeypatch.setattr(graph_mod, "reviewer", _StubReviewerApproved())
+    monkeypatch.setattr(graph_mod, "qa_reviewer", _StubQAApproved())
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_insights",
+        lambda _ctx: {
+            "summary_lines": ["ok"],
+            "risks": [],
+            "recommendations": [],
+            "iteration_recommendation": {},
+        },
+    )
+
+    state = {
+        "execution_output": "Traceback (most recent call last):\nboom",
+        "execution_error": True,
+        "sandbox_failed": True,
+        "runtime_fix_terminal": True,
+        "runtime_fix_terminal_reason": "max_runtime_fix_attempts_reached",
+        "error_message": "runtime boom",
+        "artifact_content_issues": ["missing outputs"],
+        "output_contract_report": {"overall_status": "error", "missing": ["data/metrics.json"], "present": []},
+        "best_attempt_dir": str(best_dir),
+        "best_attempt_score": 950.0,
+        "best_attempt_id": 8,
+        "last_attempt_score": 120.0,
+        "last_attempt_valid": False,
+        "selected_strategy": {"analysis_type": "classification"},
+        "business_objective": "",
+        "generated_code": "print('broken')\n",
+        "execution_contract": {
+            "required_outputs": ["data/metrics.json", "data/scored_rows.csv", "data/submission.csv"],
+            "artifact_requirements": {
+                "required_files": ["data/metrics.json", "data/scored_rows.csv", "data/submission.csv"]
+            },
+            "validation_requirements": {"primary_metric": "auc"},
+            "evaluation_spec": {"objective_type": "predictive"},
+            "spec_extraction": {"case_taxonomy": []},
+        },
+        "evaluation_spec": {"objective_type": "predictive"},
+        "iteration_count": 0,
+        "feedback_history": [],
+    }
+
+    result = graph_mod.run_result_evaluator(state)
+
+    assert result["review_verdict"] in {"APPROVED", "APPROVE_WITH_WARNINGS"}
+    assert result["ml_review_stack"]["runtime"]["status"] == "OK"
+    metric_state = json.loads((tmp_path / "data" / "metric_state.json").read_text(encoding="utf-8"))
+    assert metric_state["primary_metric_value"] == 0.8125
+    assert (tmp_path / "artifacts" / "ml_engineer_last.py").read_text(encoding="utf-8") == "print('best attempt')\n"
 
 
 def test_run_review_board_increments_iteration_on_escalation_to_needs_improvement(tmp_path, monkeypatch):

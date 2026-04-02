@@ -9022,6 +9022,7 @@ def _snapshot_best_attempt(
     artifact_index: List[Dict[str, Any]],
     execution_output: str,
     plots_local: List[str],
+    generated_code: str | None = None,
     diagnostics: Dict[str, Any] | None = None,
     dest_root: str = os.path.join("artifacts", "best_attempt"),
     contract: Dict[str, Any] | None = None,
@@ -9047,6 +9048,8 @@ def _snapshot_best_attempt(
             "plots_local": plots_local,
             "diagnostics": diagnostics or {},
         }
+        if isinstance(generated_code, str) and generated_code.strip():
+            meta["generated_code"] = generated_code
         metrics_aliases = {
             "metrics.json",
             "cv_metrics.json",
@@ -9206,9 +9209,134 @@ def _promote_best_attempt(state: Dict[str, Any]) -> Dict[str, Any]:
                 updated["execution_output_stale"] = True
             if meta.get("plots_local") is not None:
                 updated["plots_local"] = meta.get("plots_local")
+            generated_code = meta.get("generated_code")
+            if isinstance(generated_code, str) and generated_code.strip():
+                updated["generated_code"] = generated_code
+                updated["last_generated_code"] = generated_code
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(os.path.join("artifacts", "ml_engineer_last.py"), "w", encoding="utf-8") as f_code:
+                        f_code.write(generated_code)
+                except Exception:
+                    pass
     except Exception:
         return updated
     return updated
+
+
+def _should_restore_best_attempt(
+    state: Dict[str, Any] | None,
+    *,
+    include_metric_round: bool = False,
+) -> bool:
+    state = state if isinstance(state, dict) else {}
+    if not include_metric_round and bool(state.get("ml_improvement_round_active")):
+        return False
+    best_dir = state.get("best_attempt_dir")
+    if not isinstance(best_dir, str) or not best_dir.strip() or not os.path.isdir(best_dir):
+        return False
+    best_score = _coerce_float(state.get("best_attempt_score"))
+    if best_score is None:
+        return False
+
+    if bool(state.get("execution_error")) or bool(state.get("sandbox_failed")) or bool(state.get("runtime_fix_terminal")):
+        return True
+    if _has_runtime_failure_marker(state.get("execution_output")):
+        return True
+
+    artifact_issues = state.get("artifact_content_issues")
+    if isinstance(artifact_issues, list) and any(str(item).strip() for item in artifact_issues):
+        return True
+
+    oc_report = state.get("output_contract_report")
+    if isinstance(oc_report, dict):
+        if str(oc_report.get("overall_status") or "").strip().lower() == "error":
+            return True
+        missing = oc_report.get("missing")
+        if isinstance(missing, list) and any(str(item).strip() for item in missing):
+            return True
+
+    last_attempt_valid = state.get("last_attempt_valid")
+    if isinstance(last_attempt_valid, bool) and not last_attempt_valid:
+        return True
+
+    last_score = _coerce_float(state.get("last_attempt_score"))
+    if last_score is not None and float(best_score) > float(last_score):
+        return True
+
+    return False
+
+
+def _restore_best_attempt_as_authoritative_state(
+    state: Dict[str, Any] | None,
+    *,
+    stage: str,
+    clear_review_state: bool = False,
+    include_metric_round: bool = False,
+) -> Dict[str, Any]:
+    state = dict(state) if isinstance(state, dict) else {}
+    if not _should_restore_best_attempt(state, include_metric_round=include_metric_round):
+        return state
+
+    updates = _promote_best_attempt(state)
+    if not updates:
+        return state
+
+    restored = {**state, **updates}
+    restored.update(_clear_runtime_blockers())
+    restored["error_message"] = ""
+    restored["artifact_content_issues"] = []
+    restored["artifact_content_diagnostics"] = {}
+    restored["visuals_missing"] = False
+    restored["last_attempt_valid"] = True
+    restored["runtime_fix_count"] = 0
+    restored["sandbox_retry_count"] = 0
+    restored["ml_skipped_reason"] = None
+    restored["execution_output_stale"] = True
+    restored["best_attempt_promoted_for"] = stage
+
+    success_gate_context = restored.get("last_successful_gate_context")
+    if not isinstance(success_gate_context, dict):
+        success_gate_context = restored.get("last_gate_context")
+    restored["last_gate_context"] = _clear_gate_context_after_success(success_gate_context)
+
+    if clear_review_state:
+        restored["iteration_handoff"] = {}
+        restored["review_verdict"] = restored.get("last_successful_review_verdict") or ""
+        restored["review_feedback"] = ""
+        restored["reviewer_last_result"] = {}
+        restored["qa_last_result"] = {}
+        restored["ml_review_stack"] = {}
+        try:
+            os.makedirs("data", exist_ok=True)
+            dump_json("data/iteration_handoff.json", {})
+        except Exception:
+            pass
+
+    history = [str(item) for item in (restored.get("feedback_history") or []) if str(item).strip()]
+    restore_note = (
+        f"BEST_ATTEMPT_RESTORED[{stage}]: restored attempt "
+        + str(restored.get("best_attempt_id") or "?")
+        + " as authoritative state after a later degraded execution."
+    )
+    if restore_note not in history:
+        history.append(restore_note)
+    restored["feedback_history"] = history[-40:]
+    run_id = restored.get("run_id")
+    if run_id:
+        try:
+            log_run_event(
+                run_id,
+                "best_attempt_restored",
+                {
+                    "stage": stage,
+                    "best_attempt_id": restored.get("best_attempt_id"),
+                },
+            )
+        except Exception:
+            pass
+
+    return restored
 
 def _normalize_alignment_check(
     alignment_check: Dict[str, Any],
@@ -17559,6 +17687,11 @@ def _finalize_heavy_execution(
             artifact_index=artifact_index,
             execution_output=output,
             plots_local=plots_local,
+            generated_code=(
+                state.get("generated_code")
+                if isinstance(state.get("generated_code"), str)
+                else state.get("last_generated_code")
+            ),
             diagnostics=content_diagnostics,
             contract=contract,
         )
@@ -24400,6 +24533,11 @@ def execute_code(state: AgentState) -> AgentState:
             artifact_index=artifact_index,
             execution_output=output,
             plots_local=plots_local,
+            generated_code=(
+                state.get("generated_code")
+                if isinstance(state.get("generated_code"), str)
+                else state.get("last_generated_code")
+            ),
             diagnostics=content_diagnostics,
             contract=contract,
         )
@@ -24568,6 +24706,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "result_evaluator")
     if abort_state:
         return abort_state
+    state = _restore_best_attempt_as_authoritative_state(
+        state if isinstance(state, dict) else {},
+        stage="result_evaluator",
+        clear_review_state=True,
+    )
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "result_evaluator_start", {})
@@ -26387,12 +26530,18 @@ def run_review_board(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "review_board")
     if abort_state:
         return abort_state
+    state = _restore_best_attempt_as_authoritative_state(
+        state if isinstance(state, dict) else {},
+        stage="review_board",
+        clear_review_state=False,
+    )
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "review_board_start", {})
 
+    promoted_best_for_board = str(state.get("best_attempt_promoted_for") or "").strip().lower() == "review_board"
     review_stack = state.get("ml_review_stack")
-    if not isinstance(review_stack, dict) or not review_stack:
+    if (not isinstance(review_stack, dict) or not review_stack) and not promoted_best_for_board:
         review_stack = _load_json_safe("data/ml_review_stack.json") or {}
     if not isinstance(review_stack, dict):
         review_stack = {}
@@ -31575,26 +31724,11 @@ def run_translator(state: AgentState) -> AgentState:
     if run_id:
         log_run_event(run_id, "translator_start", {})
 
-    best_score = state.get("best_attempt_score")
-    last_score = state.get("last_attempt_score")
-    promote_best = False
-    if best_score is not None and state.get("best_attempt_dir"):
-        if state.get("execution_error") or state.get("sandbox_failed"):
-            promote_best = True
-        if state.get("artifact_content_issues"):
-            promote_best = True
-        missing_outputs = (state.get("output_contract_report") or {}).get("missing") if isinstance(state.get("output_contract_report"), dict) else []
-        if missing_outputs:
-            promote_best = True
-        try:
-            if last_score is not None and float(best_score) > float(last_score):
-                promote_best = True
-        except Exception:
-            pass
-    if promote_best:
-        updates = _promote_best_attempt(state)
-        if updates:
-            state = {**state, **updates}
+    state = _restore_best_attempt_as_authoritative_state(
+        state if isinstance(state, dict) else {},
+        stage="translator",
+        clear_review_state=False,
+    )
 
     error_msg = state.get("error_message")
 

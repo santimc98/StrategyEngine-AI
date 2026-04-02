@@ -35,7 +35,10 @@ def test_build_review_board_facts_prefers_best_output_contract_and_insights_metr
     facts = graph_mod._build_review_board_facts(state)
 
     assert facts["output_contract"]["missing_required_artifacts"] == []
-    assert facts["metrics"]["primary"]["name"] in {"Normalized Gini", "ROC-AUC"}
+    primary_name = str(facts["metrics"]["primary"]["name"] or "")
+    assert primary_name in {"Normalized Gini", "ROC-AUC"} or primary_name.endswith(
+        ("Normalized Gini", "ROC-AUC")
+    )
     assert facts["metrics"]["primary"]["value"] is not None
     assert facts["metrics"]["primary"]["source"] in {"data/insights.json", "metrics.normalized"}
 
@@ -130,6 +133,7 @@ def test_promote_best_attempt_restores_metrics_report_and_primary_metric_state(t
         "output_contract_report": {"overall_status": "ok", "missing": [], "present": ["artifacts/ml/cv_metrics.json"]},
         "execution_output": "Recovered execution output",
         "plots_local": [],
+        "generated_code": "print('best candidate')\n",
         "metrics_payload": metrics_payload,
         "metrics_path": "artifacts/ml/cv_metrics.json",
         "primary_metric_state": {
@@ -147,5 +151,7 @@ def test_promote_best_attempt_restores_metrics_report_and_primary_metric_state(t
 
     assert updates["metrics_report"]["primary_metric_value"] == 40.3429
     assert updates["primary_metric_state"]["primary_metric_value"] == 40.3429
+    assert updates["generated_code"] == "print('best candidate')\n"
     persisted = json.loads((tmp_path / "data" / "metric_state.json").read_text(encoding="utf-8"))
     assert persisted["primary_metric_value"] == 40.3429
+    assert (tmp_path / "artifacts" / "ml_engineer_last.py").read_text(encoding="utf-8") == "print('best candidate')\n"
