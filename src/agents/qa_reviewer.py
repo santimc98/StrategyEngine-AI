@@ -582,8 +582,9 @@ class QAReviewerAgent:
                 "traceability artifacts, manifests, exclusions, normalization, and row/accounting evidence.\n"
                 "- Do not invent ML-only failures when the contract is cleaning-first and model_training is false.\n"
                 "- If 'cleaning_quality_summary' is present in QA context, inspect 'notable_columns' for null inflation.\n"
-                "  A column with null_inflation_pp > 35 likely indicates a broken parser (e.g., datetime parsing "
-                "destroying valid dates). This is a HARD quality failure requiring a multi-stage parsing fix.\n"
+                "  Large null_inflation_pp values may indicate a broken parser (e.g., datetime parsing destroying valid dates) "
+                "or legitimate row exclusion. Distinguish between the two by checking whether rows were dropped and whether "
+                "the inflated column is the exclusion criterion. Value destruction is a HARD quality failure; row-exclusion inflation is expected.\n"
                 "- If 'cleaning_manifest' is present, cross-check declared transformations against the actual code.\n"
                 "PROACTIVE CONTRACT COMPLIANCE (report as warnings, not gate failures):\n"
                 "Beyond the active gates, a senior QA review should surface contract compliance gaps as warnings. "
@@ -719,7 +720,7 @@ class QAReviewerAgent:
         - Include evidence in feedback using: EVIDENCE: <artifact_path>#<key> -> <short snippet>
         - If you cannot find evidence, downgrade to APPROVE_WITH_WARNINGS and state NO_EVIDENCE_FOUND.
         - SELF-CHECK BEFORE REJECT: without at least one concrete evidence item, you must not reject.
-        - Populate the "evidence" list with 3-8 items. If evidence is missing, use source="missing".
+        - Populate the "evidence" list with sufficient items to support your claims. If evidence is missing, use source="missing".
         - Evidence sources must be artifact paths or script paths; otherwise use source="missing".
         
         OUTPUT FORMAT (JSON):

@@ -48,27 +48,26 @@ this budget. Every technique you propose must be computationally feasible — es
 the wall-clock time for your parameters before proposing them.
 
 === YOUR TASK ===
-Think step-by-step like a senior data scientist. Do NOT follow a checklist — reason
-about what matters for THIS model, THIS dataset, and THIS metric.
+Think like a senior data scientist. Reason about what matters for THIS model,
+THIS dataset, and THIS metric.
 
-STEP 1 — DIAGNOSE THE BASELINE:
+DIAGNOSIS
 - What is the current metric value? How good is it already?
-- Look at CV fold std: is variance high (>0.002)? If so, variance reduction has ROI.
-  If std is already low (<0.001), multi-seed will give diminishing returns.
-- Is there a train-validation gap suggesting overfitting? If so, regularization > complexity.
+- Assess CV fold variance: is there enough instability to justify variance reduction,
+  or is the model already stable enough that multi-seed gives diminishing returns?
+- Is there a train-validation gap suggesting overfitting? If so, regularization may
+  have more ROI than added complexity.
 - What techniques are already applied? Don't suggest what's already there.
 
-STEP 2 — IDENTIFY THE HIGHEST-ROI IMPROVEMENTS:
+IMPROVEMENT PRIORITIES
 - Given the dataset size, metric quality, and remaining compute budget, which improvements
   will give the best return per compute-second invested?
-- A technique that gains +0.001 in 600s is better than one that gains +0.002 in 6000s
-  if budget is tight.
-- Be realistic: at high baselines (>0.90 AUC), individual gains are typically +0.0005-0.003.
+- Be realistic about expected gains at the current performance level.
+- A technique that completes within budget with modest gains beats one that times out.
 
-STEP 3 — SET PARAMETERS THAT FIT THE COMPUTE BUDGET:
-- Estimate training time: n_rows × n_folds × n_seeds × iterations × (framework speed factor).
-- CatBoost is ~3x slower than LightGBM per iteration at the same data size.
-- For large datasets (>200K rows), use fewer seeds, fewer folds, and aggressive early stopping.
+COMPUTE FEASIBILITY
+- Estimate wall-clock time for your proposed parameters: consider dataset size, fold count,
+  seed count, iterations, and framework speed characteristics.
 - It is BETTER to succeed with conservative parameters than to timeout with ambitious ones.
   A timed-out technique gives zero improvement.
 
@@ -1113,13 +1112,13 @@ class ModelAnalystAgent:
                     break
         if n_train and n_train > 0:
             if n_train > 500_000:
-                lines.append("DATASET_SIZE_CATEGORY: LARGE (>500K rows) — use conservative parameters: 2 seeds, 300-400 iters, 3-fold CV")
+                lines.append(f"DATASET_SIZE: LARGE ({n_train:,} rows) — compute budget is the primary constraint; scale parameters accordingly")
             elif n_train > 200_000:
-                lines.append("DATASET_SIZE_CATEGORY: MEDIUM-LARGE (200K-500K rows) — use moderate parameters: 3 seeds, 400-500 iters, 3-fold CV")
+                lines.append(f"DATASET_SIZE: MEDIUM-LARGE ({n_train:,} rows) — balance thoroughness with compute budget")
             elif n_train > 50_000:
-                lines.append("DATASET_SIZE_CATEGORY: MEDIUM (50K-200K rows) — standard parameters: 3-5 seeds, 5-fold CV")
+                lines.append(f"DATASET_SIZE: MEDIUM ({n_train:,} rows) — moderate compute pressure")
             else:
-                lines.append("DATASET_SIZE_CATEGORY: SMALL (<50K rows) — can afford expensive parameters: 5+ seeds, 5-fold CV, 50+ HPO trials")
+                lines.append(f"DATASET_SIZE: SMALL ({n_train:,} rows) — compute budget is unlikely to be a constraint")
         cat_cols = profile.get("categorical_columns") or profile.get("categorical_features")
         if isinstance(cat_cols, list):
             lines.append(f"categorical_features ({len(cat_cols)}): {cat_cols[:10]}")

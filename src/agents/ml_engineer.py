@@ -2306,22 +2306,21 @@ class MLEngineerAgent:
         OPTIMIZATION EDITOR CONTRACT
         - Treat the existing script as an approved incumbent unless the round evidence proves a local defect.
         - Optimize by targeted edits, not by regenerating a new solution.
-        - Contract paths, train/test partitioning, target semantics, required outputs, and validation protocol are immutable unless the round context explicitly says otherwise.
         - If the metric definition is a mean and the contract provides no explicit weights, use a simple arithmetic mean.
 
-        HARD CONSTRAINTS
+        SAFETY INVARIANTS (immutable)
+        - Contract paths, required outputs, input file immutability, and row-subset rules (test-only vs all-row artifacts) are never changed.
         - Output valid Python code only. No markdown, no code fences.
         - Read input data only from "$data_path".
         - Respect $cleaning_manifest_path output_dialect for CSV reads and writes.
         - Do not invent columns, synthetic rows, or fallback datasets.
-        - Do not overwrite input data.
-        - Respect required outputs exactly as contract paths.
         - Avoid network, shell operations, filesystem discovery scans, and file deletion.
-        - Forbidden calls include os.remove, os.unlink, pathlib.Path.unlink, shutil.rmtree, os.rmdir.
+        - Forbidden calls: os.remove, os.unlink, pathlib.Path.unlink, shutil.rmtree, os.rmdir.
 
-        EXECUTION INVARIANTS
-        - Keep row-subset rules exact: test-only artifacts must contain only scoring rows; all-row artifacts must contain all rows.
-        - Keep model family, CV protocol, and output contract stable unless the round invariants explicitly allow a local change.
+        TECHNICAL DEFAULTS (changeable with evidence)
+        - Model family, CV protocol, train/test partitioning logic, and validation strategy are your defaults from the incumbent.
+        - You may change these when the current round's metrics, error modes, or validation diagnostics provide clear evidence that the default is the bottleneck.
+        - When changing a technical default, document WHY the evidence justifies the change in a code comment.
         - Preserve working artifact generation and only change the code regions needed for the active hypothesis.
 
         CURRENT TASK CONTEXT
@@ -2420,9 +2419,9 @@ class MLEngineerAgent:
         critical_section = ""
         if critical_errors:
             critical_section = (
-                "!!! CRITICAL ERRORS FROM PREVIOUS ATTEMPTS (DO NOT REPEAT) !!!\n" +
+                "PREVIOUS ATTEMPT CONTEXT (understand what failed and why)\n" +
                 "\n".join(critical_errors) +
-                "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                "\n---\n"
             )
 
         memory_block = iteration_memory_block.strip()
@@ -4239,25 +4238,22 @@ class MLEngineerAgent:
           DataFrame you just wrote, which would be a tautology).
         - Use a JSON serializer helper for numpy/pandas scalars, arrays, NaN, and bool types.
 
-        CONTRACT-FIRST EXECUTION MAP (MANDATORY)
-        - Before training/inference, build and print CONTRACT_EXECUTION_MAP with:
-          target_columns, input_required_columns, training_rows_policy, train_filter,
-          primary_metric, required_outputs, allowed_feature_sets summary, required_plot_ids.
-        - If any mandatory map element is missing or contradictory, raise ValueError and stop.
+        CONTRACT EXECUTION PLANNING
+        - Before training/inference, build and print a CONTRACT_EXECUTION_MAP summarizing:
+          target columns, required input columns, training rows policy, train filter,
+          primary metric, required outputs, allowed feature sets, and required plot IDs.
+        - If any critical element is missing or contradictory, raise ValueError with a clear explanation.
 
-        PREFLIGHT GATES (MANDATORY BEFORE fit)
-        - Gate A: required input columns exist.
-        - Gate B: target and task are consistent with evaluation spec.
-          Use robust target normalization before validation:
-          read target as str, strip/lower, then attempt pd.to_numeric(errors='coerce').
+        PREFLIGHT VALIDATION (before fit)
+        Before fitting any model, verify these engineering prerequisites and print PRE_FLIGHT_GATES:
+        - Required input columns exist in the loaded data.
+        - Target column and task type are consistent with the evaluation spec.
+          Use robust target normalization: read as str, strip/lower, then pd.to_numeric(errors='coerce').
           For binary targets, accept equivalent values {0, 1} including "0", "1", "0.0", "1.0".
-          Log unique target values before and after normalization in PRE_FLIGHT_GATES output.
-        - Gate C: train/scoring row rules are applied explicitly.
-        - Gate D: forbidden/audit-only columns are excluded from modeling features.
-        - Gate E: required output directories and paths are writable.
-          For Gate E writability checks, create directories and write a marker file
-          like ".write_test_<uuid>.txt"; do not delete marker files.
-        - Print PRE_FLIGHT_GATES with PASS/FAIL per gate.
+          Log unique target values before and after normalization.
+        - Train/scoring row rules are applied explicitly.
+        - Forbidden/audit-only columns are excluded from modeling features.
+        - Required output directories exist and are writable (create dirs, write a marker file like ".write_test_<uuid>.txt"; do not delete marker files).
 
         REPAIR DECISION FRAMEWORK (WHEN FEEDBACK EXISTS)
         - Identify the smallest blocker that currently dominates:

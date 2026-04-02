@@ -368,7 +368,7 @@ class StewardAgent:
             AMBIGUITY REPORT:
             {profile['ambiguities']}
 
-            COLUMN GLOSSARY (Heuristic Hints):
+            COLUMN GLOSSARY (automated guesses from column names — validate against sample data):
             {profile['glossary']}
 
             {profile['alerts']}
@@ -392,15 +392,26 @@ class StewardAgent:
             temporal/distributional range. This means you're seeing data from BOTH the beginning AND
             end of the file, which is crucial for time-sorted or grouped datasets.
 
-            INSTRUCTIONS:
-            1. Start strictly with "DATA SUMMARY:".
-            2. Infer the Business Domain (e.g., Retail, CRM, Manufacturing) based on column names.
-            3. Explain the *meaning* of key variables relative to the Objective: "$business_objective".
-            4. Highlight Data Quality Blockers and Ambiguities (e.g., numeric-looking strings with commas, percent signs, mixed types).
-            5. Mention which columns seem to be Identifiers vs Dates vs Numerical Features, and why they matter to the objective.
-            6. Explicitly call out any columns whose meaning is unclear or overloaded.
-            7. IF sampling was used, acknowledge it but note that the sample covers both START and END of the data for better representativeness.
-            8. Be concise. NO markdown tables. Plain text only.
+            YOUR TASK:
+            Produce a data summary that gives a downstream
+            strategist and planner everything they need to design a modeling approach for
+            this business objective. Reason like a senior data scientist seeing this
+            dataset for the first time — prioritize what matters most for the stated
+            objective, not a generic checklist.
+
+            Focus your analysis on:
+            - What business domain does this data represent, and what do the key variables
+              mean relative to the objective?
+            - Which data quality issues could block or degrade modeling? Prioritize by
+              impact, not just by presence (e.g., 5% nulls in a non-critical column is
+              less important than mixed types in the likely target).
+            - Which columns are identifiers, dates, features, or targets — and why that
+              classification matters for this specific objective.
+            - Any columns whose meaning is ambiguous or overloaded.
+            - If the column glossary contains heuristic hints, validate them against the
+              sample data — they are automated guesses, not confirmed roles.
+
+            Be concise and direct. Plain text only.
             """
             
             system_prompt = render_prompt(
@@ -451,8 +462,8 @@ class StewardAgent:
                     f"Columns={cols}. Null_frac_sample={null_sample}"
                 )
             
-            # Enforce Prefix
-            if not summary.startswith("DATA SUMMARY:"):
+            # Add prefix if missing (downstream consumers may display it)
+            if not summary.startswith("DATA SUMMARY"):
                 summary = "DATA SUMMARY:\n" + summary
 
             return {
@@ -590,12 +601,17 @@ $data_atlas_summary
 Sample rows (head/tail/random):
 $sample_rows
 
-YOUR REASONING TASK:
-1. Read the business objective carefully. What is the user trying to predict, classify, or optimize?
-2. Examine the column names, types, and sample values. Which column best represents the outcome the user cares about?
-3. Consider ambiguity: if multiple columns could be the target, pick the one most aligned with the stated objective and explain your reasoning in notes.
-4. Identify columns that look like row identifiers (IDs, UUIDs, keys) and columns that could define train/test splits.
-5. Decide what additional evidence you need to confirm your hypotheses (missingness patterns, unique value counts, column distributions).
+YOUR TASK:
+Reason about the dataset and business objective to propose semantic hypotheses.
+Think like a senior data scientist deciding how to structure this data for modeling:
+
+- What is the user trying to predict, classify, or optimize?
+- Which column best represents that outcome? If multiple candidates exist, pick
+  the strongest and explain why in your notes.
+- Which columns are row identifiers or potential train/test split markers?
+- What evidence do you still need to confirm your hypotheses? Request specific
+  measurements (missingness, unique value counts, column profiles) for the
+  columns where uncertainty remains.
 
 OUTPUT FORMAT (JSON only, no markdown):
 {
@@ -605,11 +621,12 @@ OUTPUT FORMAT (JSON only, no markdown):
   "evidence_requests": [
     {"kind": "missingness"|"uniques"|"column_profile", "column": "<exact_column_name>", "max_unique": <int, optional for uniques>}
   ],
-  "notes": ["2-6 bullets explaining your reasoning: why this target, what uncertainties remain, what the evidence will clarify"]
+  "notes": ["Explain your reasoning: why this target, what uncertainties remain, what the evidence will clarify"]
 }
 
 CONSTRAINTS:
-- evidence_requests: max 12 items, only columns present in inventory/atlas.
+- evidence_requests: only columns present in inventory/atlas. Request what you
+  genuinely need — focus on columns where the answer changes your decision.
 - Do NOT invent metrics or statistics you haven't seen. State what you observe and what you need to verify.
 
 $retry_note
@@ -699,22 +716,45 @@ OUTPUT REQUIREMENTS (JSON ONLY):
   }
 }
 
-YOUR REASONING TASK:
-1. You already chose the primary_target in pass1. Keep it as provided — do not change it.
-2. Examine the measured target missingness. What fraction of labels is missing? What does this mean for training?
-   - If a significant portion of labels is missing, reason about whether those rows should be excluded from training, used for scoring, or treated differently.
-   - If all labels are present, all rows can be used for training.
-   - Express your reasoning in the rationale field.
-3. Examine the split candidates and their unique values. Do any columns define a natural train/test partition?
-4. Use the evidence_bundle as your source of truth. If it conflicts with sample rows, trust the evidence_bundle.
-5. Design column_sets using compact selectors (prefix_numeric_range, regex, all_numeric_except, all_columns_except) — do NOT enumerate full column lists.
-6. Reason about column classification with senior-level rigor:
-   - Every column should land in a deliberate set. If you use an all_columns_except catch-all, review what falls into it — columns with extreme missingness (>50%), free-text with very low cardinality, or columns you flagged as risky in notes should not silently land in a modeling set without explicit justification.
-   - Ensure consistency between your notes and your column_sets: if you flag a column as a leakage risk or post-decision indicator in notes, that column must be reflected in a leakage/exclusion set, not left in a modeling catch-all.
-   - Columns that serve as row-filtering signals (debug flags, synthetic markers, import batch identifiers) should be explicitly classified so downstream agents know their operational role.
+YOUR TASK:
+Use the measured evidence to finalize dataset semantics. Think like a senior data
+scientist validating hypotheses with data — trust measurements over assumptions.
+
+Key reasoning areas:
+
+TARGET VALIDATION:
+  You selected primary_target in pass1. Validate this choice against the measured
+  evidence. If the evidence confirms it, proceed. If the evidence reveals structural
+  problems (e.g., extreme missingness, constant values, or a column that is actually
+  a post-decision indicator), document the issue in your notes and flag it — but keep
+  primary_target consistent with the value above so downstream agents have a stable
+  reference. Use the notes field to communicate any concerns.
+
+TRAINING MASK DESIGN:
+  Examine the measured target missingness. What fraction of labels is missing?
+  Reason about whether unlabeled rows should be excluded from training, used for
+  scoring, or treated differently. Express your reasoning in the rationale field.
+
+PARTITION ANALYSIS:
+  Examine the split candidates and their unique values. Do any columns define a
+  natural train/test partition? Use the evidence_bundle as your source of truth —
+  if it conflicts with sample rows, trust the evidence_bundle.
+
+COLUMN SET DESIGN:
+  Design column_sets using compact selectors (prefix_numeric_range, regex,
+  all_numeric_except, all_columns_except). Reason with senior-level rigor:
+  - Every column should land in a deliberate set. If you use an all_columns_except
+    catch-all, review what falls into it — columns with extreme missingness, free-text,
+    or columns you flagged as risky should not silently land in a modeling set.
+  - Ensure consistency: if you flag a column as a leakage risk or post-decision
+    indicator in notes, it must be reflected in a leakage/exclusion set, not left
+    in a modeling catch-all.
+  - Columns that serve as row-filtering signals (debug flags, synthetic markers)
+    should be explicitly classified so downstream agents know their role.
 
 CONSTRAINTS:
-- primary_target must match the value provided above exactly.
+- primary_target must match the value provided above (for downstream stability).
+  Use notes to flag concerns rather than changing the target unilaterally.
 - Output JSON only. No markdown, no extra text.
 """
         prompt = render_prompt(
@@ -892,7 +932,7 @@ CONSTRAINTS:
                 role_hints.append("binary/flag")
             if role_hints:
                 sample_vals = df[col].dropna().astype(str).head(3).tolist()
-                glossary += f"- {col}: dtype={dtype}, hints={role_hints}, sample={sample_vals}\n"
+                glossary += f"- {col}: dtype={dtype}, heuristic_guess={role_hints} [VALIDATE], sample={sample_vals}\n"
 
         if remaining_cols:
             type_counts = {"numeric": 0, "categorical": 0, "boolean": 0, "datetime": 0, "other": 0}

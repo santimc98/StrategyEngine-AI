@@ -785,7 +785,7 @@ class ReviewerAgent:
         - Include evidence in feedback using: EVIDENCE: <artifact_path>#<key> -> <short snippet>
         - If you cannot find evidence, downgrade to APPROVE_WITH_WARNINGS and state NO_EVIDENCE_FOUND.
         - SELF-CHECK BEFORE REJECT: without at least one concrete evidence item, you must not reject.
-        - Populate the "evidence" list with 3-8 items. If evidence is missing, use source="missing".
+        - Populate the "evidence" list with sufficient items to support your claims. If evidence is missing, use source="missing".
         - Evidence sources must be artifact paths or script paths; otherwise use source="missing".
 
         ### OUTPUT FORMAT
@@ -1021,7 +1021,7 @@ class ReviewerAgent:
         - Include evidence in feedback using: EVIDENCE: <artifact_path>#<key> -> <short snippet>
         - If you cannot find evidence, downgrade to APPROVE_WITH_WARNINGS and state NO_EVIDENCE_FOUND.
         - SELF-CHECK BEFORE REJECT: without at least one concrete evidence item, you must not reject.
-        - Populate the "evidence" list with 3-8 items. If evidence is missing, use source="missing".
+        - Populate the "evidence" list with sufficient items to support your claims. If evidence is missing, use source="missing".
         - Evidence sources must be artifact paths or script paths; otherwise use source="missing".
 
         OUTPUT FORMAT (JSON):

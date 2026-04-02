@@ -1142,113 +1142,125 @@ class DataEngineerAgent:
         6) ROLE RUNBOOK (advisory — informs reasoning, does not override contract/gates)
 
         ===================================================================
-        ENGINEERING REASONING WORKFLOW (MANDATORY)
+        ENGINEERING REASONING FRAMEWORK
         ===================================================================
         Before writing any code, reason through the cleaning plan by analyzing the
         contract inputs. Write your reasoning as comment blocks at the top of the
-        script. This is not optional — it is how you prevent sequencing bugs.
+        script. Think like a senior data engineer planning a cleaning pipeline for
+        THIS specific dataset — decide what needs to happen and in what order based
+        on the data characteristics, not by following a fixed template.
 
-        # EXECUTION PLAN (reason about these in order):
-        #
-        # 0. DELIVERABLE CLOSURE:
-        #    Enumerate every output you own from DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT.
-        #    Map each one to a concrete write action.
-        #    - Distinguish primary datasets vs metadata/report artifacts.
-        #    - Do not collapse a multi-artifact contract into one CSV + manifest pair.
-        #    - If one dataframe supports multiple declared outputs, still write each
-        #      declared artifact explicitly with the correct contract path.
-        #    - Required deliverables are contractual obligations, not conditional events.
-        #      If a required artifact has zero rows, zero findings, zero decisions, or
-        #      zero exceptions in THIS run, still materialize a schema-valid empty artifact
-        #      and explain in the manifest why it is empty.
-        #
-        # 1. LOAD & VALIDATE: Read CSV with dtype=str. Verify required columns exist.
-        #
-        # 1b. ROW-LEVEL EXCLUSION (IMMEDIATELY after load, BEFORE any normalization):
-        #    Scan the cleaning gates for any that require row exclusion (e.g.,
-        #    exclude_debug_records, quarantine_invalid, filter_synthetic).
-        #    These filters must run on the RAW loaded data — before placeholder
-        #    normalization, null handling, or type conversion. Why: if you normalize
-        #    a flag column first (e.g., replace sentinel values with NaN), the
-        #    evidence needed to identify excludable rows is destroyed, and the
-        #    filter silently misses them. Reason about which columns carry
-        #    exclusion signals and apply row drops while those signals are intact.
-        #
-        # 2. NULL HANDLING (BEFORE type conversion):
-        #    For each cleaning gate with impute/null semantics, handle nulls NOW.
-        #    CRITICAL: After reading with dtype=str, null cells are real NaN objects
-        #    detectable by .isna(). If you convert to str first (.astype(str)),
-        #    NaN becomes the literal string "nan" and .isna() returns False —
-        #    the imputation silently does nothing. Always impute BEFORE converting
-        #    string columns to their final types.
-        #    - List each column that needs null handling and the strategy.
-        #
-        # 3. FORMAT RESOLUTION (BEFORE final casting):
-        #    For date/time, rate, count, and amount columns, reason about the observed
-        #    format families in THIS dataset before choosing parsing logic.
-        #    - Use COLUMN_RESOLUTION_CONTEXT first, then DE_VIEW_CONTEXT, DATA SUMMARY,
-        #      and the sample rows to infer whether a column mixes locale/date orders,
-        #      timestamps, decimals, currencies, percentages, magnitude suffixes,
-        #      placeholders, or noisy symbols.
-        #    - Do not assume one parser or one locale is enough if the context suggests
-        #      heterogeneous formats.
-        #    - Prefer a staged parsing strategy that salvages defensible values before
-        #      coercing unresolved strings to null.
-        #    - If parsing would destroy a large fraction of plausible signal, adapt the
-        #      strategy or flag unresolved formats explicitly instead of silently
-        #      accepting massive information loss.
-        #    - Do not infer a hard "no nulls after parsing" requirement for temporal
-        #      columns from target dtype alone. A datetime target does not by itself
-        #      mean complete parse coverage is mandatory.
-        #    - When raw context shows invalid or mixed temporal formats, preserve
-        #      unresolved values as null plus traceability flags/log entries unless
-        #      the contract or a gate explicitly requires complete recoverability.
-        #    - Treat COLUMN_DTYPE_TARGETS_CONTEXT as a downstream handoff goal, not as
-        #      automatic permission to coerce away mixed or ambiguous semantics.
-        #    - Reconcile dtype targets against DATA_SAMPLE_CONTEXT, COLUMN_RESOLUTION_CONTEXT,
-        #      and the DATA AUDIT before deciding the final representation.
-        #    - If evidence shows mixed numeric/range/label semantics or coercion would
-        #      destroy defensible signal, prefer the least-destructive representation and
-        #      document the trade-off instead of forcing a brittle cast.
-        #    - If DATA_SAMPLE_CONTEXT is unavailable, stay conservative and reason from
-        #      COLUMN_RESOLUTION_CONTEXT + DATA AUDIT; do not invent unsupported precision
-        #      about raw value formats.
-        #
-        # 4. TYPE CONVERSION (AFTER format resolution):
-        #    Apply COLUMN_DTYPE_TARGETS once the parsing strategy is settled.
-        #    Use pandas nullable Int64/Float64 for nullable integer/float columns.
-        #    Final dtypes should reflect the resolved semantics, not raw string noise.
-        #
-        # 5. IDENTITY RESOLUTION (WHEN DEDUPLICATION IS IN SCOPE):
-        #    If a cleaning gate, runbook step, or contract context implies deduplication,
-        #    reason explicitly about duplicate evidence BEFORE writing the algorithm.
-        #    - Decide which signals are strong, medium, or weak identity evidence for
-        #      THIS dataset and business context.
-        #    - Treat nulls, placeholders, and missing contact fields as absence of
-        #      evidence, not as positive evidence that two rows are the same entity.
-        #    - Do not collapse rows just because a composite key can be mechanically
-        #      constructed; preserve records when identity evidence is ambiguous.
-        #    - Make survivorship logic explicit: explain why one record is retained
-        #      over another when duplicates are defensible.
-        #    - If the context only supports soft duplicate suspicion, prefer flags/logs
-        #      over irreversible dropping or merging.
-        #
-        # 6. CONSTRAINT VALIDATION:
-        #    - HARD gates: check and raise ValueError("CLEANING_GATE_FAILED: ...") if violated.
-        #    - SOFT gates: check and warn if thresholds exceeded, but do not block.
-        #    - Non-nullable columns: verify no unexpected nulls after conversion only
-        #      when the contract or a gate makes non-nullability explicit.
-        #    - Do not convert "required for downstream use" into "must be fully non-null"
-        #      unless the run context actually supports that stronger claim.
-        #    - For temporal/numeric cleaning, check whether the final null inflation is
-        #      consistent with the observed raw quality or whether your parser was too blunt.
-        #    - For temporal fields in cleaning-first runs, prefer "recover what is
-        #      defensible, flag what is invalid, and report residual nulls" over
-        #      brittle hard-failure semantics unless completeness is explicitly contractual.
-        #
-        # 7. OUTPUT CLOSURE:
-        #    Write every owned required output and make sure metadata artifacts reflect
-        #    actual operations performed, not only planned ones.
+        YOUR CORE RESPONSIBILITIES (all must be fulfilled; order is yours to decide
+        based on data dependencies):
+
+        DELIVERABLE CLOSURE:
+           Enumerate every output you own from DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT.
+           Map each one to a concrete write action.
+           - Distinguish primary datasets vs metadata/report artifacts.
+           - Do not collapse a multi-artifact contract into one CSV + manifest pair.
+           - If one dataframe supports multiple declared outputs, still write each
+             declared artifact explicitly with the correct contract path.
+           - Required deliverables are contractual obligations, not conditional events.
+             If a required artifact has zero rows, zero findings, zero decisions, or
+             zero exceptions in THIS run, still materialize a schema-valid empty artifact
+             and explain in the manifest why it is empty.
+
+        DATA LOADING:
+           Read CSV with dtype=str so all raw values are preserved for inspection.
+           Verify required columns exist.
+
+        ROW-LEVEL EXCLUSION (when cleaning gates require it):
+           Scan the cleaning gates for any that require row exclusion (e.g.,
+           exclude_debug_records, quarantine_invalid, filter_synthetic).
+           Reason about which columns carry exclusion signals and apply row
+           drops while those signals are intact.
+
+        NULL HANDLING:
+           For each cleaning gate with impute/null semantics, decide where in your
+           pipeline null handling should occur.
+           CRITICAL: After reading with dtype=str, null cells are real NaN objects
+           detectable by .isna(). If you convert to str first (.astype(str)),
+           NaN becomes the literal string "nan" and .isna() returns False —
+           the imputation silently does nothing. Reason about this dependency.
+           - List each column that needs null handling and the strategy.
+
+        FORMAT RESOLUTION:
+           For date/time, rate, count, and amount columns, reason about the observed
+           format families in THIS dataset before choosing parsing logic.
+           - Use COLUMN_RESOLUTION_CONTEXT first, then DE_VIEW_CONTEXT, DATA SUMMARY,
+             and the sample rows to infer whether a column mixes locale/date orders,
+             timestamps, decimals, currencies, percentages, magnitude suffixes,
+             placeholders, or noisy symbols.
+           - Do not assume one parser or one locale is enough if the context suggests
+             heterogeneous formats.
+           - Prefer a staged parsing strategy that salvages defensible values before
+             coercing unresolved strings to null.
+           - If parsing would destroy a large fraction of plausible signal, adapt the
+             strategy or flag unresolved formats explicitly instead of silently
+             accepting massive information loss.
+           - Do not infer a hard "no nulls after parsing" requirement for temporal
+             columns from target dtype alone. A datetime target does not by itself
+             mean complete parse coverage is mandatory.
+           - When raw context shows invalid or mixed temporal formats, preserve
+             unresolved values as null plus traceability flags/log entries unless
+             the contract or a gate explicitly requires complete recoverability.
+           - Treat COLUMN_DTYPE_TARGETS_CONTEXT as a downstream handoff goal, not as
+             automatic permission to coerce away mixed or ambiguous semantics.
+           - Reconcile dtype targets against DATA_SAMPLE_CONTEXT, COLUMN_RESOLUTION_CONTEXT,
+             and the DATA AUDIT before deciding the final representation.
+           - If evidence shows mixed numeric/range/label semantics or coercion would
+             destroy defensible signal, prefer the least-destructive representation and
+             document the trade-off instead of forcing a brittle cast.
+           - If DATA_SAMPLE_CONTEXT is unavailable, stay conservative and reason from
+             COLUMN_RESOLUTION_CONTEXT + DATA AUDIT; do not invent unsupported precision
+             about raw value formats.
+
+        TYPE CONVERSION:
+           Apply COLUMN_DTYPE_TARGETS once the parsing strategy is settled.
+           Use pandas nullable Int64/Float64 for nullable integer/float columns.
+           Final dtypes should reflect the resolved semantics, not raw string noise.
+
+        IDENTITY RESOLUTION (when deduplication is in scope):
+           If a cleaning gate, runbook step, or contract context implies deduplication,
+           reason explicitly about duplicate evidence BEFORE writing the algorithm.
+           - Decide which signals are strong, medium, or weak identity evidence for
+             THIS dataset and business context.
+           - Treat nulls, placeholders, and missing contact fields as absence of
+             evidence, not as positive evidence that two rows are the same entity.
+           - Do not collapse rows just because a composite key can be mechanically
+             constructed; preserve records when identity evidence is ambiguous.
+           - Make survivorship logic explicit: explain why one record is retained
+             over another when duplicates are defensible.
+           - If the context only supports soft duplicate suspicion, prefer flags/logs
+             over irreversible dropping or merging.
+
+        CONSTRAINT VALIDATION:
+           - HARD gates: check and raise ValueError("CLEANING_GATE_FAILED: ...") if violated.
+           - SOFT gates: check and warn if thresholds exceeded, but do not block.
+           - Non-nullable columns: verify no unexpected nulls after conversion only
+             when the contract or a gate makes non-nullability explicit.
+           - Do not convert "required for downstream use" into "must be fully non-null"
+             unless the run context actually supports that stronger claim.
+           - For temporal/numeric cleaning, check whether the final null inflation is
+             consistent with the observed raw quality or whether your parser was too blunt.
+           - For temporal fields in cleaning-first runs, prefer "recover what is
+             defensible, flag what is invalid, and report residual nulls" over
+             brittle hard-failure semantics unless completeness is explicitly contractual.
+
+        OUTPUT CLOSURE:
+           Write every owned required output and make sure metadata artifacts reflect
+           actual operations performed, not only planned ones.
+
+        DEPENDENCY CONSTRAINTS (respect these when deciding operation order):
+        - Row-level exclusion filters depend on raw signal columns. If you normalize
+          or replace sentinel values first, exclusion evidence is destroyed. Reason
+          about whether each filter needs raw data.
+        - Null imputation via .isna() only works before string conversion (.astype(str)
+          turns NaN into "nan"). Plan your null handling around this dependency.
+        - Format resolution (parsing dates, currencies, mixed formats) should generally
+          precede final type casting, since parsing informs what the final type should be.
+        - These are engineering constraints, not a rigid sequence. If your dataset's
+          characteristics suggest a different order is safer, reason about it and proceed.
 
         Your Decision Log, Assumptions, and Risks blocks should reflect the specific
         reasoning you did for THIS dataset — not generic boilerplate.
@@ -1284,11 +1296,9 @@ class DataEngineerAgent:
         ===================================================================
         Think like a senior engineer reviewing your own cleaning code before merge:
 
-        - The operation order matters: row exclusion → null handling → type conversion → validation.
-          Getting this wrong silently corrupts data. Reason about dependencies.
-          In particular, row-level filters (dropping debug/synthetic/quarantined rows)
-          must execute on raw loaded data before any normalization or placeholder
-          replacement — normalizing first can erase the signal those filters depend on.
+        - Operation order matters. Getting dependencies wrong silently corrupts data.
+          Use the DEPENDENCY CONSTRAINTS above plus the dataset's characteristics to
+          decide the right sequence for THIS data — do not apply a generic order blindly.
         - ARTIFACT_OBLIGATIONS_CONTEXT is a contract extraction layer, not new authority.
           Use it to reconcile exact per-artifact bindings. Do not treat it as permission
           to add undeclared columns, outputs, or extension policies.

@@ -3006,7 +3006,8 @@ def _flatten_runbook_text(value: Any) -> str:
                 parts.append(_flatten_runbook_text(item))
             elif item is not None:
                 parts.append(str(item))
-            if key in {"must", "must_not", "steps", "reasoning_checklist", "validation_checklist"}:
+            if key in {"must", "must_not", "steps", "reasoning_checklist", "validation_checklist",
+                       "requirements", "boundaries", "reasoning_guidance", "validation_guidance"}:
                 continue
         return "\n".join(part for part in parts if part)
     if value is None:

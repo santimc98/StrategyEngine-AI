@@ -222,7 +222,7 @@ class ResultsAdvisorAgent:
             "Then add a mini-section:\n"
             "evidence:\n"
             "- claim: <short claim>; source: <artifact_path#key_or_script_path:line or missing>\n"
-            "Provide 3-8 evidence items; if evidence is missing, use source=missing. "
+            "Provide sufficient evidence items to support your claims; if evidence is missing, use source=missing. "
             "Evidence sources must be artifact paths or script paths; otherwise use source=missing."
         )
         user_prompt = "CONTEXT:\n" + context_snippet + "\n"
@@ -1322,9 +1322,9 @@ class ResultsAdvisorAgent:
 
         lines: List[str] = []
         metric_value_text = "n/a" if current_metric is None else f"{current_metric:.6f}".rstrip("0").rstrip(".")
-        lines.append(f"- Objetivo: subir {primary_metric} desde baseline={metric_value_text} con cambios minimos al script actual.")
-        lines.append("- Punto de insercion: crea o extiende `build_features(df)` y llamala antes del split/CV.")
-        lines.append("- Guardrail: cualquier transformacion aprendida (encoders/imputers/grouping) debe ajustarse dentro de cada fold de CV.")
+        lines.append(f"- Objective: improve {primary_metric} from baseline={metric_value_text} with minimal script changes.")
+        lines.append("- Insertion point: create or extend `build_features(df)` and call it before split/CV.")
+        lines.append("- Guardrail: any learned transformation (encoders/imputers/grouping) must be fitted within each CV fold.")
 
         if techniques:
             for technique_line in self._render_plan_technique_lines(techniques):
@@ -1334,9 +1334,9 @@ class ResultsAdvisorAgent:
             lines.extend(fallback_lines)
 
         if "build_features(" in baseline_snippet:
-            lines.append("- Reusa la funcion `build_features` existente y modifica solo bloques internos, sin reestructurar training/persistencia.")
+            lines.append("- Reuse the existing `build_features` function and modify only internal blocks, without restructuring training/persistence.")
         else:
-            lines.append("- Si no existe `build_features`, agrega una funcion compacta y deja intacto el resto del pipeline.")
+            lines.append("- If `build_features` does not exist, add a compact function and leave the rest of the pipeline intact.")
 
         if plan_notes:
             lines.append(f"- Nota del plan: {plan_notes[:180]}")
