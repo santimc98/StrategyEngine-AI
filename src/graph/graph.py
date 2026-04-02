@@ -205,6 +205,7 @@ from src.utils.data_atlas import (
     normalize_evidence_requests,
     build_default_evidence_requests,
     validate_steward_semantics,
+    resolve_steward_target_reconsideration_candidate,
 )
 from src.utils.sandbox_paths import (
     CANONICAL_RAW_REL,
@@ -2972,11 +2973,26 @@ def _build_steward_facts_block(state: Dict[str, Any]) -> str:
         cols = None
     compute_hints = profile.get("compute_hints") if isinstance(profile.get("compute_hints"), dict) else {}
     primary_target = str(dataset_semantics.get("primary_target") or "").strip()
+    target_analysis = dataset_semantics.get("target_analysis") if isinstance(dataset_semantics.get("target_analysis"), dict) else {}
+    target_status = str(
+        dataset_semantics.get("target_status")
+        or (target_analysis.get("target_status") if isinstance(target_analysis, dict) else "")
+        or ""
+    ).strip().lower()
+    recommended_primary_target = str(
+        dataset_semantics.get("recommended_primary_target")
+        or (target_analysis.get("recommended_primary_target") if isinstance(target_analysis, dict) else "")
+        or ""
+    ).strip()
+    target_status_reason = str(
+        dataset_semantics.get("target_status_reason")
+        or (target_analysis.get("target_status_reason") if isinstance(target_analysis, dict) else "")
+        or ""
+    ).strip()
     split_candidates = dataset_semantics.get("split_candidates") if isinstance(dataset_semantics.get("split_candidates"), list) else []
     id_candidates = dataset_semantics.get("id_candidates") if isinstance(dataset_semantics.get("id_candidates"), list) else []
     training_rows_rule = str(dataset_training_mask.get("training_rows_rule") or "").strip()
     scoring_rows_rule = str(dataset_training_mask.get("scoring_rows_rule") or "").strip()
-    target_analysis = dataset_semantics.get("target_analysis") if isinstance(dataset_semantics.get("target_analysis"), dict) else {}
 
     missing_frac = profile.get("missing_frac") if isinstance(profile.get("missing_frac"), dict) else {}
     missing_alerts = []
@@ -3021,6 +3037,12 @@ def _build_steward_facts_block(state: Dict[str, Any]) -> str:
         lines.append(f"- Shape: {rows} rows x {cols} cols")
     if primary_target:
         lines.append(f"- Target: {primary_target}")
+    if target_status:
+        lines.append(f"- Target validation status: {target_status}")
+    if recommended_primary_target:
+        lines.append(f"- Recommended target reconsideration: {recommended_primary_target}")
+    if target_status_reason:
+        lines.append(f"- Target validation reason: {target_status_reason}")
     if training_rows_rule:
         lines.append(f"- Training rows rule: {training_rows_rule}")
     if scoring_rows_rule:
@@ -3156,6 +3178,7 @@ def _resolve_steward_evidence_bundle(
         "resolved_count": len(evidence_items),
         "items": evidence_items,
     }
+
 
 _ABORT_EVENT = threading.Event()
 
@@ -14885,6 +14908,15 @@ def run_steward(state: AgentState) -> AgentState:
     data_atlas = {}
     data_atlas_summary = ""
     steward_evidence_bundle = {}
+    steward_target_reconsideration = {
+        "attempted": False,
+        "accepted": False,
+        "original_primary_target": "",
+        "recommended_primary_target": "",
+        "final_primary_target": "",
+        "reason": "",
+        "status_reason": "",
+    }
     steward_context_quality = {"ready": False, "reasons": ["not_computed"], "warnings": []}
     steward_context_ready = False
     steward_context_error = ""
@@ -15023,6 +15055,125 @@ def run_steward(state: AgentState) -> AgentState:
         if not isinstance(column_sets, dict):
             column_sets = {}
 
+        initial_steward_quality = validate_steward_semantics(
+            dataset_semantics=dataset_semantics,
+            dataset_training_mask=dataset_training_mask,
+            header_cols=header_cols,
+            target_missingness=target_missingness,
+            column_sets=column_sets,
+        )
+        target_reconsideration = resolve_steward_target_reconsideration_candidate(
+            current_target=primary_target,
+            steward_context_quality=initial_steward_quality,
+            dataset_semantics=dataset_semantics,
+            header_cols=header_cols,
+        )
+        steward_target_reconsideration = {
+            "attempted": False,
+            "accepted": False,
+            "original_primary_target": str(primary_target or ""),
+            "recommended_primary_target": str(target_reconsideration.get("candidate") or ""),
+            "final_primary_target": str(primary_target or ""),
+            "reason": str(target_reconsideration.get("reason") or ""),
+            "status_reason": str(target_reconsideration.get("status_reason") or ""),
+        }
+        if bool(target_reconsideration.get("should_retry")):
+            reconsidered_target = str(target_reconsideration.get("candidate") or "").strip()
+            steward_target_reconsideration["attempted"] = True
+            reconsideration_note = (
+                f"Initial target '{primary_target}' was marked invalid. "
+                f"Reconsider target '{reconsidered_target}'. "
+                f"Reason: {target_reconsideration.get('status_reason') or target_reconsideration.get('reason')}"
+            )
+            log_run_event(
+                run_id,
+                "steward_target_reconsideration_start",
+                {
+                    "original_primary_target": primary_target,
+                    "recommended_primary_target": reconsidered_target,
+                    "reason": target_reconsideration.get("reason"),
+                    "status_reason": target_reconsideration.get("status_reason"),
+                },
+            )
+            reconsideration_requests = normalize_evidence_requests(
+                (evidence_requests or [])
+                + build_default_evidence_requests(
+                    primary_target=reconsidered_target,
+                    split_candidates=split_candidates,
+                    id_candidates=id_candidates,
+                    header_cols=header_cols,
+                    max_items=16,
+                ),
+                header_cols,
+                max_items=16,
+            )
+            reconsideration_evidence_bundle = _resolve_steward_evidence_bundle(
+                csv_path=csv_path,
+                dialect_payload=dialect_payload,
+                header_cols=header_cols,
+                requested=reconsideration_requests,
+            )
+            reconsideration_target_missingness = scan_missingness(
+                csv_path,
+                dialect_payload,
+                reconsidered_target,
+            )
+            reconsideration_pass2_input = {
+                "business_objective": state.get("business_objective") if isinstance(state, dict) else "",
+                "primary_target": reconsidered_target,
+                "split_candidates": split_candidates,
+                "id_candidates": id_candidates,
+                "target_missingness": reconsideration_target_missingness,
+                "split_candidates_uniques": split_evidence,
+                "evidence_bundle": reconsideration_evidence_bundle,
+                "column_inventory_path": "data/column_inventory.json",
+                "column_inventory_preview": header_preview,
+                "data_atlas_summary": data_atlas_summary,
+                "reconsideration_note": reconsideration_note,
+            }
+            reconsideration_pass2_result = steward.decide_semantics_pass2(reconsideration_pass2_input)
+            if not isinstance(reconsideration_pass2_result, dict):
+                reconsideration_pass2_result = {}
+            reconsidered_semantics = reconsideration_pass2_result.get("dataset_semantics")
+            reconsidered_training_mask = reconsideration_pass2_result.get("dataset_training_mask")
+            reconsidered_column_sets = reconsideration_pass2_result.get("column_sets")
+            if not isinstance(reconsidered_semantics, dict):
+                reconsidered_semantics = {}
+            if not isinstance(reconsidered_training_mask, dict):
+                reconsidered_training_mask = {}
+            if not isinstance(reconsidered_column_sets, dict):
+                reconsidered_column_sets = {}
+            reconsidered_quality = validate_steward_semantics(
+                dataset_semantics=reconsidered_semantics,
+                dataset_training_mask=reconsidered_training_mask,
+                header_cols=header_cols,
+                target_missingness=reconsideration_target_missingness,
+                column_sets=reconsidered_column_sets,
+            )
+            steward_target_reconsideration["final_primary_target"] = str(
+                reconsidered_semantics.get("primary_target") or reconsidered_target
+            )
+            steward_target_reconsideration["accepted"] = bool(reconsidered_quality.get("ready"))
+            if reconsidered_quality.get("ready"):
+                primary_target = reconsidered_target
+                evidence_requests = reconsideration_requests
+                steward_evidence_bundle = reconsideration_evidence_bundle
+                target_missingness = reconsideration_target_missingness
+                dataset_semantics = reconsidered_semantics
+                dataset_training_mask = reconsidered_training_mask
+                column_sets = reconsidered_column_sets
+            log_run_event(
+                run_id,
+                "steward_target_reconsideration_complete",
+                {
+                    "accepted": bool(reconsidered_quality.get("ready")),
+                    "original_primary_target": steward_target_reconsideration.get("original_primary_target"),
+                    "final_primary_target": steward_target_reconsideration.get("final_primary_target"),
+                    "reasons": reconsidered_quality.get("reasons", []),
+                    "warnings": reconsidered_quality.get("warnings", []),
+                },
+            )
+
         # Universal fallback: if column_sets is empty on wide datasets, build selectors from inventory.
         if not column_sets and header_cols and len(header_cols) > 200:
             try:
@@ -15082,6 +15233,7 @@ def run_steward(state: AgentState) -> AgentState:
             dump_json("data/column_manifest.json", column_manifest)
             dump_json("data/steward_evidence_bundle.json", steward_evidence_bundle)
             dump_json("data/steward_semantics_quality.json", steward_context_quality)
+            dump_json("data/steward_target_reconsideration.json", steward_target_reconsideration)
             if column_manifest_summary:
                 with open("data/column_manifest_summary.txt", "w", encoding="utf-8") as f_manifest_summary:
                     f_manifest_summary.write(column_manifest_summary)
@@ -15124,6 +15276,7 @@ def run_steward(state: AgentState) -> AgentState:
         state["data_atlas"] = data_atlas
         state["data_atlas_summary"] = data_atlas_summary
         state["steward_evidence_bundle"] = steward_evidence_bundle
+        state["steward_target_reconsideration"] = steward_target_reconsideration
         state["steward_context_quality"] = steward_context_quality
         state["steward_context_ready"] = steward_context_ready
         state["steward_context_error"] = steward_context_error
@@ -15145,6 +15298,10 @@ def run_steward(state: AgentState) -> AgentState:
             "decimal": decimal,
             "steward_context_ready": bool(steward_context_ready),
             "steward_context_reasons": (steward_context_quality or {}).get("reasons", []),
+            "target_status": (steward_context_quality or {}).get("target_status", ""),
+            "recommended_primary_target": (steward_context_quality or {}).get("recommended_primary_target", ""),
+            "target_reconsideration_attempted": bool((steward_target_reconsideration or {}).get("attempted")),
+            "target_reconsideration_accepted": bool((steward_target_reconsideration or {}).get("accepted")),
         },
     )
     log_agent_snapshot(
@@ -15168,6 +15325,7 @@ def run_steward(state: AgentState) -> AgentState:
         "data_atlas": data_atlas,
         "data_atlas_summary": data_atlas_summary,
         "steward_evidence_bundle": steward_evidence_bundle,
+        "steward_target_reconsideration": steward_target_reconsideration,
         "steward_context_quality": steward_context_quality,
         "steward_context_ready": steward_context_ready,
         "steward_context_error": steward_context_error,
@@ -27448,6 +27606,9 @@ def _build_steward_feedback_for_improvement(state: Dict[str, Any]) -> str:
     ready = bool(state.get("steward_context_ready"))
     reasons = quality.get("reasons") if isinstance(quality.get("reasons"), list) else []
     warnings = quality.get("warnings") if isinstance(quality.get("warnings"), list) else []
+    target_status = str(quality.get("target_status") or "").strip()
+    recommended_primary_target = str(quality.get("recommended_primary_target") or "").strip()
+    target_status_reason = str(quality.get("target_status_reason") or "").strip()
     semantic_summary = _truncate_handoff_text(
         str(state.get("dataset_semantics_summary") or ""),
         max_len=260,
@@ -27462,6 +27623,12 @@ def _build_steward_feedback_for_improvement(state: Dict[str, Any]) -> str:
         parts.append("reasons=" + ", ".join([str(item) for item in reasons[:3]]))
     if warnings:
         parts.append("warnings=" + ", ".join([str(item) for item in warnings[:2]]))
+    if target_status:
+        parts.append(f"target_status={target_status}")
+    if recommended_primary_target:
+        parts.append(f"recommended_primary_target={recommended_primary_target}")
+    if target_status_reason:
+        parts.append("target_status_reason=" + _truncate_handoff_text(target_status_reason, max_len=120))
     if semantic_summary:
         parts.append("dataset_semantics=" + semantic_summary)
     elif summary:

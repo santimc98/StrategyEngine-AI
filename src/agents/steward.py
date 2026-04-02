@@ -650,6 +650,10 @@ $retry_note
     def decide_semantics_pass2(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         from src.utils.prompting import render_prompt
 
+        reconsideration_note = ""
+        if isinstance(payload, dict) and payload.get("reconsideration_note"):
+            reconsideration_note = f"Reconsideration note:\n{payload.get('reconsideration_note')}"
+
         SYSTEM_PROMPT_TEMPLATE = """
 You are the Senior Data Steward.
 
@@ -678,14 +682,22 @@ Full column list path: $column_inventory_path
 Compact data atlas summary:
 $data_atlas_summary
 
+$reconsideration_note
+
 OUTPUT REQUIREMENTS (JSON ONLY):
 {
   "dataset_semantics": {
     "primary_target": "<col>",
+    "target_status": "confirmed|questioned|invalid",
+    "recommended_primary_target": "<col|null>",
+    "target_status_reason": "<short string>",
     "split_candidates": ["..."],
     "id_candidates": ["..."],
     "target_analysis": {
       "primary_target": "<col>",
+      "target_status": "confirmed|questioned|invalid",
+      "recommended_primary_target": "<col|null>",
+      "target_status_reason": "<short string>",
       "target_null_frac_exact": <float|null>,
       "target_missing_count_exact": <int|null>,
       "target_total_count_exact": <int|null>,
@@ -729,6 +741,12 @@ TARGET VALIDATION:
   a post-decision indicator), document the issue in your notes and flag it — but keep
   primary_target consistent with the value above so downstream agents have a stable
   reference. Use the notes field to communicate any concerns.
+  In addition, emit target_status as your authoritative judgment:
+  - confirmed: evidence supports the chosen target
+  - questioned: evidence raises material but not fatal concerns
+  - invalid: evidence shows the target is structurally unusable for the stated objective
+  If the evidence supports a better alternative, populate recommended_primary_target.
+  If target_status is questioned or invalid, include target_status_reason.
 
 TRAINING MASK DESIGN:
   Examine the measured target missingness. What fraction of labels is missing?
@@ -755,6 +773,10 @@ COLUMN SET DESIGN:
 CONSTRAINTS:
 - primary_target must match the value provided above (for downstream stability).
   Use notes to flag concerns rather than changing the target unilaterally.
+- target_status is authoritative. Use confirmed/questioned/invalid based on evidence,
+  not on what would be convenient downstream.
+- If target_status is questioned or invalid, include target_status_reason.
+- Use recommended_primary_target only when the evidence supports a concrete alternative.
 - Output JSON only. No markdown, no extra text.
 """
         prompt = render_prompt(
@@ -767,6 +789,7 @@ CONSTRAINTS:
             column_inventory_preview=json.dumps(payload.get("column_inventory_preview", {}), ensure_ascii=True),
             column_inventory_path=payload.get("column_inventory_path", "data/column_inventory.json"),
             data_atlas_summary=str(payload.get("data_atlas_summary", "") or ""),
+            reconsideration_note=reconsideration_note,
         )
         return self._generate_json_payload(
             prompt=prompt,

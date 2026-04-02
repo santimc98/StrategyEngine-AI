@@ -47,7 +47,11 @@ def test_normalize_and_default_evidence_requests():
 
 def test_validate_steward_semantics_gate():
     ok = validate_steward_semantics(
-        dataset_semantics={"primary_target": "label", "split_candidates": ["__split"]},
+        dataset_semantics={
+            "primary_target": "label",
+            "target_status": "confirmed",
+            "split_candidates": ["__split"],
+        },
         dataset_training_mask={"training_rows_rule": "rows where label is not missing", "scoring_rows_rule_primary": "all rows"},
         header_cols=["label", "__split", "pixel0"],
         target_missingness={"null_frac_exact": 0.4},
@@ -64,3 +68,25 @@ def test_validate_steward_semantics_gate():
     )
     assert bad["ready"] is False
     assert "missing_training_rows_rule" in bad["reasons"]
+
+
+def test_validate_steward_semantics_blocks_invalid_target_status():
+    result = validate_steward_semantics(
+        dataset_semantics={
+            "primary_target": "label",
+            "target_status": "invalid",
+            "target_status_reason": "label is 97% missing and behaves like a post-decision status",
+            "recommended_primary_target": "renewal_score",
+        },
+        dataset_training_mask={
+            "training_rows_rule": "rows where label is not missing",
+            "scoring_rows_rule_primary": "all rows",
+        },
+        header_cols=["label", "renewal_score", "__split"],
+        target_missingness={"null_frac_exact": 0.97},
+        column_sets={"explicit_columns": ["label", "__split"], "sets": []},
+    )
+    assert result["ready"] is False
+    assert "primary_target_invalid" in result["reasons"]
+    assert result["target_status"] == "invalid"
+    assert result["recommended_primary_target"] == "renewal_score"

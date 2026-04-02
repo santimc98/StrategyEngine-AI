@@ -19,6 +19,7 @@ _TARGET_HINT_TOKENS = {
 _SPLIT_HINT_TOKENS = {"split", "fold", "train", "test", "partition", "is_train", "is_test"}
 _ID_HINT_TOKENS = {"id", "uuid", "guid", "identifier", "key", "customer_id", "policy_id"}
 _SUPPORTED_EVIDENCE_KINDS = {"missingness", "uniques", "column_profile"}
+_VALID_TARGET_STATUSES = {"confirmed", "questioned", "invalid"}
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -358,6 +359,33 @@ def validate_steward_semantics(
     elif primary_target not in headers:
         reasons.append(f"primary_target_not_in_header:{primary_target}")
 
+    target_analysis = semantics.get("target_analysis") if isinstance(semantics.get("target_analysis"), dict) else {}
+    target_status_raw = semantics.get("target_status")
+    if not isinstance(target_status_raw, str) or not target_status_raw.strip():
+        target_status_raw = target_analysis.get("target_status")
+    target_status = str(target_status_raw or "").strip().lower()
+    if target_status:
+        if target_status not in _VALID_TARGET_STATUSES:
+            reasons.append(f"invalid_target_status:{target_status}")
+        elif target_status == "invalid":
+            reasons.append("primary_target_invalid")
+        elif target_status == "questioned":
+            warnings.append("primary_target_questioned")
+
+    recommended_primary_target_raw = semantics.get("recommended_primary_target")
+    if not isinstance(recommended_primary_target_raw, str) or not recommended_primary_target_raw.strip():
+        recommended_primary_target_raw = target_analysis.get("recommended_primary_target")
+    recommended_primary_target = str(recommended_primary_target_raw or "").strip()
+    if recommended_primary_target and recommended_primary_target not in headers:
+        warnings.append(f"recommended_primary_target_not_in_header:{recommended_primary_target}")
+
+    target_status_reason_raw = semantics.get("target_status_reason")
+    if not isinstance(target_status_reason_raw, str) or not target_status_reason_raw.strip():
+        target_status_reason_raw = target_analysis.get("target_status_reason")
+    target_status_reason = str(target_status_reason_raw or "").strip()
+    if target_status in {"questioned", "invalid"} and not target_status_reason:
+        warnings.append("missing_target_status_reason")
+
     training_rows_rule = str(training_mask.get("training_rows_rule") or "").strip()
     scoring_rows_rule = str(training_mask.get("scoring_rows_rule_primary") or "").strip()
     if not training_rows_rule:
@@ -394,5 +422,74 @@ def validate_steward_semantics(
         "reasons": reasons,
         "warnings": warnings,
         "primary_target": primary_target,
+        "target_status": target_status or "confirmed",
+        "recommended_primary_target": recommended_primary_target,
+        "target_status_reason": target_status_reason,
         "training_rows_rule": training_rows_rule,
+    }
+
+
+def resolve_steward_target_reconsideration_candidate(
+    *,
+    current_target: Any,
+    steward_context_quality: Dict[str, Any] | None,
+    dataset_semantics: Dict[str, Any] | None,
+    header_cols: List[str] | None,
+) -> Dict[str, Any]:
+    quality = steward_context_quality if isinstance(steward_context_quality, dict) else {}
+    semantics = dataset_semantics if isinstance(dataset_semantics, dict) else {}
+    headers = {str(col).strip() for col in (header_cols or []) if str(col).strip()}
+    current = str(current_target or "").strip()
+    target_status = str(quality.get("target_status") or semantics.get("target_status") or "").strip().lower()
+    reasons = quality.get("reasons") if isinstance(quality.get("reasons"), list) else []
+    recommended = str(
+        quality.get("recommended_primary_target")
+        or semantics.get("recommended_primary_target")
+        or ""
+    ).strip()
+    status_reason = str(
+        quality.get("target_status_reason")
+        or semantics.get("target_status_reason")
+        or ""
+    ).strip()
+    is_invalid = target_status == "invalid" or "primary_target_invalid" in {str(item) for item in reasons}
+
+    if not is_invalid:
+        return {
+            "should_retry": False,
+            "candidate": "",
+            "reason": "target_not_invalid",
+            "target_status": target_status or "confirmed",
+            "status_reason": status_reason,
+        }
+    if not recommended:
+        return {
+            "should_retry": False,
+            "candidate": "",
+            "reason": "no_recommended_primary_target",
+            "target_status": target_status or "invalid",
+            "status_reason": status_reason,
+        }
+    if recommended == current:
+        return {
+            "should_retry": False,
+            "candidate": recommended,
+            "reason": "recommended_matches_current_target",
+            "target_status": target_status or "invalid",
+            "status_reason": status_reason,
+        }
+    if recommended not in headers:
+        return {
+            "should_retry": False,
+            "candidate": recommended,
+            "reason": "recommended_target_not_in_header",
+            "target_status": target_status or "invalid",
+            "status_reason": status_reason,
+        }
+    return {
+        "should_retry": True,
+        "candidate": recommended,
+        "reason": "recommended_primary_target_available",
+        "target_status": target_status or "invalid",
+        "status_reason": status_reason,
     }

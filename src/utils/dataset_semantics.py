@@ -19,6 +19,42 @@ def _extract_primary_target(semantics: Dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_target_status(semantics: Dict[str, Any]) -> str | None:
+    status = semantics.get("target_status")
+    if isinstance(status, str) and status.strip():
+        return status.strip().lower()
+    target_info = semantics.get("target_analysis")
+    if isinstance(target_info, dict):
+        status = target_info.get("target_status")
+        if isinstance(status, str) and status.strip():
+            return status.strip().lower()
+    return None
+
+
+def _extract_recommended_primary_target(semantics: Dict[str, Any]) -> str | None:
+    recommended = semantics.get("recommended_primary_target")
+    if isinstance(recommended, str) and recommended.strip():
+        return recommended.strip()
+    target_info = semantics.get("target_analysis")
+    if isinstance(target_info, dict):
+        recommended = target_info.get("recommended_primary_target")
+        if isinstance(recommended, str) and recommended.strip():
+            return recommended.strip()
+    return None
+
+
+def _extract_target_status_reason(semantics: Dict[str, Any]) -> str | None:
+    reason = semantics.get("target_status_reason")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    target_info = semantics.get("target_analysis")
+    if isinstance(target_info, dict):
+        reason = target_info.get("target_status_reason")
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()
+    return None
+
+
 def _extract_target_columns(semantics: Dict[str, Any]) -> List[str]:
     targets: List[str] = []
 
@@ -54,6 +90,9 @@ def summarize_dataset_semantics(
     training_mask = training_mask if isinstance(training_mask, dict) else {}
 
     primary_target = _extract_primary_target(semantics)
+    target_status = _extract_target_status(semantics)
+    recommended_primary_target = _extract_recommended_primary_target(semantics)
+    target_status_reason = _extract_target_status_reason(semantics)
     target_columns = _extract_target_columns(semantics)
     target_info = semantics.get("target_analysis") if isinstance(semantics.get("target_analysis"), dict) else {}
     partial_labels = target_info.get("partial_label_detected") if isinstance(target_info, dict) else None
@@ -70,6 +109,12 @@ def summarize_dataset_semantics(
     lines: List[str] = []
     lines.append("DATASET_SEMANTICS_SUMMARY:")
     lines.append(f"- primary_target: {primary_target or 'missing'}")
+    if target_status:
+        lines.append(f"- target_status: {target_status}")
+    if recommended_primary_target:
+        lines.append(f"- recommended_primary_target: {recommended_primary_target}")
+    if target_status_reason:
+        lines.append(f"- target_status_reason: {target_status_reason}")
     if target_columns:
         lines.append(f"- target_columns: {target_columns[:8]}")
     if partial_labels is not None:
