@@ -512,6 +512,7 @@ Gates must be grounded in actual data risk, not template completeness.
 - HARD: failure makes the output corrupt, unsafe, or silently wrong (leakage surviving, target missing, schema violation).
 - SOFT: quality degraded but output remains usable (null rate above threshold, optional format).
 - Do not create gates for impossible conditions. Each gate must address a plausible risk visible in the data.
+- When profiling reveals coarse granularity, tied values, grouped events, snapshots, or other legitimate boundary ambiguities, do not collapse a semantic invariant into a brittle literal rule. Preserve the intent of the invariant and express gates that remain valid under those observed data conditions.
 - Semantic closure for row-filtering rules: if you define a training_rows_rule, scoring_rows_rule, or any condition that partitions which rows belong in the output, ask yourself whether that condition will actually be enforced. Downstream agents treat cleaning_gates as the authoritative enforcement mechanism — a rule declared only in task_semantics or runbook may be treated as advisory and skipped. If a row-filtering condition is important enough to define, it is important enough to have a corresponding HARD cleaning gate that ensures enforcement.
 
 RUNBOOK AND TECHNIQUE HANDLING — CRITICAL
