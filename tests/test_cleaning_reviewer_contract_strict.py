@@ -77,9 +77,9 @@ class TestContractStrictMode:
         )
         _assert_contains_terms(
             prompt,
-            "review decision workflow",
+            "review reasoning",
             "deterministic_gate_results",
-            "supporting evidence",
+            "authoritative when they directly evaluate a contract gate",
             "guidance",
             "substitute for reasoning",
             "missing_required_columns",

@@ -656,13 +656,21 @@ def _normalize_severity(severity: Any, required: Any = None) -> str:
 
 
 def normalize_gate_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+    key = re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+    aliases = {
+        "boolean_columns_normalized": "boolean_normalization",
+    }
+    return aliases.get(key, key)
 
 
 def _normalize_gate_name(name: Any) -> str:
     if name is None:
         return ""
     key = normalize_gate_name(str(name))
+    aliases = {
+        "boolean_columns_normalized": "boolean_normalization",
+    }
+    key = aliases.get(key, key)
     return key or ""
 
 
@@ -1515,6 +1523,7 @@ def _evaluate_gates_deterministic(
     outlier_policy = outlier_policy if isinstance(outlier_policy, dict) else {}
     outlier_report = outlier_report if isinstance(outlier_report, dict) else {}
     column_dtype_targets = column_dtype_targets if isinstance(column_dtype_targets, dict) else {}
+    training_rows_context: Optional[Dict[str, Any]] = None
 
     for gate in gates:
         name = gate["name"]
@@ -1659,10 +1668,34 @@ def _evaluate_gates_deterministic(
                 raw_sample=raw_sample,
                 params=params,
                 column_dtype_targets=column_dtype_targets,
+                manifest=manifest,
             )
             if not bool(evidence.get("applies_if", True)):
                 warnings.append(
                     f"boolean_normalization skipped: {evidence.get('skip_reason', 'not_applicable')}"
+                )
+        elif gate_key == "enforce_temporal_training_mask":
+            issues, evidence, training_rows_context = _check_enforce_temporal_training_mask(
+                cleaned_csv_path=cleaned_csv_path,
+                cleaned_header=cleaned_header,
+                params=params,
+                column_roles=column_roles,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    f"enforce_temporal_training_mask skipped: {evidence.get('skip_reason', 'not_applicable')}"
+                )
+        elif gate_key == "target_not_null_in_training":
+            issues, evidence = _check_target_not_null_in_training(
+                cleaned_csv_path=cleaned_csv_path,
+                cleaned_header=cleaned_header,
+                params=params,
+                column_roles=column_roles,
+                training_rows_context=training_rows_context,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    f"target_not_null_in_training skipped: {evidence.get('skip_reason', 'not_applicable')}"
                 )
         elif gate_key == "outlier_policy_applied":
             issues, evidence = _check_outlier_policy_applied(
@@ -1842,7 +1875,7 @@ def _build_llm_prompt(
         "SOURCE OF TRUTH AND PRECEDENCE\n"
         "1. cleaning_gates + required_columns + column_roles + dialect + contract_source_used in the payload are authoritative review scope.\n"
         "2. artifact_obligations + column_resolution_context + cleaning_code + facts + data_profile + cleaning_quality_summary are primary evidence of what the Data Engineer actually did and what the data looked like.\n"
-        "3. deterministic_gate_results are supporting evidence only. They may help focus attention, but they do NOT override the contract or your evidence-based judgment.\n"
+        "3. deterministic_gate_results are authoritative when they directly evaluate a contract gate from artifact evidence. Use them as the default resolution unless you find explicit contradictory evidence in cleaning_code, facts, or artifact_obligations.\n"
         "4. artifact_obligations is a lossless extraction of artifact bindings already declared in the contract. It introduces no new semantics.\n"
         "5. If sources conflict, preserve contract intent and prefer direct evidence from artifact_obligations/column_resolution_context/cleaning_code/data_profile over shallow pattern matching.\n\n"
         "REVIEW REASONING\n"
@@ -1857,6 +1890,7 @@ def _build_llm_prompt(
         "- no_semantic_rescale: do not infer rescaling from low numeric ranges alone. Look for explicit code evidence such as division by constants, scaler objects, or explicit multiplicative rescaling. If data is already in a low range but no such code exists, that is not a violation.\n"
         "- no_synthetic_data: distinguish between generating synthetic rows/datasets and limited stochastic operations such as noise or imputation support. Reject only when the code clearly fabricates data beyond the contract.\n\n"
         "- leakage_exclusion: reason from direct evidence of the cleaned artifact. If forbidden columns are absent from cleaned_header and/or explicitly listed as dropped in the manifest, that supports PASS. Do not treat missing_required_columns as evidence that forbidden columns are still present.\n\n"
+        "- boolean_normalization on CSV artifacts: do not fail merely because a reloaded sample shows int64 instead of int8. Width-specific integer dtypes are not stable through CSV round-trips; judge this gate by value semantics (0/1/null) unless the contract explicitly requires a binary file format preserving dtype width.\n\n"
         "NULL INFLATION DETECTION (CRITICAL)\n"
         "- The payload may include 'cleaning_quality_summary' with per-column null rates before (raw) and after (cleaned) cleaning.\n"
         "- 'null_inflation_pp' = cleaned_null_pct − raw_null_pct. It measures how much the null rate increased, but it does NOT distinguish between two very different causes:\n"
@@ -2709,6 +2743,43 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
                     col = str(entry.get("column") or "").strip()
                     if col:
                         report_columns.append(col)
+    # flat per-column detail variant:
+    # {"employees": {"capped_count": 12, ...}, "annual_revenue": {...}}
+    if not report_columns:
+        reserved = {
+            "enabled",
+            "report_version",
+            "method",
+            "percentile",
+            "notes",
+            "summary",
+            "metadata",
+            "columns_touched",
+            "target_columns",
+            "columns",
+            "applied",
+        }
+        detail_markers = {
+            "action",
+            "clipped_count",
+            "capped_count",
+            "flagged_rows",
+            "threshold",
+            "threshold_99pct",
+            "threshold_95pct",
+            "lower_bound",
+            "upper_bound",
+            "winsorized_count",
+            "iqr_multiplier",
+            "method",
+        }
+        for key, value in report.items():
+            token = str(key).strip()
+            if not token or token.lower() in reserved or not isinstance(value, dict):
+                continue
+            value_keys = {str(k).strip().lower() for k in value.keys() if str(k).strip()}
+            if value_keys & detail_markers:
+                report_columns.append(token)
     deduped: List[str] = []
     seen: set[str] = set()
     for column in report_columns:
@@ -2726,6 +2797,8 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
 _BOOLEAN_TRUE_TOKENS = {"1", "1.0", "true", "t", "yes", "y", "si", "sí", "on"}
 _BOOLEAN_FALSE_TOKENS = {"0", "0.0", "false", "f", "no", "n", "off"}
 _BOOLEAN_NULL_TOKENS = {"", "nan", "null", "none", "<na>", "na", "nat"}
+_TRAIN_TRUE_TOKENS = {"1", "1.0", "true", "t", "yes", "y", "train", "training"}
+_TRAIN_FALSE_TOKENS = {"0", "0.0", "false", "f", "no", "n", "test", "holdout", "score", "scoring", "val", "validation"}
 
 
 def _normalize_boolean_value_token(value: Any) -> Optional[str]:
@@ -2801,7 +2874,12 @@ def _read_csv_unique_string_values(csv_path: str, columns: List[str]) -> Dict[st
 
 def _resolve_boolean_normalization_targets(params: Dict[str, Any]) -> set[str]:
     allowed: set[str] = set()
-    for raw in params.get("target_values", []) if isinstance(params.get("target_values"), list) else []:
+    raw_values = []
+    if isinstance(params.get("target_values"), list):
+        raw_values.extend(params.get("target_values") or [])
+    if isinstance(params.get("allowed_values"), list):
+        raw_values.extend(params.get("allowed_values") or [])
+    for raw in raw_values:
         normalized = _normalize_boolean_value_token(raw)
         if normalized in {"0", "1"}:
             allowed.add(normalized)
@@ -2810,7 +2888,11 @@ def _resolve_boolean_normalization_targets(params: Dict[str, Any]) -> set[str]:
 
 def _resolve_allowed_cleaned_boolean_tokens(params: Dict[str, Any]) -> set[str]:
     allowed: set[str] = set()
-    raw_values = params.get("target_values", []) if isinstance(params.get("target_values"), list) else []
+    raw_values: List[Any] = []
+    if isinstance(params.get("target_values"), list):
+        raw_values.extend(params.get("target_values") or [])
+    if isinstance(params.get("allowed_values"), list):
+        raw_values.extend(params.get("allowed_values") or [])
     for raw in raw_values:
         if raw is None:
             continue
@@ -2919,6 +3001,7 @@ def _check_boolean_normalization(
     raw_sample: Optional[pd.DataFrame],
     params: Dict[str, Any],
     column_dtype_targets: Dict[str, Any],
+    manifest: Dict[str, Any],
 ) -> Tuple[List[str], Dict[str, Any]]:
     issues: List[str] = []
     candidates, evidence = _resolve_boolean_normalization_candidates(
@@ -2931,23 +3014,39 @@ def _check_boolean_normalization(
     evidence["allowed_normalized_values"] = sorted(_resolve_boolean_normalization_targets(params))
     evidence["columns_checked"] = candidates
 
+    declared_excluded = {
+        str(col).strip()
+        for key in ("column_exclusions", "dropped_columns", "forbidden_columns_removed", "removed_columns")
+        for col in _list_str(manifest.get(key) if isinstance(manifest, dict) else [])
+        if str(col).strip()
+    }
     explicit_missing = [
         column
         for column in (_list_str(params.get("columns")) + _list_str(params.get("target_columns")))
-        if str(column).strip() and str(column).strip() not in (cleaned_header or [])
+        if (
+            str(column).strip()
+            and str(column).strip() not in (cleaned_header or [])
+            and str(column).strip() not in declared_excluded
+        )
     ]
     if explicit_missing:
         issues.append("boolean_normalization_missing_columns: " + ", ".join(explicit_missing[:10]))
         evidence["missing_explicit_columns"] = explicit_missing
+    if declared_excluded:
+        evidence["declared_excluded_columns"] = sorted(declared_excluded)
 
     if not bool(evidence.get("applies_if", True)):
         return issues, evidence
 
     allowed_values = _resolve_boolean_normalization_targets(params)
     allowed_cleaned_tokens = _resolve_allowed_cleaned_boolean_tokens(params)
+    expected_dtype = str(params.get("expected_dtype") or "").strip().lower()
     cleaned_values = _read_csv_unique_string_values(cleaned_csv_path, candidates)
     cleaned_samples = {column: _string_values(sample_str, column)[:12] for column in candidates if sample_str is not None}
     evidence["allowed_cleaned_tokens"] = sorted(allowed_cleaned_tokens)
+    evidence["expected_dtype"] = expected_dtype or None
+    if expected_dtype.startswith("int") or expected_dtype in {"bool", "boolean"}:
+        evidence["csv_roundtrip_dtype_width_not_enforced"] = True
     evidence["cleaned_unique_values"] = {
         column: (cleaned_values.get(column) or cleaned_samples.get(column) or [])[:10]
         for column in candidates
@@ -2981,6 +3080,250 @@ def _check_boolean_normalization(
     if invalid_by_column:
         evidence["invalid_values"] = invalid_by_column
 
+    return issues, evidence
+
+
+def _read_csv_selected_columns(path: str, columns: List[str]) -> Optional[pd.DataFrame]:
+    requested = [str(col).strip() for col in columns if str(col).strip()]
+    if not path or not os.path.exists(path) or not requested:
+        return None
+    encoding = _infer_encoding(path)
+    delimiter = _infer_delimiter_from_file(path) or ","
+    try:
+        header = pd.read_csv(path, nrows=0, sep=delimiter, encoding=encoding, low_memory=False)
+    except Exception:
+        return None
+    available = [col for col in requested if col in [str(name) for name in header.columns]]
+    if not available:
+        return None
+    try:
+        return pd.read_csv(
+            path,
+            usecols=available,
+            dtype="string",
+            sep=delimiter,
+            encoding=encoding,
+            low_memory=False,
+        )
+    except Exception:
+        return None
+
+
+def _parse_datetime_series_robust(values: pd.Series) -> pd.Series:
+    base = values.astype("string").fillna("")
+    parsed = pd.to_datetime(base, errors="coerce")
+    needs_dayfirst = base.str.contains(r"/", regex=True, na=False) | base.str.contains(
+        r"^\d{2}-\d{2}-\d{4}", regex=True, na=False
+    )
+    alt = pd.Series(pd.NaT, index=base.index, dtype="datetime64[ns]")
+    if bool(needs_dayfirst.any()):
+        alt.loc[needs_dayfirst] = pd.to_datetime(base.loc[needs_dayfirst], errors="coerce", dayfirst=True)
+    choose_alt = alt.notna() & parsed.isna()
+    return alt.where(choose_alt, parsed)
+
+
+def _resolve_training_indicator_candidates(
+    cleaned_header: List[str],
+    column_roles: Dict[str, List[str]],
+    params: Dict[str, Any],
+) -> List[str]:
+    candidates = (
+        _list_str(params.get("training_indicator_columns"))
+        + _list_str(params.get("split_column"))
+        + _list_str(params.get("split_columns"))
+    )
+    candidates.extend(_columns_with_role_tokens(column_roles, {"split", "partition", "fold"}))
+    candidates.extend(["__split", "split", "partition", "is_train", "train_flag", "training_flag"])
+    deduped: List[str] = []
+    for candidate in candidates:
+        if candidate in cleaned_header and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def _normalize_training_indicator_mask(series: pd.Series) -> Optional[pd.Series]:
+    normalized: List[Optional[bool]] = []
+    recognized = 0
+    for raw in series.astype("string").fillna("").tolist():
+        token = str(raw).strip().lower()
+        if token in _BOOLEAN_NULL_TOKENS:
+            normalized.append(None)
+            continue
+        if token in _TRAIN_TRUE_TOKENS:
+            normalized.append(True)
+            recognized += 1
+            continue
+        if token in _TRAIN_FALSE_TOKENS:
+            normalized.append(False)
+            recognized += 1
+            continue
+        return None
+    if recognized <= 0:
+        return None
+    return pd.Series(normalized, index=series.index, dtype="boolean")
+
+
+def _resolve_temporal_cutoff(params: Dict[str, Any]) -> Optional[pd.Timestamp]:
+    raw = params.get("training_cutoff") or params.get("cutoff")
+    if not raw:
+        rule = str(params.get("rule") or "")
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", rule)
+        raw = match.group(1) if match else None
+    if not raw:
+        return None
+    parsed = pd.to_datetime(str(raw), errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.normalize()
+
+
+def _check_enforce_temporal_training_mask(
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+) -> Tuple[List[str], Dict[str, Any], Optional[Dict[str, Any]]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+
+    date_candidates = _list_str(params.get("column")) + _list_str(params.get("columns"))
+    if not date_candidates:
+        date_candidates.extend(_columns_with_role_tokens(column_roles, {"time", "date", "timestamp"}))
+        date_candidates.extend(["created_at", "timestamp", "date"])
+    date_col = _pick_first_existing(date_candidates, cleaned_header)
+    cutoff = _resolve_temporal_cutoff(params)
+    evidence["date_column"] = date_col or None
+    evidence["training_cutoff"] = cutoff.date().isoformat() if cutoff is not None else None
+    if not date_col:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "temporal_column_missing"
+        return issues, evidence, None
+    if cutoff is None:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "training_cutoff_missing_or_invalid"
+        return issues, evidence, None
+
+    indicator_candidates = _resolve_training_indicator_candidates(cleaned_header, column_roles, params)
+    columns_to_load = [date_col] + indicator_candidates
+    frame = _read_csv_selected_columns(cleaned_csv_path, columns_to_load)
+    if frame is None or date_col not in frame.columns:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "cleaned_csv_temporal_columns_unavailable"
+        return issues, evidence, None
+
+    parsed_dates = _parse_datetime_series_robust(frame[date_col])
+    evidence["rows_read"] = int(len(frame))
+    evidence["date_parse_failures"] = int(parsed_dates.isna().sum())
+    future_mask = parsed_dates.notna() & (parsed_dates.dt.normalize() > cutoff)
+    training_mask = parsed_dates.notna() & (parsed_dates.dt.normalize() <= cutoff)
+    evidence["future_rows_present"] = int(future_mask.sum())
+
+    mask_source = "date_cutoff_rule"
+    indicator_column = None
+    for candidate in indicator_candidates:
+        if candidate not in frame.columns:
+            continue
+        indicator_mask = _normalize_training_indicator_mask(frame[candidate])
+        if indicator_mask is None:
+            continue
+        indicator_column = candidate
+        mask_source = f"indicator:{candidate}"
+        evidence["training_indicator_column"] = candidate
+        evidence["training_indicator_distinct_values"] = _string_values(frame, candidate)[:8]
+        explicit_training = indicator_mask.fillna(False).astype(bool)
+        training_mask = explicit_training & parsed_dates.notna()
+        violating = explicit_training & future_mask
+        if violating.any():
+            issues.append(
+                f"training-designated rows violate cutoff {cutoff.date().isoformat()} in {date_col}"
+            )
+            evidence["training_rows_after_cutoff"] = int(violating.sum())
+        break
+
+    evidence["training_mask_source"] = mask_source
+    evidence["training_rows_count"] = int(training_mask.sum())
+    if indicator_column is None and future_mask.any():
+        evidence["note"] = (
+            "future rows are allowed outside the contract-defined training subset; "
+            "gate enforced on rows satisfying the training cutoff rule"
+        )
+
+    context = {
+        "frame": frame,
+        "date_column": date_col,
+        "cutoff": cutoff,
+        "training_mask": training_mask,
+        "training_mask_source": mask_source,
+    }
+    return issues, evidence, context
+
+
+def _check_target_not_null_in_training(
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+    training_rows_context: Optional[Dict[str, Any]],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+    target_candidates = _list_str(params.get("column")) + _list_str(params.get("target_columns"))
+    if not target_candidates:
+        target_candidates.extend(_columns_with_role_tokens(column_roles, {"target", "label", "outcome"}))
+        target_candidates.extend(["target", "label", "y"])
+    target_col = _pick_first_existing(target_candidates, cleaned_header)
+    evidence["target_column"] = target_col or None
+    evidence["applies_to"] = str(params.get("applies_to") or "training_rows")
+    if not target_col:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "target_column_missing"
+        return issues, evidence
+    if not training_rows_context or not isinstance(training_rows_context, dict):
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "training_rows_context_unavailable"
+        return issues, evidence
+
+    frame = training_rows_context.get("frame")
+    if not isinstance(frame, pd.DataFrame):
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "training_rows_frame_unavailable"
+        return issues, evidence
+    if target_col not in frame.columns:
+        date_col = str(training_rows_context.get("date_column") or "").strip()
+        reload_cols = [target_col]
+        if date_col:
+            reload_cols.append(date_col)
+        reloaded = _read_csv_selected_columns(cleaned_csv_path, reload_cols)
+        if reloaded is None or target_col not in reloaded.columns:
+            evidence["applies_if"] = False
+            evidence["skip_reason"] = "target_column_unavailable_in_cleaned_csv"
+            return issues, evidence
+        if date_col and date_col in reloaded.columns:
+            frame = reloaded
+            parsed_dates = _parse_datetime_series_robust(frame[date_col])
+            cutoff = training_rows_context.get("cutoff")
+            if isinstance(cutoff, pd.Timestamp):
+                training_mask = parsed_dates.notna() & (parsed_dates.dt.normalize() <= cutoff)
+            else:
+                training_mask = parsed_dates.notna()
+        else:
+            frame = reloaded
+            training_mask = pd.Series([True] * len(frame), index=frame.index)
+    else:
+        training_mask = training_rows_context.get("training_mask")
+        if not isinstance(training_mask, pd.Series) or len(training_mask) != len(frame):
+            evidence["applies_if"] = False
+            evidence["skip_reason"] = "training_mask_unavailable"
+            return issues, evidence
+
+    target_series = frame[target_col]
+    null_mask = target_series.map(_is_null_like_text)
+    violating = training_mask.fillna(False).astype(bool) & null_mask.fillna(True).astype(bool)
+    evidence["training_rows_count"] = int(training_mask.fillna(False).astype(bool).sum())
+    evidence["null_training_rows"] = int(violating.sum())
+    evidence["training_mask_source"] = str(training_rows_context.get("training_mask_source") or "unknown")
+    if violating.any():
+        issues.append(f"{target_col} contains null values inside training rows")
     return issues, evidence
 
 

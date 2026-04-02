@@ -232,6 +232,58 @@ def test_outlier_policy_applied_accepts_dict_shaped_report_columns():
     assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
 
 
+def test_outlier_policy_applied_accepts_flat_top_level_column_report():
+    df = pd.DataFrame(
+        {
+            "employees": [10, 20, 30],
+            "annual_revenue": [1000, 2000, 3000],
+        }
+    )
+    gates = [
+        {
+            "name": "outlier_policy_applied",
+            "severity": "HARD",
+            "params": {"strict": True},
+        }
+    ]
+    manifest = {"outlier_treatment": {"policy_applied": True}}
+    outlier_policy = {
+        "enabled": True,
+        "apply_stage": "data_engineer",
+        "target_columns": ["employees", "annual_revenue"],
+        "strict": True,
+    }
+    outlier_report = {
+        "employees": {"threshold_99pct": 5000, "capped_count": 2},
+        "annual_revenue": {"threshold_99pct": 9000, "capped_count": 1},
+    }
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=[],
+        cleaned_header=list(df.columns),
+        cleaned_csv_path="data/cleaned_data.csv",
+        sample_str=df.astype(str),
+        sample_infer=df,
+        manifest=manifest,
+        raw_sample=None,
+        column_roles={},
+        allowed_feature_sets={},
+        outlier_policy=outlier_policy,
+        outlier_report=outlier_report,
+        outlier_report_path="data/outlier_treatment_report.json",
+    )
+
+    gate_entry = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "outlier_policy_applied"
+    )
+    evidence = gate_entry.get("evidence") or {}
+    assert gate_entry.get("passed") is True
+    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+
+
 def test_boolean_normalization_passes_for_nullable_integer_boolean_columns(tmp_path: Path):
     csv_path = tmp_path / "cleaned.csv"
     cleaned = pd.DataFrame(
@@ -288,6 +340,60 @@ def test_boolean_normalization_passes_for_nullable_integer_boolean_columns(tmp_p
     assert set(evidence.get("columns_checked") or []) == {"marketing_consent", "demo_requested", "mql_flag"}
 
 
+def test_boolean_normalization_passes_when_contract_requests_int8_but_csv_roundtrip_is_int64(tmp_path: Path):
+    csv_path = tmp_path / "cleaned.csv"
+    cleaned = pd.DataFrame(
+        {
+            "webinar_attended": [1, 0, 1, None],
+            "demo_requested": [0, 1, 1, 0],
+        }
+    )
+    cleaned.to_csv(csv_path, index=False)
+    gates = [
+        {
+            "name": "boolean_columns_normalized",
+            "severity": "HARD",
+            "params": {
+                "columns": ["webinar_attended", "demo_requested"],
+                "expected_dtype": "int8",
+                "allowed_values": [0, 1],
+            },
+        }
+    ]
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=[],
+        cleaned_header=list(cleaned.columns),
+        cleaned_csv_path=str(csv_path),
+        sample_str=cleaned.astype("string"),
+        sample_infer=cleaned,
+        manifest={},
+        raw_sample=pd.DataFrame(
+            {
+                "webinar_attended": ["yes", "no", "1", None],
+                "demo_requested": ["0", "1", "yes", "0"],
+            }
+        ),
+        column_roles={"pre_decision": ["webinar_attended", "demo_requested"]},
+        allowed_feature_sets={},
+        column_dtype_targets={
+            "webinar_attended": {"target_dtype": "int8", "nullable": True, "role": "pre_decision"},
+            "demo_requested": {"target_dtype": "int8", "nullable": True, "role": "pre_decision"},
+        },
+    )
+
+    gate_entry = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "boolean_normalization"
+    )
+    evidence = gate_entry.get("evidence") or {}
+    assert gate_entry.get("passed") is True
+    assert evidence.get("expected_dtype") == "int8"
+    assert evidence.get("csv_roundtrip_dtype_width_not_enforced") is True
+
+
 def test_boolean_normalization_fails_when_cleaned_values_still_contain_text_tokens(tmp_path: Path):
     csv_path = tmp_path / "cleaned.csv"
     cleaned = pd.DataFrame(
@@ -338,3 +444,110 @@ def test_boolean_normalization_fails_when_cleaned_values_still_contain_text_toke
     evidence = gate_entry.get("evidence") or {}
     assert gate_entry.get("passed") is False
     assert "marketing_consent" in (evidence.get("invalid_values") or {})
+
+
+def test_temporal_training_mask_allows_future_rows_outside_training_subset(tmp_path: Path):
+    csv_path = tmp_path / "cleaned.csv"
+    cleaned = pd.DataFrame(
+        {
+            "created_at": ["2024-12-15", "2024-12-31", "2025-01-05", "2025-02-01"],
+            "won_90d": [1, 0, None, None],
+            "lead_id": ["a", "b", "c", "d"],
+        }
+    )
+    cleaned.to_csv(csv_path, index=False)
+    gates = [
+        {
+            "name": "enforce_temporal_training_mask",
+            "severity": "HARD",
+            "params": {
+                "column": "created_at",
+                "training_cutoff": "2024-12-31",
+                "rule": "Training rows must satisfy created_at <= '2024-12-31'",
+            },
+        },
+        {
+            "name": "target_not_null_in_training",
+            "severity": "HARD",
+            "params": {"column": "won_90d", "applies_to": "training_rows"},
+        },
+    ]
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=[],
+        cleaned_header=list(cleaned.columns),
+        cleaned_csv_path=str(csv_path),
+        sample_str=cleaned.astype("string"),
+        sample_infer=cleaned,
+        manifest={},
+        raw_sample=None,
+        column_roles={"time_columns": ["created_at"], "outcome": ["won_90d"], "identifiers": ["lead_id"]},
+        allowed_feature_sets={},
+    )
+
+    temporal_gate = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "enforce_temporal_training_mask"
+    )
+    target_gate = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "target_not_null_in_training"
+    )
+    temporal_evidence = temporal_gate.get("evidence") or {}
+    target_evidence = target_gate.get("evidence") or {}
+    assert result["status"] == "APPROVED"
+    assert temporal_gate.get("passed") is True
+    assert target_gate.get("passed") is True
+    assert temporal_evidence.get("future_rows_present") == 2
+    assert temporal_evidence.get("training_rows_count") == 2
+    assert target_evidence.get("null_training_rows") == 0
+
+
+def test_temporal_training_mask_fails_only_when_explicit_training_rows_cross_cutoff(tmp_path: Path):
+    csv_path = tmp_path / "cleaned.csv"
+    cleaned = pd.DataFrame(
+        {
+            "created_at": ["2024-12-20", "2025-01-05", "2025-01-10"],
+            "__split": ["train", "train", "score"],
+            "won_90d": [1, 0, None],
+        }
+    )
+    cleaned.to_csv(csv_path, index=False)
+    gates = [
+        {
+            "name": "enforce_temporal_training_mask",
+            "severity": "HARD",
+            "params": {
+                "column": "created_at",
+                "training_cutoff": "2024-12-31",
+                "rule": "Training rows must satisfy created_at <= '2024-12-31'",
+            },
+        }
+    ]
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=[],
+        cleaned_header=list(cleaned.columns),
+        cleaned_csv_path=str(csv_path),
+        sample_str=cleaned.astype("string"),
+        sample_infer=cleaned,
+        manifest={},
+        raw_sample=None,
+        column_roles={"time_columns": ["created_at"], "split_indicator": ["__split"], "outcome": ["won_90d"]},
+        allowed_feature_sets={},
+    )
+
+    gate_entry = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "enforce_temporal_training_mask"
+    )
+    evidence = gate_entry.get("evidence") or {}
+    assert result["status"] == "REJECTED"
+    assert gate_entry.get("passed") is False
+    assert evidence.get("training_mask_source") == "indicator:__split"
+    assert evidence.get("training_rows_after_cutoff") == 1
