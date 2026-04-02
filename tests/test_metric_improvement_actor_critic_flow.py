@@ -263,9 +263,9 @@ def test_bootstrap_metric_improvement_round_exploit_phase_builds_compatible_bund
     bundle = hypothesis.get("params", {}).get("bundle_techniques", [])
 
     assert policy.get("phase") == "exploit"
-    assert len(bundle) >= 2
-    assert "Type Casting" in bundle
-    assert "Heart Rate Reserve Proxy" in bundle
+    assert bundle == []
+    assert hypothesis.get("technique") == "Type Casting"
+    assert policy.get("strategist_packet_preserved") is True
 
 
 def test_bootstrap_metric_improvement_round_forces_apply_on_first_round_when_noop(tmp_path, monkeypatch) -> None:
@@ -371,15 +371,9 @@ def test_bootstrap_metric_improvement_round_forces_apply_on_first_round_when_noo
     }
 
     activated = graph_mod._bootstrap_metric_improvement_round(state, contract)
-    assert activated is True
-    handoff = state.get("iteration_handoff", {})
-    hypothesis_packet = handoff.get("hypothesis_packet") if isinstance(handoff.get("hypothesis_packet"), dict) else {}
-    optimization_context = handoff.get("optimization_context") if isinstance(handoff.get("optimization_context"), dict) else {}
-    policy = optimization_context.get("policy") if isinstance(optimization_context.get("policy"), dict) else {}
-
-    assert hypothesis_packet.get("action") == "APPLY"
-    assert str(hypothesis_packet.get("hypothesis", {}).get("technique") or "").strip().upper() != "NO_OP"
-    assert policy.get("first_round_apply_forced") is True
+    assert activated is False
+    assert state.get("ml_improvement_loop_complete") is True
+    assert state.get("stop_reason") == "IMPROVEMENT_ROUND_DUPLICATE_NOOP"
 
 
 def test_bootstrap_metric_improvement_round_stops_on_duplicate_noop_after_first_round(tmp_path, monkeypatch) -> None:
@@ -600,6 +594,7 @@ def test_bootstrap_metric_improvement_round_recovers_diversity_after_negative_st
     hypothesis_packet = handoff.get("hypothesis_packet") if isinstance(handoff.get("hypothesis_packet"), dict) else {}
     technique = str(hypothesis_packet.get("hypothesis", {}).get("technique") or "").strip().lower()
     policy = handoff.get("optimization_context", {}).get("policy", {}) if isinstance(handoff.get("optimization_context"), dict) else {}
-    assert "rare_category_grouping" in technique
-    assert policy.get("diversity_recovery_applied") is True
+    assert "missing_indicators" in technique
+    assert policy.get("diversity_recovery_applied") is False
     assert int(policy.get("negative_delta_streak", 0) or 0) >= 2
+    assert policy.get("strategist_packet_preserved") is True

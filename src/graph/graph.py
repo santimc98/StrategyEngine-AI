@@ -28443,6 +28443,42 @@ def _resolve_metric_round_hybrid_policy(
         seen_success.add(key)
         successful_ranked.append(technique)
 
+    params = hypothesis.get("params") if isinstance(hypothesis.get("params"), dict) else {}
+    bundle_techniques = (
+        params.get("bundle_techniques")
+        if isinstance(params.get("bundle_techniques"), list)
+        else []
+    )
+    bundle_techniques = [str(item).strip() for item in bundle_techniques if str(item).strip()][:3]
+    if not bundle_techniques and action == "APPLY" and current_technique and current_technique.upper() != "NO_OP":
+        bundle_techniques = [current_technique]
+
+    policy_meta = {
+        "policy": "strategist_reasoned_hypothesis_v1",
+        "phase": phase,
+        "explore_rounds": int(explore_rounds),
+        "round_id": int(safe_round_id),
+        "rounds_allowed": int(safe_rounds_allowed),
+        "min_delta": float(min_delta),
+        "patience": int(safe_patience),
+        "no_improve_streak": int(safe_no_improve),
+        "bundle_size": int(len(bundle_techniques)),
+        "bundle_techniques": bundle_techniques[:3],
+        "compatibility_rule": "strategist_selected_bundle",
+        "first_round_apply_forced": False,
+        "first_round_force_reason": "",
+        "negative_delta_streak": int(negative_delta_streak),
+        "recent_negative_techniques": recent_negative_techniques[:6],
+        "successful_techniques": successful_ranked[:6],
+        "diversity_recovery_applied": False,
+        "diversity_recovery_reason": "",
+        "diversity_alternate_technique": "",
+        "strategist_action": action,
+        "strategist_technique": current_technique or None,
+        "strategist_packet_preserved": True,
+    }
+    return packet, policy_meta
+
     bundle_techniques: List[str] = []
     if safe_round_id == 1 and action != "APPLY" and plan_entries:
         selected_entry = None
@@ -29400,6 +29436,63 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         return False
 
     if _is_duplicate_noop_hypothesis(hypothesis_packet):
+        state["ml_improvement_round_active"] = False
+        state["ml_improvement_continue"] = False
+        state["ml_improvement_attempted"] = True
+        state["ml_improvement_loop_complete"] = True
+        state["ml_improvement_kept"] = "baseline"
+        state["ml_improvement_force_finalize_reason"] = "duplicate_noop_hypothesis"
+        state["stop_reason"] = "IMPROVEMENT_ROUND_DUPLICATE_NOOP"
+        state["last_iteration_type"] = None
+        _append_feedback_history(
+            state,
+            (
+                "METRIC_IMPROVEMENT_LOOP_STOP: strategist returned duplicate/no-op hypothesis; "
+                "the system preserves that decision and terminates the loop."
+            ),
+        )
+        if run_id:
+            tracker_context = (
+                hypothesis_packet.get("tracker_context")
+                if isinstance(hypothesis_packet.get("tracker_context"), dict)
+                else {}
+            )
+            hypothesis = (
+                hypothesis_packet.get("hypothesis")
+                if isinstance(hypothesis_packet.get("hypothesis"), dict)
+                else {}
+            )
+            try:
+                log_run_event(
+                    run_id,
+                    "metric_improvement_round_terminated",
+                    {
+                        "reason": "duplicate_noop_hypothesis",
+                        "round_id": int(round_id),
+                        "round_count_current": int(round_index_before),
+                        "rounds_allowed": int(rounds),
+                        "action": str(hypothesis_packet.get("action") or ""),
+                        "technique": str(hypothesis.get("technique") or ""),
+                        "signature": str(tracker_context.get("signature") or ""),
+                        "duplicate_of": str(tracker_context.get("duplicate_of") or ""),
+                    },
+                )
+            except Exception:
+                pass
+            append_experiment_entry(
+                run_id,
+                {
+                    "iter": int(state.get("iteration_count", 0) or 0),
+                    "event": "hypothesis_terminated",
+                    "phase": "metric_improvement_round",
+                    "round_id": int(round_id),
+                    "action": str(hypothesis_packet.get("action") or ""),
+                    "signature": str(tracker_context.get("signature") or ""),
+                    "duplicate_of": str(tracker_context.get("duplicate_of") or ""),
+                    "reason": "duplicate_noop_hypothesis",
+                },
+            )
+        return False
         # Before terminating, attempt blueprint fallback recovery: if the
         # optimization_blueprint still has untried actions, synthesize a
         # hypothesis directly from the next blueprint action.  This is

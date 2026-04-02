@@ -2,6 +2,159 @@ from src.agents.strategist import StrategistAgent
 from src.utils.actor_critic_schemas import validate_iteration_hypothesis_packet
 
 
+def test_generate_iteration_hypothesis_llm_mode_preserves_reasoned_selection(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("STRATEGIST_ITERATION_MODE", "llm")
+    strategist = StrategistAgent()
+    monkeypatch.setattr(
+        strategist,
+        "_generate_iteration_hypothesis_llm",
+        lambda _ctx: {
+            "packet_type": "iteration_hypothesis_packet",
+            "packet_version": "1.0",
+            "run_id": "run_test",
+            "iteration": 2,
+            "hypothesis_id": "h_reasoned1",
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "target_encoding",
+                "objective": "Exploit the incumbent signal on high-cardinality categoricals.",
+                "target_columns": ["merchant_id"],
+                "feature_scope": "model_features",
+                "params": {"smoothing": 20},
+                "expected_effect": {"target_error_modes": ["minority_class_recall_low"], "direction": "positive"},
+            },
+            "tracker_context": {"signature": "sig_target_encoding", "is_duplicate": False, "duplicate_of": None},
+            "fallback_if_not_applicable": "NO_OP",
+        },
+    )
+    monkeypatch.setattr(
+        strategist,
+        "_generate_iteration_hypothesis_deterministic",
+        lambda _ctx: {
+            "packet_type": "iteration_hypothesis_packet",
+            "packet_version": "1.0",
+            "run_id": "run_test",
+            "iteration": 2,
+            "hypothesis_id": "h_det0001",
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "missing_indicators",
+                "objective": "Deterministic fallback.",
+                "target_columns": ["ALL_NUMERIC"],
+                "feature_scope": "model_features",
+                "params": {},
+                "expected_effect": {"target_error_modes": ["metric_stagnation"], "direction": "positive"},
+            },
+            "tracker_context": {"signature": "sig_det", "is_duplicate": False, "duplicate_of": None},
+            "fallback_if_not_applicable": "NO_OP",
+        },
+    )
+
+    packet = strategist.generate_iteration_hypothesis(
+        {
+            "run_id": "run_test",
+            "iteration": 2,
+            "primary_metric_name": "roc_auc",
+            "min_delta": 0.0005,
+            "feature_engineering_plan": {"techniques": []},
+            "critique_packet": {"error_modes": [{"id": "minority_class_recall_low"}]},
+            "experiment_tracker": [],
+        }
+    )
+
+    assert packet.get("hypothesis", {}).get("technique") == "target_encoding"
+    assert strategist.last_iteration_meta.get("source") == "llm"
+
+
+def test_generate_iteration_hypothesis_llm_mode_downgrades_duplicate_to_noop(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("STRATEGIST_ITERATION_MODE", "llm")
+    strategist = StrategistAgent()
+    monkeypatch.setattr(
+        strategist,
+        "_generate_iteration_hypothesis_llm",
+        lambda _ctx: {
+            "packet_type": "iteration_hypothesis_packet",
+            "packet_version": "1.0",
+            "run_id": "run_test",
+            "iteration": 3,
+            "hypothesis_id": "h_reasoned_dup",
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "missing_indicators",
+                "objective": "Retry prior signal.",
+                "target_columns": ["ALL_NUMERIC"],
+                "feature_scope": "model_features",
+                "params": {},
+                "expected_effect": {"target_error_modes": ["metric_stagnation"], "direction": "positive"},
+            },
+            "tracker_context": {"signature": "dup_sig", "is_duplicate": False, "duplicate_of": None},
+            "fallback_if_not_applicable": "NO_OP",
+        },
+    )
+
+    packet = strategist.generate_iteration_hypothesis(
+        {
+            "run_id": "run_test",
+            "iteration": 3,
+            "primary_metric_name": "roc_auc",
+            "min_delta": 0.0005,
+            "feature_engineering_plan": {"techniques": []},
+            "critique_packet": {"error_modes": [{"id": "metric_stagnation"}]},
+            "experiment_tracker": [{"signature": "dup_sig"}],
+        }
+    )
+
+    assert packet.get("action") == "NO_OP"
+    assert packet.get("tracker_context", {}).get("duplicate_of") == "dup_sig"
+    assert strategist.last_iteration_meta.get("source") == "llm"
+
+
+def test_generate_iteration_hypothesis_hybrid_mode_uses_deterministic_only_on_llm_failure(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("STRATEGIST_ITERATION_MODE", "hybrid")
+    strategist = StrategistAgent()
+    monkeypatch.setattr(strategist, "_generate_iteration_hypothesis_llm", lambda _ctx: {})
+    monkeypatch.setattr(
+        strategist,
+        "_generate_iteration_hypothesis_deterministic",
+        lambda _ctx: {
+            "packet_type": "iteration_hypothesis_packet",
+            "packet_version": "1.0",
+            "run_id": "run_test",
+            "iteration": 2,
+            "hypothesis_id": "h_det0002",
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "frequency_encoding",
+                "objective": "Fallback deterministic hypothesis.",
+                "target_columns": ["merchant_id"],
+                "feature_scope": "model_features",
+                "params": {},
+                "expected_effect": {"target_error_modes": ["minority_class_recall_low"], "direction": "positive"},
+            },
+            "tracker_context": {"signature": "sig_freq", "is_duplicate": False, "duplicate_of": None},
+            "fallback_if_not_applicable": "NO_OP",
+        },
+    )
+
+    packet = strategist.generate_iteration_hypothesis(
+        {
+            "run_id": "run_test",
+            "iteration": 2,
+            "primary_metric_name": "roc_auc",
+            "min_delta": 0.0005,
+            "feature_engineering_plan": {"techniques": []},
+            "critique_packet": {"error_modes": [{"id": "minority_class_recall_low"}]},
+            "experiment_tracker": [],
+        }
+    )
+
+    assert packet.get("hypothesis", {}).get("technique") == "frequency_encoding"
+    assert strategist.last_iteration_meta.get("source") == "deterministic_fallback"
+
+
 def test_generate_iteration_hypothesis_supports_all_numeric_macro(monkeypatch) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("STRATEGIST_ITERATION_MODE", "deterministic")

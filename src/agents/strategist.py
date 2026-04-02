@@ -120,12 +120,12 @@ class StrategistAgent:
         except (ValueError, TypeError):
             self._max_tokens = 8192
         self.iteration_mode = self._normalize_iteration_mode(
-            os.getenv("STRATEGIST_ITERATION_MODE", "hybrid")
+            os.getenv("STRATEGIST_ITERATION_MODE", "llm")
         )
         self.last_iteration_hypothesis: Dict[str, Any] = {}
         self.last_iteration_meta: Dict[str, Any] = {
             "mode": self.iteration_mode,
-            "source": "deterministic",
+            "source": "llm" if self.iteration_mode != "deterministic" else "deterministic",
             "model": None,
         }
         self.model = _OpenRouterModelShim(self)
@@ -147,39 +147,51 @@ class StrategistAgent:
         value = str(raw or "").strip().lower()
         if value in {"llm", "hybrid", "deterministic"}:
             return value
-        return "hybrid"
+        return "llm"
 
     def generate_iteration_hypothesis(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        deterministic_packet = self._generate_iteration_hypothesis_deterministic(context)
         mode = self.iteration_mode
         self.last_iteration_meta = {
             "mode": mode,
-            "source": "deterministic",
-            "model": None,
+            "source": "llm" if mode != "deterministic" else "deterministic",
+            "model": self.last_model_used or self.model_name if mode != "deterministic" else None,
         }
         if mode == "deterministic":
+            deterministic_packet = self._generate_iteration_hypothesis_deterministic(context)
             self.last_iteration_hypothesis = deterministic_packet
             return deterministic_packet
 
         llm_packet = self._generate_iteration_hypothesis_llm(context)
-        valid_packet, errors = validate_iteration_hypothesis_packet(llm_packet)
-        if valid_packet:
+        finalized_llm_packet, errors = self._finalize_reasoned_iteration_hypothesis(llm_packet, context)
+        if finalized_llm_packet:
             self.last_iteration_meta = {
                 "mode": mode,
                 "source": "llm",
                 "model": self.last_model_used or self.model_name,
             }
-            self.last_iteration_hypothesis = llm_packet
-            return llm_packet
+            self.last_iteration_hypothesis = finalized_llm_packet
+            return finalized_llm_packet
+
+        if mode == "hybrid":
+            deterministic_packet = self._generate_iteration_hypothesis_deterministic(context)
+            self.last_iteration_meta = {
+                "mode": mode,
+                "source": "deterministic_fallback",
+                "model": self.last_model_used or self.model_name,
+                "validation_errors": errors[:6],
+            }
+            self.last_iteration_hypothesis = deterministic_packet
+            return deterministic_packet
 
         self.last_iteration_meta = {
             "mode": mode,
-            "source": "deterministic_fallback",
+            "source": "llm_noop_fallback",
             "model": self.last_model_used or self.model_name,
             "validation_errors": errors[:6],
         }
-        self.last_iteration_hypothesis = deterministic_packet
-        return deterministic_packet
+        llm_noop_packet = self._build_iteration_llm_noop_packet(context, errors)
+        self.last_iteration_hypothesis = llm_noop_packet
+        return llm_noop_packet
 
     def _parse_json_object(self, raw_text: Any) -> Dict[str, Any]:
         text = str(raw_text or "").strip()
@@ -232,6 +244,127 @@ class StrategistAgent:
                 if nested:
                     signatures.add(nested)
         return signatures
+
+    def _summarize_iteration_round_history(self, round_history: Any) -> List[Dict[str, Any]]:
+        if not isinstance(round_history, list):
+            return []
+        summarized: List[Dict[str, Any]] = []
+        for entry in round_history[-6:]:
+            if not isinstance(entry, dict):
+                continue
+            summarized.append(
+                {
+                    "round_id": entry.get("round_id"),
+                    "hypothesis": str(entry.get("hypothesis") or entry.get("technique") or "").strip() or None,
+                    "metric_improved": entry.get("metric_improved"),
+                    "governance_approved": entry.get("governance_approved"),
+                    "kept": entry.get("kept"),
+                    "baseline_metric": entry.get("baseline_metric"),
+                    "candidate_metric": entry.get("candidate_metric"),
+                    "reason": str(entry.get("reason") or "").strip() or None,
+                }
+            )
+        return summarized
+
+    def _resolve_iteration_packet_basics(
+        self,
+        context: Dict[str, Any],
+    ) -> Tuple[str, int, str, float, set[str]]:
+        context = context if isinstance(context, dict) else {}
+        run_id = str(context.get("run_id") or "unknown_run").strip() or "unknown_run"
+        try:
+            iteration = int(context.get("iteration") or 1)
+        except Exception:
+            iteration = 1
+        if iteration <= 0:
+            iteration = 1
+        primary_metric_name = str(context.get("primary_metric_name") or "primary_metric").strip() or "primary_metric"
+        try:
+            min_delta = float(context.get("min_delta", 0.0005) or 0.0005)
+        except Exception:
+            min_delta = 0.0005
+        if min_delta < 0:
+            min_delta = 0.0
+        tracker_entries = context.get("experiment_tracker")
+        if not isinstance(tracker_entries, list):
+            tracker_entries = []
+        known_signatures = self._collect_tracker_signatures(tracker_entries)
+        return run_id, iteration, primary_metric_name, min_delta, known_signatures
+
+    def _build_iteration_llm_noop_packet(
+        self,
+        context: Dict[str, Any],
+        errors: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        run_id, iteration, primary_metric_name, min_delta, _ = self._resolve_iteration_packet_basics(context)
+        explanation = "Strategist reasoning did not yield a valid actionable hypothesis."
+        if errors:
+            explanation += " Validation: " + "; ".join(str(item) for item in errors[:2] if str(item).strip())
+        signature = f"llm_noop_round_{iteration}"
+        return build_noop_iteration_hypothesis_packet(
+            run_id=run_id,
+            iteration=iteration,
+            signature=signature,
+            duplicate_of=None,
+            primary_metric_name=primary_metric_name,
+            min_delta=min_delta,
+            explanation=explanation[:280],
+        )
+
+    def _finalize_reasoned_iteration_hypothesis(
+        self,
+        packet: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        if not isinstance(packet, dict) or not packet:
+            return {}, ["llm_packet_missing"]
+
+        run_id, iteration, primary_metric_name, min_delta, known_signatures = (
+            self._resolve_iteration_packet_basics(context)
+        )
+        hypothesis = packet.get("hypothesis") if isinstance(packet.get("hypothesis"), dict) else {}
+        fallback_signature = build_hypothesis_signature(
+            technique=hypothesis.get("technique"),
+            target_columns=normalize_target_columns(hypothesis.get("target_columns")),
+            feature_scope=hypothesis.get("feature_scope"),
+            params=hypothesis.get("params"),
+        )
+        if not fallback_signature:
+            fallback_signature = f"reasoned_round_{iteration}"
+
+        sanitized = self._sanitize_iteration_hypothesis_packet(
+            packet,
+            primary_metric_name=primary_metric_name,
+            min_delta=min_delta,
+            fallback_signature=fallback_signature,
+            prefer_noop_on_missing_technique=True,
+        )
+        tracker_context = (
+            sanitized.get("tracker_context")
+            if isinstance(sanitized.get("tracker_context"), dict)
+            else {}
+        )
+        signature = str(tracker_context.get("signature") or fallback_signature).strip() or fallback_signature
+        if signature in known_signatures:
+            return (
+                build_noop_iteration_hypothesis_packet(
+                    run_id=run_id,
+                    iteration=iteration,
+                    signature=signature,
+                    duplicate_of=signature,
+                    primary_metric_name=primary_metric_name,
+                    min_delta=min_delta,
+                    explanation=(
+                        "Strategist-selected hypothesis duplicates prior tracker evidence; emit NO_OP instead of replaying it."
+                    )[:280],
+                ),
+                [],
+            )
+
+        valid_packet, errors = validate_iteration_hypothesis_packet(sanitized)
+        if valid_packet:
+            return sanitized, []
+        return {}, errors
 
     def _dedupe_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         deduped: List[Dict[str, Any]] = []
@@ -881,6 +1014,7 @@ class StrategistAgent:
         tracker_entries = context.get("experiment_tracker")
         if not isinstance(tracker_entries, list):
             tracker_entries = []
+        round_history = self._summarize_iteration_round_history(context.get("round_history"))
 
         optimization_blueprint = context.get("optimization_blueprint")
         if not isinstance(optimization_blueprint, dict):
@@ -897,6 +1031,7 @@ class StrategistAgent:
             "critique_packet": critique_packet,
             "feature_engineering_plan": feature_engineering_plan,
             "experiment_tracker": tracker_entries[-10:],
+            "round_history": round_history,
             "dataset_profile_signals": {
                 "has_missing_signal": self._dataset_has_missingness_signal(
                     context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
@@ -916,9 +1051,9 @@ class StrategistAgent:
         if blueprint_actions:
             blueprint_instruction = (
                 "An optimization blueprint is provided in 'optimization_blueprint_actions'. "
-                "Use it as a source of evidence and candidate ideas, not as a fixed queue. "
+                "Use it as a source of evidence and candidate ideas, not as a fixed queue and not as an override. "
                 "Prefer a blueprint action only when it still aligns with critique_packet, "
-                "dataset_profile_signals, and recent experiment_tracker outcomes. "
+                "dataset_profile_signals, round_history, and recent experiment_tracker outcomes. "
                 "Down-rank techniques that recently regressed, duplicate prior work, or look too expensive "
                 "for the likely ROI. When you choose a blueprint action, reuse its concrete_params "
                 "and code_change_hint when they still make sense.\n"
@@ -928,17 +1063,18 @@ class StrategistAgent:
             "You are selecting the next metric-improvement experiment for a senior ML workflow.\n"
             "Return ONLY JSON for one iteration_hypothesis_packet. No markdown. No extra text.\n\n"
             "Reasoning workflow:\n"
-            "1. Diagnose what recent evidence suggests: variance issue, underfitting, feature signal gap, "
+            "1. Diagnose what recent evidence suggests about the current incumbent: variance issue, underfitting, feature signal gap, "
             "search-space issue, calibration problem, or no credible next move.\n"
-            "2. Choose the single highest-ROI next hypothesis for THIS context, balancing expected lift, "
-            "compute cost, and recent regressions.\n"
-            "3. Prefer the cheapest valid experiment that meaningfully tests the idea.\n"
-            "4. Do not repeat a duplicate hypothesis signature. If every credible option is duplicate or low-value, emit NO_OP.\n\n"
+            "2. Use critique_packet, round_history, experiment_tracker, and dataset_profile_signals to decide whether to exploit the incumbent's strongest signal, pivot away from repeated regressions, or stop.\n"
+            "3. Choose the single highest-ROI next hypothesis for THIS context, balancing expected lift, compute cost, and recent regressions.\n"
+            "4. Prefer the cheapest valid experiment that meaningfully tests the idea.\n"
+            "5. Do not repeat a duplicate hypothesis signature. If every credible option is duplicate or low-value, emit NO_OP.\n\n"
             "Rules:\n"
             "- Exactly one hypothesis; action APPLY or NO_OP.\n"
             "- If duplicate signature then action must be NO_OP.\n"
             "- Allowed target macros: ALL_NUMERIC, ALL_CATEGORICAL, ALL_TEXT, ALL_DATETIME, ALL_BOOLEAN.\n"
-            "- Use critique_packet, experiment_tracker, dataset_profile_signals, and feature_engineering_plan as primary evidence.\n"
+            "- You own the selection. feature_engineering_plan and optimization_blueprint_actions are advisory inputs, not a mandatory queue.\n"
+            "- Use critique_packet, round_history, experiment_tracker, dataset_profile_signals, and feature_engineering_plan as primary evidence.\n"
             + blueprint_instruction
             + "\nContext:\n"
             + json.dumps(llm_context, ensure_ascii=False)
@@ -1176,6 +1312,7 @@ class StrategistAgent:
         primary_metric_name: str,
         min_delta: float,
         fallback_signature: str,
+        prefer_noop_on_missing_technique: bool = False,
     ) -> Dict[str, Any]:
         out: Dict[str, Any] = dict(packet) if isinstance(packet, dict) else {}
         out["packet_type"] = "iteration_hypothesis_packet"
@@ -1215,11 +1352,22 @@ class StrategistAgent:
         if action == "NO_OP":
             technique = "NO_OP"
         elif not technique or technique.upper() == "NO_OP":
-            technique = "missing_indicators"
+            if prefer_noop_on_missing_technique:
+                action = "NO_OP"
+                out["action"] = action
+                technique = "NO_OP"
+                is_duplicate = False
+                duplicate_of = None
+            else:
+                technique = "missing_indicators"
 
         objective = str(hypothesis.get("objective") or "").strip()
         if not objective:
-            objective = "Apply one focused feature-engineering change aligned to critique findings."
+            objective = (
+                "No-op because strategist did not provide a concrete next experiment."
+                if action == "NO_OP"
+                else "Apply one focused feature-engineering change aligned to critique findings."
+            )
         if len(objective) > 220:
             objective = objective[:217].rstrip() + "..."
 
