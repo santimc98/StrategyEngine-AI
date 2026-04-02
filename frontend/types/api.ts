@@ -52,6 +52,28 @@ export interface RunLogsResponse {
   }>;
 }
 
+export interface RunActivityEntry {
+  index: number;
+  ts: string;
+  event: string;
+  phase: string;
+  title: string;
+  summary: string;
+  details: Array<{
+    label: string;
+    value: string;
+  }>;
+  level: string;
+}
+
+export interface RunActivityResponse {
+  run_id: string;
+  after_line: number;
+  next_after_line: number;
+  entries: RunActivityEntry[];
+  snapshot: JsonRecord;
+}
+
 export interface ReportPlotItem {
   filename: string;
   title: string;

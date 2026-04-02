@@ -25,6 +25,10 @@ def _log_path(run_id: str) -> str:
     return os.path.join(RUNS_DIR, run_id, "worker_log.jsonl")
 
 
+def _events_path(run_id: str) -> str:
+    return os.path.join(RUNS_DIR, run_id, "events.jsonl")
+
+
 def _final_state_path(run_id: str) -> str:
     return os.path.join(RUNS_DIR, run_id, "worker_final_state.json")
 
@@ -216,6 +220,30 @@ def read_log_entries(run_id: str, after_line: int = 0) -> List[Dict[str, Any]]:
                         entries.append(json.loads(line))
                     except json.JSONDecodeError:
                         pass
+    except FileNotFoundError:
+        pass
+    return entries
+
+
+def read_event_entries(run_id: str, after_line: int = 0) -> List[Dict[str, Any]]:
+    """Read raw event entries, optionally skipping the first `after_line` lines."""
+    path = _events_path(run_id)
+    entries: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i < after_line:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    payload.setdefault("_line", i)
+                    entries.append(payload)
     except FileNotFoundError:
         pass
     return entries

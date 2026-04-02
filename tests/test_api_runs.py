@@ -326,3 +326,79 @@ def test_artifact_manifest_endpoint_returns_manifest(client, monkeypatch, tmp_pa
     payload = response.json()
     assert payload["run_id"] == "runmanifest1"
     assert payload["summary"]["required_total"] == 6
+
+
+def test_run_activity_endpoint_returns_curated_internal_events(client, monkeypatch, tmp_path):
+    runs_dir = tmp_path / "runs"
+    run_dir = runs_dir / "runactivity1"
+    run_dir.mkdir(parents=True)
+
+    _patch_run_paths(monkeypatch, runs_dir)
+
+    (run_dir / "worker_status.json").write_text(
+        json.dumps({"status": "running", "stage_name": "Data Engineer", "progress": 42, "iteration": 2}),
+        encoding="utf-8",
+    )
+    (run_dir / "events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-02T10:07:24.411781+00:00",
+                        "event": "run_init",
+                        "payload": {"csv_path": "C:/tmp/demo.csv", "dataset_fingerprint": "abc123def456"},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-02T10:19:50.700079+00:00",
+                        "event": "heavy_runner_request",
+                        "payload": {"mode": "data_engineer_cleaning", "attempt_id": 2},
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/runs/runactivity1/activity")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_id"] == "runactivity1"
+    assert len(payload["entries"]) == 2
+    assert payload["entries"][0]["title"] == "Run init"
+    assert payload["entries"][1]["event"] == "heavy_runner_request"
+    assert payload["entries"][1]["details"][0]["label"] == "Modo"
+    assert payload["snapshot"]["current_stage"] == "Data Engineer"
+    assert payload["snapshot"]["latest_phase"] == "runtime"
+
+
+def test_run_activity_endpoint_supports_incremental_cursor(client, monkeypatch, tmp_path):
+    runs_dir = tmp_path / "runs"
+    run_dir = runs_dir / "runactivity2"
+    run_dir.mkdir(parents=True)
+
+    _patch_run_paths(monkeypatch, runs_dir)
+
+    (run_dir / "worker_status.json").write_text(json.dumps({"status": "running"}), encoding="utf-8")
+    (run_dir / "events.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"timestamp": "2026-04-02T10:00:00+00:00", "event": "run_init", "payload": {}}),
+                json.dumps({"timestamp": "2026-04-02T10:01:00+00:00", "event": "steward_start", "payload": {}}),
+                json.dumps({"timestamp": "2026-04-02T10:02:00+00:00", "event": "steward_complete", "payload": {}}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/runs/runactivity2/activity?after_line=1")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [entry["event"] for entry in payload["entries"]] == ["steward_start", "steward_complete"]
+    assert payload["after_line"] == 1
+    assert payload["next_after_line"] == 3
