@@ -2630,7 +2630,6 @@ $payload_json
 
     def _default_metrics_for_scope(self, scope: str, objective_type: str) -> List[str]:
         scope_norm = str(scope or "").strip().lower()
-        objective_norm = str(objective_type or "").strip().lower()
         if scope_norm == "cleaning_only":
             return [
                 "data_quality_pass_rate",
@@ -2638,34 +2637,28 @@ $payload_json
                 "transformation_traceability_completeness",
             ]
         if scope_norm == "ml_only":
-            if objective_norm == "prescriptive":
-                return ["expected_value", "decision_gain"]
-            if objective_norm == "causal":
-                return ["effect_size", "confidence_interval_width"]
-            if objective_norm == "comparative":
-                return ["lift_at_k", "ranking_quality"]
-            if objective_norm == "descriptive":
-                return ["summary_statistics", "pattern_stability"]
-            return ["accuracy", "roc_auc"]
-        return ["data_quality_pass_rate", "primary_model_metric", "decision_readiness"]
+            return [
+                "primary_business_metric",
+                "generalization_metric",
+                "decision_readiness",
+            ]
+        return [
+            "data_quality_pass_rate",
+            "primary_business_metric",
+            "decision_readiness",
+        ]
 
     def _default_validation_for_scope(self, scope: str, objective_type: str) -> Tuple[str, str]:
         scope_norm = str(scope or "").strip().lower()
-        objective_norm = str(objective_type or "").strip().lower()
         if scope_norm == "cleaning_only":
             return (
                 "data_quality_validation_with_rule_based_checks",
                 "This run is focused on cleaning and preparation, so validation should emphasize data quality, leakage prevention, and traceability rather than model performance.",
             )
         if scope_norm == "ml_only":
-            if objective_norm == "predictive":
-                return (
-                    "holdout_or_cross_validation_based_on_data_structure",
-                    "This run assumes modeling on prepared data, so validation should test generalization using the lightest credible split strategy supported by the dataset structure.",
-                )
             return (
-                "objective_specific_validation",
-                "Validation should be chosen from the current modeling objective and data structure, not from generic defaults.",
+                "data_structure_driven_validation_requires_explicit_selection",
+                "Validation should be chosen from the current objective, data structure, leakage risk, and compute budget. Treat this as a placeholder that still needs explicit downstream specification.",
             )
         return (
             "staged_validation_with_cleaning_checks_and_model_evaluation",
@@ -2717,12 +2710,12 @@ $payload_json
 
         scope_recommendation = self._infer_scope_recommendation(primary, user_request)
 
-        # Use LLM-generated objective_type (with conservative fallback when missing)
+        # Preserve the LLM judgment when present; otherwise keep the objective open
+        # instead of silently forcing the strategy into a predictive framing.
         objective_type = str(primary.get("objective_type") or "").strip().lower()
         if not objective_type:
             # LLM failed to produce an objective_type — default to predictive as the
-            # most common case; downstream agents will refine based on contract context.
-            objective_type = "predictive"
+            objective_type = "unspecified"
 
         # Use LLM-generated metrics (with scope-aware defaults only if missing)
         metrics = primary.get("recommended_evaluation_metrics", [])

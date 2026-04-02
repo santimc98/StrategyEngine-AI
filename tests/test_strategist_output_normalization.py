@@ -168,6 +168,63 @@ class TestStrategistNormalization:
         assert "predictions_or_scores" not in artifact_types
         assert "clean_dataset" in artifact_types
 
+    def test_build_strategy_spec_keeps_objective_unspecified_when_llm_does_not_resolve_it(self):
+        payload = {
+            "strategies": [
+                {
+                    "title": "Ambiguous Strategy",
+                    "scope_recommendation": "ml_only",
+                    "scope_reasoning": "The run appears to require modeling but the exact framing is unresolved.",
+                    "objective_reasoning": "The business intent is not yet precise enough to lock a canonical objective label.",
+                }
+            ]
+        }
+
+        spec = self.agent._build_strategy_spec_from_llm(
+            payload,
+            data_summary='{"primary_target":"renewal_outcome"}',
+            user_request="Analiza el dataset y propone el mejor enfoque",
+        )
+
+        assert spec.get("objective_type") == "unspecified"
+        evaluation_plan = spec.get("evaluation_plan") or {}
+        assert evaluation_plan.get("metrics") == [
+            "primary_business_metric",
+            "generalization_metric",
+            "decision_readiness",
+        ]
+        assert (evaluation_plan.get("validation") or {}).get("strategy") == (
+            "data_structure_driven_validation_requires_explicit_selection"
+        )
+
+    def test_build_strategy_spec_uses_scope_defaults_instead_of_family_defaults_when_metrics_are_missing(self):
+        payload = {
+            "strategies": [
+                {
+                    "title": "Causal Framing",
+                    "objective_type": "causal",
+                    "scope_recommendation": "ml_only",
+                    "objective_reasoning": "The business wants to understand intervention impact.",
+                }
+            ]
+        }
+
+        spec = self.agent._build_strategy_spec_from_llm(
+            payload,
+            data_summary='{"primary_target":"retention"}',
+            user_request="Estimar impacto de una intervención",
+        )
+
+        evaluation_plan = spec.get("evaluation_plan") or {}
+        assert evaluation_plan.get("metrics") == [
+            "primary_business_metric",
+            "generalization_metric",
+            "decision_readiness",
+        ]
+        assert (evaluation_plan.get("validation") or {}).get("strategy") == (
+            "data_structure_driven_validation_requires_explicit_selection"
+        )
+
     def test_generate_prompt_includes_senior_contextual_sections_for_scope_and_artifacts(self):
         payload = {
             "strategies": [
@@ -210,7 +267,7 @@ class TestStrategistNormalization:
         )
         prompt = self.agent.last_prompt or ""
         _assert_contains_all(prompt, "*** MISSION ***", "*** SOURCE OF TRUTH AND PRECEDENCE ***")
-        _assert_contains_terms(prompt, "strategy reasoning workflow", "scope_recommendation", "recommended_artifacts")
+        _assert_contains_terms(prompt, "strategy reasoning", "scope_recommendation", "recommended_artifacts")
 
     @patch.dict("os.environ", {"STRATEGIST_COLUMN_REPAIR_ATTEMPTS": "1"})
     def test_generate_strategies_repairs_required_columns_with_inventory(self):
