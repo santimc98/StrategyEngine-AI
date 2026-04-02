@@ -2634,34 +2634,196 @@ def _materialize_structured_report(
 
 
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the first valid JSON object from *text*.
+
+    Uses **string-aware** brace matching (respects quoted strings and
+    escape sequences) so braces inside string values are ignored.
+
+    If no complete JSON object is found (e.g. the LLM truncated mid-
+    output), attempts a *truncation repair*: finds the longest ``{…``
+    prefix, closes any open arrays / objects, and re-parses.
+    """
     if not text:
         return None
     raw = str(text).strip()
+
+    # ── Fast path: entire text is valid JSON ──
     try:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else None
     except Exception:
         pass
 
+    # ── Strip markdown fences (```json … ```) wrapping ──
+    cleaned = re.sub(r"```json\s*", "", raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r"```", "", cleaned).strip()
+    if cleaned != raw:
+        try:
+            parsed = json.loads(cleaned)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            pass
+
+    # ── String-aware brace scan (handles braces inside quoted values) ──
     n = len(raw)
-    for start in range(n):
-        if raw[start] != "{":
+    for scan_start in range(n):
+        if raw[scan_start] != "{":
             continue
         depth = 0
-        for end in range(start, n):
-            ch = raw[end]
-            if ch == "{":
+        in_str = False
+        escape = False
+        for pos in range(scan_start, n):
+            ch = raw[pos]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
                 depth += 1
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = raw[start:end + 1]
+                    candidate = raw[scan_start:pos + 1]
                     try:
                         parsed = json.loads(candidate)
                         if isinstance(parsed, dict):
                             return parsed
                     except Exception:
-                        break
+                        break  # this opening brace failed; try next
+        # If we exhausted the string without closing → try truncation repair
+        if depth > 0:
+            result = _repair_truncated_json(raw[scan_start:])
+            if result is not None:
+                return result
+            break  # only try repair on the first plausible object
+    return None
+
+
+def _repair_truncated_json(fragment: str) -> Optional[Dict[str, Any]]:
+    """Try to close a truncated JSON object and parse it.
+
+    Strategy: walk the fragment tracking open structures (object / array /
+    string).  At the point of truncation, close everything that is still
+    open.  Then try ``json.loads``.
+    """
+    if not fragment or fragment[0] != "{":
+        return None
+
+    # Strip trailing garbage after the last meaningful JSON token.
+    # LLM often appends ``\n```json\n{`` of a second attempt after truncation.
+    # We split on the *first* obvious re-start of a new JSON block.
+    re_start = re.search(r"```\s*json\s*\n\s*\{", fragment[1:], flags=re.IGNORECASE)
+    if re_start:
+        fragment = fragment[: re_start.start() + 1]
+
+    # Walk and track open structures
+    stack: list = []  # 'o' for object, 'a' for array
+    in_str = False
+    escape = False
+    last_good = 0
+    for i, ch in enumerate(fragment):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            last_good = i
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append("o")
+        elif ch == "[":
+            stack.append("a")
+        elif ch == "}":
+            if stack and stack[-1] == "o":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "a":
+                stack.pop()
+        if ch.strip():
+            last_good = i
+
+    # Trim to last meaningful character
+    truncated = fragment[: last_good + 1]
+
+    # If we were inside a string, close it
+    if in_str:
+        truncated = truncated.rstrip("\\") + '"'
+
+    # Trim trailing comma (invalid before a closing bracket)
+    truncated = truncated.rstrip().rstrip(",")
+
+    # Close remaining open structures
+    for item in reversed(stack):
+        truncated += "]" if item == "a" else "}"
+
+    try:
+        parsed = json.loads(truncated)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def _rescue_markdown_from_raw_json(raw_text: str) -> Optional[str]:
+    """Last-resort rescue: extract readable markdown from raw/truncated JSON report.
+
+    When the LLM returns a structured JSON report but it is truncated or
+    malformed and cannot be fully parsed, this function extracts the text
+    content from the ``blocks`` array as best-effort markdown so the user
+    sees human-readable text instead of raw JSON.
+    """
+    if not raw_text:
+        return None
+
+    # Try to parse via _extract_first_json_object first (it does truncation repair)
+    payload = _extract_first_json_object(raw_text)
+    if payload and isinstance(payload.get("blocks"), list) and payload["blocks"]:
+        lines: list = []
+        title = str(payload.get("title") or "").strip()
+        if title:
+            lines.append(f"# {title}\n")
+        for block in payload["blocks"]:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type") or "").strip().lower()
+            if btype == "heading":
+                level = int(block.get("level") or 2)
+                lines.append(f"\n{'#' * level} {block.get('text', '')}\n")
+            elif btype == "paragraph":
+                lines.append(f"\n{block.get('text', '')}\n")
+            elif btype == "bullet_list":
+                items = block.get("items") or []
+                for item in items:
+                    lines.append(f"- {item}")
+                lines.append("")
+            elif btype == "numbered_list":
+                items = block.get("items") or []
+                for idx, item in enumerate(items, 1):
+                    lines.append(f"{idx}. {item}")
+                lines.append("")
+            elif btype == "artifact":
+                lead_in = block.get("lead_in") or ""
+                if lead_in:
+                    lines.append(f"\n{lead_in}\n")
+                analysis = block.get("analysis") or []
+                for item in analysis:
+                    lines.append(f"- {item}")
+                lines.append("")
+            elif btype == "markdown":
+                lines.append(f"\n{block.get('content', '')}\n")
+        if lines:
+            return "\n".join(lines)
     return None
 
 
@@ -3267,9 +3429,9 @@ class BusinessTranslatorAgent:
         self.last_report_blocks = None
         self.last_report_payload = None
         try:
-            self._max_tokens = int(os.getenv("TRANSLATOR_MAX_TOKENS", "8000"))
+            self._max_tokens = int(os.getenv("TRANSLATOR_MAX_TOKENS", "16384"))
         except Exception:
-            self._max_tokens = 8000
+            self._max_tokens = 16384
 
     def _call_llm(self, prompt: str) -> str:
         model = getattr(self, "model", None)
@@ -3286,6 +3448,13 @@ class BusinessTranslatorAgent:
             temperature=0.2,
             max_tokens=int(self._max_tokens),
         )
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        if finish_reason in ("length", "max_tokens"):
+            print(
+                f"WARNING [Translator]: LLM response truncated "
+                f"(finish_reason={finish_reason}, max_tokens={self._max_tokens}). "
+                f"Consider raising TRANSLATOR_MAX_TOKENS."
+            )
         return (response.choices[0].message.content or "").strip()
 
     def generate_report(
@@ -4060,82 +4229,76 @@ them to understand what happened, whether the results are trustworthy, and
 what to do next.
 
 === SOURCE OF TRUTH AND PRECEDENCE ===
-1. FACTS_BLOCK is authoritative for the executive decision label used in this report.
-2. If FACTS_BLOCK includes an authoritative run outcome, it overrides softer
-   signals from reviewer verdicts, data adequacy, heuristics, or narrative text.
-3. RUN NARRATIVE and DETAILED CONTEXT explain what happened and why; they do not
-   override the authoritative executive outcome.
-4. Evidence must come from listed artifacts or explicit deterministic facts.
-   If support is missing, state uncertainty explicitly instead of presenting the claim as established.
-5. Separate FINAL INCUMBENT STATE from IMPROVEMENT HISTORY.
-   Valid engineering progress should be recognized, but KPI snapshots, stability
-   claims, and deployment recommendations must be grounded in the final incumbent only.
-6. If a challenger was rejected, mention it only as rejected exploration history.
-   Never present rejected challenger metrics or charts as the final model state.
-7. Distinguish clearly between supported facts, cautious inference, and recommended action.
-   Use assertive language only for facts supported by artifacts or deterministic context.
-   If you introduce timelines, thresholds, rollout gates, remediation windows, or
-   operating policies not explicit in the artifacts, frame them as recommendations
-   or scenarios, not as established run facts.
+- FACTS_BLOCK is authoritative for the executive decision label. If it includes
+  an authoritative run outcome, it overrides softer signals from reviewer verdicts,
+  data adequacy, heuristics, or narrative text.
+- RUN NARRATIVE and DETAILED CONTEXT explain what happened and why; they do not
+  override the authoritative executive outcome.
+- Evidence must come from listed artifacts or explicit deterministic facts.
+  If support is missing, state uncertainty explicitly instead of presenting the claim as established.
+- Separate FINAL INCUMBENT STATE from IMPROVEMENT HISTORY.
+  KPI snapshots, stability claims, and deployment recommendations must be grounded
+  in the final incumbent only. Rejected challengers are exploration history, not final state.
+- Distinguish clearly between supported facts, cautious inference, and recommended action.
+  Use assertive language only for facts supported by artifacts or deterministic context.
+  Timelines, thresholds, rollout gates, or policies not explicit in the artifacts
+  must be framed as recommendations, not established run facts.
 
-=== TRANSLATION DECISION WORKFLOW (MANDATORY) ===
-Before writing, reason through these steps internally. Your report should
-reflect this analysis, not just list data.
+=== REPORT REASONING ===
+Before writing, reason internally about these areas. Your report should
+reflect this analysis, not just list data. The order and depth you give
+each area is yours to decide based on what matters most for THIS run.
 
-1. ASSESS THE OUTCOME
-   - The authoritative executive outcome for this report is: $executive_decision_label
-   - What was the business objective? Did the system achieve it?
-   - If reviewer or adequacy signals differ from the authoritative outcome,
-     explain the discrepancy but do NOT override the authoritative outcome.
-   - If a metric improvement loop ran, what was the best metric achieved
-     vs the baseline? How many techniques were tried?
-   - If the canonical_primary_metric in FACTS_BLOCK differs from metrics
-     on disk, trust the canonical value — it reflects the selected incumbent.
+OUTCOME ASSESSMENT
+- The authoritative executive outcome for this report is: $executive_decision_label
+- What was the business objective? Did the system achieve it?
+- If reviewer or adequacy signals differ from the authoritative outcome,
+  explain the discrepancy but do NOT override the authoritative outcome.
+- If a metric improvement loop ran, what was the best metric achieved
+  vs the baseline? How many techniques were tried?
+- If the canonical_primary_metric in FACTS_BLOCK differs from metrics
+  on disk, trust the canonical value — it reflects the selected incumbent.
+- If improvement history exists, make the ML engineer's progress visible,
+  but keep final KPI/stability language tied to the selected incumbent only.
 
-   - If improvement history exists, make the ML engineer's progress visible,
-     but keep final KPI/stability language tied to the selected incumbent only.
+WHAT MATTERS
+- From all the metrics and artifacts below, decide which findings are
+  truly decision-relevant for this run. Include as much supporting detail
+  as needed to make the report clear, rigorous, and useful.
+- Prioritize: primary metric performance, data quality issues,
+  compliance failures, and risks that affect production readiness.
+- If cleaning work materially enabled the final result, surface the
+  most important data-engineering operations and explain why they mattered.
+- If an EDA Fact Pack exists, use it to identify the few missingness,
+  cardinality, constant-column, or type-conversion signals that genuinely
+  explain model readiness or residual risk.
+- If engineering change summaries exist, distinguish clearly between
+  accepted interventions, rejected experiments, and the concrete effect each
+  had on data readiness, model quality, or deployment trust.
 
-2. IDENTIFY WHAT MATTERS
-   - From all the metrics and artifacts below, decide which findings are
-     truly decision-relevant for this run. Include as much supporting detail
-     as needed to make the report clear, rigorous, and useful.
-   - Prioritize: primary metric performance, data quality issues,
-     compliance failures, and risks that affect production readiness.
-   - If cleaning work materially enabled the final result, surface the
-     most important data-engineering operations and explain why they mattered.
-   - If an EDA Fact Pack exists, use it to identify the few missingness,
-     cardinality, constant-column, or type-conversion signals that genuinely
-     explain model readiness or residual risk.
-   - If engineering change summaries exist, distinguish clearly between
-     accepted interventions, rejected experiments, and the concrete effect each
-     had on data readiness, model quality, or deployment trust.
+ENGINEERING IMPACT
+- Which engineering interventions actually changed the system state?
+- Describe accepted data-engineering and model-engineering moves that
+  changed readiness, incumbent quality, or deployment trust at the level of
+  detail that best serves the report.
+- If experiments were rejected, mention them only when they explain why the
+  final incumbent was kept or why deployment remains limited.
+- Do not mention agents as workflow theater. Give credit to data engineering
+  or model engineering work only when it materially changed the outcome.
 
-3. ATTRIBUTE ENGINEERING IMPACT
-   - Ask internally which engineering interventions actually changed the system state.
-   - Describe the accepted data-engineering and model-engineering moves that
-     changed readiness, incumbent quality, or deployment trust at the level of
-     detail that best serves the report.
-   - If experiments were rejected, mention them only when they explain why the
-     final incumbent was kept or why deployment remains limited.
-   - Do not mention agents as workflow theater. Give credit to data engineering
-     or model engineering work only when it materially changed the outcome.
+CAUSALITY
+- Connect results to causes. If the metric improved, what technique
+  drove it? If it degraded, what went wrong?
+- If there are contradictions between reviewers, governance outputs, and metrics, flag them.
+- Explain how the problem was solved or partially solved through those
+  engineering decisions, not as a flat chronological list of steps.
 
-4. EXPLAIN WHY
-   - Connect results to causes. If the metric improved, what technique
-     drove it? If it degraded, what went wrong?
-   - If there are contradictions between reviewers, governance outputs, and metrics, flag them.
-   - Explain how the problem was solved or partially solved through those
-     engineering decisions, not as a flat chronological list of steps.
-   - Introduce the business problem with the amount of context needed for the
-     report, then explain how the team changed the data or model state.
-
-5. RECOMMEND ACTIONS
-   - Be specific: "retry with X", "investigate Y in artifact Z",
-     "deploy with caveat W" — not generic advice.
-
-   - If you recommend a timeline, threshold, governance gate, or rollout policy
-     that is not explicit in the artifacts, make it clear that it is your
-     recommendation rather than an established outcome of the run.
+RECOMMENDED ACTIONS
+- Be specific: "retry with X", "investigate Y in artifact Z",
+  "deploy with caveat W" — not generic advice.
+- If you recommend a timeline, threshold, governance gate, or rollout policy
+  that is not explicit in the artifacts, make it clear that it is your
+  recommendation rather than an established outcome of the run.
 
 === FACTS (do not alter values) ===
 $facts_block_json
@@ -4392,6 +4555,13 @@ $execution_results
                     content = materialized_content
                     self.last_report_blocks = materialized_blocks
                     self.last_report_payload = structured_payload
+                else:
+                    # ── Rescue: LLM returned truncated/malformed JSON ──
+                    # Try to extract readable markdown from the raw JSON text
+                    # so executive_summary.md is human-readable, not raw JSON.
+                    rescued = _rescue_markdown_from_raw_json(content)
+                    if rescued:
+                        content = rescued
 
             content = _sanitize_report_text(content)
             if self.last_report_blocks is None:
@@ -4480,6 +4650,10 @@ $execution_results
                                 structured_payload_issues = repaired_structured_issues
                             else:
                                 structured_payload_issues = repaired_structured_issues
+                                # ── Rescue truncated JSON in repair attempt ──
+                                rescued = _rescue_markdown_from_raw_json(repaired)
+                                if rescued:
+                                    repaired = rescued
                                 repaired = _sanitize_report_text(repaired)
                                 repaired = _ensure_evidence_section(
                                     repaired,

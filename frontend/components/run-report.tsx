@@ -91,6 +91,24 @@ export function RunReport({ runId, report }: RunReportProps) {
             </div>
           );
         }
+        // Fallback for artifact blocks without a specific artifact_type
+        // (e.g. rescued from truncated JSON — may have lead_in + analysis)
+        if (block.lead_in || (block.analysis && block.analysis.length > 0)) {
+          return (
+            <div key={idx} style={{ margin: "24px 0 32px 0" }}>
+              {block.lead_in && (
+                <p className="muted-copy" style={{ marginBottom: "12px", fontStyle: "italic" }}>{block.lead_in}</p>
+              )}
+              {block.analysis && block.analysis.length > 0 && (
+                <div style={{ paddingLeft: "16px", borderLeft: "4px solid var(--accent)", color: "var(--muted)", fontStyle: "italic", fontSize: "0.95rem" }}>
+                  <ul style={{ margin: 0, paddingLeft: "20px" }}>
+                    {block.analysis.map((a: string, i: number) => <li key={i} style={{ marginBottom: "4px" }}>{a}</li>)}
+                  </ul>
+                </div>
+              )}
+            </div>
+          );
+        }
         return null;
 
       case "markdown":
