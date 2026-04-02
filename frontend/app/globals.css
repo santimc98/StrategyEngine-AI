@@ -33,12 +33,21 @@ body {
   margin: 0;
   padding: 0;
   min-height: 100%;
-  overflow-y: scroll;
+}
+
+html {
+  overflow-y: auto;
   background:
     radial-gradient(circle at top left, rgba(51, 92, 255, 0.12), transparent 500px),
     radial-gradient(circle at top right, rgba(111, 66, 255, 0.11), transparent 400px),
     linear-gradient(180deg, #fbfcff 0%, #f4f7ff 100vh);
   background-attachment: fixed;
+}
+
+body {
+  min-height: 100vh;
+  overflow-x: hidden;
+  background: transparent;
   color: var(--text);
   font-family: var(--font-body);
 }
