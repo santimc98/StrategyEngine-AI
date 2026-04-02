@@ -1285,7 +1285,7 @@ def _compute_temporal_analysis(
 ) -> Dict[str, Any]:
     candidates: List[str] = []
     # Use dtype-based detection + minimal structural hints for temporal candidates
-    _temporal_hints = {"date", "time", "timestamp", "datetime", "month", "year", "day", "week", "hour"}
+    _temporal_hints = {"date", "time", "timestamp", "datetime", "month", "year", "day", "week", "hour", "created", "updated", "modified"}
     for col in columns:
         tokenized = str(col).lower().replace("-", "_")
         if any(tok in tokenized for tok in _temporal_hints):
@@ -1310,23 +1310,51 @@ def _compute_temporal_analysis(
             if parse_ratio < 0.6:
                 continue
             non_null = parsed.dropna()
-            is_sorted = bool(non_null.is_monotonic_increasing) if len(non_null) > 1 else False
+            n_non_null = len(non_null)
+            is_sorted = bool(non_null.is_monotonic_increasing) if n_non_null > 1 else False
             median_seconds = None
             granularity = "unknown"
-            if len(non_null) > 2:
+            if n_non_null > 2:
                 diffs = non_null.sort_values().diff().dropna().dt.total_seconds()
                 if not diffs.empty:
                     median_seconds = float(diffs.median())
                     granularity = _infer_temporal_granularity(median_seconds)
-            details.append(
-                {
-                    "column": col,
-                    "parse_ratio": round(parse_ratio, 4),
-                    "is_sorted_ascending": is_sorted,
-                    "median_step_seconds": round(median_seconds, 3) if isinstance(median_seconds, (int, float)) else None,
-                    "granularity_hint": granularity,
-                }
-            )
+
+            # Uniqueness and duplicate analysis — critical for CV fold boundary reasoning
+            n_unique = int(non_null.nunique())
+            unique_ratio = round(n_unique / n_non_null, 4) if n_non_null > 0 else 0.0
+            n_duplicated_rows = int((non_null.duplicated(keep=False)).sum()) if n_non_null > 0 else 0
+            duplicate_ratio = round(n_duplicated_rows / n_non_null, 4) if n_non_null > 0 else 0.0
+            max_rows_per_value = 0
+            if n_non_null > 0:
+                try:
+                    max_rows_per_value = int(non_null.value_counts().iloc[0])
+                except Exception:
+                    pass
+
+            # Time span
+            time_span_days = None
+            if n_non_null >= 2:
+                try:
+                    time_span_days = round((non_null.max() - non_null.min()).total_seconds() / 86400, 1)
+                except Exception:
+                    pass
+
+            detail_entry: Dict[str, Any] = {
+                "column": col,
+                "parse_ratio": round(parse_ratio, 4),
+                "is_sorted_ascending": is_sorted,
+                "median_step_seconds": round(median_seconds, 3) if isinstance(median_seconds, (int, float)) else None,
+                "granularity_hint": granularity,
+                "unique_timestamps": n_unique,
+                "unique_ratio": unique_ratio,
+                "duplicate_timestamp_rows": n_duplicated_rows,
+                "duplicate_ratio": duplicate_ratio,
+                "max_rows_per_timestamp": max_rows_per_value,
+            }
+            if time_span_days is not None:
+                detail_entry["time_span_days"] = time_span_days
+            details.append(detail_entry)
         except Exception:
             continue
 

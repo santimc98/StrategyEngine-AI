@@ -10200,7 +10200,7 @@ class ExecutionPlannerAgent:
         # Meta-policies (source_of_truth, precedence, operational_targets,
         # agent_interface_policy) are already in the prompt or enforced by
         # the closing checklist — no need to repeat in the context payload.
-        compiler_support_context_payload = {
+        compiler_support_context_payload: Dict[str, Any] = {
             "business_objective": business_objective,
             "strategy_compilation_reinforcement": compiler_strategy_context,
             "column_manifest": {
@@ -10213,6 +10213,11 @@ class ExecutionPlannerAgent:
             "output_dialect": output_dialect or "unknown",
             "domain_expert_critique": critique_for_prompt or "None",
         }
+        # Include temporal profile so the compiler can reason about gate design
+        if isinstance(data_profile, dict):
+            temporal_analysis = data_profile.get("temporal_analysis")
+            if isinstance(temporal_analysis, dict) and temporal_analysis.get("details"):
+                compiler_support_context_payload["temporal_profile"] = temporal_analysis
         compiler_support_context = json.dumps(
             compiler_support_context_payload,
             indent=2,
@@ -10220,6 +10225,13 @@ class ExecutionPlannerAgent:
         )
         # ── Task A user_input: lean context for semantic reasoning ──
         # Single authoritative source per concept. No redundant column views.
+        # Extract temporal analysis from data profile if available
+        temporal_context = ""
+        if isinstance(data_profile, dict):
+            temporal_analysis = data_profile.get("temporal_analysis")
+            if isinstance(temporal_analysis, dict) and temporal_analysis.get("details"):
+                temporal_context = f"\ntemporal_profile:\n{json.dumps(temporal_analysis, indent=2)}"
+
         user_input = f"""
 strategy:
 {strategy_json}
@@ -10244,7 +10256,7 @@ resolved_target:
 
 data_profile_summary:
 {data_summary_for_prompt}
-
+{temporal_context}
 domain_expert_critique:
 {critique_for_prompt or "None"}
 """
