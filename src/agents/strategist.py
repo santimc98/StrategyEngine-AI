@@ -834,37 +834,29 @@ class StrategistAgent:
                     "objective": "Apply bounded quantile bins to reduce over-sensitive continuous splits.",
                 }
             )
-        # Late-stage universal candidates (variance reduction + advanced encoding)
-        # These are always beneficial when the baseline is already reasonable.
-        out.append(
-            {
-                "technique": "target_encoding",
-                "target_columns": ["ALL_CATEGORICAL"],
-                "feature_scope": "model_features",
-                "params": {"cv": 5, "smoothing": 10.0},
-                "objective": "Add K-fold target encoding for categoricals to extract more signal than ordinal encoding.",
-            }
-        )
-        out.append(
-            {
-                "technique": "multi_seed_averaging",
-                "target_columns": ["ALL"],
-                "feature_scope": "model_features",
-                "params": {"seeds": [42, 123, 456, 789, 2024], "aggregation": "mean"},
-                "objective": "Train with multiple random seeds and average predictions for variance reduction.",
-            }
-        )
-        out.append(
-            {
-                "technique": "stacking_ensemble",
-                "target_columns": ["ALL"],
-                "feature_scope": "model_features",
-                "params": {"meta_learner": "LogisticRegression", "cv": 3},
-                "objective": "Build 2-level stacking with diverse base learners and a meta-learner on OOF predictions.",
-            }
-        )
         # Apply feasibility filter against dataset profile
         out = self._filter_candidates_by_feasibility(out, dataset_profile)
+        # If error-mode matching produced no candidates, add generic improvement candidates
+        if not out:
+            out.append(
+                {
+                    "technique": "target_encoding",
+                    "target_columns": ["ALL_CATEGORICAL"],
+                    "feature_scope": "model_features",
+                    "params": {"cv": 5, "smoothing": 10.0},
+                    "objective": "Add K-fold target encoding for categoricals to extract more signal than ordinal encoding.",
+                }
+            )
+            out.append(
+                {
+                    "technique": "multi_seed_averaging",
+                    "target_columns": ["ALL"],
+                    "feature_scope": "model_features",
+                    "params": {"seeds": [42, 123, 456, 789, 2024], "aggregation": "mean"},
+                    "objective": "Train with multiple random seeds and average predictions for variance reduction.",
+                }
+            )
+            out = self._filter_candidates_by_feasibility(out, dataset_profile)
         if not out:
             out.append(
                 {
@@ -1109,10 +1101,10 @@ class StrategistAgent:
             },
             "application_constraints": {
                 "edit_mode": "incremental",
-                "max_code_regions_to_change": 3,
+                "max_code_regions_to_change": 5,
                 "forbid_replanning": True,
-                "forbid_model_family_switch": True,
-                "must_keep": ["data_split_logic", "cv_protocol", "output_paths_contract"],
+                "forbid_model_family_switch": False,
+                "must_keep": ["data_split_logic", "output_paths_contract"],
             },
             "success_criteria": {
                 "primary_metric_name": primary_metric_name,
@@ -1287,10 +1279,10 @@ class StrategistAgent:
             else {}
         )
         try:
-            max_regions = int(app_constraints.get("max_code_regions_to_change", 3) or 3)
+            max_regions = int(app_constraints.get("max_code_regions_to_change", 5) or 5)
         except Exception:
-            max_regions = 3
-        max_regions = min(8, max(1, max_regions))
+            max_regions = 5
+        max_regions = min(12, max(1, max_regions))
         must_keep_raw = app_constraints.get("must_keep") if isinstance(app_constraints.get("must_keep"), list) else []
         must_keep: List[str] = []
         for item in must_keep_raw:
@@ -1301,12 +1293,12 @@ class StrategistAgent:
             if len(must_keep) >= 10:
                 break
         if not must_keep:
-            must_keep = ["data_split_logic", "cv_protocol", "output_paths_contract"]
+            must_keep = ["data_split_logic", "output_paths_contract"]
         out["application_constraints"] = {
             "edit_mode": "incremental",
             "max_code_regions_to_change": max_regions,
             "forbid_replanning": bool(app_constraints.get("forbid_replanning", True)),
-            "forbid_model_family_switch": bool(app_constraints.get("forbid_model_family_switch", True)),
+            "forbid_model_family_switch": bool(app_constraints.get("forbid_model_family_switch", False)),
             "must_keep": must_keep,
         }
 
@@ -1945,42 +1937,22 @@ $payload_json
         *** USER REQUEST ***
         "$user_request"
 
-        *** STRATEGY REASONING WORKFLOW (MANDATORY) ***
-        Before writing the strategy, reason in this order:
-        1. Determine the real business intent of THIS run.
-        2. Decide the operational scope recommendation from context:
-           - cleaning_only
-           - ml_only
-           - full_pipeline
-        3. Choose objective_type only AFTER understanding the run intent.
-           objective_type is a compact label for your conclusion, not the starting point.
-        4. Calibrate validation, techniques, and artifacts to the chosen scope.
-        5. Keep the plan minimal and credible for the current dataset, not generically impressive.
+        *** STRATEGY REASONING ***
+        Before writing the strategy, reason through these areas (order is yours to decide):
+        - What is the real business intent of THIS run?
+        - What operational scope does it need? (cleaning_only, ml_only, or full_pipeline)
+        - What objective_type best captures the intent? (this is a compact label for your conclusion, not the starting point)
+        - What validation, techniques, and artifacts are calibrated to that scope?
+        - What is the minimal credible plan for THIS dataset — not a generically impressive one?
 
         *** SCOPE AWARENESS ***
-        Not all business objectives require a full ML pipeline. Before designing your strategy,
-        determine what the objective actually needs:
+        Not all business objectives require a full ML pipeline. Determine what the objective actually needs
+        and set scope_recommendation accordingly:
+        - **cleaning_only**: Data quality / ETL objectives — strategy focused on cleaning, quality gates, validation. No ML models.
+        - **ml_only**: Pre-cleaned data — strategy focused on modeling, feature engineering, evaluation. Minimal cleaning.
+        - **full_pipeline**: End-to-end prediction/optimization work — cleaning through evaluation.
 
-        - **Data quality / ETL objectives** (e.g., "clean this dataset", "standardize columns",
-          "remove duplicates", "fix missing values"): Design a strategy focused ENTIRELY on data
-          cleaning and transformation. Do NOT propose ML models or predictions. Your strategy
-          should specify cleaning operations, quality gates, and validation criteria.
-          Set scope_recommendation: "cleaning_only" in your output.
-
-        - **ML on pre-cleaned data** (e.g., "this data is already clean, build a model",
-          "train a classifier on this prepared dataset"): Design a strategy focused on modeling.
-          Minimize cleaning steps (only validation/passthrough). Focus on model selection,
-          feature engineering, and evaluation.
-          Set scope_recommendation: "ml_only" in your output.
-
-        - **Full pipeline** (most common — e.g., "predict X", "optimize Y", "forecast Z"):
-          Design a complete strategy covering cleaning, feature engineering, modeling,
-          and evaluation. This is the default when the objective involves prediction or optimization.
-          Set scope_recommendation: "full_pipeline" in your output.
-
-        Your strategy's techniques, required_columns, and evaluation approach must align with
-        the scope you identify. A cleaning-only strategy should NOT include model training steps.
-        An ML-only strategy should NOT include heavy data cleaning operations.
+        Your techniques, required_columns, and evaluation approach must align with the scope you identify.
 
         *** YOUR TASK ***
         Design a strategy using FIRST PRINCIPLES REASONING.
@@ -1991,48 +1963,18 @@ $payload_json
 
         CRITICAL: Your reasoning must be universal and adaptable to ANY objective, not hardcoded to specific problem types.
 
-        *** STEP 1: UNDERSTAND THE BUSINESS QUESTION (First Principles) ***
-        Before proposing techniques, answer these fundamental questions:
+        *** BUSINESS UNDERSTANDING ***
+        Before proposing techniques, reason through:
+        - What is the business trying to learn, achieve, or decide?
+        - What action or decision follows from the analysis?
+        - What success metric captures business value (not generic ML metrics)?
 
-        1. **WHAT is the business trying to LEARN or ACHIEVE?**
-           - Are they trying to UNDERSTAND patterns? (descriptive/exploratory)
-           - Are they trying to PREDICT future outcomes? (predictive)
-           - Are they trying to OPTIMIZE a decision? (prescriptive)
-           - Are they trying to EXPLAIN why something happens? (causal/diagnostic)
-           - Are they trying to RANK/PRIORITIZE items? (comparative)
-
-        2. **WHAT is the DECISION or ACTION that follows from this analysis?**
-           - Will the business change prices? (optimization)
-           - Will they target specific customers? (classification/segmentation)
-           - Will they forecast demand? (time series prediction)
-           - Will they adjust a process? (causal inference)
-
-        3. **WHAT is the SUCCESS METRIC from the business perspective?**
-           - Maximizing revenue/profit? (optimization metric)
-           - Minimizing error in prediction? (accuracy metric)
-           - Understanding customer segments? (descriptive metric)
-           - Identifying causal relationships? (statistical significance)
-
-        *** STEP 2: TRANSLATE TO DATA SCIENCE OBJECTIVE ***
-        Based on your answers above, explicitly state:
-        - **objective_type**: One of [descriptive, predictive, prescriptive, causal, comparative]
-        - **objective_reasoning**: WHY you chose this type (2-3 sentences connecting business goal to objective type)
-        - **success_metric**: What metric best captures business success (not generic ML metrics)
+        Then translate to a data science framing:
+        - **objective_type**: Common types include descriptive, predictive, prescriptive, causal, comparative — but use whatever label best captures the intent. If none fits, propose your own with clear reasoning.
+        - **objective_reasoning**: WHY this type fits the business goal (2-3 sentences)
+        - **success_metric**: The metric that captures business success
         - **scope_recommendation**: One of [cleaning_only, ml_only, full_pipeline]
-        - **scope_reasoning**: WHY this run needs that scope and what is explicitly out of scope
-
-        Examples of objective_reasoning (DO NOT COPY, USE AS REFERENCE):
-        - "The business wants to find the optimal price point to maximize expected revenue (Price × Success Probability).
-           This is a PRESCRIPTIVE objective because the goal is not just to predict success, but to recommend the best
-           price per customer segment. Success metric: Expected Revenue."
-
-        - "The business wants to predict customer churn in the next 30 days to enable proactive retention.
-           This is a PREDICTIVE objective because the goal is forecasting a future binary outcome.
-           Success metric: Precision at top 20% (cost of false positives is high)."
-
-        - "The business wants to understand what customer segments exist based on behavior patterns.
-           This is a DESCRIPTIVE objective because the goal is pattern discovery, not prediction.
-           Success metric: Segment interpretability and separation quality (silhouette score)."
+        - **scope_reasoning**: WHY this run needs that scope and what is out of scope
 
         *** STRATEGY ROADMAP THINKING (for iterative ML work only when scope requires it) ***
         If this looks like predictive or optimization work that may evolve across multiple
@@ -2054,85 +1996,32 @@ $payload_json
         is unlikely to pay off. Do NOT force every strategy to include every phase or
         every advanced technique.
 
-        *** STEP 3: CONTEXT-AWARE STRATEGY DESIGN ***
-        You are a Chief Data Strategist designing executable plans. Your decisions must be driven by DATA CONTEXT,
-        not arbitrary thresholds or pre-defined capability lists.
+        *** FEASIBILITY AND STRATEGY DESIGN ***
+        Your decisions must be driven by THIS dataset's context, not arbitrary thresholds or canned capability lists.
 
-        FIRST PRINCIPLES FEASIBILITY (Replace Hardcoded Rules):
-        Instead of checking against fixed row limits, reason through:
+        For every technique you propose, reason through:
+        - **Statistical power**: Does the data have enough observations per feature to support this method?
+        - **Signal quality**: Given the data profile (missing rates, cardinality, variance), is this method appropriate?
+        - **Compute-value tradeoff**: Is the added complexity justified by expected lift over a simpler baseline?
+        - **Failure modes**: What happens if this underperforms? Define a credible fallback.
 
-        1. **STATISTICAL POWER**: Does the data have enough observations per feature to support the proposed method?
-           - Linear models: Generally robust even with moderate n/p ratios
-           - Tree ensembles: Can handle high dimensionality but need enough leaf samples
-           - Complex methods: Evaluate variance-bias tradeoff dynamically
+        For each technique, state WHY it fits this data profile, WHAT could fail, and WHAT the fallback is.
 
-        2. **SIGNAL-TO-NOISE**: Given the data profile (missing rates, cardinality, variance), what methods are appropriate?
-           - High noise → favor regularization, ensembles
-           - Clean signal → simpler methods may suffice
-           - Sparse features → consider appropriate encoding strategies
-
-        3. **COMPUTE-VALUE TRADEOFF**: Is the added complexity justified by expected lift?
-           - Simple baseline + small improvement can be the right answer
-           - Complex method + meaningful improvement can justify the investment
-           - State the marginal value of extra performance in business terms when possible
-
-        4. **FAILURE MODE ANALYSIS**: What happens if the method underperforms?
-           - Define graceful degradation: complex -> medium -> simple fallback chain
-           - Identify the likely failure mode and recovery action
-
-        DYNAMIC CAPABILITY ASSESSMENT:
-        Rather than fixed "can/cannot" lists, evaluate each technique against:
-        - Data volume and quality (from dataset summary)
-        - Feature complexity (cardinality, types, relationships)
-        - Business constraints (latency, interpretability, auditability)
-        - Available validation strategy (enough data for holdout? time-based split needed?)
-
-        STRATEGY CALIBRATION PROTOCOL:
-        For ANY proposed technique, explicitly state:
-        - WHY this technique fits the data profile (not generic "it's good for classification")
-        - WHAT could cause it to fail (data-specific risks)
-        - FALLBACK if primary approach underperforms (always have Plan B)
-        - EXPECTED LIFT over naive baseline (quantify the value proposition)
-
-        
-        *** DATA SCIENCE FIRST PRINCIPLES (UNIVERSAL REASONING) ***
-        1. **REPRESENTATIVENESS (The "Bias" Check):**
-           - Does your selected data subset represent the *Full Reality* of the problem?
-           - *Rule:* NEVER filter the target variable to a single class if the goal is comparison or prediction.
-        
-        2. **SIGNAL MAXIMIZATION (The "Feature" Check):**
-           - *Action:* Select ALL columns that might carry information. Be broad.
+        Key principles:
+        - Never filter the target variable to a single class if the goal involves comparison or prediction.
+        - Be broad with feature selection — include columns that might carry information.
+        - Be clear about what exactly you are solving for and why.
            
-        3. **TARGET CLARITY:**
-           - What exactly are we solving for? (e.g. Price Optimization -> Target = "Success Probability" given Price).
-           
-        *** STEP 4: DYNAMIC VALIDATION STRATEGY ***
+        *** VALIDATION STRATEGY ***
         Choose validation strategy from the actual data structure, leakage risk, and compute budget.
-        Reason explicitly about:
-        - temporal ordering or sequence dependence
-        - grouped entities that must not leak across splits
-        - label imbalance and whether stratification matters
-        - sample size relative to feature complexity
-        - whether the budget supports repeated CV or only a lighter estimate
-
+        Reason about temporal ordering, grouped entities, label imbalance, sample size vs feature complexity,
+        and whether the budget supports repeated CV or only a lighter estimate.
         Use numeric thresholds only when the current dataset context makes them defensible.
 
-        *** STEP 5: EVALUATE APPROPRIATE METRICS AND ARTIFACTS ***
-        Based on your scope_recommendation and objective_type, reason through what metrics
-        and artifacts best measure success.
-        DO NOT use pre-defined universal lists. Instead, think:
-        - What does the business care about? (revenue, accuracy, interpretability, coverage)
-        - What are the risks? (false positives costly? false negatives worse?)
-        - What validates the approach? (cross-validation, time split, holdout)
-        - Which outputs are genuinely needed for THIS run? cleaned datasets, enriched datasets,
-          reports, metrics, predictions, explanations, diagnostics, or none of some of them?
-
-        Examples (DO NOT COPY LITERALLY):
-        - Prescriptive (optimization): Expected Value, Revenue Lift, Opportunity Cost
-        - Predictive (classification): Precision@K, ROC-AUC, F1 (depends on cost asymmetry)
-        - Predictive (regression): MAE, RMSE, MAPE (depends on scale sensitivity)
-        - Descriptive (segmentation): Silhouette Score, Segment Size Distribution, Interpretability
-        - Causal: ATE (Average Treatment Effect), Statistical Significance, Confidence Intervals
+        *** METRICS AND ARTIFACTS ***
+        Reason through what metrics and artifacts best measure success for THIS run's scope and objective.
+        Think about what the business cares about, what the risks are, what validates the approach,
+        and which outputs are genuinely needed — not a generic checklist.
 
         *** CRITICAL OUTPUT RULES ***
         - RETURN ONLY RAW JSON. NO MARKDOWN. NO COMMENTS.
@@ -2141,7 +2030,7 @@ $payload_json
         - The object must include these keys:
           {
             "title": "Strategy name",
-            "objective_type": "One of: descriptive, predictive, prescriptive, causal, comparative",
+            "objective_type": "Label that best captures business intent (common: descriptive, predictive, prescriptive, causal, comparative — or propose your own)",
             "objective_reasoning": "2-3 sentences explaining WHY this objective_type fits the business goal",
             "success_metric": "Primary business metric (not generic ML metric)",
             "scope_recommendation": "One of: cleaning_only, ml_only, full_pipeline",
@@ -2172,9 +2061,9 @@ $payload_json
         - In WIDE-SCHEMA MODE, required_columns count must stay inside the configured budget.
         - NEVER invent, rename, abbreviate, or infer columns not present in AUTHORIZED COLUMN INVENTORY.
         - If uncertain about a column, omit it (do not hallucinate).
-        - "objective_reasoning" is MANDATORY and must connect business goal → objective_type.
-        - "scope_recommendation" and "scope_reasoning" are MANDATORY and must reflect THIS run, not generic defaults.
-        - "feasibility_analysis" is MANDATORY - no technique without data-driven justification.
+        - "objective_reasoning" must connect business goal → objective_type.
+        - "scope_recommendation" and "scope_reasoning" must reflect THIS run, not generic defaults.
+        - "feasibility_analysis" is required — no technique without data-driven justification.
         - "recommended_artifacts" must be scoped to THIS run. Cleaning-only runs should not require predictions.
         - "fallback_chain" must be concise and credible - every strategy needs a Plan B.
         - "reasoning" must include: why this fits the objective, what could fail, and recovery plan.
@@ -2828,18 +2717,12 @@ $payload_json
 
         scope_recommendation = self._infer_scope_recommendation(primary, user_request)
 
-        # Use LLM-generated objective_type (with fallback only when missing/blank)
+        # Use LLM-generated objective_type (with conservative fallback when missing)
         objective_type = str(primary.get("objective_type") or "").strip().lower()
         if not objective_type:
-            combined = " ".join([str(user_request or "").lower()])
-            if any(tok in combined for tok in ["optimiz", "maximize", "minimize", "optimal", "best price"]):
-                objective_type = "prescriptive"
-            elif any(tok in combined for tok in ["predict", "forecast", "estimate future"]):
-                objective_type = "predictive"
-            elif any(tok in combined for tok in ["explain", "why", "cause", "impact of"]):
-                objective_type = "causal"
-            else:
-                objective_type = "descriptive"
+            # LLM failed to produce an objective_type — default to predictive as the
+            # most common case; downstream agents will refine based on contract context.
+            objective_type = "predictive"
 
         # Use LLM-generated metrics (with scope-aware defaults only if missing)
         metrics = primary.get("recommended_evaluation_metrics", [])
