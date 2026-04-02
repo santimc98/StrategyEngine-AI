@@ -197,7 +197,7 @@ from src.utils.ml_validation import validate_model_metrics_consistency, validate
 from src.utils.json_sanitize import dump_json
 from src.utils.run_facts_pack import build_run_facts_pack, format_run_facts_block
 from src.utils.context_pack import build_context_pack, compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
-from src.utils.dataset_semantics import summarize_dataset_semantics
+from src.utils.dataset_semantics import summarize_dataset_semantics, build_target_lineage_summary
 from src.utils.dataset_evidence import read_header, scan_missingness, scan_uniques, sample_rows
 from src.utils.data_atlas import (
     build_data_atlas,
@@ -2961,6 +2961,7 @@ def _build_steward_facts_block(state: Dict[str, Any]) -> str:
     )
     column_sets = state.get("column_sets") if isinstance(state.get("column_sets"), dict) else {}
     data_profile = state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {}
+    target_lineage = state.get("target_lineage_summary") if isinstance(state.get("target_lineage_summary"), dict) else {}
     rows = profile.get("rows")
     cols = profile.get("cols")
     try:
@@ -3043,6 +3044,18 @@ def _build_steward_facts_block(state: Dict[str, Any]) -> str:
         lines.append(f"- Recommended target reconsideration: {recommended_primary_target}")
     if target_status_reason:
         lines.append(f"- Target validation reason: {target_status_reason}")
+    preliminary_target = str(target_lineage.get("preliminary_steward_target") or "").strip()
+    final_contract_target = str(target_lineage.get("final_contract_target") or "").strip()
+    lineage_status = str(target_lineage.get("lineage_status") or "").strip()
+    lineage_summary = str(target_lineage.get("lineage_summary") or "").strip()
+    if preliminary_target:
+        lines.append(f"- Preliminary steward target: {preliminary_target}")
+    if final_contract_target:
+        lines.append(f"- Final contract target: {final_contract_target}")
+    if lineage_status:
+        lines.append(f"- Target lineage status: {lineage_status}")
+    if lineage_summary:
+        lines.append(f"- Target lineage summary: {lineage_summary}")
     if training_rows_rule:
         lines.append(f"- Training rows rule: {training_rows_rule}")
     if scoring_rows_rule:
@@ -5395,6 +5408,7 @@ def _purge_execution_outputs(
         "data/plan.json",
         "data/evaluation_spec.json",
         "data/execution_contract.json",
+        "data/target_lineage_summary.json",
     }
     for path in preserve_paths or []:
         norm = _normalize_output_path(str(path or ""))
@@ -14875,26 +14889,24 @@ def run_steward(state: AgentState) -> AgentState:
         agent_models=agent_models,
     )
 
+    steward_summary_payload = {
+        "run_id": run_id,
+        "csv_path": csv_path,
+        "encoding": encoding,
+        "sep": sep,
+        "decimal": decimal,
+        "summary": summary,
+    }
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/steward_summary.txt", "w", encoding="utf-8") as f_summary:
             f_summary.write(summary or "")
         with open("data/steward_summary.json", "w", encoding="utf-8") as f_summary_json:
-            json.dump(
-                {
-                    "run_id": run_id,
-                    "csv_path": csv_path,
-                    "encoding": encoding,
-                    "sep": sep,
-                    "decimal": decimal,
-                    "summary": summary,
-                },
-                f_summary_json,
-                indent=2,
-                ensure_ascii=False,
-            )
+            json.dump(steward_summary_payload, f_summary_json, indent=2, ensure_ascii=False)
     except Exception as summary_err:
         print(f"Warning: failed to persist steward summary: {summary_err}")
+    if isinstance(state, dict):
+        state["steward_summary"] = steward_summary_payload
 
     print(f"Steward Detected: Encoding={encoding}, Sep='{sep}', Decimal='{decimal}'")
 
@@ -18046,6 +18058,34 @@ def run_execution_planner(state: AgentState) -> AgentState:
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
 
+    target_lineage_summary: Dict[str, Any] = {}
+    try:
+        steward_summary_for_lineage = (
+            state.get("steward_summary") if isinstance(state.get("steward_summary"), dict) else {}
+        )
+        if not steward_summary_for_lineage:
+            steward_summary_for_lineage = (
+                _load_json_safe(_abs_in_work(work_dir_abs, "data/steward_summary.json")) or {}
+            )
+        dataset_semantics_for_lineage = (
+            state.get("dataset_semantics") if isinstance(state.get("dataset_semantics"), dict) else {}
+        )
+        if not dataset_semantics_for_lineage:
+            dataset_semantics_for_lineage = (
+                _load_json_safe(_abs_in_work(work_dir_abs, "data/dataset_semantics.json")) or {}
+            )
+        target_lineage_summary = build_target_lineage_summary(
+            steward_summary_for_lineage,
+            dataset_semantics_for_lineage,
+            contract if isinstance(contract, dict) else {},
+        )
+        if target_lineage_summary:
+            dump_json(_abs_in_work(work_dir_abs, "data/target_lineage_summary.json"), target_lineage_summary)
+            if isinstance(state, dict):
+                state["target_lineage_summary"] = target_lineage_summary
+    except Exception as target_lineage_err:
+        print(f"Warning: failed to persist target_lineage_summary.json: {target_lineage_err}")
+
     if not planner_contract_accepted:
         error_message = "Execution planner produced a contract that failed validation (fail-closed)."
         if run_id:
@@ -18254,6 +18294,9 @@ def run_execution_planner(state: AgentState) -> AgentState:
         result["execution_contract_signature"] = contract_snapshot_payload.get("execution_contract_signature")
         result["execution_contract_min_signature"] = contract_snapshot_payload.get("execution_contract_min_signature")
         result["execution_contract_source"] = contract_snapshot_payload.get("execution_contract_source")
+    if target_lineage_summary:
+        result["target_lineage_summary"] = target_lineage_summary
+        result["target_lineage_summary_path"] = "data/target_lineage_summary.json"
     if view_payload:
         result.update(view_payload)
     if isinstance(policy, dict) and policy:
@@ -30792,6 +30835,112 @@ def _upsert_metric_improvement_summary(summary: str, line: str) -> str:
     return "\n".join(filtered)
 
 
+def _format_metric_round_value(value: Any) -> str:
+    coerced = _coerce_float(value)
+    if coerced is None:
+        return "unknown"
+    return f"{float(coerced):.12g}"
+
+
+def _build_metric_round_final_summary(
+    *,
+    metric_name: str,
+    kept: str,
+    baseline_metric: Optional[float],
+    candidate_metric: Optional[float],
+    final_metric: Optional[float],
+    metric_improved: bool,
+    governance_approved: bool,
+    candidate_assessment_status: str,
+) -> str:
+    metric_label = metric_name or "primary_metric"
+    baseline_text = _format_metric_round_value(baseline_metric)
+    candidate_text = _format_metric_round_value(candidate_metric)
+    final_text = _format_metric_round_value(final_metric)
+    candidate_status = candidate_assessment_status or "UNKNOWN"
+
+    if kept == "improved":
+        return (
+            f"The challenger was promoted as the final incumbent for {metric_label}. "
+            f"Metric moved from {baseline_text} to {candidate_text}; final incumbent metric={final_text}. "
+            f"Candidate governance status: {candidate_status}."
+        )
+    if kept == "baseline" and metric_improved:
+        if governance_approved:
+            rationale = "it was not selected as the final incumbent"
+        else:
+            rationale = "governance rejected the challenger"
+        return (
+            f"The challenger improved {metric_label} from {baseline_text} to {candidate_text}, "
+            f"but {rationale}. The final incumbent remained the approved baseline at {final_text}. "
+            f"Candidate governance status: {candidate_status}."
+        )
+    if kept == "baseline":
+        governance_clause = (
+            "passed governance review"
+            if governance_approved
+            else "did not pass governance review"
+        )
+        return (
+            f"The challenger {governance_clause} but did not improve {metric_label} versus the incumbent "
+            f"({baseline_text} vs candidate {candidate_text}). The final incumbent remained the approved baseline "
+            f"at {final_text}. Candidate governance status: {candidate_status}."
+        )
+    return (
+        f"Metric round completed for {metric_label}. Final incumbent metric={final_text}, "
+        f"baseline={baseline_text}, candidate={candidate_text}, kept={kept or 'unknown'}. "
+        f"Candidate governance status: {candidate_status}."
+    )
+
+
+def _sync_review_board_metric_facts(
+    payload: Dict[str, Any],
+    *,
+    metric_name: str,
+    baseline_metric: Optional[float],
+    candidate_metric: Optional[float],
+    final_metric: Optional[float],
+    kept: str,
+) -> None:
+    if not isinstance(payload, dict):
+        return
+    deterministic_facts = (
+        copy.deepcopy(payload.get("deterministic_facts"))
+        if isinstance(payload.get("deterministic_facts"), dict)
+        else {}
+    )
+    metrics_facts = (
+        copy.deepcopy(deterministic_facts.get("metrics"))
+        if isinstance(deterministic_facts.get("metrics"), dict)
+        else {}
+    )
+    primary = (
+        copy.deepcopy(metrics_facts.get("primary"))
+        if isinstance(metrics_facts.get("primary"), dict)
+        else {}
+    )
+    if metric_name:
+        primary["name"] = metric_name
+        primary.setdefault("canonical_name", metric_name)
+    if final_metric is not None:
+        primary["value"] = float(final_metric)
+        primary["source"] = "metric_round_finalization.final_incumbent"
+    primary["baseline_value"] = baseline_metric
+    primary["candidate_value"] = candidate_metric
+    primary["final_value"] = final_metric
+    primary["kept"] = kept
+    metrics_facts["primary"] = primary
+    metrics_facts["metric_round"] = {
+        "metric_name": metric_name,
+        "baseline_metric": baseline_metric,
+        "candidate_metric": candidate_metric,
+        "final_metric": final_metric,
+        "kept": kept,
+    }
+    deterministic_facts["metrics"] = metrics_facts
+    payload["deterministic_facts"] = deterministic_facts
+
+
 def _restore_metric_round_baseline_state(state: Dict[str, Any]) -> None:
     if not isinstance(state, dict):
         return
@@ -30930,6 +31079,7 @@ def _sync_review_board_verdict_after_metric_round(
         if isinstance(state.get("ml_improvement_round_candidate_board_payload"), dict)
         else board_payload
     )
+    candidate_assessment_summary = str(candidate_board_payload.get("summary") or "").strip()
     original_candidate_assessment_status = normalize_review_status(
         candidate_board_payload.get("candidate_assessment_status")
         or candidate_board_payload.get("status")
@@ -30952,6 +31102,16 @@ def _sync_review_board_verdict_after_metric_round(
             payload.get("candidate_assessment_status") or payload.get("status") or final_verdict
         )
     )
+    final_summary = _build_metric_round_final_summary(
+        metric_name=metric_name,
+        kept=kept,
+        baseline_metric=baseline_metric,
+        candidate_metric=candidate_metric,
+        final_metric=final_metric,
+        metric_improved=metric_improved,
+        governance_approved=governance_approved,
+        candidate_assessment_status=candidate_assessment_status,
+    )
     summary_line = (
         "METRIC_IMPROVEMENT_FINAL: "
         + f"kept={kept or 'unknown'} "
@@ -30961,7 +31121,10 @@ def _sync_review_board_verdict_after_metric_round(
         + f"candidate={candidate_metric} "
         + f"min_delta={min_delta}"
     )
-    payload["summary"] = _upsert_metric_improvement_summary(str(payload.get("summary") or ""), summary_line)
+    payload["final_incumbent_summary"] = final_summary
+    if candidate_assessment_summary:
+        payload["candidate_assessment_summary"] = candidate_assessment_summary[:1200]
+    payload["summary"] = _upsert_metric_improvement_summary(final_summary, summary_line)
     payload["status"] = final_verdict
     payload["final_review_verdict"] = final_verdict
     payload["candidate_assessment_status"] = candidate_assessment_status
@@ -30992,6 +31155,14 @@ def _sync_review_board_verdict_after_metric_round(
         "force_finalize": bool(force_finalize),
         "force_finalize_reason": force_finalize_reason,
     }
+    _sync_review_board_metric_facts(
+        payload,
+        metric_name=metric_name,
+        baseline_metric=baseline_metric,
+        candidate_metric=candidate_metric,
+        final_metric=final_metric,
+        kept=kept,
+    )
     state["review_board_verdict"] = payload
     try:
         os.makedirs("data", exist_ok=True)

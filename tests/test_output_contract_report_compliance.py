@@ -361,6 +361,150 @@ class TestBuildOutputContractReport:
         assert report["missing"] == []
         assert report["overall_status"] == "ok"
 
+    def test_empty_scoring_output_errors_when_primary_scoring_cohort_exists(self, tmp_path):
+        clean_dir = tmp_path / "artifacts" / "clean"
+        ml_dir = tmp_path / "artifacts" / "ml"
+        data_dir = tmp_path / "data"
+        clean_dir.mkdir(parents=True)
+        ml_dir.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+
+        (clean_dir / "leads_full_archive.csv").write_text(
+            "\n".join(
+                [
+                    "lead_id,created_at",
+                    "L1,2025-06-15",
+                    "L2,2025-07-02",
+                    "L3,2025-07-20",
+                    "L4,2024-12-01",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (ml_dir / "leads_scored.csv").write_text(
+            "lead_id,win_probability,score_decile,created_at\n",
+            encoding="utf-8",
+        )
+        (data_dir / "cleaning_manifest.json").write_text('{"output_dialect": {"sep": ",", "encoding": "utf-8"}}')
+
+        contract = {
+            "scoring_rows_rule_primary": "created_at >= '2025-07-01'",
+            "required_outputs": [
+                {
+                    "path": "artifacts/clean/leads_full_archive.csv",
+                    "owner": "data_engineer",
+                    "required": True,
+                    "intent": "full_fidelity_archive",
+                    "kind": "dataset",
+                },
+                {
+                    "path": "artifacts/ml/leads_scored.csv",
+                    "owner": "ml_engineer",
+                    "required": True,
+                    "intent": "scoring_output",
+                    "kind": "predictions",
+                },
+            ],
+            "artifact_requirements": {
+                "required_files": [
+                    {"path": "artifacts/clean/leads_full_archive.csv"},
+                    {"path": "artifacts/ml/leads_scored.csv"},
+                ],
+                "full_archive_dataset": {"output_path": "artifacts/clean/leads_full_archive.csv"},
+                "scored_rows_schema": {
+                    "required_columns": ["lead_id", "win_probability", "score_decile"],
+                },
+            },
+        }
+
+        original_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            report = build_output_contract_report(contract, work_dir=".")
+        finally:
+            os.chdir(original_cwd)
+
+        assert report["overall_status"] == "error"
+        artifact_report = report["artifact_requirements_report"]
+        assert artifact_report["status"] == "error"
+        mismatches = artifact_report["row_count_report"]["mismatches"]
+        assert len(mismatches) == 1
+        assert mismatches[0]["path"] == "artifacts/ml/leads_scored.csv"
+        assert mismatches[0]["expected_row_count"] == 2
+        assert mismatches[0]["actual_row_count"] == 0
+
+    def test_holdout_predictions_must_match_secondary_selector_rule(self, tmp_path):
+        clean_dir = tmp_path / "artifacts" / "clean"
+        ml_dir = tmp_path / "artifacts" / "ml"
+        data_dir = tmp_path / "data"
+        clean_dir.mkdir(parents=True)
+        ml_dir.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+
+        (clean_dir / "leads_full_archive.csv").write_text(
+            "\n".join(
+                [
+                    "lead_id,created_at",
+                    "L1,2025-01-10",
+                    "L2,2025-03-05",
+                    "L3,2024-11-01",
+                    "L4,2025-08-01",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (ml_dir / "holdout_predictions.csv").write_text(
+            "\n".join(
+                [
+                    "lead_id,created_at,win_probability,score_decile",
+                    "L3,2024-11-01,0.20,4",
+                    "L3B,2024-12-20,0.15,5",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (data_dir / "cleaning_manifest.json").write_text('{"output_dialect": {"sep": ",", "encoding": "utf-8"}}')
+
+        contract = {
+            "scoring_rows_rule_secondary": "created_at BETWEEN '2025-01-01' AND '2025-06-30'",
+            "required_outputs": [
+                {
+                    "path": "artifacts/clean/leads_full_archive.csv",
+                    "owner": "data_engineer",
+                    "required": True,
+                    "intent": "full_fidelity_archive",
+                    "kind": "dataset",
+                },
+                {
+                    "path": "artifacts/ml/holdout_predictions.csv",
+                    "owner": "ml_engineer",
+                    "required": True,
+                    "intent": "holdout_predictions",
+                    "kind": "predictions",
+                },
+            ],
+            "artifact_requirements": {
+                "required_files": [
+                    {"path": "artifacts/clean/leads_full_archive.csv"},
+                    {"path": "artifacts/ml/holdout_predictions.csv"},
+                ],
+                "full_archive_dataset": {"output_path": "artifacts/clean/leads_full_archive.csv"},
+            },
+        }
+
+        original_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            report = build_output_contract_report(contract, work_dir=".")
+        finally:
+            os.chdir(original_cwd)
+
+        assert report["overall_status"] == "error"
+        selector_report = report["artifact_requirements_report"]["selector_report"]
+        assert len(selector_report["mismatches"]) == 1
+        assert selector_report["mismatches"][0]["path"] == "artifacts/ml/holdout_predictions.csv"
+        assert selector_report["mismatches"][0]["all_rows_match_rule"] is False
+
 
 class TestRealWorldScenarios:
     """Test realistic scenarios that previously failed."""

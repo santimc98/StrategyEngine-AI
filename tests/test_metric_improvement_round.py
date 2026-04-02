@@ -639,6 +639,59 @@ def test_sync_review_board_verdict_promotes_authoritative_status_and_preserves_c
     assert payload["candidate_assessment_status"] == "NEEDS_IMPROVEMENT"
 
 
+def test_sync_review_board_verdict_rewrites_summary_and_primary_fact_to_final_incumbent(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    Path("data").mkdir(parents=True, exist_ok=True)
+    board_payload = {
+        "status": "APPROVED",
+        "final_review_verdict": "APPROVED",
+        "candidate_assessment_status": "APPROVED",
+        "summary": "The system recovered to PR-AUC 0.2373 after regression.",
+        "deterministic_facts": {
+            "metrics": {
+                "primary": {
+                    "name": "pr_auc",
+                    "value": 0.23731575773380917,
+                    "source": "artifacts/ml/cv_metrics.json",
+                }
+            }
+        },
+    }
+    Path("data/review_board_verdict.json").write_text(json.dumps(board_payload), encoding="utf-8")
+    state = {
+        "review_verdict": "APPROVED",
+        "review_board_verdict": dict(board_payload),
+    }
+    metric_loop_state = {
+        "target": {"name": "pr_auc", "min_delta": 0.0005},
+        "round": {"baseline": {"metric_value": 0.25671148099991203}},
+        "candidate": {"metric_value": 0.23731575773380917},
+        "final": {"label": "baseline", "metric_value": 0.25671148099991203},
+        "selection": {
+            "selected_label": "baseline",
+            "approved": True,
+            "governance_approved": True,
+            "metric_improved": False,
+            "improved_by_metric": False,
+            "stability_ok": True,
+            "deterministic_blockers": False,
+            "advisory_review_mode": True,
+            "force_finalize": False,
+        },
+    }
+
+    _sync_review_board_verdict_after_metric_round(state, metric_loop_state=metric_loop_state)
+
+    payload = state["review_board_verdict"]
+    assert payload["candidate_assessment_summary"] == "The system recovered to PR-AUC 0.2373 after regression."
+    assert payload["final_incumbent_summary"].startswith("The challenger passed governance review but did not improve pr_auc")
+    assert "approved baseline at 0.256711481" in payload["summary"]
+    primary = payload["deterministic_facts"]["metrics"]["primary"]
+    assert primary["value"] == pytest.approx(0.25671148099991203, abs=1e-12)
+    assert primary["candidate_value"] == pytest.approx(0.23731575773380917, abs=1e-12)
+    assert primary["kept"] == "baseline"
+
+
 def test_finalize_round_refreshes_output_contract_after_baseline_restore(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     metrics_path = Path("artifacts/ml/cv_metrics.json")

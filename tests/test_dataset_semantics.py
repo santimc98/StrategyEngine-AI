@@ -1,4 +1,4 @@
-from src.utils.dataset_semantics import summarize_dataset_semantics
+from src.utils.dataset_semantics import summarize_dataset_semantics, build_target_lineage_summary
 
 
 def test_summarize_dataset_semantics_surfaces_target_validation_status():
@@ -26,3 +26,30 @@ def test_summarize_dataset_semantics_surfaces_target_validation_status():
     assert "target_status: invalid" in summary
     assert "recommended_primary_target: renewal_probability" in summary
     assert "target_status_reason: score_label is 96% missing" in summary
+
+
+def test_build_target_lineage_summary_preserves_preliminary_validated_and_final_targets():
+    lineage = build_target_lineage_summary(
+        {
+            "summary": "## Target Variable Decision\n**Recommended primary target: `won_90d`**",
+        },
+        {
+            "primary_target": "pipeline_amount_90d",
+            "target_status": "questioned",
+            "recommended_primary_target": "pipeline_amount_90d",
+            "target_status_reason": "Zero inflation requires extra care.",
+        },
+        {
+            "task_semantics": {
+                "primary_target": "won_90d",
+            }
+        },
+    )
+
+    assert lineage["preliminary_steward_target"] == "won_90d"
+    assert lineage["validated_steward_target"] == "pipeline_amount_90d"
+    assert lineage["final_contract_target"] == "won_90d"
+    assert lineage["preliminary_summary_conflicts_with_validated_semantics"] is True
+    assert lineage["contract_differs_from_validated_steward"] is True
+    assert lineage["contract_matches_preliminary_steward"] is True
+    assert lineage["lineage_status"] == "diverged"

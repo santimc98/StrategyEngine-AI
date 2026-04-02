@@ -22,6 +22,7 @@ from src.utils.csv_dialect import (
     read_csv_sample,
     coerce_number,
 )
+from src.utils.dataset_semantics import build_target_lineage_summary
 
 
 def _detect_primary_language(text: str, preferred_language: Optional[str] = None) -> str:
@@ -1089,6 +1090,144 @@ def _build_metric_progress_summary(
     return summary
 
 
+def _format_board_metric_value(value: Any) -> str:
+    coerced = _coerce_float(value)
+    if coerced is None:
+        return "unknown"
+    return f"{float(coerced):.12g}"
+
+
+def _build_final_incumbent_board_summary(
+    review_board_verdict: Dict[str, Any],
+    canonical_metric_name: str,
+    canonical_metric_value: Optional[float],
+) -> str:
+    verdict = review_board_verdict if isinstance(review_board_verdict, dict) else {}
+    finalization = (
+        verdict.get("metric_round_finalization")
+        if isinstance(verdict.get("metric_round_finalization"), dict)
+        else {}
+    )
+    metric_name = str(
+        finalization.get("metric_name")
+        or canonical_metric_name
+        or ""
+    ).strip()
+    if not finalization:
+        return str(verdict.get("summary") or "").strip()
+
+    kept = str(finalization.get("kept") or "").strip().lower() or "unknown"
+    baseline_metric = _coerce_float(finalization.get("baseline_metric"))
+    candidate_metric = _coerce_float(finalization.get("candidate_metric"))
+    final_metric = _coerce_float(finalization.get("final_metric"))
+    if final_metric is None and canonical_metric_value is not None:
+        final_metric = float(canonical_metric_value)
+    metric_improved = bool(
+        finalization.get("metric_improved")
+        if isinstance(finalization.get("metric_improved"), bool)
+        else finalization.get("improved_by_metric")
+    )
+    governance_approved = bool(
+        finalization.get("governance_approved")
+        if isinstance(finalization.get("governance_approved"), bool)
+        else finalization.get("approved")
+    )
+    candidate_status = str(verdict.get("candidate_assessment_status") or verdict.get("status") or "UNKNOWN").strip()
+    metric_label = metric_name or "primary_metric"
+    baseline_text = _format_board_metric_value(baseline_metric)
+    candidate_text = _format_board_metric_value(candidate_metric)
+    final_text = _format_board_metric_value(final_metric)
+
+    if kept == "improved":
+        return (
+            f"The challenger became the final incumbent for {metric_label}. "
+            f"Metric moved from {baseline_text} to {candidate_text}; final incumbent metric={final_text}. "
+            f"Candidate governance status: {candidate_status}."
+        )
+    if kept == "baseline" and metric_improved:
+        reason = "governance rejected the challenger" if not governance_approved else "it was not selected as the incumbent"
+        return (
+            f"The challenger improved {metric_label} from {baseline_text} to {candidate_text}, but {reason}. "
+            f"The final incumbent remained the approved baseline at {final_text}. "
+            f"Candidate governance status: {candidate_status}."
+        )
+    if kept == "baseline":
+        governance_clause = "passed governance review" if governance_approved else "did not pass governance review"
+        return (
+            f"The challenger {governance_clause} but did not improve {metric_label} versus the incumbent "
+            f"({baseline_text} vs candidate {candidate_text}). The final incumbent remained the approved baseline "
+            f"at {final_text}. Candidate governance status: {candidate_status}."
+        )
+    return (
+        f"Metric round completed for {metric_label}. Final incumbent metric={final_text}, "
+        f"baseline={baseline_text}, candidate={candidate_text}, kept={kept}. "
+        f"Candidate governance status: {candidate_status}."
+    )
+
+
+def _sanitize_review_board_verdict_for_translator(
+    review_board_verdict: Dict[str, Any],
+    canonical_metric_name: str,
+    canonical_metric_value: Optional[float],
+) -> Dict[str, Any]:
+    if not isinstance(review_board_verdict, dict) or not review_board_verdict:
+        return {}
+    sanitized = copy.deepcopy(review_board_verdict)
+    final_summary = str(
+        sanitized.get("final_incumbent_summary")
+        or _build_final_incumbent_board_summary(
+            sanitized,
+            canonical_metric_name,
+            canonical_metric_value,
+        )
+        or ""
+    ).strip()
+    if final_summary:
+        sanitized["final_incumbent_summary"] = final_summary
+        sanitized["summary"] = final_summary
+
+    finalization = (
+        sanitized.get("metric_round_finalization")
+        if isinstance(sanitized.get("metric_round_finalization"), dict)
+        else {}
+    )
+    if finalization:
+        deterministic_facts = (
+            copy.deepcopy(sanitized.get("deterministic_facts"))
+            if isinstance(sanitized.get("deterministic_facts"), dict)
+            else {}
+        )
+        metrics_facts = (
+            copy.deepcopy(deterministic_facts.get("metrics"))
+            if isinstance(deterministic_facts.get("metrics"), dict)
+            else {}
+        )
+        primary = (
+            copy.deepcopy(metrics_facts.get("primary"))
+            if isinstance(metrics_facts.get("primary"), dict)
+            else {}
+        )
+        final_metric = _coerce_float(finalization.get("final_metric"))
+        if final_metric is None and canonical_metric_value is not None:
+            final_metric = float(canonical_metric_value)
+        metric_name = str(finalization.get("metric_name") or canonical_metric_name or primary.get("name") or "").strip()
+        if metric_name:
+            primary["name"] = metric_name
+            primary.setdefault("canonical_name", metric_name)
+        if final_metric is not None:
+            primary["value"] = float(final_metric)
+            primary["source"] = "metric_round_finalization.final_incumbent"
+        primary["baseline_value"] = finalization.get("baseline_metric")
+        primary["candidate_value"] = finalization.get("candidate_metric")
+        primary["final_value"] = final_metric
+        primary["kept"] = finalization.get("kept")
+        metrics_facts["primary"] = primary
+        deterministic_facts["metrics"] = metrics_facts
+        sanitized["deterministic_facts"] = deterministic_facts
+
+    return sanitized
+
+
 def _build_business_objective_summary(
     business_objective: Any,
     *,
@@ -1653,7 +1792,11 @@ def _summarize_ml_engineer_change_summary(
     else:
         summary["current_incumbent_basis"] = "original_approved_baseline"
     if isinstance(review_board_verdict, dict) and review_board_verdict:
-        board_summary = str(review_board_verdict.get("summary") or "").strip()
+        board_summary = str(
+            review_board_verdict.get("final_incumbent_summary")
+            or review_board_verdict.get("summary")
+            or ""
+        ).strip()
         required_actions = review_board_verdict.get("required_actions")
         if board_summary:
             summary["review_board_summary"] = board_summary[:600]
@@ -3348,6 +3491,7 @@ def _extract_steward_signal_pack(
     steward_summary: Dict[str, Any],
     data_profile: Dict[str, Any],
     dataset_semantics: Dict[str, Any],
+    target_lineage_summary: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     if not isinstance(steward_summary, dict):
         steward_summary = {}
@@ -3355,6 +3499,8 @@ def _extract_steward_signal_pack(
         data_profile = {}
     if not isinstance(dataset_semantics, dict):
         dataset_semantics = {}
+    if not isinstance(target_lineage_summary, dict):
+        target_lineage_summary = {}
 
     selectors = dataset_semantics.get("selectors", {}) if isinstance(dataset_semantics.get("selectors"), dict) else {}
     target_analysis = dataset_semantics.get("target_analysis", {}) if isinstance(dataset_semantics.get("target_analysis"), dict) else {}
@@ -3391,10 +3537,22 @@ def _extract_steward_signal_pack(
             }
         )
 
+    summary_excerpt = str(steward_summary.get("summary") or "")[:1200]
+    summary_excerpt_scope = "preliminary_steward_assessment"
+    summary_excerpt_warning = ""
+    if bool(target_lineage_summary.get("preliminary_summary_conflicts_with_validated_semantics")):
+        summary_excerpt_scope = "preliminary_steward_assessment"
+        summary_excerpt_warning = (
+            "The steward summary excerpt reflects the preliminary assessment and conflicts with the "
+            "validated steward semantics. Preserve that disagreement explicitly if it matters."
+        )
+
     return {
         "rows": profile_stats.get("n_rows"),
         "cols": profile_stats.get("n_cols"),
         "primary_target": selectors.get("primary_target") or target_analysis.get("primary_target"),
+        "target_status": target_analysis.get("target_status"),
+        "recommended_primary_target": target_analysis.get("recommended_primary_target"),
         "training_rows_rule": selectors.get("training_rows_rule"),
         "scoring_rows_rule": selectors.get("scoring_rows_rule_primary") or selectors.get("scoring_rows_rule_secondary"),
         "split_candidates": selectors.get("split_candidates", []),
@@ -3407,7 +3565,10 @@ def _extract_steward_signal_pack(
             "cross_validation_feasible": compute_hints.get("cross_validation_feasible"),
             "deep_learning_feasible": compute_hints.get("deep_learning_feasible"),
         },
-        "summary_excerpt": str(steward_summary.get("summary") or "")[:1200],
+        "summary_excerpt": summary_excerpt,
+        "summary_excerpt_scope": summary_excerpt_scope,
+        "summary_excerpt_warning": summary_excerpt_warning,
+        "target_lineage": target_lineage_summary,
     }
 
 class BusinessTranslatorAgent:
@@ -3578,6 +3739,18 @@ class BusinessTranslatorAgent:
             or _safe_load_json(os.path.join("work", "data", "dataset_semantics.json"))
             or {}
         )
+        target_lineage_summary = (
+            _safe_load_json("data/target_lineage_summary.json")
+            or _safe_load_json(os.path.join(work_dir, "data", "target_lineage_summary.json"))
+            or _safe_load_json(os.path.join("work", "data", "target_lineage_summary.json"))
+            or {}
+        )
+        if not isinstance(target_lineage_summary, dict) or not target_lineage_summary:
+            target_lineage_summary = build_target_lineage_summary(
+                steward_summary if isinstance(steward_summary, dict) else {},
+                dataset_semantics if isinstance(dataset_semantics, dict) else {},
+                contract if isinstance(contract, dict) else {},
+            )
         cleaning_manifest = (
             state.get("cleaning_manifest")
             if isinstance(state.get("cleaning_manifest"), dict)
@@ -3662,6 +3835,7 @@ class BusinessTranslatorAgent:
             steward_summary=steward_summary,
             data_profile=data_profile,
             dataset_semantics=dataset_semantics,
+            target_lineage_summary=target_lineage_summary,
         )
         weights_path = _first_artifact_path(artifact_index, "weights")
         predictions_path = _first_artifact_path(artifact_index, "predictions")
@@ -3980,11 +4154,16 @@ class BusinessTranslatorAgent:
             canonical_metric_name=_canonical_metric_name,
             canonical_metric_value=_canonical_metric_value,
         )
+        sanitized_review_board_verdict = _sanitize_review_board_verdict_for_translator(
+            review_board_verdict if isinstance(review_board_verdict, dict) else {},
+            _canonical_metric_name,
+            _canonical_metric_value,
+        )
         ml_engineer_change_summary = _summarize_ml_engineer_change_summary(
             metric_loop_context=metric_loop_context if isinstance(metric_loop_context, dict) else {},
             canonical_metric_name=_canonical_metric_name,
             canonical_metric_value=_canonical_metric_value,
-            review_board_verdict=review_board_verdict if isinstance(review_board_verdict, dict) else {},
+            review_board_verdict=sanitized_review_board_verdict,
         )
         final_incumbent_metric_records = []
         if isinstance(slot_payloads, dict):
@@ -4123,6 +4302,7 @@ class BusinessTranslatorAgent:
             "strategy_title": strategy_title,
             "review_verdict": review_verdict or compliance,
             "steward_signal_pack": steward_signal_pack,
+            "target_lineage": target_lineage_summary,
             "data_adequacy": {
                 "status": (data_adequacy_report or {}).get("status"),
                 "reasons": (data_adequacy_report or {}).get("reasons", [])[:3],
@@ -4150,6 +4330,7 @@ class BusinessTranslatorAgent:
             "slot_payloads": slot_payloads,
             "slot_coverage": slot_coverage_context,
             "steward_signal_pack": steward_signal_pack,
+            "target_lineage": target_lineage_summary,
             "steward_context": steward_context,
             "cleaning_context": cleaning_context,
             "cleaning_progress_summary": cleaning_progress_summary,
@@ -4158,7 +4339,7 @@ class BusinessTranslatorAgent:
             "run_summary_context": run_summary_context,
             "artifact_manifest": manifest,
             "data_adequacy_report_json": data_adequacy_report,
-            "review_board_verdict_json": review_board_verdict if isinstance(review_board_verdict, dict) else {},
+            "review_board_verdict_json": sanitized_review_board_verdict,
             "alignment_check": alignment_check_context,
             "model_metrics_context": model_metrics_context,
             "ml_engineer_change_summary": ml_engineer_change_summary,
@@ -4254,6 +4435,9 @@ OUTCOME ASSESSMENT
 - What was the business objective? Did the system achieve it?
 - If reviewer or adequacy signals differ from the authoritative outcome,
   explain the discrepancy but do NOT override the authoritative outcome.
+- If target_lineage is present, preserve the difference between the
+  preliminary steward assessment, the validated steward semantics, and the
+  final contract target. Do not rewrite those stages as if they were always aligned.
 - If a metric improvement loop ran, what was the best metric achieved
   vs the baseline? How many techniques were tried?
 - If the canonical_primary_metric in FACTS_BLOCK differs from metrics

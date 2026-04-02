@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+import re
 from typing import List, Dict, Any, Tuple, Optional
 
 
@@ -305,6 +306,266 @@ def _count_csv_rows(
     return int(total)
 
 
+def _split_contract_rule_clauses(rule: str) -> List[str]:
+    text = str(rule or "").strip()
+    if not text:
+        return []
+    protected = re.sub(
+        r"(?is)\bBETWEEN\s+'[^']+'\s+AND\s+'[^']+'",
+        lambda m: m.group(0).replace(" AND ", " __BETWEEN_AND__ "),
+        text,
+    )
+    clauses = re.split(r"(?i)\s+AND\s+", protected)
+    return [clause.replace("__BETWEEN_AND__", " AND ").strip() for clause in clauses if clause.strip()]
+
+
+def _coerce_rule_literal(series: "pd.Series", raw_value: str):
+    import pandas as pd
+
+    value = str(raw_value).strip()
+    if value.startswith("'") and value.endswith("'"):
+        value = value[1:-1]
+
+    parsed_int = _coerce_positive_int(value)
+    if parsed_int is not None and not re.search(r"[-:/T]", value):
+        return pd.to_numeric(series, errors="coerce"), float(parsed_int)
+
+    if re.search(r"\d{4}-\d{2}-\d{2}", value):
+        return pd.to_datetime(series, errors="coerce"), pd.Timestamp(value)
+
+    return series.astype(str).str.strip(), str(value)
+
+
+def _evaluate_contract_rule(df, rule: str) -> Tuple[Optional["pd.Series"], List[str], List[str]]:
+    import pandas as pd
+
+    clauses = _split_contract_rule_clauses(rule)
+    if not clauses:
+        return None, [], ["empty_rule"]
+
+    mask = pd.Series(True, index=df.index)
+    referenced_cols: List[str] = []
+    errors: List[str] = []
+
+    for clause in clauses:
+        between_match = re.match(
+            r"(?is)^([A-Za-z_][A-Za-z0-9_]*)\s+BETWEEN\s+'([^']+)'\s+AND\s+'([^']+)'$",
+            clause,
+        )
+        if between_match:
+            col, low_raw, high_raw = between_match.groups()
+            referenced_cols.append(col)
+            if col not in df.columns:
+                errors.append(f"missing_column:{col}")
+                continue
+            series = pd.to_datetime(df[col], errors="coerce")
+            mask &= series.between(pd.Timestamp(low_raw), pd.Timestamp(high_raw), inclusive="both")
+            continue
+
+        null_match = re.match(r"(?is)^([A-Za-z_][A-Za-z0-9_]*)\s+IS\s+(NOT\s+)?NULL$", clause)
+        if null_match:
+            col, not_token = null_match.groups()
+            referenced_cols.append(col)
+            if col not in df.columns:
+                errors.append(f"missing_column:{col}")
+                continue
+            mask &= df[col].notna() if not_token else df[col].isna()
+            continue
+
+        compare_match = re.match(
+            r"(?is)^([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|=|<|>)\s*('[^']*'|[-+]?\d+(?:\.\d+)?)$",
+            clause,
+        )
+        if compare_match:
+            col, operator, raw_value = compare_match.groups()
+            referenced_cols.append(col)
+            if col not in df.columns:
+                errors.append(f"missing_column:{col}")
+                continue
+            lhs, rhs = _coerce_rule_literal(df[col], raw_value)
+            if operator == "<=":
+                mask &= lhs <= rhs
+            elif operator == ">=":
+                mask &= lhs >= rhs
+            elif operator == "<":
+                mask &= lhs < rhs
+            elif operator == ">":
+                mask &= lhs > rhs
+            else:
+                mask &= lhs == rhs
+            continue
+
+        errors.append(f"unsupported_clause:{clause}")
+
+    if errors:
+        return None, referenced_cols, errors
+    return mask, referenced_cols, []
+
+
+def _resolve_contract_subset_validation(
+    contract: Dict[str, Any],
+    artifact_requirements: Dict[str, Any],
+    work_dir: str,
+    dialect: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    import pandas as pd
+    from src.utils.contract_accessors import (
+        get_artifact_requirements,
+        get_cleaned_dataset_output_path,
+        get_declared_artifact_path_by_intent,
+        normalize_artifact_path,
+    )
+
+    artifact_requirements = dict(artifact_requirements) if isinstance(artifact_requirements, dict) else {}
+    hydrated_file_schemas = dict(artifact_requirements.get("file_schemas") or {})
+
+    checked: List[Dict[str, Any]] = []
+    mismatches: List[Dict[str, Any]] = []
+    mismatch_seen = set()
+    errors: List[Dict[str, Any]] = []
+
+    if not isinstance(contract, dict):
+        return hydrated_file_schemas, {
+            "checked": checked,
+            "mismatches": mismatches,
+            "errors": errors,
+            "summary": "Subset selector checks skipped: invalid contract",
+        }
+
+    top_artifacts = get_artifact_requirements(contract)
+    full_archive_cfg = top_artifacts.get("full_archive_dataset") if isinstance(top_artifacts, dict) else {}
+    task_semantics = contract.get("task_semantics") if isinstance(contract.get("task_semantics"), dict) else {}
+    split_spec = contract.get("split_spec") if isinstance(contract.get("split_spec"), dict) else {}
+    source_rel = (
+        get_declared_artifact_path_by_intent(contract, "full_fidelity_archive", owner="data_engineer", required_only=True)
+        or (full_archive_cfg.get("output_path") if isinstance(full_archive_cfg, dict) else "")
+        or get_cleaned_dataset_output_path(contract)
+    )
+    source_rel = normalize_artifact_path(source_rel)
+    source_abs = os.path.join(work_dir, source_rel) if source_rel else ""
+    source_df = None
+    if source_abs and os.path.exists(source_abs):
+        sep = dialect.get("sep", ",") if isinstance(dialect, dict) else ","
+        encoding = dialect.get("encoding", "utf-8") if isinstance(dialect, dict) else "utf-8"
+        source_df = pd.read_csv(source_abs, sep=sep, encoding=encoding)
+
+    checks = [
+        {
+            "intent": "holdout_predictions",
+            "rule": str(
+                contract.get("scoring_rows_rule_secondary")
+                or task_semantics.get("scoring_rows_rule_secondary")
+                or split_spec.get("scoring_rows_rule_secondary")
+                or ""
+            ).strip(),
+        },
+        {
+            "intent": "scoring_output",
+            "rule": str(
+                contract.get("scoring_rows_rule_primary")
+                or task_semantics.get("scoring_rows_rule_primary")
+                or split_spec.get("scoring_rows_rule_primary")
+                or ""
+            ).strip(),
+        },
+    ]
+
+    for item in checks:
+        intent = item["intent"]
+        rule = item["rule"]
+        if not rule:
+            continue
+
+        output_rel = get_declared_artifact_path_by_intent(contract, intent, owner="ml_engineer", required_only=True)
+        output_rel = normalize_artifact_path(output_rel)
+        if not output_rel:
+            continue
+        output_abs = os.path.join(work_dir, output_rel)
+
+        expected_count = None
+        referenced_cols: List[str] = []
+        if source_df is not None:
+            source_mask, referenced_cols, source_errors = _evaluate_contract_rule(source_df, rule)
+            if source_errors:
+                errors.append(
+                    {
+                        "path": output_rel,
+                        "intent": intent,
+                        "rule": rule,
+                        "source_path": source_rel,
+                        "errors": source_errors,
+                    }
+                )
+            elif source_mask is not None:
+                expected_count = int(source_mask.sum())
+
+        schema_obj = hydrated_file_schemas.get(output_rel)
+        if not isinstance(schema_obj, dict):
+            schema_obj = {}
+        if expected_count is not None and _coerce_positive_int(schema_obj.get("expected_row_count")) is None:
+            schema_obj["expected_row_count"] = int(expected_count)
+            schema_obj.setdefault("selector_rule", rule)
+            schema_obj.setdefault("selector_intent", intent)
+            hydrated_file_schemas[output_rel] = schema_obj
+
+        if not os.path.exists(output_abs):
+            continue
+
+        actual_count = _count_csv_rows(output_abs, dialect=dialect)
+        payload: Dict[str, Any] = {
+            "path": output_rel,
+            "intent": intent,
+            "rule": rule,
+            "actual_row_count": actual_count,
+            "expected_row_count": expected_count,
+            "matches": expected_count is None or actual_count == expected_count,
+        }
+
+        def _record_mismatch(kind: str) -> None:
+            key = (output_rel, intent, kind)
+            if key in mismatch_seen:
+                return
+            mismatch_seen.add(key)
+            mismatch_payload = dict(payload)
+            mismatch_payload["mismatch_kind"] = kind
+            mismatches.append(mismatch_payload)
+
+        sep = dialect.get("sep", ",") if isinstance(dialect, dict) else ","
+        encoding = dialect.get("encoding", "utf-8") if isinstance(dialect, dict) else "utf-8"
+        output_df = pd.read_csv(output_abs, sep=sep, encoding=encoding)
+        output_mask, output_referenced, output_errors = _evaluate_contract_rule(output_df, rule)
+        selector_cols_present = bool(output_referenced or referenced_cols) and all(
+            col in output_df.columns for col in (output_referenced or referenced_cols)
+        )
+        payload["selector_columns_present"] = selector_cols_present
+
+        if output_errors and not any(err.startswith("missing_column:") for err in output_errors):
+            payload["selector_errors"] = output_errors
+            errors.append(dict(payload))
+        elif selector_cols_present and output_mask is not None:
+            matches_rule = bool(output_mask.all())
+            payload["all_rows_match_rule"] = matches_rule
+            payload["rows_matching_rule"] = int(output_mask.sum())
+            if not matches_rule:
+                _record_mismatch("selector_rule")
+
+        if expected_count is not None and actual_count != expected_count:
+            _record_mismatch("row_count")
+
+        checked.append(payload)
+
+    summary = (
+        f"Subset selector checks: {len(checked)}; "
+        f"Mismatches: {len(mismatches)}; Errors: {len(errors)}"
+    )
+    return hydrated_file_schemas, {
+        "checked": checked,
+        "mismatches": mismatches,
+        "errors": errors,
+        "summary": summary,
+    }
+
+
 def check_csv_row_counts(
     file_schemas: Dict[str, Any],
     work_dir: str = ".",
@@ -382,6 +643,7 @@ def check_csv_row_counts(
 def check_artifact_requirements(
     artifact_requirements: Dict[str, Any],
     work_dir: str = ".",
+    contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     P1.4: Check all artifact requirements including files and scored_rows schema.
@@ -404,6 +666,7 @@ def check_artifact_requirements(
             "files_report": {},
             "scored_rows_report": {},
             "row_count_report": {},
+            "selector_report": {},
             "summary": "Invalid artifact_requirements",
         }
 
@@ -421,6 +684,19 @@ def check_artifact_requirements(
     files_report = check_required_outputs(file_paths)
     file_schemas = artifact_requirements.get("file_schemas", {})
     dialect = get_csv_dialect(work_dir)
+    selector_report = {
+        "checked": [],
+        "mismatches": [],
+        "errors": [],
+        "summary": "Subset selector checks skipped: no contract context",
+    }
+    if isinstance(contract, dict):
+        file_schemas, selector_report = _resolve_contract_subset_validation(
+            contract,
+            artifact_requirements,
+            work_dir=work_dir,
+            dialect=dialect,
+        )
     row_count_report = check_csv_row_counts(file_schemas, work_dir=work_dir, dialect=dialect)
 
     # Check scored_rows schema
@@ -462,6 +738,8 @@ def check_artifact_requirements(
     # Determine overall status
     if files_report.get("missing"):
         status = "error"
+    elif selector_report.get("mismatches") or selector_report.get("errors"):
+        status = "error"
     elif row_count_report.get("mismatches") or row_count_report.get("errors"):
         status = "error"
     elif scored_rows_report.get("applicable", True) and scored_rows_report.get("missing_columns"):
@@ -484,13 +762,15 @@ def check_artifact_requirements(
     summary = (
         f"Files: {files_report.get('summary', 'N/A')}; "
         f"Rows: {row_count_report.get('summary', 'N/A')}; "
-        f"Scored rows: {scored_rows_report.get('summary', 'N/A')}"
+        f"Scored rows: {scored_rows_report.get('summary', 'N/A')}; "
+        f"Subset selectors: {selector_report.get('summary', 'N/A')}"
     )
 
     return {
         "status": status,
         "files_report": files_report,
         "row_count_report": row_count_report,
+        "selector_report": selector_report,
         "scored_rows_report": scored_rows_report,
         "summary": summary,
     }
@@ -536,7 +816,7 @@ def build_output_contract_report(
 
     # 2) Check artifact requirements with schema validation
     artifact_req = get_artifact_requirements(contract) if isinstance(contract, dict) else {}
-    artifact_report = check_artifact_requirements(artifact_req, work_dir=work_dir)
+    artifact_report = check_artifact_requirements(artifact_req, work_dir=work_dir, contract=contract)
 
     # 3) Build unified report
     report: Dict[str, Any] = {

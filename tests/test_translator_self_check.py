@@ -5,6 +5,7 @@ from src.agents.business_translator import (
     BusinessTranslatorAgent,
     _build_metric_progress_summary,
     _score_report_quality,
+    _sanitize_review_board_verdict_for_translator,
     _validate_report,
     _validate_report_structure,
 )
@@ -89,6 +90,53 @@ def test_translator_prompt_declares_source_of_truth_and_authoritative_outcome(tm
 
     assert "=== SOURCE OF TRUTH AND PRECEDENCE ===" in report
     assert "The authoritative executive outcome for this report is: NO_GO" in report
+
+
+def test_translator_prompt_preserves_target_lineage_when_steward_and_contract_diverge(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"run_outcome": "GO_WITH_LIMITATIONS"}, f)
+    with open(os.path.join("data", "steward_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "summary": "## Target Variable Decision\n**Recommended primary target: `won_90d`**",
+            },
+            f,
+        )
+    with open(os.path.join("data", "dataset_semantics.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "primary_target": "pipeline_amount_90d",
+                "target_status": "questioned",
+                "recommended_primary_target": "pipeline_amount_90d",
+                "target_status_reason": "Zero inflation requires extra care.",
+            },
+            f,
+        )
+    with open(os.path.join("data", "execution_contract.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "task_semantics": {
+                    "primary_target": "won_90d",
+                }
+            },
+            f,
+        )
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {"execution_output": "OK", "business_objective": "Rank leads by expected commercial value."}
+    )
+
+    assert '"target_lineage": {' in prompt
+    assert '"preliminary_steward_target": "won_90d"' in prompt
+    assert '"validated_steward_target": "pipeline_amount_90d"' in prompt
+    assert '"final_contract_target": "won_90d"' in prompt
+    assert '"summary_excerpt_scope": "preliminary_steward_assessment"' in prompt
 
 
 def test_translator_openrouter_call_uses_configured_max_tokens(monkeypatch):
@@ -380,6 +428,39 @@ def test_translator_prompt_preserves_metric_round_governance_flags(tmp_path, mon
     assert '"metric_improved": true' in prompt
     assert '"governance_approved": true' in prompt
     assert '"governance_approved": false' in prompt
+
+
+def test_sanitized_review_board_verdict_prefers_final_incumbent_summary():
+    payload = _sanitize_review_board_verdict_for_translator(
+        {
+            "summary": "Recovered to PR-AUC 0.2373.",
+            "candidate_assessment_status": "APPROVED",
+            "metric_round_finalization": {
+                "metric_name": "pr_auc",
+                "kept": "baseline",
+                "baseline_metric": 0.25671148099991203,
+                "candidate_metric": 0.23731575773380917,
+                "final_metric": 0.25671148099991203,
+                "metric_improved": False,
+                "governance_approved": True,
+                "approved": True,
+            },
+            "deterministic_facts": {
+                "metrics": {
+                    "primary": {
+                        "name": "pr_auc",
+                        "value": 0.23731575773380917,
+                    }
+                }
+            },
+        },
+        "pr_auc",
+        0.25671148099991203,
+    )
+
+    assert payload["summary"].startswith("The challenger passed governance review but did not improve pr_auc")
+    assert payload["deterministic_facts"]["metrics"]["primary"]["value"] == 0.25671148099991203
+    assert payload["deterministic_facts"]["metrics"]["primary"]["candidate_value"] == 0.23731575773380917
 
 
 def test_translator_kpi_snapshot_uses_canonical_final_metric_only(tmp_path, monkeypatch):
@@ -723,7 +804,7 @@ def test_translator_prompt_includes_engineering_change_summaries(tmp_path, monke
     assert "Data Engineer Change Summary:" in prompt
     assert "ML Engineer Change Summary:" in prompt
     assert "Run Causal Impact Summary:" in prompt
-    assert "ATTRIBUTE ENGINEERING IMPACT" in prompt
+    assert "ENGINEERING IMPACT" in prompt
     assert "Business Objective Summary:" in prompt
     assert "Do not mention agents as workflow theater." in prompt
     assert '"accepted_interventions": ["Parsed 1stYearAmount from currency-like strings to float64", "Parsed Debtors from numeric-like strings to Float64"]' in prompt
