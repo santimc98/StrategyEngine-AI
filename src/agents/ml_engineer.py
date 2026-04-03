@@ -910,6 +910,11 @@ class MLEngineerAgent:
                     if isinstance(optimization_context_raw.get("round_history_recent"), list)
                     else []
                 ),
+                "incumbent_brief": (
+                    optimization_context_raw.get("incumbent_brief")
+                    if isinstance(optimization_context_raw.get("incumbent_brief"), dict)
+                    else {}
+                ),
             }
         keep_optimization_lane = bool(optimization_lane.get("active")) and (
             optimization_context or hypothesis_packet or deferred_optimization
@@ -956,6 +961,11 @@ class MLEngineerAgent:
             "patch_objectives": patch_objectives[:8],
             "critic_packet": critic_packet if isinstance(critic_packet, dict) else {},
             "hypothesis_packet": hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
+            "incumbent_brief": (
+                raw.get("incumbent_brief")
+                if isinstance(raw.get("incumbent_brief"), dict)
+                else {}
+            ),
             "editor_constraints": {
                 "must_apply_hypothesis": bool(editor_constraints.get("must_apply_hypothesis")),
                 "forbid_noop": bool(editor_constraints.get("forbid_noop")),
@@ -1987,6 +1997,42 @@ class MLEngineerAgent:
             tail_len=300,
         )
 
+        # Build incumbent brief from handoff
+        incumbent_brief_raw = (
+            handoff_payload.get("incumbent_brief")
+            if isinstance(handoff_payload.get("incumbent_brief"), dict)
+            else {}
+        )
+        if not incumbent_brief_raw:
+            incumbent_brief_raw = (
+                optimization_context.get("incumbent_brief")
+                if isinstance(optimization_context.get("incumbent_brief"), dict)
+                else {}
+            )
+
+        # Build a prominent metric goal statement
+        inc_score = incumbent_brief_raw.get("incumbent_score")
+        inc_metric = str(incumbent_brief_raw.get("primary_metric") or round_brief.get("primary_metric_name") or "").strip()
+        best_score = incumbent_brief_raw.get("best_score_so_far")
+        hib = incumbent_brief_raw.get("higher_is_better", round_brief.get("higher_is_better", True))
+        hyp_technique = str(active_hypothesis_brief.get("technique") or "").strip()
+        hyp_objective = str(active_hypothesis_brief.get("objective") or "").strip()
+        goal_lines: list = []
+        if inc_metric and inc_score is not None:
+            direction = "higher" if hib else "lower"
+            goal_lines.append(f"Incumbent score: {inc_score} on '{inc_metric}' ({direction} is better).")
+        if best_score is not None and inc_score is not None and best_score != inc_score:
+            goal_lines.append(f"Best observed so far: {best_score}.")
+        if hyp_technique:
+            goal_lines.append(f"Active hypothesis to test: '{hyp_technique}'.")
+        if hyp_objective:
+            goal_lines.append(f"Hypothesis objective: {hyp_objective}")
+        # Critique reasoning — why this hypothesis was chosen
+        analysis_summary = str(critic_packet.get("analysis_summary") or "").strip()
+        if analysis_summary:
+            goal_lines.append(f"Analyst reasoning for this hypothesis: {analysis_summary[:400]}")
+        metric_goal_block = "\n".join(goal_lines) if goal_lines else "No metric goal context available."
+
         return {
             "round_brief": self._serialize_json_for_prompt(
                 round_brief,
@@ -2031,6 +2077,13 @@ class MLEngineerAgent:
                 repair_ground_truth
             ),
             "optimization_feedback_brief": feedback_brief or "No optimization feedback provided.",
+            "incumbent_brief": self._serialize_json_for_prompt(
+                incumbent_brief_raw,
+                max_chars=1400,
+                max_str_len=220,
+                max_list_items=10,
+            ),
+            "metric_goal_block": metric_goal_block,
         }
 
     def _build_optimization_authoritative_state(
@@ -5020,76 +5073,86 @@ class MLEngineerAgent:
         """
 
         USER_EDITOR_OPTIMIZATION_TEMPLATE = """
-        MODE: METRIC_IMPROVEMENT
-        MODE: CODE_EDITOR_MODE_OPTIMIZATION
+        MODE: METRIC_IMPROVEMENT (phase: $phase_classification)
         You are editing an incumbent script to improve its metric. Do not regenerate from zero.
 
-        CURRENT STATE (phase: $phase_classification):
-        - Round context: $optimization_round_brief
-        - Evidence so far: $current_evidence_brief
-        - Recent attempts: $recent_tracker
-        - Feedback digest: $optimization_feedback_brief
+        ===================================================================
+        YOUR OBJECTIVE
+        ===================================================================
+        $metric_goal_block
 
-        CURRENT TASK CONTEXT
-        CURRENT PHASE: $phase_classification
-        CURRENT ROUND BRIEF:
-        $optimization_round_brief
-        CURRENT EVIDENCE BRIEF:
-        $current_evidence_brief
-        RECENT ATTEMPTS:
-        $recent_tracker
-        FEEDBACK DIGEST:
-        $optimization_feedback_brief
+        ===================================================================
+        INCUMBENT SCRIPT CONTEXT
+        ===================================================================
+        What the script you are editing currently achieves:
+        $incumbent_brief
 
-        ACTIVE HYPOTHESIS (proposal to test, not a literal recipe):
+        Round context: $optimization_round_brief
+
+        ===================================================================
+        HYPOTHESIS TO IMPLEMENT
+        ===================================================================
         $active_hypothesis_brief
 
-        OPTIONAL BLUEPRINT CONTEXT (advisory, not mandatory recipe):
+        Optional blueprint (advisory, not a recipe):
         $optimization_blueprint_hint
 
-        VERIFIED ENVIRONMENT FACTS (authoritative; prefer these over memory or heuristics):
-        $verified_environment_facts
+        ===================================================================
+        EVIDENCE & FEEDBACK
+        ===================================================================
+        Recent attempts: $recent_tracker
+        Analysis: $current_evidence_brief
+        Feedback: $optimization_feedback_brief
 
-        REPAIR GROUND TRUTH (root cause + guardrails):
-        $repair_ground_truth
-
-        EDIT SCOPE:
-        $repair_scope
-
-        REPAIR SCOPE:
-        $repair_scope
-
-        SCOPE ENFORCEMENT:
-        $editor_scope_brief
-
+        ===================================================================
+        EDIT DIRECTIVES
+        ===================================================================
         WHAT TO CHANGE:
         $patch_objectives
 
         WHAT TO PROTECT:
         $must_preserve
-        Locked invariants: $invariants_lock
 
         LOCKED INVARIANTS:
         $invariants_lock
 
-        PREVIOUS SCRIPT:
+        SCOPE ENFORCEMENT:
+        $editor_scope_brief
+
+        ===================================================================
+        ENVIRONMENT FACTS
+        ===================================================================
+        Verified facts (authoritative — prefer these over memory or heuristics):
+        $verified_environment_facts
+
+        Repair ground truth (root cause + guardrails):
+        $repair_ground_truth
+
+        Repair scope:
+        $repair_scope
+
+        ===================================================================
+        PREVIOUS SCRIPT
+        ===================================================================
         $previous_code
 
         YOUR TASK:
         Return ONLY the full updated Python script. No markdown, no explanation.
-        Treat the active hypothesis as an optimization proposal to test, not a literal recipe to copy.
-        Your priority order is: (1) make the script run without errors,
-        (2) produce all contract-required artifacts with correct row counts,
-        (3) then implement the metric improvement hypothesis. If the script has
-        a runtime failure, fix that first — a broken script cannot test any
-        hypothesis. Use the evidence to target the weakest part of the incumbent
-        rather than inventing a new plan. If the named technique conflicts with
-        verified environment facts, callable signatures, feature dtypes, or runtime
-        constraints, implement the closest compatible variant that preserves the
-        hypothesis intent and document that choice in the script comments.
-        Use the broader authoritative system context when a lock packet is sparse
-        or generic. Prefer the cheapest valid change that tests the idea without
-        destabilizing working behavior.
+
+        Reasoning guidance:
+        - Start by understanding the incumbent: what model, features, and pipeline
+          produced the current score. Then identify where the hypothesis should be
+          applied — the specific code region that handles the relevant stage.
+        - Treat the hypothesis as a proposal to test, not a literal recipe. If the
+          named technique conflicts with verified environment facts, callable
+          signatures, feature dtypes, or runtime constraints, implement the closest
+          compatible variant and document that choice in a code comment.
+        - Priority order: (1) make the script run without errors, (2) produce all
+          contract-required artifacts with correct row counts, (3) implement the
+          hypothesis. A broken script cannot test any hypothesis.
+        - Prefer the cheapest valid change that tests the idea without destabilizing
+          working behavior. Use the evidence to target the weakest part of the
+          incumbent rather than inventing a new plan.
         """
 
         USER_IMPROVE_TEMPLATE = """
@@ -5247,6 +5310,8 @@ class MLEngineerAgent:
                     invariants_lock=optimization_briefs.get("invariants_lock") or "{}",
                     recent_tracker=optimization_briefs.get("recent_tracker") or "[]",
                     optimization_feedback_brief=optimization_briefs.get("optimization_feedback_brief") or "No optimization feedback provided.",
+                    incumbent_brief=optimization_briefs.get("incumbent_brief") or "{}",
+                    metric_goal_block=optimization_briefs.get("metric_goal_block") or "No metric goal context available.",
                     patch_objectives=patch_objectives_block,
                     must_preserve=must_preserve_block,
                     editor_scope_brief=editor_scope_brief or "No explicit scope constraints provided.",

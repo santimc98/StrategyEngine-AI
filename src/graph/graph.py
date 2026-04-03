@@ -29060,6 +29060,99 @@ def _build_metric_improvement_feedback_block(
     )
 
 
+def _build_incumbent_brief(
+    state: Dict[str, Any],
+    metric_snapshot: Dict[str, Any],
+    baseline_metrics_override: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Build a compact summary of the incumbent script for the editor context.
+
+    Gives the editor a high-level understanding of WHAT the script does and
+    achieves, so it can reason about WHERE and HOW to apply the hypothesis
+    without parsing thousands of lines of raw code.
+
+    Uses fallback chain for reviewer/metrics: first tries the baseline snapshot
+    fields (populated by prior rounds), then falls back to live state fields
+    (available before the baseline snapshot is written in the same bootstrap call).
+    """
+    metric_snapshot = metric_snapshot if isinstance(metric_snapshot, dict) else {}
+    brief: Dict[str, Any] = {}
+
+    # 1. Metric performance
+    metric_name = str(metric_snapshot.get("primary_metric_name") or "").strip()
+    incumbent_value = metric_snapshot.get("incumbent_metric") or metric_snapshot.get("baseline_metric")
+    best_so_far = metric_snapshot.get("best_metric_so_far")
+    higher_is_better = metric_snapshot.get("higher_is_better", True)
+    if metric_name:
+        brief["primary_metric"] = metric_name
+    if incumbent_value is not None:
+        brief["incumbent_score"] = float(incumbent_value)
+    if best_so_far is not None:
+        brief["best_score_so_far"] = float(best_so_far)
+    brief["higher_is_better"] = bool(higher_is_better)
+
+    # 2. Reviewer assessment of incumbent (strengths + known weaknesses)
+    # Fallback chain: baseline snapshot (round 2+) → live state (round 1)
+    reviewer_packet = (
+        state.get("ml_improvement_round_baseline_reviewer_packet")
+        if isinstance(state.get("ml_improvement_round_baseline_reviewer_packet"), dict)
+        else {}
+    )
+    if not reviewer_packet:
+        reviewer_packet = (
+            state.get("reviewer_last_result")
+            if isinstance(state.get("reviewer_last_result"), dict)
+            else {}
+        )
+    if reviewer_packet:
+        review_summary: Dict[str, Any] = {}
+        if reviewer_packet.get("status"):
+            review_summary["verdict"] = str(reviewer_packet["status"])
+        warnings = reviewer_packet.get("warnings") or []
+        if warnings:
+            review_summary["known_warnings"] = [str(w) for w in warnings[:4]]
+        suggestions = reviewer_packet.get("improvement_suggestions")
+        if isinstance(suggestions, dict):
+            review_summary["improvement_areas"] = suggestions
+        if review_summary:
+            brief["reviewer_assessment"] = review_summary
+
+    # 3. Baseline metrics payload (model info if available)
+    # Fallback chain: explicit override → baseline snapshot → live metrics_report
+    baseline_metrics = baseline_metrics_override if isinstance(baseline_metrics_override, dict) and baseline_metrics_override else {}
+    if not baseline_metrics:
+        baseline_metrics = (
+            state.get("ml_improvement_round_baseline_metrics")
+            if isinstance(state.get("ml_improvement_round_baseline_metrics"), dict)
+            else {}
+        )
+    if not baseline_metrics:
+        baseline_metrics = (
+            state.get("metrics_report")
+            if isinstance(state.get("metrics_report"), dict)
+            else {}
+        )
+    if baseline_metrics:
+        # Extract model family if present
+        for key in ("model_family", "model_type", "model_name", "algorithm"):
+            if baseline_metrics.get(key):
+                brief["model_info"] = str(baseline_metrics[key])
+                break
+        # Extract CV score if present
+        for key in ("cv_score", "cv_mean", "mean_cv_score"):
+            if baseline_metrics.get(key) is not None:
+                brief["cv_score"] = float(baseline_metrics[key])
+                break
+
+    # 4. Round context
+    round_id = metric_snapshot.get("round_id")
+    rounds_allowed = metric_snapshot.get("rounds_allowed")
+    if round_id is not None:
+        brief["round"] = f"{round_id} of {rounds_allowed or '?'}"
+
+    return brief
+
+
 def _build_metric_improvement_patch_objectives(hypothesis_packet: Dict[str, Any]) -> List[str]:
     hypothesis_packet = hypothesis_packet if isinstance(hypothesis_packet, dict) else {}
     hypothesis = hypothesis_packet.get("hypothesis") if isinstance(hypothesis_packet.get("hypothesis"), dict) else {}
@@ -29866,9 +29959,11 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         and hypothesis_technique
         and hypothesis_technique.upper() != "NO_OP"
     )
+    incumbent_brief = _build_incumbent_brief(state, metric_snapshot, baseline_metrics_override=baseline_metrics)
     optimization_context = {
         "policy": hybrid_policy_meta,
         "metric_snapshot": metric_snapshot,
+        "incumbent_brief": incumbent_brief,
         "contract_lock": _build_metric_round_contract_lock(contract, output_paths, metric_name),
         "active_hypothesis": compress_long_lists(hypothesis_packet or {})[0],
         "experiment_tracker_recent": compress_long_lists((tracker_entries or [])[-5:])[0],
@@ -29967,6 +30062,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "patch_objectives": patch_objectives,
         "critic_packet": critique_packet,
         "hypothesis_packet": hypothesis_packet,
+        "incumbent_brief": incumbent_brief,
         "optimization_blueprint": (
             optimization_blueprint
             if isinstance(optimization_blueprint, dict)
