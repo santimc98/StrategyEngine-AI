@@ -14742,6 +14742,7 @@ _RUNTIME_MODEL_AGENT_KEYS = (
     "execution_planner",
     "execution_planner_compiler",
     "data_engineer",
+    "data_engineer_editor",
     "data_engineer_fallback",
     "ml_engineer",
     "ml_engineer_editor",
@@ -14773,6 +14774,10 @@ def get_runtime_agent_models() -> Dict[str, str]:
             or getattr(execution_planner, "model_name", "")
         ),
         "data_engineer": _normalize_runtime_model_name(getattr(data_engineer, "model_name", "")),
+        "data_engineer_editor": _normalize_runtime_model_name(
+            getattr(data_engineer, "editor_model_name", "")
+            or getattr(data_engineer, "model_name", "")
+        ),
         "data_engineer_fallback": _normalize_runtime_model_name(getattr(data_engineer, "fallback_model_name", "")),
         "ml_engineer": _normalize_runtime_model_name(getattr(ml_engineer, "model_name", "")),
         "ml_engineer_fallback": _normalize_runtime_model_name(getattr(ml_engineer, "fallback_model_name", "")),
@@ -14855,11 +14860,25 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
         execution_planner.compiler_model_name = execution_planner_compiler_model
 
     data_engineer_model = normalized.get("data_engineer")
+    data_engineer_editor_model = _normalize_runtime_model_name(overrides.get("data_engineer_editor"))
     data_engineer_fallback_model = normalized.get("data_engineer_fallback")
     if data_engineer_model:
         data_engineer.model_name = data_engineer_model
     if data_engineer_fallback_model:
         data_engineer.fallback_model_name = data_engineer_fallback_model
+    if data_engineer_model or data_engineer_editor_model or data_engineer_fallback_model:
+        resolver = getattr(data_engineer, "_resolve_editor_model_name", None)
+        if callable(resolver):
+            data_engineer.editor_model_name = _normalize_runtime_model_name(
+                resolver(
+                    primary_model=_normalize_runtime_model_name(getattr(data_engineer, "model_name", "")),
+                    editor_model_override=data_engineer_editor_model or None,
+                )
+            )
+        elif data_engineer_editor_model:
+            data_engineer.editor_model_name = data_engineer_editor_model
+        elif data_engineer_model:
+            data_engineer.editor_model_name = _normalize_runtime_model_name(getattr(data_engineer, "model_name", ""))
     if (data_engineer_model or data_engineer_fallback_model) and hasattr(data_engineer, "last_model_used"):
         data_engineer.last_model_used = None
 

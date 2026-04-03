@@ -34,6 +34,7 @@ MODEL_SETTING_SPECS: List[Dict[str, str]] = [
     {"key": "failure_explainer", "label": "Failure Explainer", "section": "primary"},
     {"key": "strategist_fallback", "label": "Strategist Fallback", "section": "advanced"},
     {"key": "execution_planner_compiler", "label": "Execution Planner Compiler", "section": "advanced"},
+    {"key": "data_engineer_editor", "label": "Data Engineer Editor", "section": "advanced"},
     {"key": "data_engineer_fallback", "label": "Data Engineer Fallback", "section": "advanced"},
     {"key": "ml_engineer_editor", "label": "ML Engineer Editor", "section": "advanced"},
     {"key": "ml_engineer_fallback", "label": "ML Engineer Fallback", "section": "advanced"},
