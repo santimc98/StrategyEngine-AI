@@ -39,6 +39,19 @@ _scan_code_safety_ref = "scan_code_safety"
 
 
 class DataEngineerAgent:
+    @staticmethod
+    def _resolve_editor_model_name(
+        *,
+        primary_model: str | None = None,
+        editor_model_override: str | None = None,
+    ) -> str:
+        primary = str(primary_model or "").strip()
+        explicit = str(editor_model_override or "").strip()
+        if explicit:
+            return explicit
+        # Default: use primary model for editor too (override via env var)
+        return primary
+
     def __init__(self, api_key: str = None):
         """
         Initializes the Data Engineer Agent with OpenRouter primary + fallback.
@@ -81,10 +94,16 @@ class DataEngineerAgent:
             self.model_name = "minimax/minimax-m2.7"
         if not self.fallback_model_name:
             self.fallback_model_name = "moonshotai/kimi-k2.5"
+        _editor_raw = (os.getenv("OPENROUTER_DE_EDITOR_MODEL") or "").strip()
+        self.editor_model_name = self._resolve_editor_model_name(
+            primary_model=self.model_name,
+            editor_model_override=_editor_raw,
+        )
         self.logger.info(
-            "DATA_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s",
+            "DATA_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s editor=%s",
             self.model_name,
             self.fallback_model_name,
+            self.editor_model_name,
         )
 
         self.last_prompt = None
@@ -1529,10 +1548,21 @@ class DataEngineerAgent:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ]
+            # Use editor model for repair/patch iterations when configured
+            effective_primary = (
+                self.editor_model_name
+                if patch_mode_active and self.editor_model_name
+                else self.model_name
+            )
+            effective_fallback = (
+                self.model_name
+                if effective_primary != self.model_name
+                else self.fallback_model_name
+            )
             response, model_used = call_chat_with_fallback(
                 self.client,
                 messages,
-                [self.model_name, self.fallback_model_name],
+                [effective_primary, effective_fallback],
                 call_kwargs={"temperature": 0.0 if patch_mode_active else 0.1},
                 logger=self.logger,
                 context_tag="data_engineer",
