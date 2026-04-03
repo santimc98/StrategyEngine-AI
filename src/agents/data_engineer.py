@@ -206,6 +206,10 @@ class DataEngineerAgent:
                 "Series.replace({dict}, np.nan) works, but Series.replace(list, np.nan) inside .apply() raises ValueError — use .map() or .where() instead.",
                 "Int64/Float64 nullable dtypes: use pd.array() or .astype('Int64') after imputation, not before.",
                 "print() with unicode characters (checkmarks, arrows) fails on Windows cp1252 — use ASCII-safe characters only.",
+                "BooleanDtype columns: fillna() only accepts bool values (True/False/pd.NA), not int or float. "
+                "Use fillna(False) not fillna(0) or fillna(0.0). Note that is_numeric_dtype() returns True for "
+                "BooleanDtype, so median()/mean() return float which is incompatible with BooleanDtype.fillna(). "
+                "Always check dtype before imputing: if col.dtype == pd.BooleanDtype(), use bool fill values.",
             ],
         }
 
