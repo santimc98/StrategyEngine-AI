@@ -29959,6 +29959,28 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         and hypothesis_technique
         and hypothesis_technique.upper() != "NO_OP"
     )
+    # Skip round entirely when hypothesis is NO_OP — nothing to execute
+    if not enforce_apply_hypothesis:
+        run_id = str(state.get("run_id") or "")
+        if run_id:
+            try:
+                log_run_event(
+                    run_id,
+                    "metric_improvement_round_skipped",
+                    {
+                        "reason": "no_op_hypothesis",
+                        "hypothesis_action": hypothesis_action,
+                        "hypothesis_technique": hypothesis_technique or "NONE",
+                        "round_id": int(round_id),
+                    },
+                )
+            except Exception:
+                pass
+        print(
+            f"METRIC_IMPROVEMENT: Skipping round {round_id} — "
+            f"hypothesis is NO_OP (action={hypothesis_action}, technique={hypothesis_technique or 'NONE'})"
+        )
+        return False
     incumbent_brief = _build_incumbent_brief(state, metric_snapshot, baseline_metrics_override=baseline_metrics)
     optimization_context = {
         "policy": hybrid_policy_meta,

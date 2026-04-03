@@ -2135,6 +2135,15 @@ class MLEngineerAgent:
                 else {}
             )
         )
+        task_semantics = (
+            execution_contract.get("task_semantics")
+            if isinstance(execution_contract.get("task_semantics"), dict)
+            else (
+                ml_view.get("task_semantics")
+                if isinstance(ml_view.get("task_semantics"), dict)
+                else {}
+            )
+        )
 
         model_features = (
             execution_contract.get("model_features")
@@ -2159,6 +2168,8 @@ class MLEngineerAgent:
                 forbidden_features = []
 
         target_columns = evaluation_spec.get("target_columns")
+        if not isinstance(target_columns, list) or not target_columns:
+            target_columns = evaluation_spec.get("label_columns")
         if not isinstance(target_columns, list) or not target_columns:
             target_columns = validation_requirements.get("label_columns")
         if not isinstance(target_columns, list):
@@ -2234,9 +2245,30 @@ class MLEngineerAgent:
                 "metric_definition_rule": metric_rule,
                 "model_features": [str(item) for item in model_features[:60] if str(item).strip()],
                 "forbidden_features": [str(item) for item in forbidden_features[:30] if str(item).strip()],
-                "split_column": split_spec.get("split_column"),
-                "training_rows_rule": split_spec.get("training_rows_rule"),
-                "scoring_rows_rule": split_spec.get("scoring_rows_rule"),
+                "split_column": (
+                    split_spec.get("split_column")
+                    or validation_requirements.get("split_column")
+                    or (validation_requirements.get("params") or {}).get("split_column")
+                    or task_semantics.get("temporal_split_column")
+                    or task_semantics.get("split_column")
+                ),
+                "training_rows_rule": (
+                    split_spec.get("training_rows_rule")
+                    or validation_requirements.get("training_rows_rule")
+                    or (validation_requirements.get("params") or {}).get("training_rows_rule")
+                    or task_semantics.get("training_rows_rule")
+                    or split_spec.get("train_filter_rule")
+                    or validation_requirements.get("train_filter_rule")
+                ),
+                "scoring_rows_rule": (
+                    split_spec.get("scoring_rows_rule")
+                    or validation_requirements.get("scoring_rows_rule")
+                    or (validation_requirements.get("params") or {}).get("scoring_rows_rule")
+                    or task_semantics.get("scoring_rows_rule_primary")
+                    or task_semantics.get("scoring_rows_rule")
+                    or split_spec.get("score_rows")
+                    or validation_requirements.get("score_rows")
+                ),
                 "required_outputs": self._normalize_required_output_entries_for_prompt(
                     (
                         execution_contract.get("required_outputs")
