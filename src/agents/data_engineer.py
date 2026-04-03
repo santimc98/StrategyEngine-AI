@@ -645,12 +645,44 @@ class DataEngineerAgent:
             return self._truncate_prompt_text(data_audit, max_len=2200, head_len=1500, tail_len=500) or "{}"
         return "\n".join(item for item in lines if str(item).strip())
 
+    def _build_attempt_history_block(
+        self,
+        attempt_history: Optional[List[Dict[str, Any]]],
+        current_attempt: int,
+    ) -> str:
+        entries = list(attempt_history or [])
+        if not entries:
+            return ""
+        lines = ["PREVIOUS ATTEMPT CONTEXT (understand the pattern of failures — do not repeat them)"]
+        for entry in entries[-4:]:
+            att = entry.get("attempt", "?")
+            status = entry.get("status", "UNKNOWN")
+            source = entry.get("source", "unknown")
+            failed = entry.get("failed_gates") or []
+            fixes = entry.get("required_fixes") or []
+            err_tail = str(entry.get("runtime_error_tail") or "").strip()
+            summary = str(entry.get("feedback_summary") or "").strip()
+            lines.append(f"ATTEMPT {att} — {status} (from {source}):")
+            if failed:
+                lines.append(f"  Failed gates: {', '.join(failed[:5])}")
+            if fixes:
+                lines.append(f"  Required fixes: {'; '.join(fixes[:3])}")
+            if err_tail:
+                lines.append(f"  Runtime error: {err_tail[:300]}")
+            if summary:
+                lines.append(f"  Feedback: {summary[:300]}")
+        lines.append(f"Current attempt: {current_attempt}")
+        lines.append("---")
+        return "\n".join(lines)
+
     def _build_repair_prompt_context(
         self,
         *,
         data_audit: str,
         previous_code: str,
         feedback_record: Optional[Dict[str, Any]] = None,
+        attempt_history: Optional[List[Dict[str, Any]]] = None,
+        current_attempt: int = 1,
     ) -> Dict[str, Any]:
         normalized = self._normalize_feedback_record(feedback_record, data_audit)
         repair_sections = self._extract_labeled_repair_sections(
@@ -710,8 +742,10 @@ class DataEngineerAgent:
             "Preserve working cleaning stages that are not implicated by the latest failure evidence.",
             "Return the full updated script body, not snippets or diffs.",
         ]
+        attempt_history_block = self._build_attempt_history_block(attempt_history, current_attempt)
         return {
             "feedback_record_json": json.dumps(normalized or {}, indent=2, ensure_ascii=False),
+            "attempt_history_block": attempt_history_block,
             "patch_objectives": "\n".join(f"- {item}" for item in patch_objectives[:8]),
             "must_preserve": "\n".join(f"- {item}" for item in must_preserve),
             "error_context": self._build_compact_repair_error_context(data_audit, normalized) or "{}",
@@ -914,6 +948,7 @@ class DataEngineerAgent:
         repair_mode: bool = False,
         previous_code: Optional[str] = None,
         feedback_record: Optional[Dict[str, Any]] = None,
+        attempt_history: Optional[List[Dict[str, Any]]] = None,
         artifact_obligations: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
@@ -1453,6 +1488,8 @@ class DataEngineerAgent:
         You are editing a previously generated cleaning script body. Do not regenerate from zero
         unless the previous script body is clearly unusable.
 
+        $attempt_history_block
+
         LATEST_ITERATION_FEEDBACK_RECORD_JSON:
         $feedback_record_json
 
@@ -1531,6 +1568,8 @@ class DataEngineerAgent:
                 data_audit=data_audit,
                 previous_code=str(previous_code or ""),
                 feedback_record=feedback_record,
+                attempt_history=attempt_history,
+                current_attempt=len(attempt_history or []) + 1,
             )
             user_message = render_prompt(USER_REPAIR_TEMPLATE, **repair_prompt_context)
         else:

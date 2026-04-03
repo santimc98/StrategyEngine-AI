@@ -11073,6 +11073,18 @@ def _merge_de_override_with_feedback_record(
     )
     if de_record:
         merged = _merge_de_audit_override(merged, _build_latest_feedback_record_block(de_record))
+        # Accumulate attempt history for editor context
+        history = list(new_state.get("data_engineer_attempt_history") or [])
+        history.append({
+            "attempt": int(de_record.get("iteration") or len(history) + 1),
+            "source": str(de_record.get("source") or "unknown"),
+            "status": str(de_record.get("status") or "UNKNOWN"),
+            "failed_gates": (de_record.get("failed_gates") or [])[:6],
+            "required_fixes": (de_record.get("required_fixes") or [])[:4],
+            "runtime_error_tail": str(de_record.get("runtime_error_tail") or "")[:400],
+            "feedback_summary": str(de_record.get("feedback") or "")[:500],
+        })
+        new_state["data_engineer_attempt_history"] = history[-5:]  # keep last 5
     new_state["data_engineer_audit_override"] = merged
 
 def _normalize_reason_tags(text: str, failed_gates: List[str] | None = None) -> List[str]:
@@ -14636,6 +14648,7 @@ class AgentState(TypedDict):
     last_runtime_error_tail: str # Added for Runtime Error Visibility
     data_engineer_audit_override: str
     data_engineer_feedback_record: Dict[str, Any]
+    data_engineer_attempt_history: List[Dict[str, Any]]
     ml_engineer_audit_override: str
     ml_feedback_record: Dict[str, Any]
     leakage_audit_summary: str
@@ -19006,6 +19019,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
         kwargs["previous_code"] = previous_de_code
     if "feedback_record" in sig.parameters and latest_de_feedback_record:
         kwargs["feedback_record"] = latest_de_feedback_record
+    if "attempt_history" in sig.parameters:
+        kwargs["attempt_history"] = list(state.get("data_engineer_attempt_history") or [])
     code = data_engineer.generate_cleaning_script(**kwargs)
     try:
         os.makedirs("artifacts", exist_ok=True)
