@@ -4915,6 +4915,131 @@ def _extract_derived_column_names(value: Any) -> List[str]:
     return deduped
 
 
+def _collect_auxiliary_feature_family_columns(
+    contract: Dict[str, Any],
+    *,
+    semantic_feature_norms: set[str] | None = None,
+) -> List[str]:
+    if not isinstance(contract, dict):
+        return []
+    semantic_feature_norms = semantic_feature_norms or set()
+    allowed_sets = contract.get("allowed_feature_sets")
+    if not isinstance(allowed_sets, dict):
+        return []
+
+    reserved_keys = {
+        "model_features",
+        "segmentation_features",
+        "audit_only_features",
+        "forbidden_features",
+        "forbidden_for_modeling",
+        "rationale",
+    }
+    collected: List[str] = []
+    seen: set[str] = set()
+    for raw_key, raw_value in allowed_sets.items():
+        key = str(raw_key or "").strip().lower()
+        if not key or key in reserved_keys:
+            continue
+        for candidate in _extract_derived_column_names(raw_value):
+            token = str(candidate or "").strip()
+            if not token or token.lower().startswith("selector:"):
+                continue
+            norm = _normalize_column_identifier(token)
+            if not norm or norm in semantic_feature_norms or norm in seen:
+                continue
+            seen.add(norm)
+            collected.append(token)
+    return collected
+
+
+def _reconcile_compiled_feature_surfaces(
+    compiled_contract: Dict[str, Any],
+    semantic_core: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Preserve semantic model_features authority while projecting derived extras.
+
+    The semantic core owns the top-level model_features list. The compile stage is
+    allowed to materialize additional concrete derived columns, but those must live
+    in derived_columns (or auxiliary feature families), not by mutating
+    shared.model_features.
+    """
+    if not isinstance(compiled_contract, dict):
+        return {}
+    semantic_core = semantic_core if isinstance(semantic_core, dict) else {}
+
+    semantic_features = _canonicalize_string_list(semantic_core.get("model_features"))
+    if not semantic_features:
+        return compiled_contract
+
+    repaired = copy.deepcopy(compiled_contract)
+    shared_payload = repaired.get("shared") if isinstance(repaired.get("shared"), dict) else None
+    feature_surface = shared_payload if isinstance(shared_payload, dict) else repaired
+
+    compiled_features = _canonicalize_string_list(feature_surface.get("model_features"))
+    semantic_norms = {_normalize_column_identifier(item) for item in semantic_features if _normalize_column_identifier(item)}
+
+    derived_candidates: List[str] = []
+    for source in (
+        repaired.get("derived_columns"),
+        feature_surface.get("derived_columns") if isinstance(feature_surface, dict) else None,
+        (repaired.get("feature_engineering_plan") or {}).get("derived_columns")
+        if isinstance(repaired.get("feature_engineering_plan"), dict)
+        else None,
+        (feature_surface.get("feature_engineering_plan") or {}).get("derived_columns")
+        if isinstance(feature_surface, dict) and isinstance(feature_surface.get("feature_engineering_plan"), dict)
+        else None,
+    ):
+        for candidate in _extract_derived_column_names(source):
+            norm = _normalize_column_identifier(candidate)
+            if not norm or norm in semantic_norms:
+                continue
+            derived_candidates.append(candidate)
+
+    for candidate in _collect_auxiliary_feature_family_columns(
+        feature_surface,
+        semantic_feature_norms=semantic_norms,
+    ):
+        derived_candidates.append(candidate)
+
+    derived_norms = {
+        _normalize_column_identifier(item)
+        for item in derived_candidates
+        if _normalize_column_identifier(item)
+    }
+
+    promoted_extras: List[str] = []
+    for feature in compiled_features:
+        norm = _normalize_column_identifier(feature)
+        if not norm or norm in semantic_norms:
+            continue
+        if norm in derived_norms:
+            promoted_extras.append(feature)
+
+    merged_derived: List[str] = []
+    seen_derived: set[str] = set()
+    for candidate in derived_candidates + promoted_extras:
+        token = str(candidate or "").strip()
+        norm = _normalize_column_identifier(token)
+        if not token or not norm or norm in semantic_norms or norm in seen_derived:
+            continue
+        seen_derived.add(norm)
+        merged_derived.append(token)
+
+    repaired["model_features"] = semantic_features
+    if isinstance(feature_surface, dict):
+        feature_surface["model_features"] = semantic_features
+    if merged_derived:
+        repaired["derived_columns"] = merged_derived
+        if isinstance(feature_surface, dict):
+            feature_surface["derived_columns"] = merged_derived
+    elif "derived_columns" in repaired:
+        repaired["derived_columns"] = []
+        if isinstance(feature_surface, dict) and "derived_columns" in feature_surface:
+            feature_surface["derived_columns"] = []
+    return repaired
+
+
 
 def _synthesize_selectors_from_allowed_feature_sets(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
@@ -10646,6 +10771,7 @@ domain_expert_critique:
 
                     quality_error_message = None
                     if parsed is not None and isinstance(parsed, dict):
+                        parsed = _reconcile_compiled_feature_surfaces(parsed, planner_semantic_core)
                         round_has_candidate = True
                         planner_contract_canonical = copy.deepcopy(parsed)
                         candidate_for_validation = copy.deepcopy(parsed)

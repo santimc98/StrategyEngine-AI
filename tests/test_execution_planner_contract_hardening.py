@@ -8,6 +8,7 @@ from src.agents.execution_planner import (
     _build_patch_transport_validation,
     _repair_common_json_damage,
     _build_semantic_guard_validation,
+    _reconcile_compiled_feature_surfaces,
     ExecutionPlannerAgent,
     _apply_planner_structural_support,
     parse_derive_from_expression,
@@ -1266,6 +1267,32 @@ def test_semantic_guard_allows_pre_decision_role_refinement_into_structural_buck
         for issue in (result.get("issues") or [])
         if isinstance(issue, dict)
     )
+
+
+def test_reconcile_compiled_feature_surfaces_preserves_semantic_model_features_and_promotes_derived_extras():
+    semantic_core = {
+        "model_features": ["region", "country", "industry"],
+    }
+    compiled_contract = {
+        "model_features": ["region", "country", "industry", "account_age_days", "days_since_last_qbr"],
+        "allowed_feature_sets": {
+            "model_features": ["region", "country", "industry"],
+            "derived_temporal_features": ["account_age_days", "days_since_last_qbr"],
+            "audit_only_features": ["account_created_at"],
+        },
+        "feature_engineering_plan": {
+            "derived_columns": ["account_age_days", "days_since_last_qbr"],
+        },
+    }
+
+    repaired = _reconcile_compiled_feature_surfaces(compiled_contract, semantic_core)
+
+    assert repaired.get("model_features") == ["region", "country", "industry"]
+    assert set(repaired.get("derived_columns") or []) == {"account_age_days", "days_since_last_qbr"}
+
+    validation = _build_semantic_guard_validation(semantic_core, repaired)
+    rules = {issue.get("rule") for issue in (validation.get("issues") or []) if isinstance(issue, dict)}
+    assert "semantic_guard.model_features_changed" not in rules
 
 
 def test_contract_validation_accepts_explicit_optimization_direction_and_tie_breakers():
