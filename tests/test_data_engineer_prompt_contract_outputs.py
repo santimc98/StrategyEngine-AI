@@ -230,6 +230,109 @@ def test_data_engineer_prompt_requires_empty_required_artifacts_to_be_materializ
     _assert_contains_terms(prompt, "schema-valid empty artifact", "write the empty artifact")
 
 
+def test_data_engineer_repair_prompt_surfaces_structured_ground_truth():
+    agent = DataEngineerAgent(api_key="fake")
+    execution_contract = {
+        "scope": "cleaning_only",
+        "required_outputs": [
+            {"path": "artifacts/clean/accounts_modelling_ready.csv", "owner": "data_engineer", "required": True},
+            {"path": "artifacts/clean/cleaning_manifest.json", "owner": "data_engineer", "required": True},
+        ],
+    }
+    de_view = {
+        "scope": "cleaning_only",
+        "required_columns": ["account_id", "snapshot_month_end"],
+        "output_path": "artifacts/clean/accounts_modelling_ready.csv",
+        "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+        "cleaning_gates": ["identifier_and_split_key_completeness"],
+        "data_engineer_runbook": {"steps": ["clean", "persist"]},
+    }
+    data_audit = (
+        "RUNTIME_ERROR_CONTEXT:\n"
+        "ValueError: identifier_and_split_key_completeness - Nulls introduced in primary identifiers after parsing: snapshot_month_end\n\n"
+        "RETRY_CONTEXT_JSON:\n"
+        "{\n"
+        '  "error_type": "runtime_error",\n'
+        '  "repair_focus": "runtime"\n'
+        "}\n\n"
+        "REPAIR_GROUND_TRUTH_JSON:\n"
+        "{\n"
+        '  "root_cause_type": "runtime_error",\n'
+        '  "repair_focus": "runtime",\n'
+        '  "repair_goal": [\n'
+        '    "Rework the transformation for snapshot_month_end so it preserves recoverable values and avoids null inflation introduced by parsing/coercion."\n'
+        "  ],\n"
+        '  "causal_deltas": [\n'
+        "    {\n"
+        '      "kind": "parser_introduced_null_inflation",\n'
+        '      "column": "snapshot_month_end"\n'
+        "    }\n"
+        "  ],\n"
+        '  "stable_regions": ["artifact_generation:artifacts/clean/cleaning_manifest.json"],\n'
+        '  "rethink_required": true,\n'
+        '  "rethink_reason": "The same gate/failure pattern has already recurred on the same implicated column(s): snapshot_month_end"\n'
+        "}\n\n"
+        "REPAIR_SCOPE_JSON:\n"
+        "{\n"
+        '  "phase": "compliance_runtime",\n'
+        '  "protected_regions": ["artifact_generation:artifacts/clean/cleaning_manifest.json"]\n'
+        "}\n\n"
+        "RETHINK_MODE:\n"
+        "The same failure pattern has repeated. Rethink the implicated transformation strategy instead of applying another local patch.\n"
+    )
+
+    with patch(
+        "src.agents.data_engineer.call_chat_with_fallback",
+        return_value=(_mock_response("print('ok')"), "mock/model"),
+    ):
+        agent.generate_cleaning_script(
+            data_audit=data_audit,
+            strategy={"required_columns": ["account_id", "snapshot_month_end"]},
+            input_path="data/raw.csv",
+            execution_contract=execution_contract,
+            de_view=de_view,
+            repair_mode=True,
+            previous_code="import pandas as pd\nprint('prev')\n",
+            feedback_record={
+                "agent": "data_engineer",
+                "source": "runtime_sandbox_execute",
+                "status": "REJECTED",
+                "iteration": 2,
+                "feedback": "snapshot_month_end became null after parsing again.",
+                "failed_gates": ["identifier_and_split_key_completeness"],
+                "required_fixes": ["Fix parsing/coercion for snapshot_month_end."],
+            },
+            attempt_history=[
+                {
+                    "attempt": 1,
+                    "source": "runtime_sandbox_execute",
+                    "status": "REJECTED",
+                    "failed_gates": ["identifier_and_split_key_completeness"],
+                    "required_fixes": ["Fix parsing/coercion for snapshot_month_end."],
+                    "runtime_error_tail": "Nulls introduced in primary identifiers after parsing: snapshot_month_end",
+                    "feedback_summary": "snapshot_month_end became null after parsing.",
+                }
+            ],
+        )
+
+    prompt = agent.last_prompt or ""
+    _assert_contains_all(
+        prompt,
+        "STRUCTURED_REPAIR_GROUND_TRUTH_JSON",
+        "STRUCTURED_REPAIR_SCOPE_JSON",
+        "RETHINK_MODE_NOTE",
+        "parser_introduced_null_inflation",
+        "snapshot_month_end",
+    )
+    _assert_contains_terms(
+        prompt,
+        "authoritative causal context",
+        "verified repair goal",
+        "rethink the implicated transformation strategy",
+        "stable region",
+    )
+
+
 def test_data_engineer_prompt_frames_date_and_numeric_cleaning_as_format_resolution():
     agent = DataEngineerAgent(api_key="fake")
     execution_contract = {

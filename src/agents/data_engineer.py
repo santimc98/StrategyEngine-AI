@@ -679,6 +679,25 @@ class DataEngineerAgent:
         lines.append("---")
         return "\n".join(lines)
 
+    def _extract_structured_repair_context(self, data_audit: str) -> Dict[str, Any]:
+        retry_context = self._extract_json_after_marker(data_audit, "RETRY_CONTEXT_JSON:")
+        repair_ground_truth = self._extract_json_after_marker(data_audit, "REPAIR_GROUND_TRUTH_JSON:")
+        repair_scope = self._extract_json_after_marker(data_audit, "REPAIR_SCOPE_JSON:")
+        rethink_required = bool(
+            (isinstance(repair_ground_truth, dict) and repair_ground_truth.get("rethink_required"))
+            or "RETHINK_MODE:" in str(data_audit or "")
+        )
+        rethink_reason = ""
+        if isinstance(repair_ground_truth, dict):
+            rethink_reason = str(repair_ground_truth.get("rethink_reason") or "").strip()
+        return {
+            "retry_context": retry_context if isinstance(retry_context, dict) else {},
+            "repair_ground_truth": repair_ground_truth if isinstance(repair_ground_truth, dict) else {},
+            "repair_scope": repair_scope if isinstance(repair_scope, dict) else {},
+            "rethink_required": rethink_required,
+            "rethink_reason": rethink_reason,
+        }
+
     def _build_repair_prompt_context(
         self,
         *,
@@ -689,6 +708,12 @@ class DataEngineerAgent:
         current_attempt: int = 1,
     ) -> Dict[str, Any]:
         normalized = self._normalize_feedback_record(feedback_record, data_audit)
+        structured = self._extract_structured_repair_context(data_audit)
+        retry_context_payload = structured.get("retry_context") if isinstance(structured.get("retry_context"), dict) else {}
+        repair_ground_truth = (
+            structured.get("repair_ground_truth") if isinstance(structured.get("repair_ground_truth"), dict) else {}
+        )
+        repair_scope = structured.get("repair_scope") if isinstance(structured.get("repair_scope"), dict) else {}
         repair_sections = self._extract_labeled_repair_sections(
             data_audit,
             allowed_labels=[
@@ -707,6 +732,35 @@ class DataEngineerAgent:
             repair_sections.get("LLM_FAILURE_EXPLANATION", "")
         )
         patch_objectives: List[str] = []
+        if structured.get("rethink_required"):
+            rethink_reason = str(structured.get("rethink_reason") or "").strip()
+            rethink_msg = (
+                "The same failure pattern has repeated. Rethink the implicated transformation strategy instead of applying another local patch."
+            )
+            if rethink_reason:
+                rethink_msg += " " + rethink_reason
+            patch_objectives.append(rethink_msg)
+        repair_goals = repair_ground_truth.get("repair_goal")
+        if isinstance(repair_goals, list):
+            for item in repair_goals:
+                token = str(item or "").strip()
+                if token:
+                    patch_objectives.append("Achieve the verified repair goal: " + token)
+        causal_deltas = repair_ground_truth.get("causal_deltas")
+        if isinstance(causal_deltas, list):
+            for delta in causal_deltas[:4]:
+                if not isinstance(delta, dict):
+                    continue
+                kind = str(delta.get("kind") or "").strip().lower()
+                column = str(delta.get("column") or "").strip()
+                if kind == "parser_introduced_null_inflation" and column:
+                    patch_objectives.append(
+                        f"Fix {column} by changing the implicated transform so it no longer introduces null inflation against the raw source."
+                    )
+                elif kind == "mixed_format_input" and column:
+                    patch_objectives.append(
+                        f"Treat {column} as mixed-format input and use a safer staged resolution strategy instead of a single coercive parse."
+                    )
         if explainer_directives.get("fixes"):
             patch_objectives.extend(
                 [str(item) for item in (explainer_directives.get("fixes") or []) if str(item).strip()]
@@ -746,6 +800,19 @@ class DataEngineerAgent:
             "Preserve working cleaning stages that are not implicated by the latest failure evidence.",
             "Return the full updated script body, not snippets or diffs.",
         ]
+        stable_regions = repair_ground_truth.get("stable_regions")
+        if isinstance(stable_regions, list):
+            for item in stable_regions[:4]:
+                token = str(item or "").strip()
+                if token:
+                    must_preserve.append("Preserve verified stable region: " + token)
+        protected_regions = repair_scope.get("protected_regions")
+        if isinstance(protected_regions, list):
+            for item in protected_regions[:4]:
+                token = str(item or "").strip()
+                if token:
+                    must_preserve.append("Avoid unnecessary edits to protected region: " + token)
+        must_preserve = list(dict.fromkeys([str(item) for item in must_preserve if str(item).strip()]))[:8]
         attempt_history_block = self._build_attempt_history_block(attempt_history, current_attempt)
         return {
             "feedback_record_json": json.dumps(normalized or {}, indent=2, ensure_ascii=False),
@@ -753,6 +820,14 @@ class DataEngineerAgent:
             "patch_objectives": "\n".join(f"- {item}" for item in patch_objectives[:8]),
             "must_preserve": "\n".join(f"- {item}" for item in must_preserve),
             "error_context": self._build_compact_repair_error_context(data_audit, normalized) or "{}",
+            "retry_context_json": json.dumps(retry_context_payload or {}, indent=2, ensure_ascii=False),
+            "repair_ground_truth_json": json.dumps(repair_ground_truth or {}, indent=2, ensure_ascii=False),
+            "repair_scope_json": json.dumps(repair_scope or {}, indent=2, ensure_ascii=False),
+            "rethink_mode_note": (
+                "ACTIVE: the same failure pattern repeated; rethink the implicated transformation instead of reapplying the same patch."
+                if structured.get("rethink_required")
+                else "inactive"
+            ),
             "previous_code": self._truncate_prompt_text(
                 self._strip_runtime_injection_from_previous_code(previous_code),
                 max_len=12000,
@@ -1497,6 +1572,18 @@ class DataEngineerAgent:
         LATEST_ITERATION_FEEDBACK_RECORD_JSON:
         $feedback_record_json
 
+        STRUCTURED_RETRY_CONTEXT_JSON (authoritative causal summary):
+        $retry_context_json
+
+        STRUCTURED_REPAIR_GROUND_TRUTH_JSON (authoritative verified facts; patch to these facts, not just the narrative symptom):
+        $repair_ground_truth_json
+
+        STRUCTURED_REPAIR_SCOPE_JSON (authoritative touch/preserve guidance):
+        $repair_scope_json
+
+        RETHINK_MODE_NOTE:
+        $rethink_mode_note
+
         ACTIVE_PATCH_OBJECTIVES:
         $patch_objectives
 
@@ -1510,6 +1597,8 @@ class DataEngineerAgent:
         $previous_code
 
         Repair task:
+        - Treat STRUCTURED_REPAIR_GROUND_TRUTH_JSON as the authoritative causal context for this retry.
+          Fix the verified deltas and the verified repair goal, not just the symptom wording.
         - Consult the column_profiles in DATA_SAMPLE_CONTEXT when available to verify your
           parsing approach matches the actual data patterns (null_pct, looks_datetime,
           observed_format_patterns, looks_numeric). If the profile is unavailable, reason

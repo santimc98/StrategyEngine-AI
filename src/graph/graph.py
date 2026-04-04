@@ -12433,6 +12433,7 @@ def _build_column_repair_context(
             exact_non_null_ratio = _compute_exact_non_null_ratio(csv_path, dialect, column)
             if exact_non_null_ratio is not None:
                 payload["raw_non_null_ratio_exact"] = round(float(exact_non_null_ratio), 6)
+                payload["raw_null_ratio_exact"] = round(1.0 - float(exact_non_null_ratio), 6)
                 if row_count is not None:
                     raw_null_count = max(int(row_count - round(float(exact_non_null_ratio) * row_count)), 0)
                     payload["raw_null_count_exact"] = raw_null_count
@@ -12472,6 +12473,60 @@ def _build_column_repair_context(
             "If a referenced column shows multiple observed datetime format patterns, use staged parsing and compare post-parse null inflation against the raw null rate before declaring the column invalid."
         )
     return facts, directives
+
+
+def _detect_repeated_de_failure_pattern(
+    state: Dict[str, Any] | None,
+    *,
+    failed_gates: List[str] | None,
+    referenced_columns: List[str] | None,
+    failure_signature: str = "",
+) -> Tuple[bool, str]:
+    state = state if isinstance(state, dict) else {}
+    history = state.get("data_engineer_attempt_history")
+    if not isinstance(history, list) or not history:
+        return False, ""
+
+    current_gates = [str(item).strip().lower() for item in (failed_gates or []) if str(item).strip()]
+    current_columns = [str(item).strip().lower() for item in (referenced_columns or []) if str(item).strip()]
+    signature = str(failure_signature or "").strip().lower()
+
+    gate_hits = 0
+    column_hits = 0
+    signature_hits = 0
+    for entry in history[-4:]:
+        if not isinstance(entry, dict):
+            continue
+        entry_gates = [str(item).strip().lower() for item in (entry.get("failed_gates") or []) if str(item).strip()]
+        entry_text = " ".join(
+            [
+                str(entry.get("feedback_summary") or ""),
+                str(entry.get("runtime_error_tail") or ""),
+                " ".join(entry_gates),
+            ]
+        ).lower()
+        if current_gates and any(gate in entry_gates or gate in entry_text for gate in current_gates):
+            gate_hits += 1
+        if current_columns and any(
+            re.search(rf"(?<![A-Za-z0-9_]){re.escape(column)}(?![A-Za-z0-9_])", entry_text)
+            for column in current_columns
+        ):
+            column_hits += 1
+        if signature and signature in entry_text:
+            signature_hits += 1
+
+    if current_gates and gate_hits >= 2:
+        if not current_columns or column_hits >= 1 or signature_hits >= 1:
+            if current_columns:
+                return (
+                    True,
+                    "The same gate/failure pattern has already recurred on the same implicated column(s): "
+                    + ", ".join(current_columns[:3]),
+                )
+            return True, "The same gate/failure pattern has already recurred across recent repair attempts."
+    if signature and signature_hits >= 2:
+        return True, "Recent attempts repeated the same failure signature instead of changing the implicated implementation."
+    return False, ""
 
 
 def _build_repair_ground_truth(
@@ -12525,6 +12580,9 @@ def _build_repair_ground_truth(
     environment_facts: List[Dict[str, Any]] = []
     repair_directives: List[str] = []
     do_not_change: List[str] = []
+    causal_deltas: List[Dict[str, Any]] = []
+    repair_goals: List[str] = []
+    stable_regions: List[str] = []
 
     if exception_type:
         verified_facts.append({"fact": "exception_type", "value": exception_type, "source": "runtime_traceback"})
@@ -12541,6 +12599,9 @@ def _build_repair_ground_truth(
                 "value": [str(path) for path in (missing_outputs or [])[:8]],
                 "source": "output_contract",
             }
+        )
+        repair_goals.append(
+            "Restore generation of the missing contract outputs at the exact declared paths once the blocking failure is fixed."
         )
     if keyword_match:
         verified_facts.append(
@@ -12625,10 +12686,17 @@ def _build_repair_ground_truth(
             compatibility_notes.append(text)
     for path in (present_outputs or [])[:6]:
         do_not_change.append(f"Keep artifact generation for {path} unchanged unless the failing block directly requires it.")
+        stable_regions.append(f"artifact_generation:{path}")
     if error_type == "runtime_api_misuse":
         do_not_change.append("Do not refactor unrelated modeling logic before the verified failing API call is corrected.")
+        repair_goals.append(
+            "Correct the verified failing API usage to match the callable signature without refactoring unrelated working logic."
+        )
     if error_type in {"output_missing", "artifact_io"}:
         do_not_change.append("Keep working training logic stable while restoring contract outputs at exact paths.")
+        repair_goals.append(
+            "Repair artifact writing or path handling without changing unrelated business logic."
+        )
 
     for action in retry_context.get("recommended_actions") or []:
         text = str(action or "").strip()
@@ -12647,6 +12715,76 @@ def _build_repair_ground_truth(
         verified_facts.append({"fact": "failed_gate", "value": label[:180], "source": "review_pipeline"})
         if len([item for item in verified_facts if item.get("fact") == "failed_gate"]) >= 6:
             break
+
+    combined_failure_text = " ".join(
+        [
+            runtime_text,
+            specific_error,
+            failure_signature,
+            " ".join(str(item or "") for item in (failed_gates or [])),
+            " ".join(str(item or "") for item in (required_fixes or [])),
+        ]
+    ).lower()
+    parser_inflation_tokens = (
+        "introduced by parsing",
+        "after parsing",
+        "after coercion",
+        "parse_temporal_anchor",
+        "identifier_and_split_key_completeness",
+        "identifier_completeness",
+        "split_key",
+        "completeness",
+    )
+    for fact in verified_facts:
+        if not isinstance(fact, dict):
+            continue
+        if str(fact.get("fact") or "").strip().lower() != "column_repair_context":
+            continue
+        value = fact.get("value")
+        if not isinstance(value, dict):
+            continue
+        column = str(fact.get("column") or "").strip()
+        if not column:
+            continue
+        raw_non_null_ratio = value.get("raw_non_null_ratio_exact")
+        raw_null_ratio = value.get("raw_null_ratio_exact")
+        patterns = value.get("observed_format_patterns") if isinstance(value.get("observed_format_patterns"), list) else []
+        if isinstance(raw_non_null_ratio, (int, float)) and float(raw_non_null_ratio) >= 0.999 and any(
+            token in combined_failure_text for token in parser_inflation_tokens
+        ):
+            delta = {
+                "kind": "parser_introduced_null_inflation",
+                "column": column,
+                "raw_non_null_ratio_exact": round(float(raw_non_null_ratio), 6),
+                "raw_null_ratio_exact": round(float(raw_null_ratio), 6) if isinstance(raw_null_ratio, (int, float)) else None,
+                "raw_null_count_exact": value.get("raw_null_count_exact"),
+                "observed_format_patterns": [str(item).strip() for item in patterns[:6] if str(item).strip()],
+                "raw_sample_values": [str(item).strip() for item in (value.get("raw_sample_values") or [])[:6] if str(item).strip()],
+                "symptom": "The raw source is complete, but the current transform is introducing nulls before the gate check.",
+            }
+            if delta not in causal_deltas:
+                causal_deltas.append(delta)
+            goal = (
+                f"Rework the transformation for {column} so it preserves recoverable values and avoids null inflation introduced by parsing/coercion."
+            )
+            if goal not in repair_goals:
+                repair_goals.append(goal)
+        if len(patterns) > 1:
+            delta = {
+                "kind": "mixed_format_input",
+                "column": column,
+                "observed_format_patterns": [str(item).strip() for item in patterns[:6] if str(item).strip()],
+                "symptom": "Multiple observed raw format families mean a single coercive parse is unlikely to be safe.",
+            }
+            if delta not in causal_deltas:
+                causal_deltas.append(delta)
+
+    rethink_required, rethink_reason = _detect_repeated_de_failure_pattern(
+        state,
+        failed_gates=failed_gates,
+        referenced_columns=referenced_columns,
+        failure_signature=failure_signature,
+    )
 
     if not error_type and missing_outputs:
         error_type = "output_missing"
@@ -12668,6 +12806,11 @@ def _build_repair_ground_truth(
         "candidate_call_sites": candidate_call_sites[:4],
         "compatibility_notes": compatibility_notes[:6],
         "do_not_change": do_not_change[:8],
+        "causal_deltas": causal_deltas[:8],
+        "repair_goal": list(dict.fromkeys([str(item) for item in repair_goals if str(item).strip()]))[:6],
+        "stable_regions": list(dict.fromkeys([str(item) for item in stable_regions + do_not_change if str(item).strip()]))[:8],
+        "rethink_required": bool(rethink_required),
+        "rethink_reason": rethink_reason or None,
     }
 
 
@@ -12775,6 +12918,30 @@ def _build_repair_scope(
                     if target not in editable_targets:
                         editable_targets.append(target)
 
+    for delta in repair_ground_truth.get("causal_deltas") or []:
+        if not isinstance(delta, dict):
+            continue
+        kind = str(delta.get("kind") or "").strip().lower()
+        column = str(delta.get("column") or "").strip()
+        if kind == "parser_introduced_null_inflation" and column:
+            finding = (
+                f"{column}: the raw source appears complete, but the current transform is introducing nulls before gate validation."
+            )
+            if finding not in active_findings:
+                active_findings.append(finding)
+            target = f"parse_logic:{column}"
+            if target not in editable_targets:
+                editable_targets.append(target)
+        elif kind == "mixed_format_input" and column:
+            finding = (
+                f"{column}: mixed raw format families are present; a single coercive parse is not a safe implementation."
+            )
+            if finding not in active_findings:
+                active_findings.append(finding)
+            target = f"parse_logic:{column}"
+            if target not in editable_targets:
+                editable_targets.append(target)
+
     for call_site in repair_ground_truth.get("candidate_call_sites") or []:
         if not isinstance(call_site, dict):
             continue
@@ -12816,12 +12983,31 @@ def _build_repair_scope(
         )
     if must_preserve:
         protected_regions.extend(must_preserve[:4])
+    stable_regions = repair_ground_truth.get("stable_regions")
+    if isinstance(stable_regions, list):
+        for item in stable_regions[:4]:
+            token = str(item or "").strip()
+            if token and token not in protected_regions:
+                protected_regions.append(token)
     if missing_outputs:
         invariants.append(
             "If you touch output-writing logic, regenerate only the missing contract artifacts at exact paths: "
             + ", ".join(missing_outputs[:4])
             + "."
         )
+    for goal in repair_ground_truth.get("repair_goal") or []:
+        text = str(goal or "").strip()
+        if text and text not in active_findings:
+            active_findings.append("repair_goal: " + text)
+        if len(active_findings) >= 8:
+            break
+    if bool(repair_ground_truth.get("rethink_required")):
+        rethink_reason = str(repair_ground_truth.get("rethink_reason") or "").strip()
+        invariants.append(
+            "The same failure pattern has repeated. Rethink the implicated transformation strategy instead of reapplying another local patch."
+        )
+        if rethink_reason:
+            active_findings.append("rethink_required: " + rethink_reason)
     active_hypothesis = (
         optimization_context.get("active_hypothesis")
         if isinstance(optimization_context.get("active_hypothesis"), dict)
@@ -12861,6 +13047,81 @@ def _build_repair_scope(
         "must_preserve_invariants": invariants[:8],
         "widen_scope_rule": "Only widen edit scope if new verified runtime evidence directly implicates another block.",
     }
+
+
+def _append_data_engineer_structured_repair_context(
+    payload: str,
+    *,
+    state: Dict[str, Any],
+    runtime_output: Any,
+    failed_gates: List[str] | None,
+    required_fixes: List[str] | None,
+    missing_outputs: List[str] | None,
+    present_outputs: List[str] | None,
+    evidence_focus: List[Dict[str, Any]] | None = None,
+    repair_focus_hint: str = "",
+    must_preserve: List[str] | None = None,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    retry_context = _build_retry_context(
+        runtime_tail=str(runtime_output or ""),
+        hard_failures=[],
+        failed_gates=[str(item) for item in (failed_gates or []) if str(item).strip()],
+        missing_outputs=[str(item) for item in (missing_outputs or []) if str(item).strip()],
+        present_outputs=[str(item) for item in (present_outputs or []) if str(item).strip()],
+        required_fixes=[str(item) for item in (required_fixes or []) if str(item).strip()],
+        state=state,
+    )
+    hinted_focus = str(repair_focus_hint or "").strip().lower()
+    if hinted_focus and (
+        not str(retry_context.get("repair_focus") or "").strip()
+        or hinted_focus == "compliance"
+    ):
+        retry_context["repair_focus"] = hinted_focus
+    repair_ground_truth = _build_repair_ground_truth(
+        state=state,
+        retry_context=retry_context,
+        runtime_output=runtime_output,
+        missing_outputs=missing_outputs,
+        present_outputs=present_outputs,
+        failed_gates=failed_gates,
+        required_fixes=required_fixes,
+    )
+    effective_focus = str(
+        (repair_ground_truth.get("repair_focus") if isinstance(repair_ground_truth, dict) else "")
+        or retry_context.get("repair_focus")
+        or repair_focus_hint
+        or "runtime"
+    ).strip().lower()
+    repair_scope = _build_repair_scope(
+        repair_focus=effective_focus,
+        repair_ground_truth=repair_ground_truth,
+        required_fixes=required_fixes,
+        failed_gates=failed_gates,
+        evidence_focus=evidence_focus,
+        must_preserve=must_preserve,
+        missing_outputs=missing_outputs,
+    )
+
+    blocks: List[str] = []
+    if retry_context:
+        blocks.append("RETRY_CONTEXT_JSON:\n" + json.dumps(retry_context, ensure_ascii=False, indent=2))
+    if repair_ground_truth:
+        blocks.append("REPAIR_GROUND_TRUTH_JSON:\n" + json.dumps(repair_ground_truth, ensure_ascii=False, indent=2))
+    if repair_scope:
+        blocks.append("REPAIR_SCOPE_JSON:\n" + json.dumps(repair_scope, ensure_ascii=False, indent=2))
+    if isinstance(repair_ground_truth, dict) and repair_ground_truth.get("rethink_required"):
+        rethink_reason = str(repair_ground_truth.get("rethink_reason") or "").strip()
+        rethink_msg = (
+            "The same failure pattern has repeated. Rethink the implicated transformation strategy instead of applying another local patch."
+        )
+        if rethink_reason:
+            rethink_msg += " " + rethink_reason
+        blocks.append("RETHINK_MODE:\n" + rethink_msg)
+
+    payload_text = str(payload or "").strip()
+    if blocks:
+        payload_text = payload_text + ("\n\n" if payload_text else "") + "\n\n".join(blocks)
+    return payload_text, retry_context, repair_ground_truth, repair_scope
 
 
 def _classify_runtime_failure_details(
@@ -19936,6 +20197,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         new_state["de_runtime_retry_done_run_id"] = run_id
                     new_state["execution_error_message"] = runtime_error_text[-4000:]
                     base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                    required_de_outputs = get_required_outputs_by_owner(
+                        state.get("execution_contract", {}) or {},
+                        "data_engineer",
+                    )
+                    for path in (de_output_path, de_manifest_path, de_outlier_report_path):
+                        token = str(path or "").strip()
+                        if token and token not in required_de_outputs:
+                            required_de_outputs.append(token)
+                    present_de_outputs, missing_de_outputs = _collect_outputs_state(required_de_outputs)
                     error_snippet = _extract_error_snippet(code, runtime_error_text)
                     traceback_tail = _tail_lines(runtime_error_text, 20)
                     payload = "RUNTIME_ERROR_CONTEXT:\n" + runtime_error_text[-3000:]
@@ -20011,6 +20281,30 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 )
                     except Exception as explainer_err:
                         print(f"Warning: heavy-runner DE failure explainer failed: {explainer_err}")
+                    payload, _, _, _ = _append_data_engineer_structured_repair_context(
+                        payload,
+                        state=state,
+                        runtime_output=runtime_error_text,
+                        failed_gates=["runtime_failure"],
+                        required_fixes=[
+                            str(item)
+                            for item in list(gate_hints or []) + list(explainer_fix_hints)
+                            if str(item).strip()
+                        ],
+                        missing_outputs=missing_de_outputs,
+                        present_outputs=present_de_outputs,
+                        evidence_focus=[
+                            {
+                                "claim": "Heavy runner reported runtime code error.",
+                                "source": "heavy_runner_error",
+                            }
+                        ],
+                        repair_focus_hint="runtime",
+                        must_preserve=[
+                            "Keep owned output paths and manifest/output-closure logic intact unless the verified root cause directly implicates them.",
+                            "Preserve cleaning stages that are not implicated by the latest verified runtime evidence.",
+                        ],
+                    )
                     _merge_de_override_with_feedback_record(
                         new_state,
                         base_override=base_override,
@@ -20487,6 +20781,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     new_state["de_runtime_reviewer_done"] = True
                                 if run_id:
                                     new_state["de_runtime_reviewer_done_run_id"] = run_id
+                                required_de_outputs = get_required_outputs_by_owner(
+                                    state.get("execution_contract", {}) or {},
+                                    "data_engineer",
+                                )
+                                for path in (de_output_path, de_manifest_path, de_outlier_report_path):
+                                    token = str(path or "").strip()
+                                    if token and token not in required_de_outputs:
+                                        required_de_outputs.append(token)
+                                present_de_outputs, missing_de_outputs = _collect_outputs_state(required_de_outputs)
                                 error_snippet = _extract_error_snippet(code, error_details)
                                 payload = "RUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
                                 traceback_tail = _tail_lines(error_details, 20)
@@ -20566,6 +20869,30 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
                                 except Exception:
                                     pass
+                                payload, _, _, _ = _append_data_engineer_structured_repair_context(
+                                    payload,
+                                    state=state,
+                                    runtime_output=error_details,
+                                    failed_gates=["runtime_failure"],
+                                    required_fixes=[
+                                        str(item)
+                                        for item in list(gate_hints or []) + list(explainer_fix_hints)
+                                        if str(item).strip()
+                                    ],
+                                    missing_outputs=missing_de_outputs,
+                                    present_outputs=present_de_outputs,
+                                    evidence_focus=[
+                                        {
+                                            "claim": "Sandbox execution returned traceback/runtime error.",
+                                            "source": "sandbox_error",
+                                        }
+                                    ],
+                                    repair_focus_hint="runtime",
+                                    must_preserve=[
+                                        "Keep owned output paths and manifest/output-closure logic intact unless the verified root cause directly implicates them.",
+                                        "Preserve cleaning stages that are not implicated by the latest verified runtime evidence.",
+                                    ],
+                                )
                                 _merge_de_override_with_feedback_record(
                                     new_state,
                                     base_override=state.get("data_engineer_audit_override") or state.get("data_summary", ""),
@@ -21411,6 +21738,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             reviewer_retries = int(state.get("cleaning_reviewer_retry_count", 0))
                             if reviewer_retries < 2:
                                 base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                                required_de_outputs = get_required_outputs_by_owner(
+                                    state.get("execution_contract", {}) or {},
+                                    "data_engineer",
+                                )
+                                for path in (de_output_path, de_manifest_path, de_outlier_report_path):
+                                    token = str(path or "").strip()
+                                    if token and token not in required_de_outputs:
+                                        required_de_outputs.append(token)
+                                present_de_outputs, missing_de_outputs = _collect_outputs_state(required_de_outputs)
                                 fixes = review_result.get("required_fixes", [])
                                 fixes_text = ""
                                 if isinstance(fixes, list) and fixes:
@@ -21461,6 +21797,22 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         )
                                         if len(gate_evidence_items) >= 8:
                                             break
+                                payload, _, _, _ = _append_data_engineer_structured_repair_context(
+                                    payload,
+                                    state=state,
+                                    runtime_output=str(review_result.get("feedback") or ""),
+                                    failed_gates=failed_checks,
+                                    required_fixes=required_fix_items,
+                                    missing_outputs=missing_de_outputs,
+                                    present_outputs=present_de_outputs,
+                                    evidence_focus=gate_evidence_items
+                                    or [{"claim": "Cleaning reviewer rejected DE output.", "source": "cleaning_reviewer_report.json"}],
+                                    repair_focus_hint="compliance",
+                                    must_preserve=[
+                                        "Keep owned artifact materialization logic that already satisfies the contract.",
+                                        "Preserve transformations not implicated by the reviewer evidence.",
+                                    ],
+                                )
                                 _merge_de_override_with_feedback_record(
                                     new_state,
                                     base_override=base_override,
