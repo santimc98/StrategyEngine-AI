@@ -257,6 +257,89 @@ def test_iteration_handoff_builds_callable_compatibility_facts_for_sklearn_api_m
     )
 
 
+def test_iteration_handoff_exposes_column_repair_context_for_parser_introduced_nulls(tmp_path):
+    csv_path = tmp_path / "account_snapshots.csv"
+    csv_path.write_text(
+        "account_id,snapshot_month_end,churn_60d\n"
+        "A001,2025-01-31,0\n"
+        "A002,31/12/2024,1\n"
+        "A003,12-31-2024,\n",
+        encoding="utf-8",
+    )
+    runtime_output = (
+        "Traceback (most recent call last)\n"
+        "  File \"script.py\", line 88, in <module>\n"
+        "    main()\n"
+        "  File \"script.py\", line 72, in main\n"
+        "    raise ValueError('identifier_and_split_key_completeness - Nulls introduced in primary identifiers after parsing: snapshot_month_end')\n"
+        "ValueError: identifier_and_split_key_completeness - Nulls introduced in primary identifiers after parsing: snapshot_month_end\n"
+    )
+    state = {
+        "iteration_count": 2,
+        "execution_contract": {"required_outputs": ["artifacts/clean/accounts_snapshot_ml_ready.csv"]},
+        "execution_output": runtime_output,
+        "last_runtime_error_tail": runtime_output,
+        "csv_path": str(csv_path),
+        "csv_encoding": "utf-8",
+        "csv_sep": ",",
+        "csv_decimal": ".",
+        "dataset_profile": {
+            "column_profiles": {
+                "snapshot_month_end": {
+                    "null_pct": 0.0,
+                    "null_count": 0,
+                    "looks_datetime": True,
+                    "observed_format_patterns": ["YYYY-MM-DD", "DD/MM/YYYY", "MM-DD-YYYY"],
+                },
+                "account_id": {
+                    "null_pct": 0.0,
+                    "null_count": 0,
+                    "unique_count": 3,
+                },
+            }
+        },
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["identifier_and_split_key_completeness"],
+            "required_fixes": ["Fix parsing/coercion for snapshot_month_end without blaming the raw CSV."],
+            "feedback": "snapshot_month_end became null after parsing.",
+        },
+        oc_report={"present": [], "missing": ["artifacts/clean/accounts_snapshot_ml_ready.csv"]},
+        review_result={},
+        qa_result={},
+        evaluation_spec={"primary_metric": "pr_auc"},
+    )
+
+    repair_ground_truth = handoff["repair_ground_truth"]
+    assert any(
+        fact.get("fact") == "column_repair_context"
+        and fact.get("column") == "snapshot_month_end"
+        and fact.get("value", {}).get("raw_non_null_ratio_exact") == pytest.approx(1.0)
+        for fact in repair_ground_truth["verified_facts"]
+    )
+    assert any(
+        "introduced by parsing or coercion" in directive.lower()
+        for directive in repair_ground_truth.get("repair_directives", [])
+    )
+    assert any(
+        "staged parsing" in directive.lower()
+        for directive in repair_ground_truth.get("repair_directives", [])
+    )
+    repair_scope = handoff["repair_scope"]
+    assert any(
+        "snapshot_month_end: raw source is fully populated" in item
+        for item in repair_scope.get("active_findings", [])
+    )
+    assert any(
+        "parse_logic:snapshot_month_end" == item
+        for item in repair_scope.get("editable_targets", [])
+    )
+
+
 def test_iteration_handoff_builds_patch_only_repair_scope_for_runtime_repair():
     generated_code = (
         "def check_writable(path):\n"

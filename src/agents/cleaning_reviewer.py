@@ -2714,6 +2714,7 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
       - {"columns_touched": ["col1", ...]}              (canonical)
       - {"target_columns": ["col1", ...]}               (list variant)
       - {"target_columns": {"col1": {...}, ...}}         (dict-keyed variant)
+      - {"targets": ["col1", ...] | {"col1": {...}}}    (alternative contract variant)
       - {"columns": ["col1", ...] | {"col1": {...}}}    (legacy)
       - {"applied": [{"column": "col1", ...}, ...]}     (per-column detail variant)
 
@@ -2729,6 +2730,12 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
             report_columns = [str(key).strip() for key in target_cols.keys() if str(key).strip()]
         else:
             report_columns = _list_str(target_cols)
+    if not report_columns:
+        targets = report.get("targets")
+        if isinstance(targets, dict):
+            report_columns = [str(key).strip() for key in targets.keys() if str(key).strip()]
+        else:
+            report_columns = _list_str(targets)
     raw_columns = report.get("columns")
     if not report_columns and isinstance(raw_columns, list):
         report_columns = _list_str(raw_columns)
@@ -2756,6 +2763,7 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
             "metadata",
             "columns_touched",
             "target_columns",
+            "targets",
             "columns",
             "applied",
         }

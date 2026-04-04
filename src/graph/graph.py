@@ -12308,6 +12308,172 @@ def _build_callable_api_compatibility_payload(
     return payload
 
 
+def _load_dataset_profile_for_repair(state: Dict[str, Any] | None) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    profile = state.get("dataset_profile") if isinstance(state.get("dataset_profile"), dict) else {}
+    if not profile and isinstance(state.get("profile"), dict):
+        profile = state.get("profile")
+    if not profile:
+        loaded = _load_json_safe("data/dataset_profile.json")
+        if isinstance(loaded, dict):
+            profile = loaded
+    return profile if isinstance(profile, dict) else {}
+
+
+def _collect_repair_column_candidates(state: Dict[str, Any] | None) -> List[str]:
+    state = state if isinstance(state, dict) else {}
+    candidates: List[str] = []
+    profile = _load_dataset_profile_for_repair(state)
+    column_profiles = profile.get("column_profiles") if isinstance(profile.get("column_profiles"), dict) else {}
+    for key in column_profiles.keys():
+        token = str(key or "").strip()
+        if token and token not in candidates:
+            candidates.append(token)
+
+    csv_path = str(state.get("csv_path") or "").strip()
+    csv_sep = str(state.get("csv_sep") or ",")
+    csv_encoding = str(state.get("csv_encoding") or "utf-8")
+    header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep) if csv_path and os.path.exists(csv_path) else []
+    for col in header_cols:
+        token = str(col or "").strip()
+        if token and token not in candidates:
+            candidates.append(token)
+    return candidates[:300]
+
+
+def _extract_referenced_repair_columns(
+    state: Dict[str, Any] | None,
+    texts: List[str] | None,
+) -> List[str]:
+    candidates = _collect_repair_column_candidates(state)
+    if not candidates:
+        return []
+    haystack = "\n".join(str(item or "") for item in (texts or [])).lower()
+    if not haystack.strip():
+        return []
+    referenced: List[str] = []
+    for column in sorted(candidates, key=lambda item: (-len(item), item.lower())):
+        token = str(column or "").strip()
+        if not token:
+            continue
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(token.lower())}(?![A-Za-z0-9_])"
+        if re.search(pattern, haystack):
+            referenced.append(token)
+        if len(referenced) >= 6:
+            break
+    return referenced
+
+
+def _build_column_repair_context(
+    state: Dict[str, Any] | None,
+    columns: List[str] | None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    state = state if isinstance(state, dict) else {}
+    selected = [str(col).strip() for col in (columns or []) if str(col or "").strip()]
+    if not selected:
+        return [], []
+
+    profile = _load_dataset_profile_for_repair(state)
+    column_profiles = profile.get("column_profiles") if isinstance(profile.get("column_profiles"), dict) else {}
+    csv_path = str(state.get("csv_path") or "").strip()
+    dialect = {
+        "encoding": str(state.get("csv_encoding") or "utf-8"),
+        "sep": str(state.get("csv_sep") or ","),
+        "decimal": str(state.get("csv_decimal") or "."),
+        "quotechar": '"',
+    }
+    row_count = (
+        _estimate_row_count(
+            csv_path,
+            dialect.get("encoding") or "utf-8",
+            dialect.get("sep") or ",",
+            dialect.get("quotechar") or '"',
+            None,
+        )
+        if csv_path and os.path.exists(csv_path)
+        else None
+    )
+    sample_df = (
+        sample_raw_columns(csv_path, dialect, selected, nrows=120, dtype=str)
+        if csv_path and os.path.exists(csv_path)
+        else None
+    )
+
+    facts: List[Dict[str, Any]] = []
+    fully_present_raw: List[str] = []
+    multi_format_temporal: List[str] = []
+    for column in selected[:4]:
+        payload: Dict[str, Any] = {}
+        profile_entry = column_profiles.get(column)
+        if isinstance(profile_entry, dict):
+            for key in (
+                "null_pct",
+                "null_count",
+                "unique_count",
+                "looks_datetime",
+                "looks_numeric",
+                "numeric_unparsed_count",
+            ):
+                if key in profile_entry:
+                    payload[key] = profile_entry.get(key)
+            patterns = profile_entry.get("observed_format_patterns")
+            if isinstance(patterns, list) and patterns:
+                cleaned_patterns = [str(item).strip() for item in patterns if str(item or "").strip()]
+                if cleaned_patterns:
+                    payload["observed_format_patterns"] = cleaned_patterns[:6]
+                    if len(cleaned_patterns) > 1:
+                        multi_format_temporal.append(column)
+            top_values = profile_entry.get("top_values")
+            if isinstance(top_values, dict) and top_values:
+                payload["top_values_sample"] = {
+                    str(k): v for k, v in list(top_values.items())[:5] if str(k).strip()
+                }
+
+        if csv_path and os.path.exists(csv_path):
+            exact_non_null_ratio = _compute_exact_non_null_ratio(csv_path, dialect, column)
+            if exact_non_null_ratio is not None:
+                payload["raw_non_null_ratio_exact"] = round(float(exact_non_null_ratio), 6)
+                if row_count is not None:
+                    raw_null_count = max(int(row_count - round(float(exact_non_null_ratio) * row_count)), 0)
+                    payload["raw_null_count_exact"] = raw_null_count
+                    if raw_null_count == 0:
+                        fully_present_raw.append(column)
+
+        if sample_df is not None and column in sample_df.columns:
+            sample_series = sample_df[column]
+            payload["raw_non_null_ratio_sample"] = round(float(sample_series.notna().mean()), 6)
+            sample_values: List[str] = []
+            for item in sample_series.dropna().astype(str).tolist():
+                token = str(item).strip()
+                if token and token not in sample_values:
+                    sample_values.append(token)
+                if len(sample_values) >= 6:
+                    break
+            if sample_values:
+                payload["raw_sample_values"] = sample_values
+
+        if payload:
+            facts.append(
+                {
+                    "fact": "column_repair_context",
+                    "column": column,
+                    "value": payload,
+                    "source": "dataset_profile+raw_csv",
+                }
+            )
+
+    directives: List[str] = []
+    if fully_present_raw:
+        directives.append(
+            "When a failing gate names specific columns, verify whether nulls were introduced by parsing or coercion before treating the raw dataset as incomplete."
+        )
+    if multi_format_temporal:
+        directives.append(
+            "If a referenced column shows multiple observed datetime format patterns, use staged parsing and compare post-parse null inflation against the raw null rate before declaring the column invalid."
+        )
+    return facts, directives
+
+
 def _build_repair_ground_truth(
     *,
     state: Dict[str, Any],
@@ -12425,6 +12591,18 @@ def _build_repair_ground_truth(
         failure_signature = ": ".join([part for part in [exception_type, exception_message] if part]).strip()
     failure_signature = failure_signature[:320]
     compatibility_notes: List[str] = []
+    referenced_columns = _extract_referenced_repair_columns(
+        state,
+        [runtime_text, specific_error] + [str(item or "") for item in (required_fixes or [])] + [str(item or "") for item in (failed_gates or [])],
+    )
+    column_facts, column_directives = _build_column_repair_context(state, referenced_columns)
+    for item in column_facts:
+        if item not in verified_facts:
+            verified_facts.append(item)
+    for item in column_directives:
+        text = str(item or "").strip()
+        if text and text not in repair_directives:
+            repair_directives.append(text)
     compatibility_payload = _build_callable_api_compatibility_payload(
         candidate_call_sites,
         unexpected_keyword=keyword_match.group(1) if keyword_match else "",
@@ -12567,6 +12745,35 @@ def _build_repair_scope(
             text = f"{name}:{value}"
             if text not in active_findings:
                 active_findings.append(text)
+        elif name == "column_repair_context" and isinstance(value, dict):
+            column = str(fact.get("column") or "").strip()
+            if not column:
+                continue
+            raw_non_null_ratio = value.get("raw_non_null_ratio_exact")
+            if isinstance(raw_non_null_ratio, (int, float)):
+                pct = round(float(raw_non_null_ratio) * 100.0, 1)
+                if float(raw_non_null_ratio) >= 0.999:
+                    text = (
+                        f"{column}: raw source is fully populated; if completeness fails after parsing, "
+                        "treat it as parser/coercion null inflation before blaming the input dataset."
+                    )
+                else:
+                    text = f"{column}: raw source non-null ratio is {pct:.1f}%."
+                if text not in active_findings:
+                    active_findings.append(text)
+            patterns = value.get("observed_format_patterns")
+            if isinstance(patterns, list):
+                cleaned_patterns = [str(item).strip() for item in patterns if str(item or "").strip()]
+                if len(cleaned_patterns) > 1:
+                    text = (
+                        f"{column}: multiple observed format patterns detected "
+                        f"({', '.join(cleaned_patterns[:4])}); prefer staged parsing over a single coercive pass."
+                    )
+                    if text not in active_findings:
+                        active_findings.append(text)
+                    target = f"parse_logic:{column}"
+                    if target not in editable_targets:
+                        editable_targets.append(target)
 
     for call_site in repair_ground_truth.get("candidate_call_sites") or []:
         if not isinstance(call_site, dict):

@@ -284,6 +284,62 @@ def test_outlier_policy_applied_accepts_flat_top_level_column_report():
     assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
 
 
+def test_outlier_policy_applied_accepts_targets_dict_report():
+    df = pd.DataFrame(
+        {
+            "employees": [10, 20, 30],
+            "annual_revenue": [1000, 2000, 3000],
+        }
+    )
+    gates = [
+        {
+            "name": "outlier_policy_applied",
+            "severity": "HARD",
+            "params": {"strict": True},
+        }
+    ]
+    manifest = {"outlier_treatment": {"policy_applied": True}}
+    outlier_policy = {
+        "enabled": True,
+        "apply_stage": "data_engineer",
+        "target_columns": ["employees", "annual_revenue"],
+        "strict": True,
+    }
+    outlier_report = {
+        "enabled": True,
+        "targets": {
+            "employees": {"threshold_99pct": 5000, "capped_count": 2},
+            "annual_revenue": {"threshold_99pct": 9000, "capped_count": 1},
+        },
+        "actions": ["clip_and_flag"],
+    }
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=[],
+        cleaned_header=list(df.columns),
+        cleaned_csv_path="data/cleaned_data.csv",
+        sample_str=df.astype(str),
+        sample_infer=df,
+        manifest=manifest,
+        raw_sample=None,
+        column_roles={},
+        allowed_feature_sets={},
+        outlier_policy=outlier_policy,
+        outlier_report=outlier_report,
+        outlier_report_path="data/outlier_treatment_report.json",
+    )
+
+    gate_entry = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "outlier_policy_applied"
+    )
+    evidence = gate_entry.get("evidence") or {}
+    assert gate_entry.get("passed") is True
+    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+
+
 def test_boolean_normalization_passes_for_nullable_integer_boolean_columns(tmp_path: Path):
     csv_path = tmp_path / "cleaned.csv"
     cleaned = pd.DataFrame(
