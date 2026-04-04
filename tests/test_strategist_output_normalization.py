@@ -98,6 +98,29 @@ class TestStrategistNormalization:
         assert validation["invalid_count"] == 2
         assert len(validation["invalid_details"]) == 2
 
+    def test_authoritative_hardening_infers_audit_only_columns_from_reasoning(self):
+        payload = {
+            "strategies": [
+                {
+                    "title": "Churn ranking",
+                    "required_columns": ["account_id", "csm_owner", "churn_60d"],
+                    "reasoning": (
+                        "CSM owner should be excluded from the initial model and "
+                        "evaluated separately as a stratification variable for reporting."
+                    ),
+                }
+            ]
+        }
+
+        hardened = self.agent._apply_authoritative_strategy_hardening(
+            payload,
+            ["account_id", "csm_owner", "churn_60d"],
+        )
+
+        strategy = hardened["strategies"][0]
+        assert strategy.get("audit_only_columns") == ["csm_owner"]
+        assert hardened.get("authoritative_hardening", {}).get("status") == "applied"
+
     def test_build_strategy_spec_includes_target_columns(self):
         payload = {
             "strategies": [
@@ -267,7 +290,14 @@ class TestStrategistNormalization:
         )
         prompt = self.agent.last_prompt or ""
         _assert_contains_all(prompt, "*** MISSION ***", "*** SOURCE OF TRUTH AND PRECEDENCE ***")
-        _assert_contains_terms(prompt, "strategy reasoning", "scope_recommendation", "recommended_artifacts")
+        _assert_contains_terms(
+            prompt,
+            "strategy reasoning",
+            "scope_recommendation",
+            "recommended_artifacts",
+            "structured facts win",
+            "audit_only_columns",
+        )
 
     @patch.dict("os.environ", {"STRATEGIST_COLUMN_REPAIR_ATTEMPTS": "1"})
     def test_generate_strategies_repairs_required_columns_with_inventory(self):

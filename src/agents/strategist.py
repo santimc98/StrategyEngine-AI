@@ -1873,6 +1873,7 @@ $payload_json
                 )
                 candidate_parsed = json.loads(self._clean_json(repaired))
                 candidate_payload = self._normalize_strategist_output(candidate_parsed)
+                candidate_payload = self._apply_authoritative_strategy_hardening(candidate_payload, allowed_columns)
                 candidate_payload = self._enforce_strategy_count(candidate_payload, strategy_count)
                 candidate_validation = self._validate_required_columns(
                     candidate_payload,
@@ -2048,6 +2049,8 @@ $payload_json
         3) AUTHORIZED COLUMN INVENTORY / COLUMN SETS / COLUMN MANIFEST (authoritative for column names and families)
         4) COMPUTE CONSTRAINTS (authoritative for practicality)
         5) Generic data science patterns are advisory only and must never override the current run context
+        6) If free-text narrative conflicts with STEWARD_FACTS, DATASET_SEMANTICS_SUMMARY, or COLUMN METADATA,
+           the structured facts win. Do not blend contradictory rules into a compromise.
 
         *** DATASET SUMMARY ***
         $data_summary
@@ -2189,6 +2192,7 @@ $payload_json
             "analysis_type": "Brief label (e.g. 'Price Optimization', 'Churn Prediction')",
             "hypothesis": "What you expect to find or achieve",
             "required_columns": ["exact", "column", "names", "from", "summary"],
+            "audit_only_columns": ["optional", "columns", "to", "preserve", "for", "audit", "reporting", "or", "stratification", "but", "not", "model", "inputs"],
             "feature_families": [{"family": "optional", "rationale": "optional", "selector_hint": "optional"}],
             "techniques": ["list", "of", "data science techniques"],
             "feasibility_analysis": {
@@ -2209,6 +2213,8 @@ $payload_json
         - In WIDE-SCHEMA MODE, required_columns count must stay inside the configured budget.
         - NEVER invent, rename, abbreviate, or infer columns not present in AUTHORIZED COLUMN INVENTORY.
         - If uncertain about a column, omit it (do not hallucinate).
+        - If you conclude a column should be excluded from the initial model, quarantined, or used only for audit/reporting/stratification,
+          list it in "audit_only_columns" instead of leaving that decision only in prose.
         - "objective_reasoning" must connect business goal → objective_type.
         - "scope_recommendation" and "scope_reasoning" must reflect THIS run, not generic defaults.
         - "feasibility_analysis" is required — no technique without data-driven justification.
@@ -2270,6 +2276,7 @@ $payload_json
 
             # Normalization (Fix for crash 'list' object has no attribute 'get')
             payload = self._normalize_strategist_output(parsed)
+            payload = self._apply_authoritative_strategy_hardening(payload, allowed_columns)
             payload = self._enforce_strategy_count(payload, strategy_count)
             payload, diversity_validation = self._ensure_strategy_diversity(
                 payload=payload,
@@ -2502,6 +2509,201 @@ $payload_json
             normalized.append(name)
         return normalized
 
+    def _normalize_strategy_column_list(
+        self,
+        values: Any,
+        allowed_columns: List[str],
+    ) -> List[str]:
+        allowed_lookup = {
+            str(col).strip().lower(): str(col).strip()
+            for col in allowed_columns
+            if isinstance(col, str) and str(col).strip()
+        }
+        normalized: List[str] = []
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            return normalized
+        for item in values:
+            candidate = None
+            if isinstance(item, str):
+                candidate = item.strip()
+            elif isinstance(item, dict):
+                maybe_name = item.get("name") or item.get("column")
+                if isinstance(maybe_name, str):
+                    candidate = maybe_name.strip()
+            if not candidate:
+                continue
+            canonical = allowed_lookup.get(candidate.lower())
+            if canonical and canonical not in normalized:
+                normalized.append(canonical)
+        return normalized
+
+    def _collect_strategy_reasoning_fragments(self, strategy: Dict[str, Any]) -> List[str]:
+        fragments: List[str] = []
+
+        def _add(value: Any) -> None:
+            if not isinstance(value, str):
+                return
+            text = value.strip()
+            if text:
+                fragments.append(text)
+
+        for key in (
+            "objective_reasoning",
+            "scope_reasoning",
+            "validation_rationale",
+            "hypothesis",
+            "reasoning",
+            "expected_lift",
+        ):
+            _add(strategy.get(key))
+
+        fallback_chain = strategy.get("fallback_chain")
+        if isinstance(fallback_chain, list):
+            for item in fallback_chain:
+                _add(item)
+
+        feasibility = strategy.get("feasibility_analysis")
+        if isinstance(feasibility, dict):
+            for item in feasibility.values():
+                _add(item)
+
+        feature_families = strategy.get("feature_families")
+        if isinstance(feature_families, list):
+            for entry in feature_families:
+                if isinstance(entry, str):
+                    _add(entry)
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("family", "rationale", "selector_hint", "description", "pattern"):
+                    _add(entry.get(key))
+
+        recommended_artifacts = strategy.get("recommended_artifacts")
+        if isinstance(recommended_artifacts, list):
+            for entry in recommended_artifacts:
+                if not isinstance(entry, dict):
+                    continue
+                _add(entry.get("rationale"))
+
+        return fragments
+
+    def _infer_audit_only_columns_from_reasoning(
+        self,
+        strategy: Dict[str, Any],
+        allowed_columns: List[str],
+    ) -> List[str]:
+        if not isinstance(strategy, dict) or not allowed_columns:
+            return []
+
+        cue_patterns = (
+            re.compile(r"\bexclude(?:d|s)?\b", flags=re.IGNORECASE),
+            re.compile(r"\bquarantin(?:e|ed|ing)\b", flags=re.IGNORECASE),
+            re.compile(r"\baudit[- ]only\b", flags=re.IGNORECASE),
+            re.compile(r"\breport(?:ing)?[- ]only\b", flags=re.IGNORECASE),
+            re.compile(r"\bstratification variable\b", flags=re.IGNORECASE),
+            re.compile(r"\bevaluat(?:e|ed|ion) separately\b", flags=re.IGNORECASE),
+            re.compile(r"\boutside the initial model\b", flags=re.IGNORECASE),
+            re.compile(r"\bexclude from (?:the )?(?:initial )?model\b", flags=re.IGNORECASE),
+            re.compile(r"\bshould be excluded from (?:the )?(?:initial )?model\b", flags=re.IGNORECASE),
+            re.compile(r"\bdo not include in (?:the )?(?:initial )?model\b", flags=re.IGNORECASE),
+            re.compile(r"\bmust not be model features?\b", flags=re.IGNORECASE),
+            re.compile(r"\bshould not be model features?\b", flags=re.IGNORECASE),
+            re.compile(r"\bnot as a model feature\b", flags=re.IGNORECASE),
+            re.compile(r"\bused only for (?:audit|reporting|stratification)\b", flags=re.IGNORECASE),
+        )
+
+        inferred: List[str] = []
+        fragments = self._collect_strategy_reasoning_fragments(strategy)
+        if not fragments:
+            return inferred
+
+        allowed_patterns = []
+        for canonical in allowed_columns:
+            if not isinstance(canonical, str) or not canonical.strip():
+                continue
+            tokens = [tok for tok in re.split(r"[_\s\-]+", canonical.lower()) if tok]
+            if not tokens:
+                continue
+            if len(tokens) == 1:
+                pattern_text = re.escape(tokens[0])
+            else:
+                pattern_text = r"[_\s\-]+".join(re.escape(tok) for tok in tokens)
+            allowed_patterns.append(
+                (
+                    canonical,
+                    re.compile(
+                        rf"(?<![A-Za-z0-9]){pattern_text}(?![A-Za-z0-9])",
+                        flags=re.IGNORECASE,
+                    ),
+                )
+            )
+
+        for fragment in fragments:
+            for sentence in re.split(r"[\n.;]+", fragment):
+                snippet = sentence.strip()
+                if not snippet:
+                    continue
+                if not any(pattern.search(snippet) for pattern in cue_patterns):
+                    continue
+                for canonical, pattern in allowed_patterns:
+                    if pattern.search(snippet) and canonical not in inferred:
+                        inferred.append(canonical)
+
+        return inferred
+
+    def _apply_authoritative_strategy_hardening(
+        self,
+        payload: Dict[str, Any],
+        allowed_columns: List[str],
+    ) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"strategies": []}
+        strategies = payload.get("strategies")
+        if not isinstance(strategies, list) or not strategies:
+            return payload
+
+        hardened_payload = dict(payload)
+        hardened_strategies: List[Dict[str, Any]] = []
+        hardening_notes: List[Dict[str, Any]] = []
+
+        for idx, strategy in enumerate(strategies):
+            if not isinstance(strategy, dict):
+                continue
+            strategy_copy = dict(strategy)
+            explicit_audit_only = self._normalize_strategy_column_list(
+                strategy_copy.get("audit_only_columns"),
+                allowed_columns,
+            )
+            inferred_audit_only = self._infer_audit_only_columns_from_reasoning(
+                strategy_copy,
+                allowed_columns,
+            )
+            merged_audit_only: List[str] = []
+            for col in explicit_audit_only + inferred_audit_only:
+                if col not in merged_audit_only:
+                    merged_audit_only.append(col)
+            if merged_audit_only:
+                strategy_copy["audit_only_columns"] = merged_audit_only
+            if inferred_audit_only:
+                hardening_notes.append(
+                    {
+                        "strategy_index": idx,
+                        "strategy_title": strategy_copy.get("title", f"strategy_{idx}"),
+                        "derived_audit_only_columns": inferred_audit_only,
+                    }
+                )
+            hardened_strategies.append(strategy_copy)
+
+        hardened_payload["strategies"] = hardened_strategies
+        if hardening_notes:
+            hardened_payload["authoritative_hardening"] = {
+                "status": "applied",
+                "notes": hardening_notes,
+            }
+        return hardened_payload
+
     def _extract_required_column_names(self, strategy: Dict[str, Any]) -> List[str]:
         required_raw = strategy.get("required_columns") if isinstance(strategy, dict) else None
         if not isinstance(required_raw, list):
@@ -2695,6 +2897,7 @@ $payload_json
                 repaired_raw = self._clean_json(repaired_content)
                 repaired_parsed = json.loads(repaired_raw)
                 candidate = self._normalize_strategist_output(repaired_parsed)
+                candidate = self._apply_authoritative_strategy_hardening(candidate, allowed_columns)
                 candidate_validation = self._validate_required_columns(
                     candidate,
                     allowed_columns,
