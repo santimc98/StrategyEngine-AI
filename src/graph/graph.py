@@ -11643,8 +11643,8 @@ def _normalize_handoff_items(values: Any, max_items: int = 10, max_len: int = 18
     return out
 
 
-def _normalize_handoff_evidence(values: Any, max_items: int = 10) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
+def _normalize_handoff_evidence(values: Any, max_items: int = 10) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     if not isinstance(values, list):
         return out
     for value in values:
@@ -11653,11 +11653,15 @@ def _normalize_handoff_evidence(values: Any, max_items: int = 10) -> List[Dict[s
         if isinstance(value, dict):
             claim = _truncate_handoff_text(value.get("claim"), max_len=260)
             source = _truncate_handoff_text(value.get("source") or "missing", max_len=220) or "missing"
+            payload = value.get("payload") if isinstance(value.get("payload"), dict) else None
         else:
             claim = _truncate_handoff_text(value, max_len=260)
+            payload = None
         if not claim:
             continue
         item = {"claim": claim, "source": source}
+        if payload is not None:
+            item["payload"] = payload
         if item in out:
             continue
         out.append(item)
@@ -11713,9 +11717,14 @@ def _extract_verified_gate_feedback(
                 compact = _truncate_handoff_text(json.dumps(evidence_source, ensure_ascii=True), max_len=220)
                 if compact:
                     claim = f"{claim} | Evidence: {compact}"
+                evidence_item = {
+                    "claim": _truncate_handoff_text(claim, max_len=260),
+                    "source": source,
+                    "payload": evidence_source,
+                }
             else:
                 source = _truncate_handoff_text(evidence_source or "gate_results", max_len=220) or "gate_results"
-            evidence_item = {"claim": _truncate_handoff_text(claim, max_len=260), "source": source}
+                evidence_item = {"claim": _truncate_handoff_text(claim, max_len=260), "source": source}
             if evidence_item not in evidence:
                 evidence.append(evidence_item)
 
@@ -11742,6 +11751,88 @@ def _extract_verified_gate_feedback(
         "hard_failures": raw_hard[:15],
         "soft_failures": raw_soft[:15],
         "evidence": _normalize_handoff_evidence(packet.get("evidence"), max_items=12),
+    }
+
+
+def _extract_structured_repair_evidence(
+    evidence_focus: List[Dict[str, Any]] | None,
+) -> Dict[str, Any]:
+    evidence_focus = evidence_focus if isinstance(evidence_focus, list) else []
+    verified_facts: List[Dict[str, Any]] = []
+    causal_deltas: List[Dict[str, Any]] = []
+    repair_goals: List[str] = []
+
+    for item in evidence_focus:
+        if not isinstance(item, dict):
+            continue
+        claim = str(item.get("claim") or "").strip()
+        if not claim:
+            continue
+        gate_match = re.search(r"Gate\s+([A-Za-z0-9_]+)\s+failed", claim, re.IGNORECASE)
+        gate_name = str(gate_match.group(1) or "").strip() if gate_match else ""
+        evidence_payload = item.get("payload") if isinstance(item.get("payload"), dict) else None
+        if evidence_payload is None and "| Evidence:" in claim:
+            raw_payload = claim.split("| Evidence:", 1)[1].strip()
+            if raw_payload.startswith("{") and raw_payload.endswith("}"):
+                try:
+                    evidence_payload = json.loads(raw_payload)
+                except Exception:
+                    evidence_payload = None
+        if not isinstance(evidence_payload, dict):
+            continue
+
+        artifact_present = any(
+            bool(evidence_payload.get(key))
+            for key in ("report_present", "report_file_exists", "artifact_present", "file_exists", "manifest_present")
+        )
+        expected_columns: List[str] = []
+        observed_columns: List[str] = []
+        missing_columns: List[str] = []
+        for key, value in evidence_payload.items():
+            key_token = str(key or "").strip().lower()
+            if "missing" in key_token and "column" in key_token and isinstance(value, list):
+                missing_columns.extend(str(col).strip() for col in value if str(col).strip())
+            elif ("target_columns" in key_token or "expected_columns" in key_token) and isinstance(value, list):
+                expected_columns.extend(str(col).strip() for col in value if str(col).strip())
+            elif ("columns_touched" in key_token or "matched_columns" in key_token or "observed_columns" in key_token) and isinstance(value, list):
+                observed_columns.extend(str(col).strip() for col in value if str(col).strip())
+
+        expected_columns = list(dict.fromkeys(expected_columns))
+        observed_columns = list(dict.fromkeys(observed_columns))
+        missing_columns = list(dict.fromkeys(missing_columns))
+
+        if artifact_present and ((expected_columns and not observed_columns) or missing_columns):
+            fact = {
+                "fact": "artifact_schema_mismatch",
+                "gate": gate_name or None,
+                "value": {
+                    "artifact_present": True,
+                    "expected_columns": expected_columns[:8],
+                    "observed_columns": observed_columns[:8],
+                    "missing_columns": missing_columns[:8],
+                },
+                "source": item.get("source") or "gate_results#evidence",
+            }
+            if fact not in verified_facts:
+                verified_facts.append(fact)
+            delta = {
+                "kind": "artifact_schema_mismatch",
+                "gate": gate_name or None,
+                "expected_columns": expected_columns[:8],
+                "observed_columns": observed_columns[:8],
+                "missing_columns": missing_columns[:8],
+                "symptom": "The artifact exists, but its schema or field naming does not reconcile with reviewer expectations.",
+            }
+            if delta not in causal_deltas:
+                causal_deltas.append(delta)
+            goal = "Preserve the underlying artifact generation and reconcile its schema/field names with the contract/reviewer expectations."
+            if goal not in repair_goals:
+                repair_goals.append(goal)
+
+    return {
+        "verified_facts": verified_facts[:8],
+        "causal_deltas": causal_deltas[:8],
+        "repair_goals": repair_goals[:4],
     }
 
 
@@ -12669,6 +12760,7 @@ def _build_repair_ground_truth(
     present_outputs: List[str] | None,
     failed_gates: List[str] | None,
     required_fixes: List[str] | None,
+    evidence_focus: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     retry_context = retry_context if isinstance(retry_context, dict) else {}
     runtime_text = _resolve_authoritative_runtime_text(runtime_output, state=state) or str(runtime_output or "").strip()
@@ -12910,6 +13002,18 @@ def _build_repair_ground_truth(
             if delta not in causal_deltas:
                 causal_deltas.append(delta)
 
+    structured_evidence = _extract_structured_repair_evidence(evidence_focus)
+    for item in structured_evidence.get("verified_facts") or []:
+        if item not in verified_facts:
+            verified_facts.append(item)
+    for item in structured_evidence.get("causal_deltas") or []:
+        if item not in causal_deltas:
+            causal_deltas.append(item)
+    for item in structured_evidence.get("repair_goals") or []:
+        text = str(item or "").strip()
+        if text and text not in repair_goals:
+            repair_goals.append(text)
+
     rethink_required, rethink_reason = _detect_repeated_de_failure_pattern(
         state,
         failed_gates=failed_gates,
@@ -13072,6 +13176,16 @@ def _build_repair_scope(
             target = f"parse_logic:{column}"
             if target not in editable_targets:
                 editable_targets.append(target)
+        elif kind == "artifact_schema_mismatch":
+            gate = str(delta.get("gate") or "").strip()
+            finding = (
+                f"{gate or 'artifact'}: the artifact exists, but its schema or field naming does not match the reviewer/contract expectations."
+            )
+            if finding not in active_findings:
+                active_findings.append(finding)
+            target = f"artifact_schema:{gate or 'unknown_gate'}"
+            if target not in editable_targets:
+                editable_targets.append(target)
 
     for call_site in repair_ground_truth.get("candidate_call_sites") or []:
         if not isinstance(call_site, dict):
@@ -13216,6 +13330,7 @@ def _append_data_engineer_structured_repair_context(
         present_outputs=present_outputs,
         failed_gates=failed_gates,
         required_fixes=required_fixes,
+        evidence_focus=evidence_focus,
     )
     effective_focus = str(
         (repair_ground_truth.get("repair_focus") if isinstance(repair_ground_truth, dict) else "")
@@ -14032,6 +14147,7 @@ def _build_iteration_handoff(
         present_outputs=present_outputs,
         failed_gates=failed_gates,
         required_fixes=required_fixes,
+        evidence_focus=evidence_focus,
     )
     repair_first_focus = _resolve_repair_first_focus(
         retry_context=retry_context,

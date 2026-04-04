@@ -432,6 +432,66 @@ def test_iteration_handoff_marks_rethink_required_for_repeated_de_failure_patter
     )
 
 
+def test_iteration_handoff_builds_artifact_schema_mismatch_from_verified_reviewer_evidence():
+    state = {
+        "iteration_count": 1,
+        "execution_contract": {
+            "required_outputs": ["artifacts/clean/accounts_snapshot_ml_ready.csv"],
+        },
+    }
+
+    review_result = {
+        "gate_results": [
+            {
+                "name": "outlier_policy_applied",
+                "severity": "HARD",
+                "passed": False,
+                "issues": ["outlier_treatment_columns_missing_in_report"],
+                "evidence": {
+                    "report_present": True,
+                    "report_file_exists": True,
+                    "policy_target_columns": ["arr_current", "invoice_overdue_days"],
+                    "report_columns_touched": [],
+                    "missing_target_columns_in_report": ["arr_current", "invoice_overdue_days"],
+                },
+            }
+        ]
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={},
+        oc_report={"present": ["artifacts/clean/accounts_snapshot_ml_ready.csv"], "missing": []},
+        review_result=review_result,
+        qa_result={},
+        evaluation_spec={"primary_metric": "pr_auc"},
+    )
+
+    repair_ground_truth = handoff["repair_ground_truth"]
+    assert any(
+        fact.get("fact") == "artifact_schema_mismatch"
+        and fact.get("gate") == "outlier_policy_applied"
+        for fact in repair_ground_truth.get("verified_facts", [])
+    )
+    assert any(
+        delta.get("kind") == "artifact_schema_mismatch"
+        and delta.get("gate") == "outlier_policy_applied"
+        for delta in repair_ground_truth.get("causal_deltas", [])
+        if isinstance(delta, dict)
+    )
+    assert any(
+        "schema/field names" in str(goal or "").lower()
+        for goal in repair_ground_truth.get("repair_goal", [])
+    )
+    repair_scope = handoff["repair_scope"]
+    assert any(
+        "outlier_policy_applied: the artifact exists" in item.lower()
+        for item in repair_scope.get("active_findings", [])
+    )
+    assert "artifact_schema:outlier_policy_applied" in repair_scope.get("editable_targets", [])
+
+
 def test_iteration_handoff_builds_patch_only_repair_scope_for_runtime_repair():
     generated_code = (
         "def check_writable(path):\n"

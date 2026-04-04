@@ -2808,6 +2808,18 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
                     col = str(entry.get("column") or "").strip()
                     if col:
                         report_columns.append(col)
+    if not report_columns:
+        for list_key in ("decisions", "columns_analyzed"):
+            entries = report.get(list_key)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict):
+                    col = str(entry.get("column") or "").strip()
+                    if col:
+                        report_columns.append(col)
+            if report_columns:
+                break
     # flat per-column detail variant:
     # {"employees": {"capped_count": 12, ...}, "annual_revenue": {...}}
     if not report_columns:
