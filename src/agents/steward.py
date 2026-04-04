@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
+from dateutil import parser as date_parser
 
 try:
     import google.generativeai as genai  # type: ignore
@@ -674,6 +675,9 @@ $split_candidates_uniques
 Directed evidence bundle (requested in pass1):
 $evidence_bundle
 
+Focused structural context (derived from current target/split/id hypotheses):
+$steward_focus_context
+
 Column inventory preview (head/tail + count):
 $column_inventory_preview
 
@@ -752,11 +756,17 @@ TRAINING MASK DESIGN:
   Examine the measured target missingness. What fraction of labels is missing?
   Reason about whether unlabeled rows should be excluded from training, used for
   scoring, or treated differently. Express your reasoning in the rationale field.
+  If focused structural context includes maturity-by-bucket evidence, use it to
+  justify the boundary. Do not exclude additional mature buckets unless the
+  measured evidence supports that decision.
 
 PARTITION ANALYSIS:
   Examine the split candidates and their unique values. Do any columns define a
   natural train/test partition? Use the evidence_bundle as your source of truth —
   if it conflicts with sample rows, trust the evidence_bundle.
+  If focused structural context shows repeated entities across split buckets,
+  preserve legitimate longitudinal structure and distinguish that from exact
+  duplicate (id, split) pairs.
 
 COLUMN SET DESIGN:
   Design column_sets using compact selectors (prefix_numeric_range, regex,
@@ -786,6 +796,7 @@ CONSTRAINTS:
             target_missingness=json.dumps(payload.get("target_missingness", {}), ensure_ascii=True),
             split_candidates_uniques=json.dumps(payload.get("split_candidates_uniques", []), ensure_ascii=True),
             evidence_bundle=json.dumps(payload.get("evidence_bundle", {}), ensure_ascii=True),
+            steward_focus_context=str(payload.get("steward_focus_context", "") or ""),
             column_inventory_preview=json.dumps(payload.get("column_inventory_preview", {}), ensure_ascii=True),
             column_inventory_path=payload.get("column_inventory_path", "data/column_inventory.json"),
             data_atlas_summary=str(payload.get("data_atlas_summary", "") or ""),
@@ -1201,6 +1212,7 @@ def build_dataset_profile(
         "rows_for_estimate": rows_for_compute,
         "cols_for_estimate": cols_for_compute,
     }
+    temporal_analysis = _compute_temporal_analysis(df, columns)
 
     profile = {
         "rows": int(df.shape[0]),
@@ -1235,6 +1247,7 @@ def build_dataset_profile(
             "diagnostics": dialect_info.get("diagnostics") or {},
         },
         "compute_hints": compute_hints,
+        "temporal_analysis": temporal_analysis,
     }
     return profile
 
@@ -1305,7 +1318,45 @@ def _compute_temporal_analysis(
     details: List[Dict[str, Any]] = []
     for col in candidates[:max_candidates]:
         try:
-            parsed = pd.to_datetime(sample_df[col], errors="coerce", dayfirst=True)
+            series = sample_df[col]
+            non_missing_mask = series.notna()
+            if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+                try:
+                    text = series.astype(str).str.strip()
+                    non_missing_mask = non_missing_mask & ~text.str.lower().isin({"", "nan", "none", "null", "<na>", "nat"})
+                except Exception:
+                    pass
+            working = series.where(non_missing_mask)
+            parsed = pd.to_datetime(working, errors="coerce", utc=True)
+            remaining = non_missing_mask & parsed.isna()
+            if bool(remaining.any()):
+                parsed_dayfirst = pd.to_datetime(working[remaining], errors="coerce", utc=True, dayfirst=True)
+                parsed.loc[remaining] = parsed_dayfirst
+            remaining = non_missing_mask & parsed.isna()
+            if bool(remaining.any()):
+                def _fallback_parse(value: Any) -> pd.Timestamp:
+                    text = str(value or "").strip()
+                    if not text or text.lower() in {"nan", "none", "null", "<na>", "nat"}:
+                        return pd.NaT
+                    for dayfirst in (False, True):
+                        try:
+                            ts = pd.Timestamp(date_parser.parse(text, dayfirst=dayfirst))
+                            if ts.tzinfo is None:
+                                return ts.tz_localize("UTC")
+                            return ts.tz_convert("UTC")
+                        except Exception:
+                            continue
+                    return pd.NaT
+
+                fallback = working[remaining].apply(_fallback_parse)
+                parsed.loc[remaining] = fallback
+            try:
+                parsed = parsed.dt.tz_convert(None)
+            except Exception:
+                try:
+                    parsed = parsed.dt.tz_localize(None)
+                except Exception:
+                    pass
             parse_ratio = float(parsed.notna().mean())
             if parse_ratio < 0.6:
                 continue
@@ -1316,6 +1367,7 @@ def _compute_temporal_analysis(
             granularity = "unknown"
             if n_non_null > 2:
                 diffs = non_null.sort_values().diff().dropna().dt.total_seconds()
+                diffs = diffs[diffs > 0]
                 if not diffs.empty:
                     median_seconds = float(diffs.median())
                     granularity = _infer_temporal_granularity(median_seconds)

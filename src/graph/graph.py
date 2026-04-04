@@ -202,6 +202,8 @@ from src.utils.dataset_evidence import read_header, scan_missingness, scan_uniqu
 from src.utils.data_atlas import (
     build_data_atlas,
     summarize_data_atlas,
+    build_steward_focus_context,
+    summarize_steward_focus_context,
     normalize_evidence_requests,
     build_default_evidence_requests,
     validate_steward_semantics,
@@ -3191,6 +3193,54 @@ def _resolve_steward_evidence_bundle(
         "resolved_count": len(evidence_items),
         "items": evidence_items,
     }
+
+
+def _build_steward_focus_context_from_csv(
+    csv_path: str,
+    dialect_payload: Dict[str, Any],
+    *,
+    primary_target: Any,
+    split_candidates: Any,
+    id_candidates: Any,
+) -> Dict[str, Any]:
+    selected_cols: List[str] = []
+    for raw_list in ([primary_target], split_candidates or [], id_candidates or []):
+        for item in raw_list:
+            name = str(item or "").strip()
+            if name and name not in selected_cols:
+                selected_cols.append(name)
+    if not selected_cols:
+        return {}
+    try:
+        df = pd.read_csv(
+            csv_path,
+            sep=dialect_payload.get("sep") or ",",
+            decimal=dialect_payload.get("decimal") or ".",
+            encoding=dialect_payload.get("encoding") or "utf-8",
+            usecols=selected_cols,
+            low_memory=False,
+        )
+    except Exception:
+        try:
+            df = pd.read_csv(
+                csv_path,
+                sep=dialect_payload.get("sep") or ",",
+                decimal=dialect_payload.get("decimal") or ".",
+                encoding=dialect_payload.get("encoding") or "utf-8",
+                usecols=lambda col: str(col) in set(selected_cols),
+                engine="python",
+            )
+        except Exception:
+            return {}
+    try:
+        return build_steward_focus_context(
+            df,
+            primary_target=primary_target,
+            split_candidates=split_candidates,
+            id_candidates=id_candidates,
+        )
+    except Exception:
+        return {}
 
 
 _ABORT_EVENT = threading.Event()
@@ -15146,6 +15196,8 @@ class AgentState(TypedDict):
     data_atlas: Dict[str, Any]
     data_atlas_summary: str
     steward_evidence_bundle: Dict[str, Any]
+    steward_focus_context: Dict[str, Any]
+    steward_focus_context_summary: str
     steward_context_quality: Dict[str, Any]
     steward_context_ready: bool
     steward_context_error: str
@@ -15629,6 +15681,8 @@ def run_steward(state: AgentState) -> AgentState:
     data_atlas = {}
     data_atlas_summary = ""
     steward_evidence_bundle = {}
+    steward_focus_context = {}
+    steward_focus_context_summary = ""
     steward_target_reconsideration = {
         "attempted": False,
         "accepted": False,
@@ -15750,6 +15804,15 @@ def run_steward(state: AgentState) -> AgentState:
                 continue
             split_evidence.append(scan_uniques(csv_path, dialect_payload, str(col), max_unique=20))
 
+        steward_focus_context = _build_steward_focus_context_from_csv(
+            csv_path,
+            dialect_payload,
+            primary_target=primary_target,
+            split_candidates=split_candidates,
+            id_candidates=id_candidates,
+        )
+        steward_focus_context_summary = summarize_steward_focus_context(steward_focus_context)
+
         steward_pass2_input = {
             "business_objective": state.get("business_objective") if isinstance(state, dict) else "",
             "primary_target": primary_target,
@@ -15761,6 +15824,7 @@ def run_steward(state: AgentState) -> AgentState:
             "column_inventory_path": "data/column_inventory.json",
             "column_inventory_preview": header_preview,
             "data_atlas_summary": data_atlas_summary,
+            "steward_focus_context": steward_focus_context_summary,
         }
         pass2_result = steward.decide_semantics_pass2(steward_pass2_input)
         if not isinstance(pass2_result, dict):
@@ -15839,6 +15903,14 @@ def run_steward(state: AgentState) -> AgentState:
                 dialect_payload,
                 reconsidered_target,
             )
+            reconsideration_focus_context = _build_steward_focus_context_from_csv(
+                csv_path,
+                dialect_payload,
+                primary_target=reconsidered_target,
+                split_candidates=split_candidates,
+                id_candidates=id_candidates,
+            )
+            reconsideration_focus_context_summary = summarize_steward_focus_context(reconsideration_focus_context)
             reconsideration_pass2_input = {
                 "business_objective": state.get("business_objective") if isinstance(state, dict) else "",
                 "primary_target": reconsidered_target,
@@ -15850,6 +15922,7 @@ def run_steward(state: AgentState) -> AgentState:
                 "column_inventory_path": "data/column_inventory.json",
                 "column_inventory_preview": header_preview,
                 "data_atlas_summary": data_atlas_summary,
+                "steward_focus_context": reconsideration_focus_context_summary,
                 "reconsideration_note": reconsideration_note,
             }
             reconsideration_pass2_result = steward.decide_semantics_pass2(reconsideration_pass2_input)
@@ -15879,6 +15952,8 @@ def run_steward(state: AgentState) -> AgentState:
                 primary_target = reconsidered_target
                 evidence_requests = reconsideration_requests
                 steward_evidence_bundle = reconsideration_evidence_bundle
+                steward_focus_context = reconsideration_focus_context
+                steward_focus_context_summary = reconsideration_focus_context_summary
                 target_missingness = reconsideration_target_missingness
                 dataset_semantics = reconsidered_semantics
                 dataset_training_mask = reconsidered_training_mask
@@ -15953,8 +16028,12 @@ def run_steward(state: AgentState) -> AgentState:
             dump_json("data/column_sets.json", column_sets)
             dump_json("data/column_manifest.json", column_manifest)
             dump_json("data/steward_evidence_bundle.json", steward_evidence_bundle)
+            dump_json("data/steward_focus_context.json", steward_focus_context)
             dump_json("data/steward_semantics_quality.json", steward_context_quality)
             dump_json("data/steward_target_reconsideration.json", steward_target_reconsideration)
+            if steward_focus_context_summary:
+                with open("data/steward_focus_context_summary.txt", "w", encoding="utf-8") as f_focus_summary:
+                    f_focus_summary.write(steward_focus_context_summary)
             if column_manifest_summary:
                 with open("data/column_manifest_summary.txt", "w", encoding="utf-8") as f_manifest_summary:
                     f_manifest_summary.write(column_manifest_summary)
@@ -15993,11 +16072,13 @@ def run_steward(state: AgentState) -> AgentState:
                         f_manifest_summary.write(column_manifest_summary)
         except Exception as manifest_err:
             print(f"Warning: failed to build column_manifest fallback: {manifest_err}")
-    if isinstance(state, dict):
-        state["data_atlas"] = data_atlas
-        state["data_atlas_summary"] = data_atlas_summary
-        state["steward_evidence_bundle"] = steward_evidence_bundle
-        state["steward_target_reconsideration"] = steward_target_reconsideration
+        if isinstance(state, dict):
+            state["data_atlas"] = data_atlas
+            state["data_atlas_summary"] = data_atlas_summary
+            state["steward_evidence_bundle"] = steward_evidence_bundle
+            state["steward_focus_context"] = steward_focus_context
+            state["steward_focus_context_summary"] = steward_focus_context_summary
+            state["steward_target_reconsideration"] = steward_target_reconsideration
         state["steward_context_quality"] = steward_context_quality
         state["steward_context_ready"] = steward_context_ready
         state["steward_context_error"] = steward_context_error

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
+from dateutil import parser as date_parser
+
 
 _TARGET_HINT_TOKENS = {
     "target",
@@ -82,6 +85,8 @@ def build_data_atlas(
     cardinality = profile.get("cardinality") if isinstance(profile.get("cardinality"), dict) else {}
     sampling = profile.get("sampling") if isinstance(profile.get("sampling"), dict) else {}
     compute_hints = profile.get("compute_hints") if isinstance(profile.get("compute_hints"), dict) else {}
+    duplicate_stats = profile.get("duplicate_stats") if isinstance(profile.get("duplicate_stats"), dict) else {}
+    temporal_analysis = profile.get("temporal_analysis") if isinstance(profile.get("temporal_analysis"), dict) else {}
 
     entries: List[Dict[str, Any]] = []
     constant_like_cols: List[str] = []
@@ -168,6 +173,23 @@ def build_data_atlas(
             "total_rows_in_file": _safe_int(sampling.get("total_rows_in_file")),
         },
         "compute_hints": compute_hints,
+        "duplicate_stats": {
+            "row_dup_count": _safe_int(duplicate_stats.get("row_dup_count")) or 0,
+            "row_dup_frac": _safe_float(duplicate_stats.get("row_dup_frac")) or 0.0,
+        },
+        "temporal_overview": {
+            "is_time_series": bool(temporal_analysis.get("is_time_series")),
+            "detected_datetime_columns": [
+                str(col)
+                for col in (temporal_analysis.get("detected_datetime_columns") or [])
+                if isinstance(col, str) and col.strip()
+            ][:12],
+            "details": [
+                item
+                for item in (temporal_analysis.get("details") or [])[:8]
+                if isinstance(item, dict)
+            ],
+        },
         "signals": {
             "constant_like_count": len(constant_like_cols),
             "constant_like_sample": constant_like_cols[:30],
@@ -192,6 +214,8 @@ def summarize_data_atlas(
     coverage = atlas.get("coverage") if isinstance(atlas.get("coverage"), dict) else {}
     sampling = atlas.get("sampling") if isinstance(atlas.get("sampling"), dict) else {}
     compute_hints = atlas.get("compute_hints") if isinstance(atlas.get("compute_hints"), dict) else {}
+    duplicate_stats = atlas.get("duplicate_stats") if isinstance(atlas.get("duplicate_stats"), dict) else {}
+    temporal_overview = atlas.get("temporal_overview") if isinstance(atlas.get("temporal_overview"), dict) else {}
     signals = atlas.get("signals") if isinstance(atlas.get("signals"), dict) else {}
     columns = atlas.get("columns") if isinstance(atlas.get("columns"), list) else []
 
@@ -215,6 +239,34 @@ def summarize_data_atlas(
             f"cv_feasible={compute_hints.get('cross_validation_feasible')}, "
             f"dl_feasible={compute_hints.get('deep_learning_feasible')}"
         )
+    lines.append(
+        f"- duplicate_rows: count={int(duplicate_stats.get('row_dup_count') or 0)}, "
+        f"frac={duplicate_stats.get('row_dup_frac')}"
+    )
+    if temporal_overview:
+        lines.append(
+            f"- temporal_overview: is_time_series={bool(temporal_overview.get('is_time_series'))}, "
+            f"detected_datetime_columns={list(temporal_overview.get('detected_datetime_columns') or [])[:8]}"
+        )
+        temporal_details = temporal_overview.get("details")
+        if isinstance(temporal_details, list) and temporal_details:
+            compact_details = []
+            for item in temporal_details[:5]:
+                if not isinstance(item, dict):
+                    continue
+                compact_details.append(
+                    {
+                        "column": str(item.get("column") or ""),
+                        "granularity_hint": item.get("granularity_hint"),
+                        "parse_ratio": item.get("parse_ratio"),
+                        "unique_ratio": item.get("unique_ratio"),
+                        "duplicate_ratio": item.get("duplicate_ratio"),
+                        "max_rows_per_timestamp": item.get("max_rows_per_timestamp"),
+                        "time_span_days": item.get("time_span_days"),
+                    }
+                )
+            if compact_details:
+                lines.append(f"- temporal_details: {compact_details}")
     lines.append(
         f"- constant_like_count: {int(signals.get('constant_like_count') or 0)} "
         f"(sample={list(signals.get('constant_like_sample') or [])[:8]})"
@@ -427,6 +479,286 @@ def validate_steward_semantics(
         "target_status_reason": target_status_reason,
         "training_rows_rule": training_rows_rule,
     }
+
+
+def _effective_non_missing_mask(series: pd.Series) -> pd.Series:
+    try:
+        text = series.astype(str).str.strip()
+    except Exception:
+        return series.notna()
+    return series.notna() & ~text.str.lower().isin({"", "nan", "none", "null", "<na>", "nat"})
+
+
+def _parse_datetime_multi(series: pd.Series) -> pd.Series:
+    if not isinstance(series, pd.Series):
+        return pd.Series(dtype="datetime64[ns]")
+    mask = _effective_non_missing_mask(series)
+    working = series.where(mask)
+    parsed = pd.to_datetime(working, errors="coerce", utc=True)
+    remaining = mask & parsed.isna()
+    if bool(remaining.any()):
+        parsed_dayfirst = pd.to_datetime(working[remaining], errors="coerce", utc=True, dayfirst=True)
+        parsed.loc[remaining] = parsed_dayfirst
+    remaining = mask & parsed.isna()
+    if bool(remaining.any()):
+        def _fallback_parse(value: Any) -> pd.Timestamp:
+            text = str(value or "").strip()
+            if not text or text.lower() in {"nan", "none", "null", "<na>", "nat"}:
+                return pd.NaT
+            for dayfirst in (False, True):
+                try:
+                    ts = pd.Timestamp(date_parser.parse(text, dayfirst=dayfirst))
+                    if ts.tzinfo is None:
+                        return ts.tz_localize("UTC")
+                    return ts.tz_convert("UTC")
+                except Exception:
+                    continue
+            return pd.NaT
+
+        fallback = working[remaining].apply(_fallback_parse)
+        parsed.loc[remaining] = fallback
+    try:
+        return parsed.dt.tz_convert(None)
+    except Exception:
+        try:
+            return parsed.dt.tz_localize(None)
+        except Exception:
+            return parsed
+
+
+def _bucketize_temporal_series(parsed: pd.Series, granularity_hint: str) -> pd.Series:
+    if not isinstance(parsed, pd.Series):
+        return pd.Series(dtype="object")
+    granularity = str(granularity_hint or "").strip().lower()
+    if granularity in {"monthly", "yearly"}:
+        return parsed.dt.to_period("M").astype(str)
+    if granularity == "weekly":
+        return parsed.dt.to_period("W").astype(str)
+    if granularity in {"hourly", "sub-minute"}:
+        return parsed.dt.strftime("%Y-%m-%d %H:%M:%S")
+    return parsed.dt.strftime("%Y-%m-%d")
+
+
+def build_steward_focus_context(
+    df: pd.DataFrame,
+    *,
+    primary_target: Any,
+    split_candidates: Any,
+    id_candidates: Any,
+    max_bucket_count: int = 24,
+) -> Dict[str, Any]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {
+            "primary_target": str(primary_target or "").strip(),
+            "split_candidates": [],
+            "id_candidates": [],
+            "temporal_label_maturity": [],
+            "identifier_structure": [],
+        }
+
+    target = str(primary_target or "").strip()
+    split_cols = [str(col).strip() for col in (split_candidates or []) if str(col).strip() in df.columns]
+    id_cols = [str(col).strip() for col in (id_candidates or []) if str(col).strip() in df.columns]
+
+    temporal_label_maturity: List[Dict[str, Any]] = []
+    if target in df.columns:
+        target_non_missing = _effective_non_missing_mask(df[target])
+        for split_col in split_cols[:6]:
+            parsed = _parse_datetime_multi(df[split_col])
+            non_missing_split = _effective_non_missing_mask(df[split_col])
+            parse_ratio = float((parsed.notna() & non_missing_split).sum() / max(int(non_missing_split.sum()), 1))
+            if parse_ratio < 0.6:
+                continue
+
+            non_null = parsed.dropna().sort_values()
+            granularity_hint = "unknown"
+            if len(non_null) > 2:
+                diffs = non_null.diff().dropna().dt.total_seconds()
+                diffs = diffs[diffs > 0]
+                if not diffs.empty:
+                    median_seconds = float(diffs.median())
+                    granularity_hint = (
+                        "sub-minute" if median_seconds < 90 else
+                        "hourly" if median_seconds < 5400 else
+                        "daily" if median_seconds < 172800 else
+                        "weekly" if median_seconds < 1209600 else
+                        "monthly" if median_seconds < 38016000 else
+                        "yearly"
+                    )
+
+            bucket = _bucketize_temporal_series(parsed, granularity_hint)
+            working = pd.DataFrame(
+                {
+                    "bucket": bucket,
+                    "target_present": target_non_missing,
+                }
+            )
+            working = working[working["bucket"].notna()]
+            if working.empty:
+                continue
+            grouped = (
+                working.groupby("bucket", dropna=True)["target_present"]
+                .agg(["count", "sum"])
+                .reset_index()
+                .rename(columns={"count": "rows", "sum": "labeled_rows"})
+            )
+            grouped["labeled_rows"] = grouped["labeled_rows"].astype(int)
+            grouped["unlabeled_rows"] = grouped["rows"] - grouped["labeled_rows"]
+            grouped["label_missing_frac"] = (
+                grouped["unlabeled_rows"] / grouped["rows"].clip(lower=1)
+            ).round(6)
+            grouped = grouped.sort_values("bucket").reset_index(drop=True)
+
+            earliest_unlabeled_bucket = None
+            latest_fully_labeled_bucket = None
+            for record in grouped.to_dict(orient="records"):
+                if int(record["unlabeled_rows"]) > 0 and earliest_unlabeled_bucket is None:
+                    earliest_unlabeled_bucket = str(record["bucket"])
+                if int(record["unlabeled_rows"]) == 0:
+                    latest_fully_labeled_bucket = str(record["bucket"])
+            latest_pre_unlabeled = None
+            if earliest_unlabeled_bucket is not None:
+                for record in grouped.to_dict(orient="records"):
+                    bucket_name = str(record["bucket"])
+                    if bucket_name >= earliest_unlabeled_bucket:
+                        break
+                    if int(record["unlabeled_rows"]) == 0:
+                        latest_pre_unlabeled = bucket_name
+
+            temporal_label_maturity.append(
+                {
+                    "split_column": split_col,
+                    "parse_ratio": round(parse_ratio, 4),
+                    "granularity_hint": granularity_hint,
+                    "raw_unique_count": int(df[split_col].nunique(dropna=True)),
+                    "logical_unique_count": int(parsed.dropna().nunique()),
+                    "latest_fully_labeled_bucket": latest_fully_labeled_bucket,
+                    "latest_fully_labeled_before_unlabeled": latest_pre_unlabeled,
+                    "earliest_bucket_with_unlabeled_rows": earliest_unlabeled_bucket,
+                    "bucket_count": int(len(grouped)),
+                    "bucket_label_maturity_sample": grouped.tail(max(1, int(max_bucket_count))).to_dict(orient="records"),
+                }
+            )
+
+    identifier_structure: List[Dict[str, Any]] = []
+    for id_col in id_cols[:4]:
+        id_mask = _effective_non_missing_mask(df[id_col])
+        id_series = df.loc[id_mask, id_col]
+        entity_rows = int(len(id_series))
+        unique_entities = int(id_series.nunique(dropna=True))
+        duplicated_entity_rows = int(id_series.duplicated(keep=False).sum()) if entity_rows else 0
+        entity_entry: Dict[str, Any] = {
+            "id_column": id_col,
+            "rows_with_id": entity_rows,
+            "unique_entities": unique_entities,
+            "duplicated_entity_rows": duplicated_entity_rows,
+            "rows_per_entity_mean": round(entity_rows / max(unique_entities, 1), 4) if entity_rows else 0.0,
+        }
+        pair_diagnostics: List[Dict[str, Any]] = []
+        for split_col in split_cols[:4]:
+            subset = df[[id_col, split_col]].copy()
+            subset = subset[_effective_non_missing_mask(subset[id_col]) & _effective_non_missing_mask(subset[split_col])]
+            if subset.empty:
+                continue
+            dup_pair_rows = int(subset.duplicated(subset=[id_col, split_col], keep=False).sum())
+            pair_diagnostics.append(
+                {
+                    "split_column": split_col,
+                    "rows_with_pair": int(len(subset)),
+                    "unique_pairs": int(subset.drop_duplicates(subset=[id_col, split_col]).shape[0]),
+                    "duplicated_pair_rows": dup_pair_rows,
+                    "duplicated_pair_frac": round(dup_pair_rows / max(len(subset), 1), 6),
+                }
+            )
+        if pair_diagnostics:
+            entity_entry["pair_diagnostics"] = pair_diagnostics
+        identifier_structure.append(entity_entry)
+
+    return {
+        "primary_target": target,
+        "split_candidates": split_cols,
+        "id_candidates": id_cols,
+        "temporal_label_maturity": temporal_label_maturity,
+        "identifier_structure": identifier_structure,
+    }
+
+
+def summarize_steward_focus_context(
+    focus_context: Dict[str, Any],
+    *,
+    max_lines: int = 40,
+    max_buckets: int = 8,
+) -> str:
+    if not isinstance(focus_context, dict):
+        return ""
+    lines: List[str] = ["STEWARD_FOCUS_CONTEXT:"]
+    primary_target = str(focus_context.get("primary_target") or "").strip()
+    if primary_target:
+        lines.append(f"- primary_target: {primary_target}")
+
+    maturity = focus_context.get("temporal_label_maturity")
+    if isinstance(maturity, list) and maturity:
+        lines.append("- temporal_label_maturity:")
+        for item in maturity[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "  - "
+                f"{item.get('split_column')}: parse_ratio={item.get('parse_ratio')}, "
+                f"granularity={item.get('granularity_hint')}, "
+                f"raw_unique={item.get('raw_unique_count')}, logical_unique={item.get('logical_unique_count')}, "
+                f"latest_fully_labeled={item.get('latest_fully_labeled_bucket')}, "
+                f"latest_pre_unlabeled={item.get('latest_fully_labeled_before_unlabeled')}, "
+                f"earliest_unlabeled={item.get('earliest_bucket_with_unlabeled_rows')}"
+            )
+            samples = item.get("bucket_label_maturity_sample")
+            if isinstance(samples, list) and samples:
+                compact = []
+                for bucket in samples[-max(1, int(max_buckets)):]:
+                    if not isinstance(bucket, dict):
+                        continue
+                    compact.append(
+                        {
+                            "bucket": bucket.get("bucket"),
+                            "rows": bucket.get("rows"),
+                            "unlabeled_rows": bucket.get("unlabeled_rows"),
+                            "label_missing_frac": bucket.get("label_missing_frac"),
+                        }
+                    )
+                if compact:
+                    lines.append(f"    buckets_tail={compact}")
+
+    identifier_structure = focus_context.get("identifier_structure")
+    if isinstance(identifier_structure, list) and identifier_structure:
+        lines.append("- identifier_structure:")
+        for item in identifier_structure[:4]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "  - "
+                f"{item.get('id_column')}: rows_with_id={item.get('rows_with_id')}, "
+                f"unique_entities={item.get('unique_entities')}, "
+                f"duplicated_entity_rows={item.get('duplicated_entity_rows')}, "
+                f"rows_per_entity_mean={item.get('rows_per_entity_mean')}"
+            )
+            pair_diagnostics = item.get("pair_diagnostics")
+            if isinstance(pair_diagnostics, list) and pair_diagnostics:
+                compact_pairs = []
+                for pair in pair_diagnostics[:4]:
+                    if not isinstance(pair, dict):
+                        continue
+                    compact_pairs.append(
+                        {
+                            "split_column": pair.get("split_column"),
+                            "duplicated_pair_rows": pair.get("duplicated_pair_rows"),
+                            "duplicated_pair_frac": pair.get("duplicated_pair_frac"),
+                            "unique_pairs": pair.get("unique_pairs"),
+                        }
+                    )
+                if compact_pairs:
+                    lines.append(f"    pair_diagnostics={compact_pairs}")
+
+    return "\n".join(lines[: max(8, int(max_lines))])
 
 
 def resolve_steward_target_reconsideration_candidate(
