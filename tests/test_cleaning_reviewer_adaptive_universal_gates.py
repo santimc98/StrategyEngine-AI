@@ -607,3 +607,148 @@ def test_temporal_training_mask_fails_only_when_explicit_training_rows_cross_cut
     assert gate_entry.get("passed") is False
     assert evidence.get("training_mask_source") == "indicator:__split"
     assert evidence.get("training_rows_after_cutoff") == 1
+
+
+def test_cleaning_reviewer_deterministically_passes_documented_first_attempt_style_cleaning(tmp_path: Path):
+    csv_path = tmp_path / "cleaned.csv"
+    cleaned = pd.DataFrame(
+        {
+            "account_id": ["ACC_001", "ACC_001", "ACC_002", "ACC_003"],
+            "snapshot_month_end": ["2025-07-31", "2025-08-31", "2025-08-31", "2025-09-30"],
+            "cohort_split": ["train", "temporal_holdout", "train", "score"],
+            "churn_60d": [0.0, 1.0, 0.0, None],
+            "arr_current": ["EUR 279,981", "$278,656", "280,147", "277,572"],
+            "nps_last_observed": [72.0, 72.0, 55.0, 61.0],
+        }
+    )
+    cleaned.to_csv(csv_path, index=False)
+
+    manifest = {
+        "cleaning_gates_status": {
+            "arr_current_numeric_conversion_verified": "WARNING_dropped_from_features",
+        },
+        "conversions": [
+            {
+                "step": "arr_current_parsing",
+                "description": "Parsed arr_current and dropped from model features when unsafe.",
+                "dropped_from_features": True,
+            }
+        ],
+        "imputation": {
+            "nps_last_observed": {
+                "strategy": "forward_fill_within_account_id",
+                "missing_before": 2,
+                "missing_after": 0,
+            }
+        },
+    }
+    gates = [
+        {
+            "name": "training_cohort_filter_enforced",
+            "severity": "HARD",
+            "params": {
+                "required_condition": "churn_60d IS NOT NULL AND snapshot_month_end <= '2025-08-31'",
+                "split_label": "train",
+            },
+        },
+        {
+            "name": "scoring_cohort_filter_enforced",
+            "severity": "HARD",
+            "params": {
+                "required_condition": "churn_60d IS NULL",
+                "split_label": "score",
+            },
+        },
+        {
+            "name": "identifier_columns_excluded_from_features",
+            "severity": "HARD",
+            "params": {
+                "forbidden_as_features": ["account_id", "snapshot_month_end", "csm_owner"],
+            },
+        },
+        {
+            "name": "arr_current_numeric_conversion_verified",
+            "severity": "HARD",
+            "params": {"column": "arr_current"},
+        },
+        {
+            "name": "nps_forward_fill_temporal_integrity",
+            "severity": "SOFT",
+            "params": {
+                "column": "nps_last_observed",
+                "group_key": "account_id",
+                "sort_key": "snapshot_month_end",
+            },
+        },
+    ]
+    cleaning_code = (
+        "df = df.sort_values(['account_id', 'snapshot_month_end']).reset_index(drop=True)\n"
+        "df['nps_last_observed'] = df.groupby('account_id')['nps_last_observed'].ffill()\n"
+    )
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=[],
+        cleaned_header=list(cleaned.columns),
+        cleaned_csv_path=str(csv_path),
+        sample_str=cleaned.astype("string"),
+        sample_infer=cleaned,
+        manifest=manifest,
+        raw_sample=None,
+        column_roles={
+            "identifier": ["account_id"],
+            "split": ["cohort_split"],
+            "outcome": ["churn_60d"],
+        },
+        allowed_feature_sets={},
+        cleaning_code=cleaning_code,
+    )
+
+    assert result["status"] == "APPROVED"
+    gate_map = {
+        normalize_gate_name(entry.get("name", "")): entry
+        for entry in result.get("gate_results", [])
+        if isinstance(entry, dict)
+    }
+    assert gate_map["training_cohort_filter_enforced"]["passed"] is True
+    assert gate_map["scoring_cohort_filter_enforced"]["passed"] is True
+    assert gate_map["identifier_columns_excluded_from_features"]["passed"] is True
+    assert gate_map["arr_current_numeric_conversion_verified"]["passed"] is True
+    assert gate_map["nps_forward_fill_temporal_integrity"]["passed"] is True
+
+
+def test_arr_current_numeric_conversion_fails_when_object_currency_strings_are_undocumented(tmp_path: Path):
+    csv_path = tmp_path / "cleaned.csv"
+    cleaned = pd.DataFrame(
+        {
+            "arr_current": ["EUR 279,981", "$278,656", "280,147"],
+        }
+    )
+    cleaned.to_csv(csv_path, index=False)
+
+    result = _evaluate_gates_deterministic(
+        gates=[
+            {
+                "name": "arr_current_numeric_conversion_verified",
+                "severity": "HARD",
+                "params": {"column": "arr_current"},
+            }
+        ],
+        required_columns=[],
+        cleaned_header=list(cleaned.columns),
+        cleaned_csv_path=str(csv_path),
+        sample_str=cleaned.astype("string"),
+        sample_infer=cleaned,
+        manifest={},
+        raw_sample=None,
+        column_roles={},
+        allowed_feature_sets={},
+    )
+
+    assert result["status"] == "REJECTED"
+    gate_entry = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "arr_current_numeric_conversion_verified"
+    )
+    assert gate_entry.get("passed") is False

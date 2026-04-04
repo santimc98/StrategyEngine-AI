@@ -11616,6 +11616,85 @@ def _normalize_handoff_evidence(values: Any, max_items: int = 10) -> List[Dict[s
     return out
 
 
+def _extract_verified_gate_feedback(
+    packet: Dict[str, Any] | None,
+    *,
+    hard_only: bool = False,
+) -> Dict[str, Any]:
+    packet = packet if isinstance(packet, dict) else {}
+    failed_gates: List[str] = []
+    required_fixes: List[str] = []
+    hard_failures: List[str] = []
+    soft_failures: List[str] = []
+    evidence: List[Dict[str, str]] = []
+
+    gate_results = packet.get("gate_results")
+    if isinstance(gate_results, list):
+        for gate in gate_results:
+            if not isinstance(gate, dict):
+                continue
+            if gate.get("passed") is not False:
+                continue
+            gate_name = str(gate.get("name") or "").strip()
+            if not gate_name:
+                continue
+            severity = str(gate.get("severity") or "HARD").strip().upper()
+            if severity not in {"HARD", "SOFT"}:
+                severity = "HARD"
+            if hard_only and severity != "HARD":
+                continue
+            issues = gate.get("issues") if isinstance(gate.get("issues"), list) else []
+            issue_text = "; ".join(str(item) for item in issues if str(item).strip())
+            summary = f"{gate_name}: {issue_text}" if issue_text else f"{gate_name}: failed"
+            if gate_name not in failed_gates:
+                failed_gates.append(gate_name)
+            if severity == "HARD":
+                if gate_name not in hard_failures:
+                    hard_failures.append(gate_name)
+                if summary not in required_fixes:
+                    required_fixes.append(summary)
+            else:
+                if gate_name not in soft_failures:
+                    soft_failures.append(gate_name)
+            evidence_source = gate.get("evidence")
+            claim = f"Gate {gate_name} failed: {issue_text or 'Gate failed.'}"
+            if isinstance(evidence_source, dict):
+                source = "gate_results#evidence"
+                compact = _truncate_handoff_text(json.dumps(evidence_source, ensure_ascii=True), max_len=220)
+                if compact:
+                    claim = f"{claim} | Evidence: {compact}"
+            else:
+                source = _truncate_handoff_text(evidence_source or "gate_results", max_len=220) or "gate_results"
+            evidence_item = {"claim": _truncate_handoff_text(claim, max_len=260), "source": source}
+            if evidence_item not in evidence:
+                evidence.append(evidence_item)
+
+    if failed_gates or hard_failures or required_fixes or soft_failures:
+        return {
+            "failed_gates": failed_gates[:20],
+            "required_fixes": required_fixes[:20],
+            "hard_failures": hard_failures[:15],
+            "soft_failures": soft_failures[:15],
+            "evidence": evidence[:12],
+        }
+
+    raw_failed = _normalize_handoff_items(packet.get("failed_gates"), max_items=20, max_len=180)
+    raw_required = _normalize_handoff_items(packet.get("required_fixes"), max_items=20, max_len=500)
+    raw_hard = _normalize_handoff_items(packet.get("hard_failures"), max_items=15, max_len=220)
+    raw_soft = _normalize_handoff_items(packet.get("soft_failures"), max_items=15, max_len=220)
+    if hard_only and raw_hard:
+        raw_failed = [item for item in raw_failed if item in raw_hard] or list(raw_hard)
+        raw_required = [item for item in raw_required if any(h in item for h in raw_hard)] or raw_required[:len(raw_hard)]
+        raw_soft = []
+    return {
+        "failed_gates": raw_failed[:20],
+        "required_fixes": raw_required[:20],
+        "hard_failures": raw_hard[:15],
+        "soft_failures": raw_soft[:15],
+        "evidence": _normalize_handoff_evidence(packet.get("evidence"), max_items=12),
+    }
+
+
 def _merge_reviewer_qa_findings(
     gate_context: Dict[str, Any] | None,
     review_result: Dict[str, Any] | None,
@@ -11626,6 +11705,8 @@ def _merge_reviewer_qa_findings(
     review_result = review_result if isinstance(review_result, dict) else {}
     qa_result = qa_result if isinstance(qa_result, dict) else {}
     eval_result = eval_result if isinstance(eval_result, dict) else {}
+    review_packet = _extract_verified_gate_feedback(review_result, hard_only=False)
+    qa_packet = _extract_verified_gate_feedback(qa_result, hard_only=False)
 
     failed_gates: List[str] = []
     required_fixes: List[str] = []
@@ -11634,8 +11715,8 @@ def _merge_reviewer_qa_findings(
 
     for source in (
         gate_context.get("failed_gates"),
-        review_result.get("failed_gates"),
-        qa_result.get("failed_gates"),
+        review_packet.get("failed_gates"),
+        qa_packet.get("failed_gates"),
     ):
         for item in _normalize_handoff_items(source, max_items=25, max_len=220):
             if item not in failed_gates:
@@ -11643,8 +11724,8 @@ def _merge_reviewer_qa_findings(
 
     for source in (
         gate_context.get("required_fixes"),
-        review_result.get("required_fixes"),
-        qa_result.get("required_fixes"),
+        review_packet.get("required_fixes"),
+        qa_packet.get("required_fixes"),
     ):
         for item in _normalize_handoff_items(source, max_items=25, max_len=500):
             if item not in required_fixes:
@@ -11652,8 +11733,8 @@ def _merge_reviewer_qa_findings(
 
     for source in (
         gate_context.get("hard_failures"),
-        review_result.get("hard_failures"),
-        qa_result.get("hard_failures"),
+        review_packet.get("hard_failures"),
+        qa_packet.get("hard_failures"),
         eval_result.get("hard_failures"),
     ):
         for item in _normalize_handoff_items(source, max_items=20, max_len=240):
@@ -11662,8 +11743,8 @@ def _merge_reviewer_qa_findings(
 
     for source in (
         gate_context.get("evidence"),
-        review_result.get("evidence"),
-        qa_result.get("evidence"),
+        review_packet.get("evidence"),
+        qa_packet.get("evidence"),
         eval_result.get("evidence"),
     ):
         for item in _normalize_handoff_evidence(source, max_items=12):
@@ -21747,11 +21828,27 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     if token and token not in required_de_outputs:
                                         required_de_outputs.append(token)
                                 present_de_outputs, missing_de_outputs = _collect_outputs_state(required_de_outputs)
-                                fixes = review_result.get("required_fixes", [])
+                                verified_retry_packet = _extract_verified_gate_feedback(
+                                    review_result,
+                                    hard_only=True,
+                                )
+                                fixes = verified_retry_packet.get("required_fixes") or review_result.get("required_fixes", [])
                                 fixes_text = ""
                                 if isinstance(fixes, list) and fixes:
                                     fixes_text = "\nREQUIRED_FIXES:\n- " + "\n- ".join(str(item) for item in fixes)
-                                evidence_text = _format_gate_failure_evidence(review_result.get("gate_results"))
+                                blocking_gate_results = []
+                                gate_results = review_result.get("gate_results")
+                                if isinstance(gate_results, list):
+                                    for gate in gate_results:
+                                        if not isinstance(gate, dict):
+                                            continue
+                                        if gate.get("passed") is not False:
+                                            continue
+                                        severity = str(gate.get("severity") or "HARD").strip().upper()
+                                        if severity != "HARD":
+                                            continue
+                                        blocking_gate_results.append(gate)
+                                evidence_text = _format_gate_failure_evidence(blocking_gate_results)
                                 payload = "CLEANING_REVIEWER_ALERT:\n" + str(review_result.get("feedback", "")).strip() + fixes_text
                                 if evidence_text:
                                     payload += "\n\n" + evidence_text
@@ -21759,13 +21856,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     feedback_record = {
                                         "agent": "cleaning_reviewer",
                                         "status": "REJECTED",
-                                        "failed_gates": [
-                                            str(item) for item in (review_result.get("failed_checks") or []) if item
-                                        ],
+                                        "failed_gates": [str(item) for item in (verified_retry_packet.get("failed_gates") or []) if item],
                                         "required_fixes": [str(item) for item in (fixes or []) if item],
-                                        "hard_failures": [
-                                            str(item) for item in (review_result.get("hard_failures") or []) if item
-                                        ],
+                                        "hard_failures": [str(item) for item in (verified_retry_packet.get("hard_failures") or []) if item],
                                     }
                                     payload += (
                                         "\n\nITERATION_FEEDBACK_RECORD_JSON:\n"
@@ -21775,16 +21868,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     pass
                                 new_state = dict(state)
                                 new_state["cleaning_reviewer_retry_count"] = reviewer_retries + 1
-                                failed_checks = [str(item) for item in (review_result.get("failed_checks") or []) if item]
-                                hard_failures = [str(item) for item in (review_result.get("hard_failures") or []) if item]
+                                failed_checks = [str(item) for item in (verified_retry_packet.get("failed_gates") or []) if item]
+                                hard_failures = [str(item) for item in (verified_retry_packet.get("hard_failures") or []) if item]
                                 required_fix_items = [str(item) for item in (fixes or []) if item]
                                 gate_evidence_items: List[Dict[str, str]] = []
-                                gate_results = review_result.get("gate_results")
-                                if isinstance(gate_results, list):
-                                    for gate in gate_results:
+                                for item in _normalize_handoff_evidence(
+                                    verified_retry_packet.get("evidence"),
+                                    max_items=8,
+                                ):
+                                    if item not in gate_evidence_items:
+                                        gate_evidence_items.append(item)
+                                if not gate_evidence_items and isinstance(blocking_gate_results, list):
+                                    for gate in blocking_gate_results:
                                         if not isinstance(gate, dict):
-                                            continue
-                                        if gate.get("passed") is True:
                                             continue
                                         gate_name = str(gate.get("name") or "unknown_gate")
                                         issues = gate.get("issues") if isinstance(gate.get("issues"), list) else []

@@ -1,6 +1,6 @@
 import pytest
 
-from src.graph.graph import _build_iteration_handoff
+from src.graph.graph import _build_iteration_handoff, _extract_verified_gate_feedback
 
 
 def test_iteration_handoff_prioritizes_runtime_and_missing_outputs(tmp_path):
@@ -585,3 +585,53 @@ def test_iteration_handoff_prefers_real_exception_over_heavy_runner_infra_marker
     assert handoff["retry_context"]["specific_error"] == "AttributeError: 'DataFrame' object has no attribute 'between'"
     assert handoff["repair_ground_truth"]["failure_signature"] == "AttributeError: 'DataFrame' object has no attribute 'between'"
     assert "HEAVY_RUNNER_INFRA_ERROR" not in handoff["repair_ground_truth"]["failure_signature"]
+
+
+def test_extract_verified_gate_feedback_filters_retry_packet_to_blocking_verified_failures():
+    packet = {
+        "failed_checks": [
+            "identifier_columns_excluded_from_features",
+            "arr_current_numeric_conversion_verified",
+            "nps_forward_fill_temporal_integrity",
+        ],
+        "required_fixes": [
+            "identifier_columns_excluded_from_features: csm_owner was not excluded from the feature set",
+            "arr_current_numeric_conversion_verified: Column remains object type with currency strings",
+            "nps_forward_fill_temporal_integrity: No evidence of partitioned forward-fill in cleaning_code",
+        ],
+        "hard_failures": [
+            "identifier_columns_excluded_from_features",
+            "arr_current_numeric_conversion_verified",
+        ],
+        "gate_results": [
+            {
+                "name": "training_cohort_filter_enforced",
+                "severity": "HARD",
+                "passed": None,
+                "issues": [],
+                "evidence": {"deterministic_support": "not_implemented"},
+            },
+            {
+                "name": "arr_current_numeric_conversion_verified",
+                "severity": "HARD",
+                "passed": False,
+                "issues": ["Column remains object type with currency strings"],
+                "evidence": "column_stats_sample#arr_current",
+            },
+            {
+                "name": "nps_forward_fill_temporal_integrity",
+                "severity": "SOFT",
+                "passed": False,
+                "issues": ["No evidence of partitioned forward-fill in cleaning_code"],
+                "evidence": "cleaning_code#nps_last_observed",
+            },
+        ],
+    }
+
+    verified = _extract_verified_gate_feedback(packet, hard_only=True)
+
+    assert verified["failed_gates"] == ["arr_current_numeric_conversion_verified"]
+    assert verified["hard_failures"] == ["arr_current_numeric_conversion_verified"]
+    assert verified["required_fixes"] == [
+        "arr_current_numeric_conversion_verified: Column remains object type with currency strings"
+    ]

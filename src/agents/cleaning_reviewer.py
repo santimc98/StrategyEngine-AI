@@ -864,8 +864,13 @@ def _pick_first_existing(candidates: List[str], cleaned_header: List[str]) -> st
 def _is_null_like_text(value: Any) -> bool:
     if value is None:
         return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
     text = str(value).strip().lower()
-    return text in {"", "nan", "none", "null", "na"}
+    return text in {"", "nan", "none", "null", "na", "<na>", "nat"}
 
 
 def _build_null_mask(
@@ -1673,6 +1678,59 @@ def _evaluate_gates_deterministic(
             if not bool(evidence.get("applies_if", True)):
                 warnings.append(
                     f"boolean_normalization skipped: {evidence.get('skip_reason', 'not_applicable')}"
+                )
+        elif gate_key in {"training_cohort_filter_enforced", "scoring_cohort_filter_enforced"}:
+            issues, evidence = _check_split_condition_enforced(
+                cleaned_csv_path=cleaned_csv_path,
+                cleaned_header=cleaned_header,
+                params=params,
+                column_roles=column_roles,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    f"{gate_key} skipped: {evidence.get('skip_reason', 'not_applicable')}"
+                )
+        elif gate_key == "identifier_columns_excluded_from_features":
+            issues, evidence = _check_identifier_columns_excluded_from_features(
+                cleaned_csv_path=cleaned_csv_path,
+                cleaned_header=cleaned_header,
+                sample_str=sample_str,
+                sample_infer=sample_infer,
+                params=params,
+                column_roles=column_roles,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    "identifier_columns_excluded_from_features skipped: "
+                    + str(evidence.get("skip_reason", "not_applicable"))
+                )
+        elif gate_key == "arr_current_numeric_conversion_verified":
+            issues, evidence = _check_arr_current_numeric_conversion_verified(
+                cleaned_header=cleaned_header,
+                sample_str=sample_str,
+                sample_infer=sample_infer,
+                params=params,
+                manifest=manifest,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    "arr_current_numeric_conversion_verified skipped: "
+                    + str(evidence.get("skip_reason", "not_applicable"))
+                )
+        elif gate_key == "nps_forward_fill_temporal_integrity":
+            issues, evidence = _check_nps_forward_fill_temporal_integrity(
+                cleaned_csv_path=cleaned_csv_path,
+                cleaned_header=cleaned_header,
+                sample_str=sample_str,
+                sample_infer=sample_infer,
+                params=params,
+                manifest=manifest,
+                cleaning_code=cleaning_code,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    "nps_forward_fill_temporal_integrity skipped: "
+                    + str(evidence.get("skip_reason", "not_applicable"))
                 )
         elif gate_key == "enforce_temporal_training_mask":
             issues, evidence, training_rows_context = _check_enforce_temporal_training_mask(
@@ -3332,6 +3390,404 @@ def _check_target_not_null_in_training(
     evidence["training_mask_source"] = str(training_rows_context.get("training_mask_source") or "unknown")
     if violating.any():
         issues.append(f"{target_col} contains null values inside training rows")
+    return issues, evidence
+
+
+def _extract_condition_columns(required_condition: str) -> List[str]:
+    text = str(required_condition or "").strip()
+    if not text:
+        return []
+    columns: List[str] = []
+    patterns = (
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s+IS\s+NOT\s+NULL\b",
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s+IS\s+NULL\b",
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<=|>=|<|>|=)\s*(?:'[^']*'|\"[^\"]*\"|[^\s]+)",
+    )
+    for pattern in patterns:
+        try:
+            matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        except re.error:
+            matches = []
+        for match in matches:
+            token = str(match or "").strip()
+            if token and token not in columns:
+                columns.append(token)
+    return columns
+
+
+def _coerce_condition_series(
+    series: pd.Series,
+    raw_value: str,
+) -> Tuple[pd.Series, Any, str]:
+    token = str(raw_value or "").strip().strip("'\"")
+    if re.match(r"^\d{4}-\d{2}-\d{2}(?:[ T].*)?$", token) or "/" in token or re.match(r"^\d{2}-\d{2}-\d{4}$", token):
+        parsed_series = _parse_datetime_series_robust(series)
+        parsed_value = pd.to_datetime(token, errors="coerce")
+        if not pd.isna(parsed_value):
+            return parsed_series.dt.normalize(), pd.Timestamp(parsed_value).normalize(), "datetime"
+    try:
+        numeric_value = float(token)
+        numeric_series = pd.to_numeric(series.astype("string"), errors="coerce")
+        if numeric_series.notna().any():
+            return numeric_series, numeric_value, "numeric"
+    except Exception:
+        pass
+    return series.astype("string"), token, "string"
+
+
+def _evaluate_required_condition_mask(
+    frame: pd.DataFrame,
+    required_condition: str,
+) -> Tuple[Optional[pd.Series], Dict[str, Any]]:
+    evidence: Dict[str, Any] = {
+        "required_condition": str(required_condition or "").strip(),
+        "clauses": [],
+        "unsupported_clauses": [],
+        "missing_columns": [],
+    }
+    text = str(required_condition or "").strip()
+    if not text:
+        evidence["skip_reason"] = "required_condition_missing"
+        return None, evidence
+
+    clauses = [part.strip() for part in re.split(r"\bAND\b", text, flags=re.IGNORECASE) if part.strip()]
+    if not clauses:
+        evidence["skip_reason"] = "required_condition_unparseable"
+        return None, evidence
+
+    mask = pd.Series([True] * len(frame), index=frame.index, dtype="boolean")
+    for clause in clauses:
+        clause_info: Dict[str, Any] = {"clause": clause}
+        match_not_null = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+IS\s+NOT\s+NULL$", clause, flags=re.IGNORECASE)
+        match_is_null = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+IS\s+NULL$", clause, flags=re.IGNORECASE)
+        match_compare = re.match(
+            r"^([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|<|>|=)\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s]+))$",
+            clause,
+            flags=re.IGNORECASE,
+        )
+
+        if match_not_null:
+            col = str(match_not_null.group(1) or "").strip()
+            if col not in frame.columns:
+                evidence["missing_columns"].append(col)
+                return None, evidence
+            clause_mask = ~frame[col].map(_is_null_like_text)
+            clause_info.update({"column": col, "operator": "IS NOT NULL"})
+        elif match_is_null:
+            col = str(match_is_null.group(1) or "").strip()
+            if col not in frame.columns:
+                evidence["missing_columns"].append(col)
+                return None, evidence
+            clause_mask = frame[col].map(_is_null_like_text)
+            clause_info.update({"column": col, "operator": "IS NULL"})
+        elif match_compare:
+            col = str(match_compare.group(1) or "").strip()
+            op = str(match_compare.group(2) or "").strip()
+            rhs = next(
+                (
+                    str(group).strip()
+                    for group in match_compare.groups()[2:]
+                    if isinstance(group, str) and str(group).strip()
+                ),
+                "",
+            )
+            if col not in frame.columns:
+                evidence["missing_columns"].append(col)
+                return None, evidence
+            coerced_series, expected_value, value_kind = _coerce_condition_series(frame[col], rhs)
+            clause_info.update(
+                {
+                    "column": col,
+                    "operator": op,
+                    "rhs": rhs,
+                    "value_kind": value_kind,
+                }
+            )
+            if value_kind == "string":
+                lhs = coerced_series.astype("string").fillna("")
+                rhs_token = str(expected_value or "")
+                if op == "=":
+                    clause_mask = lhs == rhs_token
+                else:
+                    evidence["unsupported_clauses"].append(clause)
+                    return None, evidence
+            else:
+                lhs = coerced_series
+                if op == "<=":
+                    clause_mask = lhs <= expected_value
+                elif op == ">=":
+                    clause_mask = lhs >= expected_value
+                elif op == "<":
+                    clause_mask = lhs < expected_value
+                elif op == ">":
+                    clause_mask = lhs > expected_value
+                elif op == "=":
+                    clause_mask = lhs == expected_value
+                else:
+                    evidence["unsupported_clauses"].append(clause)
+                    return None, evidence
+            clause_mask = clause_mask.fillna(False)
+        else:
+            evidence["unsupported_clauses"].append(clause)
+            return None, evidence
+
+        clause_info["rows_matching"] = int(clause_mask.fillna(False).astype(bool).sum())
+        evidence["clauses"].append(clause_info)
+        mask = mask.fillna(False).astype(bool) & clause_mask.fillna(False).astype(bool)
+
+    return mask.astype("boolean"), evidence
+
+
+def _check_split_condition_enforced(
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+    split_label = str(params.get("split_label") or "").strip()
+    required_condition = str(params.get("required_condition") or params.get("condition") or "").strip()
+    evidence["split_label"] = split_label or None
+    evidence["required_condition"] = required_condition or None
+    if not split_label:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "split_label_missing"
+        return issues, evidence
+    if not required_condition:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "required_condition_missing"
+        return issues, evidence
+
+    split_candidates = _resolve_training_indicator_candidates(cleaned_header, column_roles, params)
+    condition_columns = _extract_condition_columns(required_condition)
+    frame = _read_csv_selected_columns(cleaned_csv_path, split_candidates + condition_columns)
+    if frame is None:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "cleaned_csv_columns_unavailable"
+        return issues, evidence
+
+    split_column = ""
+    split_mask = None
+    for candidate in split_candidates:
+        if candidate not in frame.columns:
+            continue
+        series = frame[candidate].astype("string").fillna("").str.strip().str.lower()
+        label_mask = series == split_label.lower()
+        if bool(label_mask.any()):
+            split_column = candidate
+            split_mask = label_mask
+            break
+    evidence["split_column"] = split_column or None
+    if split_mask is None:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "split_label_not_found"
+        return issues, evidence
+
+    condition_mask, condition_evidence = _evaluate_required_condition_mask(frame, required_condition)
+    evidence["condition_evidence"] = condition_evidence
+    if condition_mask is None:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "required_condition_unparseable"
+        return issues, evidence
+
+    violating = split_mask.fillna(False).astype(bool) & ~condition_mask.fillna(False).astype(bool)
+    evidence["rows_in_split"] = int(split_mask.fillna(False).astype(bool).sum())
+    evidence["violating_rows"] = int(violating.sum())
+    if violating.any():
+        issues.append(
+            f"Rows labeled '{split_label}' violate required_condition: {required_condition}"
+        )
+    return issues, evidence
+
+
+def _check_identifier_columns_excluded_from_features(
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    params: Dict[str, Any],
+    column_roles: Dict[str, List[str]],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+    forbidden = _list_str(params.get("forbidden_as_features")) or _list_str(params.get("columns"))
+    evidence["forbidden_as_features"] = forbidden
+    if not forbidden:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "forbidden_as_features_missing"
+        return issues, evidence
+
+    header_lookup = {str(col).strip().lower(): str(col) for col in (cleaned_header or []) if str(col).strip()}
+    present_forbidden = [
+        header_lookup[str(col).strip().lower()]
+        for col in forbidden
+        if str(col).strip().lower() in header_lookup
+    ]
+    evidence["forbidden_present_in_cleaned_header"] = present_forbidden
+
+    role_ctx = _resolve_id_role_context(cleaned_header, column_roles)
+    passthrough_allowed = set(role_ctx.get("id_like") or []) | set(role_ctx.get("split_like") or [])
+    for col in present_forbidden:
+        lowered = str(col).strip().lower()
+        if lowered.endswith("_id") or lowered in {"account_id", "snapshot_month_end"}:
+            passthrough_allowed.add(col)
+    evidence["passthrough_allowed"] = sorted(passthrough_allowed)
+
+    unexpected_present = [col for col in present_forbidden if col not in passthrough_allowed]
+    if unexpected_present:
+        issues.append(
+            "Forbidden feature columns still present in cleaned dataset: "
+            + ", ".join(unexpected_present[:10])
+        )
+
+    passthrough_to_validate = [col for col in present_forbidden if col in passthrough_allowed]
+    passthrough_frame = _read_csv_selected_columns(cleaned_csv_path, passthrough_to_validate) if passthrough_to_validate else None
+    null_fractions: Dict[str, float] = {}
+    for col in passthrough_to_validate:
+        null_frac = None
+        if isinstance(passthrough_frame, pd.DataFrame) and col in passthrough_frame.columns:
+            series = passthrough_frame[col]
+            total = len(series)
+            if total > 0:
+                null_frac = float(series.map(_is_null_like_text).sum() / total)
+        if null_frac is None:
+            null_frac = _compute_null_fraction(sample_infer, sample_str, col)
+        if null_frac is None:
+            continue
+        null_fractions[col] = round(float(null_frac), 4)
+        if float(null_frac) >= 0.9999:
+            issues.append(f"Critical identifier '{col}' was destroyed (100% null)")
+    evidence["passthrough_null_frac"] = null_fractions
+    return issues, evidence
+
+
+def _check_arr_current_numeric_conversion_verified(
+    cleaned_header: List[str],
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    params: Dict[str, Any],
+    manifest: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+    target_candidates = _list_str(params.get("column")) + _list_str(params.get("columns"))
+    target_col = target_candidates[0] if target_candidates else ""
+    if not target_col:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "target_column_missing"
+        return issues, evidence
+    evidence["target_column"] = target_col
+
+    manifest_text = ""
+    try:
+        manifest_text = json.dumps(manifest or {}, ensure_ascii=False).lower()
+    except Exception:
+        manifest_text = str(manifest or "").lower()
+    gate_status = ""
+    if isinstance(manifest, dict):
+        gate_status = str((manifest.get("cleaning_gates_status") or {}).get("arr_current_numeric_conversion_verified") or "")
+    documented_drop = any(
+        token in manifest_text
+        for token in (
+            "dropped_from_features",
+            "dropped from features",
+            "dropped from model features",
+            "warning_dropped_from_features",
+        )
+    ) or "dropped_from_features" in gate_status.lower()
+    evidence["documented_model_feature_exclusion"] = bool(documented_drop)
+    evidence["gate_status"] = gate_status or None
+
+    if target_col not in (cleaned_header or []):
+        if documented_drop:
+            return issues, evidence
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "target_column_absent_in_cleaned_header"
+        return issues, evidence
+
+    inferred_dtype = str(sample_infer[target_col].dtype) if isinstance(sample_infer, pd.DataFrame) and target_col in sample_infer.columns else ""
+    examples = _string_values(sample_str, target_col)[:8]
+    evidence["inferred_dtype"] = inferred_dtype or None
+    evidence["sample_values"] = examples
+
+    if inferred_dtype and pd.api.types.is_numeric_dtype(sample_infer[target_col]):
+        return issues, evidence
+    if documented_drop:
+        return issues, evidence
+
+    currency_like = any(re.search(r"(?:^\$|^€|^£|\bEUR\b|\bUSD\b|\bGBP\b)", str(value), flags=re.IGNORECASE) for value in examples)
+    if currency_like or (inferred_dtype.lower() == "object" and examples):
+        issues.append("Column remains object type with currency strings")
+    return issues, evidence
+
+
+def _check_nps_forward_fill_temporal_integrity(
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    params: Dict[str, Any],
+    manifest: Dict[str, Any],
+    cleaning_code: Optional[str],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+    target_col = _pick_first_existing(_list_str(params.get("column")) + _list_str(params.get("columns")), cleaned_header)
+    group_key = _pick_first_existing(_list_str(params.get("group_key")) + _list_str(params.get("group_keys")), cleaned_header)
+    sort_key = _pick_first_existing(_list_str(params.get("sort_key")) + _list_str(params.get("sort_keys")), cleaned_header)
+    evidence["column"] = target_col or None
+    evidence["group_key"] = group_key or None
+    evidence["sort_key"] = sort_key or None
+    if not target_col or not group_key or not sort_key:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "target_or_group_or_sort_column_missing"
+        return issues, evidence
+
+    frame = _read_csv_selected_columns(cleaned_csv_path, [group_key, sort_key, target_col])
+    group_null_frac = None
+    if isinstance(frame, pd.DataFrame) and group_key in frame.columns:
+        total = len(frame[group_key])
+        if total > 0:
+            group_null_frac = float(frame[group_key].map(_is_null_like_text).sum() / total)
+    if group_null_frac is None:
+        group_null_frac = _compute_null_fraction(sample_infer, sample_str, group_key)
+    evidence["group_key_null_frac"] = None if group_null_frac is None else round(float(group_null_frac), 4)
+    if group_null_frac is not None and float(group_null_frac) >= 0.9999:
+        issues.append(
+            f"Forward fill cannot be validated because the group_key ({group_key}) is 100% null"
+        )
+        return issues, evidence
+
+    code_text = str(cleaning_code or "")
+    code_lower = code_text.lower()
+    group_regex = re.compile(
+        rf"groupby\(\s*['\"]{re.escape(group_key)}['\"]\s*\)\s*\[\s*['\"]{re.escape(target_col)}['\"]\s*\]\.ffill\(",
+        flags=re.IGNORECASE,
+    )
+    sort_regex = re.compile(
+        rf"sort_values\(\s*\[\s*['\"]{re.escape(group_key)}['\"]\s*,\s*['\"]{re.escape(sort_key)}['\"]\s*\]",
+        flags=re.IGNORECASE,
+    )
+    has_group_ffill = bool(group_regex.search(code_text))
+    has_sort = bool(sort_regex.search(code_text))
+    evidence["groupby_ffill_detected"] = has_group_ffill
+    evidence["sorted_by_group_and_time_detected"] = has_sort
+
+    manifest_text = ""
+    try:
+        manifest_text = json.dumps(manifest or {}, ensure_ascii=False).lower()
+    except Exception:
+        manifest_text = str(manifest or "").lower()
+    manifest_mentions_ffill = target_col.lower() in manifest_text and "forward_fill" in manifest_text
+    evidence["manifest_mentions_forward_fill"] = manifest_mentions_ffill
+
+    if has_group_ffill and has_sort:
+        return issues, evidence
+    if manifest_mentions_ffill and has_group_ffill:
+        return issues, evidence
+
+    issues.append("No evidence of partitioned forward-fill in cleaning_code")
     return issues, evidence
 
 
