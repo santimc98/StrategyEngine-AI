@@ -498,6 +498,7 @@ Before emitting JSON, reason through:
 2. Classify columns into semantic roles grounded in business meaning, availability at prediction time, and operational use. A column that encodes the outcome or is only available after the prediction moment cannot be a model feature. But some non-feature columns are still operationally required to define row filters, scoring scope, split logic, temporal ordering, label availability, or audit trace.
 3. Close every dependency: model_features must name explicit columns (not just conceptual families) whenever this run prepares a future modeling subset. Do not leave model_features empty while claiming future-ML readiness. If task_semantics, evaluation, or gates depend on a column, keep that dependency explicit even when the column is excluded from model_features.
 4. Verify consistency: every column in model_features appears in column_roles.pre_decision. Every column in column_roles.outcome is excluded from model_features. Columns referenced by task_semantics, gating, or validation remain represented as operational dependencies even when they are not model features.
+5. If authoritative dataset semantics already defines row-partition rules or primary/secondary scoring cohorts, carry them forward explicitly in task_semantics. Do not simplify mature cohort logic into generic "target IS NULL / target IS NOT NULL" heuristics.
 
 CANONICAL_COLUMNS
 canonical_columns must list ALL columns from column_inventory that this run acknowledges. This is the dataset's full column manifest — not just anchor columns or role-specific subsets. If column_inventory has 42 columns and none are excluded, canonical_columns has 42 entries. The compiler and downstream agents use canonical_columns as the ground truth for what columns exist.
@@ -544,6 +545,7 @@ SOURCE OF TRUTH
 1. SEMANTIC_CORE_AUTHORITY_JSON is authoritative. Do not override it with SUPPORT_CONTEXT.
 2. SUPPORT_CONTEXT improves compilation quality but never overrides semantic decisions.
 3. Do not widen scope, renegotiate intent, or re-decide whether model_training is active.
+4. Do not narrow, strengthen, or reinterpret semantic row-partition rules from SEMANTIC_CORE_AUTHORITY_JSON. Compile them faithfully.
 
 V5.0 HIERARCHICAL STRUCTURE
 The contract has a "shared" section plus one section per agent: data_engineer, ml_engineer, cleaning_reviewer, qa_reviewer, business_translator.
@@ -558,6 +560,7 @@ FIVE CORE PRINCIPLES
 3. Downstream-executable: Each downstream agent must be able to execute its task from its contract section alone (plus shared). The contract is the single source of truth for execution.
 4. No invention: Do not reference columns not in column_inventory, do not create training sections when model_training=false, do not invent artifacts beyond what the semantic core implies.
 5. Minimal: The shortest valid contract that satisfies principles 1-4. No filler sections, no padding with defaults when context provides specifics.
+6. Preserve semantic exclusions: if SEMANTIC_CORE_AUTHORITY_JSON or strategy reasoning marks a column as audit-only, reporting-only, stratification-only, or excluded from the initial model, keep it out of model_features. Represent it under audit_only_features or another non-model dependency surface when still operationally required.
 
 WHAT GOES IN "shared" (preserved verbatim from SEMANTIC_CORE where available)
 scope, active_workstreams, future_ml_handoff, task_semantics, column_roles, allowed_feature_sets, model_features, strategy_title, business_objective, output_dialect, canonical_columns, column_dtype_targets, iteration_policy.
@@ -1535,6 +1538,100 @@ def _normalize_semantic_token(value: Any) -> str:
     return token
 
 
+def _canonicalize_rule_text(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    return " ".join(str(value).strip().lower().split())
+
+
+def _is_generic_label_partition_rule(rule: Any, target_name: Any, *, positive: bool) -> bool:
+    rule_text = _canonicalize_rule_text(rule)
+    target = str(target_name or "").strip()
+    if not rule_text or not target:
+        return False
+    escaped_target = re.escape(target)
+    nullable_token = r"(?:null|missing)"
+    comparator = r"(?:is\s+not|!=)" if positive else r"(?:is|=)"
+    pattern = re.compile(
+        rf"(?:rows\s+where\s+)?{escaped_target}\s+{comparator}\s+{nullable_token}",
+        flags=re.IGNORECASE,
+    )
+    return bool(pattern.fullmatch(rule_text))
+
+
+def _reconcile_semantic_core_with_dataset_semantics(
+    semantic_core: Dict[str, Any] | None,
+    data_profile: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if not isinstance(semantic_core, dict):
+        return {}
+    if not isinstance(data_profile, dict):
+        return semantic_core
+    dataset_semantics = data_profile.get("dataset_semantics")
+    if not isinstance(dataset_semantics, dict) or not dataset_semantics:
+        return semantic_core
+
+    repaired = copy.deepcopy(semantic_core)
+    task_semantics = repaired.get("task_semantics")
+    if not isinstance(task_semantics, dict):
+        task_semantics = {}
+
+    primary_target = (
+        task_semantics.get("primary_target")
+        or dataset_semantics.get("primary_target")
+        or ((dataset_semantics.get("target_columns") or [None])[0] if isinstance(dataset_semantics.get("target_columns"), list) else None)
+    )
+
+    ds_training = str(dataset_semantics.get("training_rows_rule") or "").strip()
+    ds_scoring_primary = str(dataset_semantics.get("scoring_rows_rule_primary") or dataset_semantics.get("scoring_rows_rule") or "").strip()
+    ds_scoring_secondary = str(dataset_semantics.get("scoring_rows_rule_secondary") or "").strip()
+
+    current_training = str(task_semantics.get("training_rows_rule") or "").strip()
+    if ds_training and (
+        not current_training
+        or _is_generic_label_partition_rule(current_training, primary_target, positive=True)
+    ):
+        task_semantics["training_rows_rule"] = ds_training
+
+    current_scoring = str(task_semantics.get("scoring_rows_rule") or "").strip()
+    current_scoring_primary = str(task_semantics.get("scoring_rows_rule_primary") or "").strip()
+    if ds_scoring_primary:
+        if not current_scoring_primary or (
+            current_scoring
+            and _is_generic_label_partition_rule(current_scoring, primary_target, positive=False)
+        ):
+            task_semantics["scoring_rows_rule_primary"] = ds_scoring_primary
+        if not current_scoring or _is_generic_label_partition_rule(current_scoring, primary_target, positive=False):
+            task_semantics["scoring_rows_rule"] = ds_scoring_primary
+
+    if ds_scoring_secondary and not str(task_semantics.get("scoring_rows_rule_secondary") or "").strip():
+        task_semantics["scoring_rows_rule_secondary"] = ds_scoring_secondary
+
+    split_candidates = dataset_semantics.get("split_candidates")
+    if (
+        not str(task_semantics.get("temporal_ordering_column") or "").strip()
+        and isinstance(split_candidates, list)
+        and split_candidates
+    ):
+        first_split = str(split_candidates[0] or "").strip()
+        if first_split:
+            task_semantics["temporal_ordering_column"] = first_split
+
+    id_candidates = dataset_semantics.get("id_candidates")
+    if (
+        not str(task_semantics.get("entity_identifier") or "").strip()
+        and isinstance(id_candidates, list)
+        and id_candidates
+    ):
+        first_id = str(id_candidates[0] or "").strip()
+        if first_id:
+            task_semantics["entity_identifier"] = first_id
+
+    if task_semantics:
+        repaired["task_semantics"] = task_semantics
+    return repaired
+
+
 def _looks_like_materialized_output_path(value: Any) -> bool:
     if not isinstance(value, str) or not value.strip():
         return False
@@ -1950,7 +2047,19 @@ def _build_semantic_guard_validation(
                 {},
             )
         else:
-            for key in ("problem_family", "objective_type", "primary_target", "prediction_unit"):
+            for key in (
+                "problem_family",
+                "objective_type",
+                "primary_target",
+                "prediction_unit",
+                "unit_of_analysis",
+                "temporal_ordering_column",
+                "entity_identifier",
+                "training_rows_rule",
+                "scoring_rows_rule",
+                "scoring_rows_rule_primary",
+                "scoring_rows_rule_secondary",
+            ):
                 semantic_value = semantic_task.get(key)
                 compiled_value = compiled_task.get(key)
                 if semantic_value not in (None, "", []) and compiled_value not in (None, "", []):
@@ -1976,6 +2085,79 @@ def _build_semantic_guard_validation(
             "semantic_guard.model_features_changed",
             "Compiled contract changed top-level model_features from semantic_core.",
             {"semantic": semantic_features, "compiled": compiled_features},
+        )
+    semantic_allowed_sets = (
+        semantic_core.get("allowed_feature_sets")
+        if isinstance(semantic_core.get("allowed_feature_sets"), dict)
+        else {}
+    )
+    compiled_allowed_sets = (
+        compiled_contract.get("allowed_feature_sets")
+        if isinstance(compiled_contract.get("allowed_feature_sets"), dict)
+        else {}
+    )
+    semantic_roles = semantic_core.get("column_roles") if isinstance(semantic_core.get("column_roles"), dict) else {}
+    semantic_audit = _canonicalize_string_list(
+        semantic_allowed_sets.get("audit_only_features")
+        or semantic_roles.get("post_decision_audit_only")
+    )
+    semantic_forbidden = _canonicalize_string_list(
+        semantic_allowed_sets.get("forbidden_for_modeling")
+        or semantic_allowed_sets.get("forbidden_features")
+    )
+    compiled_audit = _canonicalize_string_list(compiled_allowed_sets.get("audit_only_features"))
+    compiled_forbidden = _canonicalize_string_list(
+        compiled_allowed_sets.get("forbidden_for_modeling")
+        or compiled_allowed_sets.get("forbidden_features")
+    )
+    compiled_feature_norms = {
+        _normalize_column_identifier(item)
+        for item in compiled_features
+        if _normalize_column_identifier(item)
+    }
+    semantic_audit_norms = {
+        _normalize_column_identifier(item)
+        for item in semantic_audit
+        if _normalize_column_identifier(item)
+    }
+    semantic_forbidden_norms = {
+        _normalize_column_identifier(item)
+        for item in semantic_forbidden
+        if _normalize_column_identifier(item)
+    }
+    if semantic_audit_norms and compiled_feature_norms.intersection(semantic_audit_norms):
+        _record_conflict(
+            "semantic_guard.audit_only_reintroduced",
+            "Compiled contract reintroduced semantic audit-only columns into model_features.",
+            {
+                "semantic_audit_only": semantic_audit,
+                "compiled_model_features": compiled_features,
+            },
+        )
+    if semantic_forbidden_norms and compiled_feature_norms.intersection(semantic_forbidden_norms):
+        _record_conflict(
+            "semantic_guard.forbidden_features_reintroduced",
+            "Compiled contract reintroduced semantic forbidden columns into model_features.",
+            {
+                "semantic_forbidden": semantic_forbidden,
+                "compiled_model_features": compiled_features,
+            },
+        )
+    if semantic_audit and compiled_audit and not set(map(_normalize_column_identifier, semantic_audit)).issubset(
+        set(map(_normalize_column_identifier, compiled_audit))
+    ):
+        _record_conflict(
+            "semantic_guard.audit_only_features_changed",
+            "Compiled contract changed audit_only_features from semantic_core.",
+            {"semantic": semantic_audit, "compiled": compiled_audit},
+        )
+    if semantic_forbidden and compiled_forbidden and not set(map(_normalize_column_identifier, semantic_forbidden)).issubset(
+        set(map(_normalize_column_identifier, compiled_forbidden))
+    ):
+        _record_conflict(
+            "semantic_guard.forbidden_features_changed",
+            "Compiled contract changed forbidden feature exclusions from semantic_core.",
+            {"semantic": semantic_forbidden, "compiled": compiled_forbidden},
         )
 
     semantic_outputs_raw = (
@@ -4511,6 +4693,8 @@ def select_relevant_columns(
         or strategy_dict.get("outcome_column")
     )
     audit_only_raw = _coerce_list(strategy_dict.get("audit_only_columns"))
+    audit_only_raw.extend(_infer_strategy_audit_only_columns(strategy_dict, inventory))
+    audit_only_raw.extend(_infer_strategy_audit_only_columns(strategy_dict, inventory))
 
     required_cols: List[str] = []
     family_cols: List[str] = []
@@ -4969,15 +5153,37 @@ def _reconcile_compiled_feature_surfaces(
     semantic_core = semantic_core if isinstance(semantic_core, dict) else {}
 
     semantic_features = _canonicalize_string_list(semantic_core.get("model_features"))
-    if not semantic_features:
-        return compiled_contract
-
     repaired = copy.deepcopy(compiled_contract)
     shared_payload = repaired.get("shared") if isinstance(repaired.get("shared"), dict) else None
     feature_surface = shared_payload if isinstance(shared_payload, dict) else repaired
+    semantic_allowed_sets = (
+        semantic_core.get("allowed_feature_sets")
+        if isinstance(semantic_core.get("allowed_feature_sets"), dict)
+        else {}
+    )
+    semantic_audit = _canonicalize_string_list(
+        semantic_allowed_sets.get("audit_only_features")
+        or (semantic_core.get("column_roles") or {}).get("post_decision_audit_only")
+    )
+    semantic_forbidden = _canonicalize_string_list(
+        semantic_allowed_sets.get("forbidden_for_modeling")
+        or semantic_allowed_sets.get("forbidden_features")
+    )
+    if not semantic_features and not semantic_audit and not semantic_forbidden:
+        return compiled_contract
 
     compiled_features = _canonicalize_string_list(feature_surface.get("model_features"))
     semantic_norms = {_normalize_column_identifier(item) for item in semantic_features if _normalize_column_identifier(item)}
+    semantic_audit_norms = {
+        _normalize_column_identifier(item)
+        for item in semantic_audit
+        if _normalize_column_identifier(item)
+    }
+    semantic_forbidden_norms = {
+        _normalize_column_identifier(item)
+        for item in semantic_forbidden
+        if _normalize_column_identifier(item)
+    }
 
     derived_candidates: List[str] = []
     for source in (
@@ -5011,7 +5217,7 @@ def _reconcile_compiled_feature_surfaces(
     promoted_extras: List[str] = []
     for feature in compiled_features:
         norm = _normalize_column_identifier(feature)
-        if not norm or norm in semantic_norms:
+        if not norm or norm in semantic_norms or norm in semantic_audit_norms or norm in semantic_forbidden_norms:
             continue
         if norm in derived_norms:
             promoted_extras.append(feature)
@@ -5026,9 +5232,20 @@ def _reconcile_compiled_feature_surfaces(
         seen_derived.add(norm)
         merged_derived.append(token)
 
-    repaired["model_features"] = semantic_features
-    if isinstance(feature_surface, dict):
-        feature_surface["model_features"] = semantic_features
+    if semantic_features:
+        repaired["model_features"] = semantic_features
+        if isinstance(feature_surface, dict):
+            feature_surface["model_features"] = semantic_features
+    elif semantic_audit_norms or semantic_forbidden_norms:
+        filtered_features = [
+            feature
+            for feature in compiled_features
+            if _normalize_column_identifier(feature) not in semantic_audit_norms
+            and _normalize_column_identifier(feature) not in semantic_forbidden_norms
+        ]
+        repaired["model_features"] = filtered_features
+        if isinstance(feature_surface, dict):
+            feature_surface["model_features"] = filtered_features
     if merged_derived:
         repaired["derived_columns"] = merged_derived
         if isinstance(feature_surface, dict):
@@ -5037,6 +5254,125 @@ def _reconcile_compiled_feature_surfaces(
         repaired["derived_columns"] = []
         if isinstance(feature_surface, dict) and "derived_columns" in feature_surface:
             feature_surface["derived_columns"] = []
+
+    allowed_sets_surface = feature_surface.get("allowed_feature_sets")
+    if not isinstance(allowed_sets_surface, dict):
+        allowed_sets_surface = {}
+        feature_surface["allowed_feature_sets"] = allowed_sets_surface
+        if feature_surface is not repaired:
+            repaired["allowed_feature_sets"] = allowed_sets_surface
+    if semantic_audit:
+        allowed_sets_surface["audit_only_features"] = semantic_audit
+    if semantic_forbidden:
+        if "forbidden_for_modeling" in allowed_sets_surface:
+            allowed_sets_surface["forbidden_for_modeling"] = semantic_forbidden
+        else:
+            allowed_sets_surface["forbidden_features"] = semantic_forbidden
+    return repaired
+
+
+def _reconcile_compiled_task_semantics(
+    compiled_contract: Dict[str, Any],
+    semantic_core: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if not isinstance(compiled_contract, dict):
+        return {}
+    semantic_core = semantic_core if isinstance(semantic_core, dict) else {}
+    semantic_task = semantic_core.get("task_semantics")
+    if not isinstance(semantic_task, dict) or not semantic_task:
+        return compiled_contract
+
+    repaired = copy.deepcopy(compiled_contract)
+    shared_payload = repaired.get("shared") if isinstance(repaired.get("shared"), dict) else None
+    surface = shared_payload if isinstance(shared_payload, dict) else repaired
+    compiled_task = surface.get("task_semantics")
+    if not isinstance(compiled_task, dict):
+        compiled_task = {}
+
+    authoritative_task = copy.deepcopy(compiled_task)
+    for key in (
+        "problem_family",
+        "objective_type",
+        "primary_target",
+        "prediction_unit",
+        "unit_of_analysis",
+        "temporal_ordering_column",
+        "entity_identifier",
+        "training_rows_rule",
+        "scoring_rows_rule",
+        "scoring_rows_rule_primary",
+        "scoring_rows_rule_secondary",
+    ):
+        semantic_value = semantic_task.get(key)
+        if semantic_value not in (None, "", []):
+            authoritative_task[key] = semantic_value
+
+    semantic_targets = _canonicalize_string_list(semantic_task.get("target_columns"))
+    if semantic_targets:
+        authoritative_task["target_columns"] = semantic_targets
+
+    surface["task_semantics"] = authoritative_task
+
+    training_rule = str(authoritative_task.get("training_rows_rule") or "").strip()
+    scoring_rule = str(authoritative_task.get("scoring_rows_rule") or "").strip()
+    scoring_primary = str(authoritative_task.get("scoring_rows_rule_primary") or "").strip()
+    scoring_secondary = str(authoritative_task.get("scoring_rows_rule_secondary") or "").strip()
+    if not scoring_primary and scoring_rule:
+        scoring_primary = scoring_rule
+
+    def _sync_surface(section: Dict[str, Any]) -> None:
+        if not isinstance(section, dict):
+            return
+        if training_rule:
+            section["training_rows_rule"] = training_rule
+        if scoring_rule:
+            section["scoring_rows_rule"] = scoring_rule
+        if scoring_primary:
+            section["scoring_rows_rule_primary"] = scoring_primary
+        if scoring_secondary:
+            section["scoring_rows_rule_secondary"] = scoring_secondary
+
+        cleaning_gates = section.get("cleaning_gates")
+        if isinstance(cleaning_gates, list):
+            for gate in cleaning_gates:
+                if not isinstance(gate, dict):
+                    continue
+                params = gate.get("params")
+                if not isinstance(params, dict):
+                    continue
+                if training_rule and "training_rows_rule" in params:
+                    params["training_rows_rule"] = training_rule
+                if scoring_rule and "scoring_rows_rule" in params:
+                    params["scoring_rows_rule"] = scoring_rule
+                if scoring_primary and "scoring_rows_rule_primary" in params:
+                    params["scoring_rows_rule_primary"] = scoring_primary
+                if scoring_secondary and "scoring_rows_rule_secondary" in params:
+                    params["scoring_rows_rule_secondary"] = scoring_secondary
+
+        artifact_requirements = section.get("artifact_requirements")
+        if not isinstance(artifact_requirements, dict):
+            return
+        cleaned_dataset = artifact_requirements.get("cleaned_dataset")
+        if not isinstance(cleaned_dataset, dict):
+            return
+        cohort_split = cleaned_dataset.get("cohort_split_column")
+        if not isinstance(cohort_split, dict):
+            return
+        values = cohort_split.get("values")
+        if not isinstance(values, dict):
+            return
+        if training_rule and "train" in values:
+            values["train"] = training_rule
+        if scoring_primary and "score_primary" in values:
+            values["score_primary"] = scoring_primary
+        if scoring_secondary and "score_secondary" in values:
+            values["score_secondary"] = scoring_secondary
+
+    for section_name in ("data_engineer", "shared"):
+        section = repaired.get(section_name)
+        if isinstance(section, dict):
+            _sync_surface(section)
+    _sync_surface(repaired)
     return repaired
 
 
@@ -7695,6 +8031,85 @@ def _normalize_column_identifier(value: Any) -> str:
     return cleaned
 
 
+def _infer_strategy_audit_only_columns(
+    strategy_dict: Dict[str, Any] | None,
+    canonical_columns: List[str] | None,
+) -> List[str]:
+    if not isinstance(strategy_dict, dict) or not isinstance(canonical_columns, list):
+        return []
+
+    cue_patterns = (
+        re.compile(r"\bexclude(?:d|s)?\b", flags=re.IGNORECASE),
+        re.compile(r"\bquarantin(?:e|ed|ing)\b", flags=re.IGNORECASE),
+        re.compile(r"\baudit[- ]only\b", flags=re.IGNORECASE),
+        re.compile(r"\breport(?:ing)?[- ]only\b", flags=re.IGNORECASE),
+        re.compile(r"\bstratification variable\b", flags=re.IGNORECASE),
+        re.compile(r"\bevaluat(?:e|ed|ion) separately\b", flags=re.IGNORECASE),
+        re.compile(r"\boutside the initial model\b", flags=re.IGNORECASE),
+        re.compile(r"\bexclude from (?:the )?(?:initial )?model\b", flags=re.IGNORECASE),
+        re.compile(r"\bshould be excluded from (?:the )?(?:initial )?model\b", flags=re.IGNORECASE),
+        re.compile(r"\bdo not include in (?:the )?(?:initial )?model\b", flags=re.IGNORECASE),
+        re.compile(r"\bmust not be model features?\b", flags=re.IGNORECASE),
+        re.compile(r"\bshould not be model features?\b", flags=re.IGNORECASE),
+        re.compile(r"\bused only for (?:audit|reporting|stratification)\b", flags=re.IGNORECASE),
+    )
+
+    fragments: List[str] = []
+    for key in (
+        "objective_reasoning",
+        "scope_reasoning",
+        "validation_rationale",
+        "hypothesis",
+        "reasoning",
+        "expected_lift",
+    ):
+        value = strategy_dict.get(key)
+        if isinstance(value, str) and value.strip():
+            fragments.append(value.strip())
+    for key in ("fallback_chain", "techniques"):
+        raw_values = strategy_dict.get(key)
+        if isinstance(raw_values, list):
+            fragments.extend([str(item).strip() for item in raw_values if str(item or "").strip()])
+    feature_families = strategy_dict.get("feature_families")
+    if isinstance(feature_families, list):
+        for entry in feature_families:
+            if isinstance(entry, str) and entry.strip():
+                fragments.append(entry.strip())
+                continue
+            if not isinstance(entry, dict):
+                continue
+            for key in ("family", "rationale", "selector_hint", "description", "pattern"):
+                value = entry.get(key)
+                if isinstance(value, str) and value.strip():
+                    fragments.append(value.strip())
+
+    allowed_patterns: List[Tuple[str, re.Pattern[str]]] = []
+    for canonical in canonical_columns:
+        if not isinstance(canonical, str) or not canonical.strip():
+            continue
+        tokens = [tok for tok in re.split(r"[_\s\-]+", canonical.lower()) if tok]
+        if not tokens:
+            continue
+        pattern_text = re.escape(tokens[0]) if len(tokens) == 1 else r"[_\s\-]+".join(re.escape(tok) for tok in tokens)
+        allowed_patterns.append(
+            (
+                canonical,
+                re.compile(rf"(?<![A-Za-z0-9]){pattern_text}(?![A-Za-z0-9])", flags=re.IGNORECASE),
+            )
+        )
+
+    inferred: List[str] = []
+    for fragment in fragments:
+        for sentence in re.split(r"[\n.;]+", fragment):
+            snippet = sentence.strip()
+            if not snippet or not any(pattern.search(snippet) for pattern in cue_patterns):
+                continue
+            for canonical, pattern in allowed_patterns:
+                if pattern.search(snippet) and canonical not in inferred:
+                    inferred.append(canonical)
+    return inferred
+
+
 def _resolve_identifier_candidates(
     contract: Dict[str, Any],
     canonical_columns: List[str] | None,
@@ -10228,7 +10643,17 @@ class ExecutionPlannerAgent:
                 if resolved:
                     resolved_target = resolved
                     break
-        strategy_json = json.dumps(strategy, indent=2)
+        strategy_for_prompt = copy.deepcopy(strategy) if isinstance(strategy, dict) else {}
+        inferred_strategy_audit_only = _infer_strategy_audit_only_columns(
+            strategy_for_prompt,
+            [str(col) for col in (column_inventory or []) if col is not None],
+        )
+        if inferred_strategy_audit_only:
+            existing_audit_only = _coerce_list(strategy_for_prompt.get("audit_only_columns"))
+            merged_audit_only = list(dict.fromkeys(existing_audit_only + inferred_strategy_audit_only))
+            strategy_for_prompt["audit_only_columns"] = merged_audit_only
+            strategy_for_prompt["audit_only_columns_inferred_from_reasoning"] = inferred_strategy_audit_only
+        strategy_json = json.dumps(strategy_for_prompt if isinstance(strategy_for_prompt, dict) else strategy, indent=2)
         column_sets_payload = column_sets if isinstance(column_sets, dict) else {}
         column_sets_summary = summarize_column_sets(column_sets_payload) if column_sets_payload else ""
         column_inventory_count = len(column_inventory or [])
@@ -10307,11 +10732,12 @@ class ExecutionPlannerAgent:
                 "analysis_type",
                 "hypothesis",
                 "required_columns",
+                "audit_only_columns",
                 "techniques",
                 "fallback_chain",
                 "reasoning",
             ):
-                value = strategy.get(key)
+                value = strategy_for_prompt.get(key) if isinstance(strategy_for_prompt, dict) else strategy.get(key)
                 if value not in (None, "", [], {}):
                     compiler_strategy_context[key] = value
             if strategy_feature_families:
@@ -10605,7 +11031,10 @@ domain_expert_critique:
                 )
 
                 if isinstance(parsed_semantic, dict):
-                    planner_semantic_core = copy.deepcopy(parsed_semantic)
+                    planner_semantic_core = _reconcile_semantic_core_with_dataset_semantics(
+                        copy.deepcopy(parsed_semantic),
+                        data_profile,
+                    )
                     semantic_success = True
                     break
 
@@ -10772,6 +11201,7 @@ domain_expert_critique:
                     quality_error_message = None
                     if parsed is not None and isinstance(parsed, dict):
                         parsed = _reconcile_compiled_feature_surfaces(parsed, planner_semantic_core)
+                        parsed = _reconcile_compiled_task_semantics(parsed, planner_semantic_core)
                         round_has_candidate = True
                         planner_contract_canonical = copy.deepcopy(parsed)
                         candidate_for_validation = copy.deepcopy(parsed)

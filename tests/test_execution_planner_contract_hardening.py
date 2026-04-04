@@ -8,7 +8,10 @@ from src.agents.execution_planner import (
     _build_patch_transport_validation,
     _repair_common_json_damage,
     _build_semantic_guard_validation,
+    _infer_strategy_audit_only_columns,
+    _reconcile_compiled_task_semantics,
     _reconcile_compiled_feature_surfaces,
+    _reconcile_semantic_core_with_dataset_semantics,
     ExecutionPlannerAgent,
     _apply_planner_structural_support,
     parse_derive_from_expression,
@@ -1293,6 +1296,138 @@ def test_reconcile_compiled_feature_surfaces_preserves_semantic_model_features_a
     validation = _build_semantic_guard_validation(semantic_core, repaired)
     rules = {issue.get("rule") for issue in (validation.get("issues") or []) if isinstance(issue, dict)}
     assert "semantic_guard.model_features_changed" not in rules
+
+
+def test_reconcile_semantic_core_promotes_authoritative_dataset_semantics_row_rules():
+    semantic_core = {
+        "task_semantics": {
+            "primary_target": "churn_60d",
+            "training_rows_rule": "churn_60d IS NOT NULL",
+            "scoring_rows_rule": "churn_60d IS NULL",
+        }
+    }
+    data_profile = {
+        "dataset_semantics": {
+            "primary_target": "churn_60d",
+            "training_rows_rule": "churn_60d IS NOT NULL AND snapshot_month_end <= '2025-10-31'",
+            "scoring_rows_rule_primary": "churn_60d IS NULL",
+            "scoring_rows_rule_secondary": "churn_60d IS NOT NULL AND snapshot_month_end > '2025-10-31'",
+            "split_candidates": ["snapshot_month_end"],
+            "id_candidates": ["account_id"],
+        }
+    }
+
+    repaired = _reconcile_semantic_core_with_dataset_semantics(semantic_core, data_profile)
+    task_semantics = repaired.get("task_semantics") or {}
+
+    assert task_semantics.get("training_rows_rule") == "churn_60d IS NOT NULL AND snapshot_month_end <= '2025-10-31'"
+    assert task_semantics.get("scoring_rows_rule") == "churn_60d IS NULL"
+    assert task_semantics.get("scoring_rows_rule_secondary") == "churn_60d IS NOT NULL AND snapshot_month_end > '2025-10-31'"
+    assert task_semantics.get("temporal_ordering_column") == "snapshot_month_end"
+    assert task_semantics.get("entity_identifier") == "account_id"
+
+
+def test_reconcile_compiled_task_semantics_preserves_semantic_partition_rules_and_cleaning_gate_params():
+    semantic_core = {
+        "task_semantics": {
+            "primary_target": "churn_60d",
+            "training_rows_rule": "churn_60d IS NOT NULL AND snapshot_month_end <= '2025-10-31'",
+            "scoring_rows_rule": "churn_60d IS NULL",
+            "scoring_rows_rule_secondary": "churn_60d IS NOT NULL AND snapshot_month_end > '2025-10-31'",
+        }
+    }
+    compiled_contract = {
+        "contract_version": "5.0",
+        "shared": {
+            "task_semantics": {
+                "primary_target": "churn_60d",
+                "training_rows_rule": "churn_60d IS NOT NULL",
+                "scoring_rows_rule": "churn_60d IS NULL",
+            },
+        },
+        "data_engineer": {
+            "cleaning_gates": [
+                {
+                    "name": "enforce_cohort_partition",
+                    "severity": "HARD",
+                    "params": {
+                        "training_rows_rule": "churn_60d IS NOT NULL",
+                        "scoring_rows_rule": "churn_60d IS NULL",
+                        "scoring_rows_rule_secondary": "",
+                    },
+                }
+            ],
+            "artifact_requirements": {
+                "cleaned_dataset": {
+                    "cohort_split_column": {
+                        "values": {
+                            "train": "churn_60d IS NOT NULL",
+                            "score_primary": "churn_60d IS NULL",
+                            "score_secondary": "",
+                        }
+                    }
+                }
+            },
+        },
+    }
+
+    repaired = _reconcile_compiled_task_semantics(compiled_contract, semantic_core)
+    task_semantics = (repaired.get("shared") or {}).get("task_semantics") or {}
+    gate_params = (((repaired.get("data_engineer") or {}).get("cleaning_gates") or [])[0] or {}).get("params") or {}
+    cohort_values = ((((repaired.get("data_engineer") or {}).get("artifact_requirements") or {}).get("cleaned_dataset") or {}).get("cohort_split_column") or {}).get("values") or {}
+
+    assert task_semantics.get("training_rows_rule") == "churn_60d IS NOT NULL AND snapshot_month_end <= '2025-10-31'"
+    assert gate_params.get("training_rows_rule") == "churn_60d IS NOT NULL AND snapshot_month_end <= '2025-10-31'"
+    assert gate_params.get("scoring_rows_rule_secondary") == "churn_60d IS NOT NULL AND snapshot_month_end > '2025-10-31'"
+    assert cohort_values.get("train") == "churn_60d IS NOT NULL AND snapshot_month_end <= '2025-10-31'"
+    assert cohort_values.get("score_secondary") == "churn_60d IS NOT NULL AND snapshot_month_end > '2025-10-31'"
+
+
+def test_infer_strategy_audit_only_columns_from_reasoning_text():
+    strategy = {
+        "objective_reasoning": (
+            "CSM owner should be excluded from the initial model and evaluated separately as a stratification variable. "
+            "risk_flag_internal is reporting-only."
+        )
+    }
+
+    inferred = _infer_strategy_audit_only_columns(
+        strategy,
+        ["account_id", "csm_owner", "risk_flag_internal", "arr_current"],
+    )
+
+    assert inferred == ["csm_owner", "risk_flag_internal"]
+
+
+def test_reconcile_compiled_feature_surfaces_preserves_semantic_audit_only_exclusions():
+    semantic_core = {
+        "allowed_feature_sets": {
+            "audit_only_features": ["csm_owner"],
+            "forbidden_features": ["risk_flag_internal"],
+        },
+        "column_roles": {
+            "post_decision_audit_only": ["csm_owner"],
+        },
+    }
+    compiled_contract = {
+        "model_features": ["arr_current", "csm_owner", "risk_flag_internal"],
+        "allowed_feature_sets": {
+            "model_features": ["arr_current", "csm_owner", "risk_flag_internal"],
+            "audit_only_features": [],
+            "forbidden_features": [],
+        },
+    }
+
+    repaired = _reconcile_compiled_feature_surfaces(compiled_contract, semantic_core)
+    validation = _build_semantic_guard_validation(semantic_core, repaired)
+    rules = {issue.get("rule") for issue in (validation.get("issues") or []) if isinstance(issue, dict)}
+
+    assert repaired.get("model_features") == ["arr_current"]
+    allowed = repaired.get("allowed_feature_sets") or {}
+    assert allowed.get("audit_only_features") == ["csm_owner"]
+    assert allowed.get("forbidden_features") == ["risk_flag_internal"]
+    assert "semantic_guard.audit_only_reintroduced" not in rules
+    assert "semantic_guard.forbidden_features_reintroduced" not in rules
 
 
 def test_contract_validation_accepts_explicit_optimization_direction_and_tie_breakers():
