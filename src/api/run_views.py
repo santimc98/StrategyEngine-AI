@@ -4,10 +4,11 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional
 
 from src.utils.paths import run_dir
-from src.utils.run_status import read_event_entries, read_final_state, read_status
+from src.utils.run_status import read_event_entries, read_final_state
 
 
 def _load_json_safe(path: Path) -> Optional[Dict[str, Any]]:
@@ -54,226 +55,259 @@ def _run_report_dir(run_id: str) -> Path:
     return _run_root(run_id) / "report"
 
 
-def _event_title(event_name: str) -> str:
-    title = re.sub(r"[_\-]+", " ", str(event_name or "").strip()).strip()
-    return title[:1].upper() + title[1:] if title else "Evento"
-
-
-def _event_phase(event_name: str, payload: Dict[str, Any]) -> str:
-    event = str(event_name or "").strip().lower()
-    step = str(payload.get("step") or "").strip().lower()
-    if step:
-        return step
-    for token in (
-        "steward",
-        "strategist",
-        "execution_planner",
-        "planner",
-        "data_engineer",
-        "ml_engineer",
-        "translator",
-        "review_board",
-        "results_advisor",
-        "reviewer",
-        "qa",
-    ):
-        if token in event:
-            return token
-    if event.startswith("heavy_runner"):
-        return "runtime"
-    if event.startswith("run_"):
-        return "run"
-    return "pipeline"
-
-
-def _compact_value(value: Any) -> str:
+def _fmt(value: Any) -> str:
+    """Compact display for a payload value."""
     if value is None:
         return ""
     if isinstance(value, bool):
-        return "sí" if value else "no"
+        return "yes" if value else "no"
     if isinstance(value, float):
-        if value.is_integer():
-            return str(int(value))
-        return f"{value:.4g}"
-    if isinstance(value, (int,)):
+        return str(int(value)) if value.is_integer() else f"{value:.4g}"
+    if isinstance(value, int):
         return str(value)
     text = str(value).strip()
-    return text[:160] + "…" if len(text) > 160 else text
+    return (text[:120] + "...") if len(text) > 120 else text
 
 
-def _activity_summary(event_name: str, payload: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]], str]:
-    event = str(event_name or "").strip().lower()
-    phase = _event_phase(event, payload)
-    details: List[Dict[str, str]] = []
+# ---------------------------------------------------------------------------
+# Agent label lookup for events
+# ---------------------------------------------------------------------------
+
+_PHASE_AGENT: Dict[str, str] = {
+    "steward": "Data Steward",
+    "strategist": "Strategist",
+    "execution_planner": "Planner",
+    "planner": "Planner",
+    "data_engineer": "Data Engineer",
+    "ml_engineer": "ML Engineer",
+    "translator": "Translator",
+    "review_board": "Review Board",
+    "results_advisor": "Results Advisor",
+    "reviewer": "Reviewer",
+    "qa": "QA Reviewer",
+    "runtime": "Runner",
+    "run": "Sistema",
+    "pipeline": "Sistema",
+}
+
+
+def _agent_for_event(event: str, payload: Dict[str, Any]) -> str:
+    """Derive a human-readable agent label from an event name."""
+    step = str(payload.get("step") or "").strip().lower()
+    if step and step in _PHASE_AGENT:
+        return _PHASE_AGENT[step]
+    ev = event.lower()
+    for token, label in _PHASE_AGENT.items():
+        if token in ev:
+            return label
+    if ev.startswith("heavy_runner"):
+        return "Runner"
+    return "Sistema"
+
+
+# ---------------------------------------------------------------------------
+# Event → single log line  (returns None to skip noisy events)
+# ---------------------------------------------------------------------------
+
+def _event_to_log_line(
+    event_name: str, payload: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    """Convert a structured event into {agent, msg, level} or None to skip."""
+    ev = event_name.strip().lower()
+
+    # Skip noisy / internal-only events
+    if ev.endswith("_view_context") or ev == "encoding_guard":
+        return None
+
+    agent = _agent_for_event(ev, payload)
     level = "info"
 
-    if event == "run_init":
-        csv_path = Path(str(payload.get("csv_path") or "")).name
-        if csv_path:
-            details.append({"label": "CSV", "value": csv_path})
-        if payload.get("dataset_fingerprint"):
-            details.append({"label": "Fingerprint", "value": str(payload.get("dataset_fingerprint"))[:12]})
-        return "La run ha arrancado y ya tiene dataset y objetivo cargados.", details, level
+    # -- run lifecycle --
+    if ev == "run_init":
+        csv_name = Path(str(payload.get("csv_path") or "")).name or "dataset"
+        return {"agent": "Sistema", "msg": f"Pipeline iniciado — {csv_name}", "level": "ok"}
 
-    if event.endswith("_start"):
-        attempt = payload.get("attempt_id") or payload.get("ml_engineer_attempt")
-        if attempt is not None:
-            details.append({"label": "Intento", "value": _compact_value(attempt)})
-        iteration = payload.get("iteration")
-        if iteration is not None:
-            details.append({"label": "Iteración", "value": _compact_value(iteration)})
-        return f"{_event_title(phase)} ha comenzado su trabajo.", details, level
+    if ev == "run_finalize":
+        return {"agent": "Sistema", "msg": "Pipeline finalizado.", "level": "ok"}
 
-    if event == "steward_complete":
-        target_status = _compact_value(payload.get("target_status") or "confirmed")
-        recommended = _compact_value(payload.get("recommended_primary_target"))
-        details.append({"label": "Target status", "value": target_status})
-        if recommended:
-            details.append({"label": "Target sugerido", "value": recommended})
-        return "El steward terminó el análisis semántico del dataset.", details, level
+    # -- steward --
+    if ev == "steward_start":
+        return {"agent": "Data Steward", "msg": "Analizando semantica del dataset...", "level": "info"}
 
-    if event == "execution_planner_complete":
-        outputs = payload.get("required_outputs") if isinstance(payload.get("required_outputs"), list) else []
-        details.append({"label": "Outputs", "value": str(len(outputs))})
-        return "El planner compiló el contrato ejecutable de la run.", details, "success"
+    if ev == "steward_complete":
+        target = _fmt(payload.get("target_status") or "confirmed")
+        rec = _fmt(payload.get("recommended_primary_target"))
+        extra = f" (recomendado: {rec})" if rec else ""
+        return {"agent": "Data Steward", "msg": f"Analisis completo — target {target}{extra}", "level": "ok"}
 
-    if event == "data_profile_built":
-        if payload.get("n_rows") is not None:
-            details.append({"label": "Filas", "value": _compact_value(payload.get("n_rows"))})
-        if payload.get("n_cols") is not None:
-            details.append({"label": "Columnas", "value": _compact_value(payload.get("n_cols"))})
-        return "Se generó el perfilado base del dataset.", details, level
+    if ev == "steward_target_reconsideration_start":
+        rec = _fmt(payload.get("recommended_primary_target"))
+        return {"agent": "Data Steward", "msg": f"Reconsideracion de target iniciada — sugerido: {rec}", "level": "warn"}
 
-    if event.endswith("_view_context"):
-        if payload.get("length") is not None:
-            details.append({"label": "Contexto", "value": f"{_compact_value(payload.get('length'))} chars"})
-        return f"Se preparó el contexto de {_event_title(phase)}.", details, level
-
-    if event == "data_engineer_backend_selection":
-        details.append({"label": "Backend", "value": _compact_value(payload.get("backend") or "unknown")})
-        scale = payload.get("dataset_scale") if isinstance(payload.get("dataset_scale"), dict) else {}
-        if scale.get("scale"):
-            details.append({"label": "Escala", "value": _compact_value(scale.get("scale"))})
-        return "El sistema eligió cómo ejecutar la limpieza en runtime.", details, level
-
-    if event == "auto_fix_applied":
-        fixes = payload.get("fixes") if isinstance(payload.get("fixes"), list) else []
-        details.append({"label": "Intento", "value": _compact_value(payload.get("attempt"))})
-        details.append({"label": "Autofixes", "value": str(len(fixes))})
-        return "Se aplicaron autofixes de runtime antes de ejecutar el script.", details, "warning"
-
-    if event == "heavy_runner_request":
-        details.append({"label": "Modo", "value": _compact_value(payload.get("mode"))})
-        details.append({"label": "Intento", "value": _compact_value(payload.get("attempt_id"))})
-        return "El sistema envió el trabajo al runner pesado.", details, level
-
-    if event == "heavy_runner_start":
-        details.append({"label": "Paso", "value": _compact_value(payload.get("step"))})
-        return "El runner está ejecutando el trabajo solicitado.", details, level
-
-    if event == "heavy_runner_complete":
-        step = _compact_value(payload.get("step"))
-        status = _compact_value(payload.get("status"))
-        downloaded = payload.get("downloaded") if isinstance(payload.get("downloaded"), list) else []
-        if step:
-            details.append({"label": "Paso", "value": step})
-        if status:
-            details.append({"label": "Estado", "value": status})
-        if downloaded:
-            details.append({"label": "Artifacts", "value": str(len(downloaded))})
-        level = "success" if status == "success" else "warning"
-        return "El runner terminó y devolvió los outputs de esa fase.", details, level
-
-    if event == "cleaned_data_summary_min_built":
-        details.append({"label": "Filas", "value": _compact_value(payload.get("row_count"))})
-        details.append({"label": "Columnas", "value": _compact_value(payload.get("column_count"))})
-        return "Se consolidó el resumen mínimo de la limpieza entregada.", details, "success"
-
-    if event.endswith("_complete"):
-        rows = payload.get("rows")
-        cols = payload.get("columns")
-        if rows is not None:
-            details.append({"label": "Filas", "value": _compact_value(rows)})
-        if cols is not None:
-            details.append({"label": "Columnas", "value": _compact_value(cols)})
-        plots = payload.get("plots_count")
-        if plots is not None:
-            details.append({"label": "Plots", "value": _compact_value(plots)})
-        return f"{_event_title(phase)} terminó su fase.", details, "success"
-
-    if event == "ml_plan_generated":
-        metric_policy = payload.get("metric_policy") if isinstance(payload.get("metric_policy"), dict) else {}
-        cv_policy = payload.get("cv_policy") if isinstance(payload.get("cv_policy"), dict) else {}
-        if metric_policy.get("primary_metric"):
-            details.append({"label": "Métrica", "value": _compact_value(metric_policy.get("primary_metric"))})
-        if cv_policy.get("strategy"):
-            details.append({"label": "CV", "value": _compact_value(cv_policy.get("strategy"))})
-        return "El ML Engineer definió el plan de entrenamiento y validación.", details, level
-
-    if event == "steward_target_reconsideration_start":
-        details.append({"label": "Target sugerido", "value": _compact_value(payload.get("recommended_primary_target"))})
-        return "Se abrió una reconsideración automática del target.", details, "warning"
-
-    if event == "steward_target_reconsideration_complete":
+    if ev == "steward_target_reconsideration_complete":
         accepted = bool(payload.get("accepted"))
-        details.append({"label": "Aceptada", "value": "sí" if accepted else "no"})
-        if payload.get("final_primary_target"):
-            details.append({"label": "Target final", "value": _compact_value(payload.get("final_primary_target"))})
-        return "La reconsideración del target ya se resolvió.", details, "success" if accepted else "warning"
+        final_t = _fmt(payload.get("final_primary_target"))
+        tag = "aceptada" if accepted else "rechazada"
+        extra = f" — target final: {final_t}" if final_t else ""
+        return {"agent": "Data Steward", "msg": f"Reconsideracion {tag}{extra}", "level": "ok" if accepted else "warn"}
 
-    if event == "review_board_complete":
-        if payload.get("final_review_verdict"):
-            details.append({"label": "Veredicto", "value": _compact_value(payload.get("final_review_verdict"))})
-        return "El review board cerró la decisión de gobernanza.", details, "success"
+    # -- planner --
+    if ev == "execution_planner_start":
+        strat = _fmt(payload.get("strategy"))
+        return {"agent": "Planner", "msg": f"Compilando contrato — {strat}" if strat else "Compilando contrato de ejecucion...", "level": "info"}
 
-    summary_parts: List[str] = []
+    if ev == "execution_planner_complete":
+        outputs = payload.get("required_outputs") if isinstance(payload.get("required_outputs"), list) else []
+        return {"agent": "Planner", "msg": f"Contrato listo — {len(outputs)} outputs definidos", "level": "ok"}
+
+    # -- profiling --
+    if ev == "data_profile_built":
+        n_r = _fmt(payload.get("n_rows"))
+        n_c = _fmt(payload.get("n_cols"))
+        parts = []
+        if n_r:
+            parts.append(f"{n_r} filas")
+        if n_c:
+            parts.append(f"{n_c} columnas")
+        desc = " — " + ", ".join(parts) if parts else ""
+        return {"agent": "Sistema", "msg": f"Dataset perfilado{desc}", "level": "info"}
+
+    # -- data engineer --
+    if ev == "data_engineer_start":
+        attempt = payload.get("attempt_id") or payload.get("iteration")
+        tag = f" (intento {_fmt(attempt)})" if attempt is not None else ""
+        return {"agent": "Data Engineer", "msg": f"Generando script de limpieza{tag}...", "level": "info"}
+
+    if ev == "data_engineer_backend_selection":
+        backend = _fmt(payload.get("backend") or "unknown")
+        scale_d = payload.get("dataset_scale") if isinstance(payload.get("dataset_scale"), dict) else {}
+        scale = _fmt(scale_d.get("scale")) if scale_d else ""
+        extra = f", escala {scale}" if scale else ""
+        return {"agent": "Data Engineer", "msg": f"Backend seleccionado: {backend}{extra}", "level": "info"}
+
+    if ev == "auto_fix_applied":
+        fixes = payload.get("fixes") if isinstance(payload.get("fixes"), list) else []
+        attempt = _fmt(payload.get("attempt"))
+        return {"agent": "Data Engineer", "msg": f"Auto-fix aplicado (intento {attempt}): {len(fixes)} correcciones", "level": "warn"}
+
+    if ev == "data_engineer_runtime_retry":
+        reason = _fmt(payload.get("reason") or payload.get("error") or "error de runtime")
+        return {"agent": "Data Engineer", "msg": f"Reintentando — {reason}", "level": "warn"}
+
+    if ev == "data_engineer_dialect_autopatched":
+        return {"agent": "Data Engineer", "msg": "Patch de dialecto aplicado automaticamente", "level": "info"}
+
+    if ev == "cleaned_data_summary_min_built":
+        rows = _fmt(payload.get("row_count"))
+        cols = _fmt(payload.get("column_count"))
+        return {"agent": "Data Engineer", "msg": f"Limpieza consolidada — {rows} filas, {cols} columnas", "level": "ok"}
+
+    # -- runner --
+    if ev == "heavy_runner_request":
+        mode = _fmt(payload.get("mode"))
+        return {"agent": "Runner", "msg": f"Enviando script al runner ({mode})", "level": "info"}
+
+    if ev == "heavy_runner_start":
+        step = _fmt(payload.get("step"))
+        return {"agent": "Runner", "msg": f"Ejecutando {step}..." if step else "Ejecutando script...", "level": "info"}
+
+    if ev == "heavy_runner_complete":
+        st = _fmt(payload.get("status"))
+        downloaded = payload.get("downloaded") if isinstance(payload.get("downloaded"), list) else []
+        extra = f" — {len(downloaded)} artifacts" if downloaded else ""
+        lvl = "ok" if st == "success" else "warn"
+        return {"agent": "Runner", "msg": f"Ejecucion {st}{extra}", "level": lvl}
+
+    # -- ML engineer --
+    if ev == "ml_plan_generated":
+        mp = payload.get("metric_policy") if isinstance(payload.get("metric_policy"), dict) else {}
+        cv = payload.get("cv_policy") if isinstance(payload.get("cv_policy"), dict) else {}
+        metric = _fmt(mp.get("primary_metric"))
+        strategy = _fmt(cv.get("strategy"))
+        parts = []
+        if metric:
+            parts.append(f"metrica: {metric}")
+        if strategy:
+            parts.append(f"CV: {strategy}")
+        desc = " — " + ", ".join(parts) if parts else ""
+        return {"agent": "ML Engineer", "msg": f"Plan de entrenamiento generado{desc}", "level": "ok"}
+
+    if ev == "ml_engineer_start":
+        attempt = payload.get("ml_engineer_attempt") or payload.get("attempt_id")
+        iteration = payload.get("iteration")
+        parts = []
+        if iteration is not None:
+            parts.append(f"iter {_fmt(iteration)}")
+        if attempt is not None:
+            parts.append(f"intento {_fmt(attempt)}")
+        tag = " (" + ", ".join(parts) + ")" if parts else ""
+        return {"agent": "ML Engineer", "msg": f"Generando modelo{tag}...", "level": "info"}
+
+    if ev == "metric_improvement_round_skipped":
+        reason = _fmt(payload.get("reason"))
+        return {"agent": "ML Engineer", "msg": f"Ronda de mejora omitida — {reason}", "level": "info"}
+
+    # -- reviewer / review board --
+    if ev == "review_board_complete":
+        verdict = _fmt(payload.get("final_review_verdict"))
+        return {"agent": "Review Board", "msg": f"Veredicto: {verdict}" if verdict else "Evaluacion completada", "level": "ok"}
+
+    # -- translator --
+    if ev == "translator_start":
+        return {"agent": "Translator", "msg": "Generando informe ejecutivo...", "level": "info"}
+
+    if ev == "translator_complete":
+        return {"agent": "Translator", "msg": "Informe ejecutivo completado.", "level": "ok"}
+
+    # -- generic _start / _complete patterns --
+    if ev.endswith("_start"):
+        return {"agent": agent, "msg": f"{agent} iniciado...", "level": "info"}
+
+    if ev.endswith("_complete"):
+        return {"agent": agent, "msg": f"{agent} completado.", "level": "ok"}
+
+    # -- fallback: show event name with any useful payload keys --
+    parts: List[str] = []
     for key in ("status", "reason", "strategy", "step"):
-        value = _compact_value(payload.get(key))
-        if value:
-            summary_parts.append(f"{key}={value}")
-    summary = " | ".join(summary_parts) if summary_parts else "Evento interno registrado."
-    return summary, details, level
+        v = _fmt(payload.get(key))
+        if v:
+            parts.append(f"{key}={v}")
+    desc = " — " + ", ".join(parts) if parts else ""
+    title = re.sub(r"[_\-]+", " ", event_name).strip()
+    return {"agent": agent, "msg": f"{title}{desc}", "level": level}
 
 
-def list_run_activity(run_id: str, after_line: int = 0) -> Dict[str, Any]:
-    raw_entries = read_event_entries(run_id, after_line=after_line)
-    entries: List[Dict[str, Any]] = []
-    for entry in raw_entries:
-        event_name = str(entry.get("event") or entry.get("type") or entry.get("name") or "").strip()
+def _iso_to_local_hms(ts_iso: str) -> str:
+    """Convert an ISO-8601 timestamp to local-time HH:MM:SS."""
+    try:
+        dt = datetime.fromisoformat(ts_iso)
+        return dt.astimezone().strftime("%H:%M:%S")
+    except Exception:
+        return ts_iso[:8] if len(ts_iso) >= 8 else ts_iso
+
+
+def list_run_event_log(run_id: str, after_line: int = 0) -> Dict[str, Any]:
+    """Read events.jsonl and return entries in the same format as worker_log."""
+    raw = read_event_entries(run_id, after_line=after_line)
+    entries: List[Dict[str, str]] = []
+    for entry in raw:
+        event_name = str(entry.get("event") or entry.get("type") or "").strip()
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
-        summary, details, level = _activity_summary(event_name, payload)
-        phase = _event_phase(event_name, payload)
-        entries.append(
-            {
-                "index": int(entry.get("_line") or 0),
-                "ts": entry.get("timestamp") or entry.get("ts"),
-                "event": event_name,
-                "phase": phase,
-                "title": _event_title(event_name),
-                "summary": summary,
-                "details": details,
-                "level": level,
-            }
-        )
-
-    status_payload = read_status(run_id) or {}
-    latest = entries[-1] if entries else None
-    snapshot = {
-        "current_stage": str(status_payload.get("stage_name") or status_payload.get("stage") or ""),
-        "status": str(status_payload.get("status") or ""),
-        "progress": status_payload.get("progress"),
-        "iteration": status_payload.get("iteration"),
-        "latest_title": latest.get("title") if latest else "",
-        "latest_summary": latest.get("summary") if latest else "",
-        "latest_phase": latest.get("phase") if latest else "",
-        "latest_ts": latest.get("ts") if latest else "",
-    }
+        log_line = _event_to_log_line(event_name, payload)
+        if log_line is None:
+            continue
+        ts_raw = entry.get("timestamp") or entry.get("ts") or ""
+        entries.append({
+            "ts": _iso_to_local_hms(str(ts_raw)),
+            "agent": log_line["agent"],
+            "msg": log_line["msg"],
+            "level": log_line["level"],
+        })
     return {
         "run_id": run_id,
         "after_line": after_line,
-        "next_after_line": after_line + len(raw_entries),
+        "next_after_line": after_line + len(raw),
         "entries": entries,
-        "snapshot": snapshot,
     }
 
 

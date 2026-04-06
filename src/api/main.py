@@ -202,7 +202,7 @@ def get_run_logs(run_id: str, after_line: int = Query(default=0, ge=0)) -> Dict[
 def get_run_activity(run_id: str, after_line: int = Query(default=0, ge=0)) -> Dict[str, Any]:
     if not _run_exists(run_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    return run_views.list_run_activity(run_id, after_line=after_line)
+    return run_views.list_run_event_log(run_id, after_line=after_line)
 
 
 @app.post("/runs", status_code=status.HTTP_201_CREATED)

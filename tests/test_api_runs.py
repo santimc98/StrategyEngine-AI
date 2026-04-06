@@ -369,11 +369,10 @@ def test_run_activity_endpoint_returns_curated_internal_events(client, monkeypat
     payload = response.json()
     assert payload["run_id"] == "runactivity1"
     assert len(payload["entries"]) == 2
-    assert payload["entries"][0]["title"] == "Run init"
-    assert payload["entries"][1]["event"] == "heavy_runner_request"
-    assert payload["entries"][1]["details"][0]["label"] == "Modo"
-    assert payload["snapshot"]["current_stage"] == "Data Engineer"
-    assert payload["snapshot"]["latest_phase"] == "runtime"
+    assert payload["entries"][0]["agent"] == "Sistema"
+    assert "demo.csv" in payload["entries"][0]["msg"]
+    assert payload["entries"][1]["agent"] == "Runner"
+    assert "runner" in payload["entries"][1]["msg"].lower()
 
 
 def test_run_activity_endpoint_supports_incremental_cursor(client, monkeypatch, tmp_path):
@@ -399,6 +398,9 @@ def test_run_activity_endpoint_supports_incremental_cursor(client, monkeypatch, 
 
     assert response.status_code == 200
     payload = response.json()
-    assert [entry["event"] for entry in payload["entries"]] == ["steward_start", "steward_complete"]
+    # After skipping line 0 (run_init), we get steward_start and steward_complete
+    assert len(payload["entries"]) == 2
+    assert payload["entries"][0]["agent"] == "Data Steward"
+    assert payload["entries"][1]["agent"] == "Data Steward"
     assert payload["after_line"] == 1
     assert payload["next_after_line"] == 3
