@@ -3,9 +3,12 @@ import os
 
 from src.agents.business_translator import (
     BusinessTranslatorAgent,
+    _build_final_incumbent_state,
+    _build_governance_contradiction_packet,
     _build_metric_progress_summary,
     _score_report_quality,
     _sanitize_review_board_verdict_for_translator,
+    _summarize_ml_engineer_change_summary,
     _validate_report,
     _validate_report_structure,
 )
@@ -878,6 +881,146 @@ def test_translator_recovers_ml_history_from_persisted_metric_loop_state(tmp_pat
     assert '"accepted_improvements": [{"round_id": 1, "hypothesis_label": "static_reference_buckets"' in prompt
     assert '"rejected_experiments": [{"round_id": 2, "hypothesis_label": "aggressive_bucket_override"' in prompt
     assert '"rounds_attempted": 2' in prompt
+
+
+def test_ml_engineer_change_summary_falls_back_to_approved_baseline():
+    final_incumbent_state = _build_final_incumbent_state(
+        executive_decision_label="GO_WITH_LIMITATIONS",
+        run_outcome_token="GO_WITH_LIMITATIONS",
+        review_board_verdict={
+            "deterministic_facts": {
+                "runtime": {"status": "OK"},
+                "output_contract": {"overall_status": "ok", "missing_required_artifacts": []},
+                "pipeline": {"review_verdict_before_board": "APPROVE_WITH_WARNINGS"},
+            }
+        },
+        output_contract_report={"overall_status": "ok", "missing": []},
+        slot_payloads={
+            "predictions_overview": {
+                "row_count": 1933,
+                "columns": ["account_id", "snapshot_month_end", "churn_risk_score"],
+            }
+        },
+        canonical_metric_name="top_decile_lift",
+        canonical_metric_value=9.933567924760364,
+        run_summary={"run_outcome": "GO_WITH_LIMITATIONS", "data_adequacy": {"status": "warning"}},
+    )
+
+    summary = _summarize_ml_engineer_change_summary(
+        metric_loop_context={},
+        canonical_metric_name="top_decile_lift",
+        canonical_metric_value=9.933567924760364,
+        review_board_verdict={"summary": "Final incumbent accepted with warnings."},
+        final_incumbent_state=final_incumbent_state,
+    )
+
+    assert summary is not None
+    assert summary["current_incumbent_basis"] == "approved_baseline"
+    assert summary["baseline_incumbent"]["predictions_rows"] == 1933
+    assert summary["selected_incumbent_metric"] == 9.933567924760364
+
+
+def test_translator_prompt_includes_final_incumbent_and_governance_contradiction_packets(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.join("artifacts", "ml"), exist_ok=True)
+    with open(os.path.join("data", "insights.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "slot_payloads": {
+                    "predictions_overview": {
+                        "row_count": 1933,
+                        "columns": ["account_id", "snapshot_month_end", "churn_risk_score"],
+                    }
+                }
+            },
+            f,
+        )
+    with open(os.path.join("data", "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "run_outcome": "GO_WITH_LIMITATIONS",
+                "data_adequacy": {
+                    "status": "insufficient_signal",
+                    "reasons": ["pipeline_aborted_before_metrics"],
+                    "recommendations": [],
+                },
+            },
+            f,
+        )
+    with open(os.path.join("data", "output_contract_report.json"), "w", encoding="utf-8") as f:
+        json.dump({"overall_status": "ok", "missing": []}, f)
+    with open(os.path.join("data", "review_board_verdict.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "summary": "Missing operational artifacts and scoring CSV despite strong metric performance.",
+                "deterministic_facts": {
+                    "runtime": {"status": "OK"},
+                    "output_contract": {"overall_status": "ok", "missing_required_artifacts": []},
+                    "pipeline": {"review_verdict_before_board": "APPROVE_WITH_WARNINGS"},
+                },
+            },
+            f,
+        )
+    with open(os.path.join("data", "ml_review_stack.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "result_evaluator": {
+                    "feedback": "The pipeline was aborted before metrics and is failing to produce the required operational artifacts (Scoring CSV)."
+                }
+            },
+            f,
+        )
+    with open(os.path.join("artifacts", "ml", "cv_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump({"top_decile_lift": 9.933567924760364}, f)
+
+    agent = BusinessTranslatorAgent(api_key="dummy_key")
+    agent.model = _EchoModel()
+    prompt = agent.generate_report(
+        {
+            "execution_output": "OK",
+            "business_objective": "Priorizar churn B2B.",
+            "primary_metric_state": {
+                "primary_metric_name": "top_decile_lift",
+                "primary_metric_value": 9.933567924760364,
+            },
+        }
+    )
+
+    assert '"final_incumbent_state": {' in prompt
+    assert '"governance_contradiction_packet": {' in prompt
+    assert '"has_contradictions": true' in prompt
+    assert '"current_incumbent_basis": "approved_baseline"' in prompt
+
+
+def test_validate_report_flags_contradicted_current_state_claims():
+    validation = _validate_report(
+        content="""
+# Decisión Ejecutiva
+
+GO_WITH_LIMITATIONS
+
+El pipeline fue interrumpido antes de completar la generación de métricas y no pudo generar algunos artefactos de salida.
+
+## Evidencia
+- [source: data/run_summary.json -> run_outcome]
+""",
+        expected_decision="GO_WITH_LIMITATIONS",
+        facts_context=[],
+        metrics_payload={},
+        plots=[],
+        expected_language="es",
+        governance_contradiction_packet={
+            "contradictions": [
+                {"id": "pipeline_aborted_before_metrics_stale"},
+                {"id": "missing_required_outputs_stale"},
+            ]
+        },
+    )
+
+    assert "contradicted_current_state_claims" in validation["critical_issues"]
+    assert validation["contradicted_current_state_claims"]
+    assert _score_report_quality(validation) < 90
 
 
 def test_translator_structure_validation_accepts_risk_semantics_without_heading():

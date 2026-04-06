@@ -1734,12 +1734,62 @@ def _summarize_ml_engineer_change_summary(
     canonical_metric_name: str,
     canonical_metric_value: Optional[float],
     review_board_verdict: Optional[Dict[str, Any]] = None,
+    final_incumbent_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(metric_loop_context, dict):
         metric_loop_context = {}
     round_history = metric_loop_context.get("round_history")
     if not isinstance(round_history, list) or not round_history:
-        return None
+        incumbent_state = final_incumbent_state if isinstance(final_incumbent_state, dict) else {}
+        review_before_board = ""
+        if isinstance(review_board_verdict, dict):
+            deterministic_pipeline = (
+                review_board_verdict.get("deterministic_facts", {}).get("pipeline", {})
+                if isinstance(review_board_verdict.get("deterministic_facts"), dict)
+                else {}
+            )
+            review_before_board = str(
+                deterministic_pipeline.get("review_verdict_before_board")
+                or review_board_verdict.get("review_verdict_before_board")
+                or review_board_verdict.get("final_review_verdict")
+                or review_board_verdict.get("status")
+                or ""
+            ).strip()
+        predictions_output = (
+            incumbent_state.get("predictions_output")
+            if isinstance(incumbent_state.get("predictions_output"), dict)
+            else {}
+        )
+        baseline_summary: Dict[str, Any] = {
+            "metric_name": canonical_metric_name or incumbent_state.get("primary_metric", {}).get("name"),
+            "baseline_metric_start": canonical_metric_value,
+            "selected_incumbent_metric": canonical_metric_value,
+            "accepted_improvements": [],
+            "rejected_experiments": [],
+            "rejected_after_metric_improvement": [],
+            "incumbent_promotions": [],
+            "rounds_attempted": 0,
+            "current_incumbent_basis": "approved_baseline",
+            "baseline_incumbent": {
+                "status": review_before_board or "approved_baseline",
+                "metric": canonical_metric_value,
+                "output_contract_status": incumbent_state.get("output_contract_status"),
+                "runtime_status": incumbent_state.get("runtime_status"),
+                "predictions_rows": predictions_output.get("row_count"),
+            },
+        }
+        if isinstance(review_board_verdict, dict) and review_board_verdict:
+            board_summary = str(
+                review_board_verdict.get("final_incumbent_summary")
+                or review_board_verdict.get("summary")
+                or ""
+            ).strip()
+            required_actions = review_board_verdict.get("required_actions")
+            if board_summary:
+                baseline_summary["review_board_summary"] = board_summary[:600]
+            if isinstance(required_actions, list) and required_actions:
+                baseline_summary["review_board_required_actions"] = [str(item) for item in required_actions[:4]]
+        return baseline_summary
 
     accepted_improvements: List[Dict[str, Any]] = []
     rejected_experiments: List[Dict[str, Any]] = []
@@ -1833,6 +1883,14 @@ def _summarize_run_causal_impact(
         enablers.append(
             f"ML engineering promoted {len(accepted_improvements)} incumbent improvement(s), starting with round {first.get('round_id')}."
         )
+    baseline_incumbent = ml_summary.get("baseline_incumbent") if isinstance(ml_summary.get("baseline_incumbent"), dict) else {}
+    if baseline_incumbent and not accepted_improvements:
+        metric_name = str(ml_summary.get("metric_name") or "primary_metric").strip() or "primary_metric"
+        metric_value = baseline_incumbent.get("metric")
+        if metric_value is not None:
+            enablers.append(
+                f"ML engineering established an approved baseline incumbent with {metric_name}={metric_value}."
+            )
     rejected_after_improvement = ml_summary.get("rejected_after_metric_improvement") if isinstance(ml_summary.get("rejected_after_metric_improvement"), list) else []
     if rejected_after_improvement:
         residual_constraints.append(
@@ -1857,6 +1915,275 @@ def _summarize_run_causal_impact(
         "residual_constraints": residual_constraints[:6],
         "narrative_focus_points": focus_points[:4],
     }
+
+
+def _normalize_text_for_search(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+def _text_matches_any(value: Any, patterns: List[str]) -> bool:
+    text = _normalize_text_for_search(value)
+    if not text:
+        return False
+    for pattern in patterns:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _build_final_incumbent_state(
+    *,
+    executive_decision_label: str,
+    run_outcome_token: str,
+    review_board_verdict: Optional[Dict[str, Any]],
+    output_contract_report: Optional[Dict[str, Any]],
+    slot_payloads: Optional[Dict[str, Any]],
+    canonical_metric_name: str,
+    canonical_metric_value: Optional[float],
+    run_summary: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    verdict = review_board_verdict if isinstance(review_board_verdict, dict) else {}
+    deterministic_facts = verdict.get("deterministic_facts") if isinstance(verdict.get("deterministic_facts"), dict) else {}
+    runtime = deterministic_facts.get("runtime") if isinstance(deterministic_facts.get("runtime"), dict) else {}
+    output_contract = deterministic_facts.get("output_contract") if isinstance(deterministic_facts.get("output_contract"), dict) else {}
+    pipeline = deterministic_facts.get("pipeline") if isinstance(deterministic_facts.get("pipeline"), dict) else {}
+    outputs = slot_payloads if isinstance(slot_payloads, dict) else {}
+    predictions = outputs.get("predictions_overview") if isinstance(outputs.get("predictions_overview"), dict) else {}
+    metric_source = (
+        deterministic_facts.get("metrics", {}).get("primary", {}).get("source")
+        if isinstance(deterministic_facts.get("metrics"), dict)
+        else None
+    )
+    output_status = str(
+        output_contract.get("overall_status")
+        or (output_contract_report or {}).get("overall_status")
+        or ""
+    ).strip()
+    missing_required = output_contract.get("missing_required_artifacts")
+    if not isinstance(missing_required, list):
+        missing_required = (output_contract_report or {}).get("missing", []) or []
+    return {
+        "authoritative_decision": executive_decision_label,
+        "run_outcome": run_outcome_token or ((run_summary or {}).get("run_outcome") if isinstance(run_summary, dict) else None),
+        "runtime_status": str(runtime.get("status") or "").strip(),
+        "output_contract_status": output_status,
+        "required_missing_artifacts": [str(item) for item in missing_required if str(item or "").strip()],
+        "review_verdict_before_board": str(
+            pipeline.get("review_verdict_before_board")
+            or verdict.get("review_verdict_before_board")
+            or ""
+        ).strip(),
+        "primary_metric": {
+            "name": canonical_metric_name,
+            "value": canonical_metric_value,
+            "source": metric_source or "primary_metric_state",
+        } if canonical_metric_name and canonical_metric_value is not None else {},
+        "predictions_output": {
+            "row_count": _coerce_int(
+                predictions.get("row_count_total")
+                or predictions.get("row_count")
+                or predictions.get("rows")
+            ),
+            "columns": predictions.get("columns") if isinstance(predictions.get("columns"), list) else [],
+        },
+        "data_adequacy_status": str(
+            ((run_summary or {}).get("data_adequacy") or {}).get("status")
+            if isinstance((run_summary or {}).get("data_adequacy"), dict)
+            else ""
+        ).strip(),
+    }
+
+
+def _collect_governance_history_sources(
+    *,
+    review_board_verdict: Optional[Dict[str, Any]],
+    ml_review_stack: Optional[Dict[str, Any]],
+    data_adequacy_report: Optional[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+
+    def _add(source: str, value: Any) -> None:
+        text = str(value or "").strip()
+        if text:
+            entries.append({"source": source, "text": text})
+
+    verdict = review_board_verdict if isinstance(review_board_verdict, dict) else {}
+    _add("review_board_verdict.summary", verdict.get("summary"))
+    for idx, item in enumerate(verdict.get("required_actions") or []):
+        _add(f"review_board_verdict.required_actions[{idx}]", item)
+    for idx, item in enumerate(verdict.get("evidence") or []):
+        if isinstance(item, dict):
+            _add(f"review_board_verdict.evidence[{idx}]", item.get("claim"))
+
+    stack = ml_review_stack if isinstance(ml_review_stack, dict) else {}
+    result_evaluator = stack.get("result_evaluator") if isinstance(stack.get("result_evaluator"), dict) else {}
+    final_pre_board = stack.get("final_pre_board") if isinstance(stack.get("final_pre_board"), dict) else {}
+    iteration_handoff = stack.get("iteration_handoff") if isinstance(stack.get("iteration_handoff"), dict) else {}
+    _add("ml_review_stack.result_evaluator.feedback", result_evaluator.get("feedback"))
+    _add("ml_review_stack.final_pre_board.feedback", final_pre_board.get("feedback"))
+    _add("ml_review_stack.iteration_handoff.runtime_error_tail", (iteration_handoff.get("feedback") or {}).get("runtime_error_tail"))
+    for idx, item in enumerate((((data_adequacy_report or {}) if isinstance(data_adequacy_report, dict) else {}).get("reasons") or [])):
+        _add(f"data_adequacy_report.reasons[{idx}]", item)
+    return entries
+
+
+def _find_matching_history_sources(
+    history_sources: List[Dict[str, str]],
+    patterns: List[str],
+) -> List[Dict[str, str]]:
+    matches: List[Dict[str, str]] = []
+    for item in history_sources:
+        text = str(item.get("text") or "").strip()
+        if not text or not _text_matches_any(text, patterns):
+            continue
+        matches.append(
+            {
+                "source": str(item.get("source") or ""),
+                "excerpt": text[:260],
+            }
+        )
+    return matches
+
+
+def _build_governance_contradiction_packet(
+    *,
+    review_board_verdict: Optional[Dict[str, Any]],
+    ml_review_stack: Optional[Dict[str, Any]],
+    data_adequacy_report: Optional[Dict[str, Any]],
+    final_incumbent_state: Optional[Dict[str, Any]],
+    decision_discrepancy: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    incumbent = final_incumbent_state if isinstance(final_incumbent_state, dict) else {}
+    output_status = str(incumbent.get("output_contract_status") or "").strip().lower()
+    runtime_status = str(incumbent.get("runtime_status") or "").strip().upper()
+    predictions_output = incumbent.get("predictions_output") if isinstance(incumbent.get("predictions_output"), dict) else {}
+    scoring_rows = _coerce_int(predictions_output.get("row_count"))
+    metric_value = _coerce_float((incumbent.get("primary_metric") or {}).get("value")) if isinstance(incumbent.get("primary_metric"), dict) else None
+    required_missing = incumbent.get("required_missing_artifacts") if isinstance(incumbent.get("required_missing_artifacts"), list) else []
+
+    history_sources = _collect_governance_history_sources(
+        review_board_verdict=review_board_verdict,
+        ml_review_stack=ml_review_stack,
+        data_adequacy_report=data_adequacy_report,
+    )
+
+    contradictions: List[Dict[str, Any]] = []
+
+    if output_status == "ok" and not required_missing:
+        patterns = [
+            r"missing operational artifacts",
+            r"required outputs?.*missing",
+            r"faltan?\s+artefactos?",
+            r"artefactos? de salida.*falt",
+        ]
+        matches = _find_matching_history_sources(history_sources, patterns)
+        if matches:
+            contradictions.append(
+                {
+                    "id": "missing_required_outputs_stale",
+                    "why_contradicted": "Current deterministic facts show output_contract=ok with no missing required artifacts.",
+                    "current_fact": "output_contract.ok_and_complete",
+                    "matched_history_sources": matches[:4],
+                }
+            )
+
+    if output_status == "ok" and (scoring_rows or 0) > 0:
+        patterns = [
+            r"scoring csv",
+            r"churn_risk_scores\.csv",
+            r"archivo de scores?",
+            r"scores? operativos?.*missing",
+            r"failing to produce.*scoring",
+        ]
+        matches = _find_matching_history_sources(history_sources, patterns)
+        if matches:
+            contradictions.append(
+                {
+                    "id": "missing_scoring_output_stale",
+                    "why_contradicted": "Current deterministic facts and slot coverage show a populated scoring output for the final incumbent.",
+                    "current_fact": "scoring_output.present",
+                    "matched_history_sources": matches[:4],
+                }
+            )
+
+    if runtime_status == "OK" and metric_value is not None:
+        patterns = [
+            r"pipeline_aborted_before_metrics",
+            r"pipeline (was )?aborted",
+            r"pipeline fue interrumpido",
+            r"interrumpido antes de completar.*m[eé]tric",
+        ]
+        matches = _find_matching_history_sources(history_sources, patterns)
+        if matches:
+            contradictions.append(
+                {
+                    "id": "pipeline_aborted_before_metrics_stale",
+                    "why_contradicted": "Current deterministic facts include a valid primary metric and successful runtime status for the final incumbent.",
+                    "current_fact": "final_incumbent.metric_available",
+                    "matched_history_sources": matches[:4],
+                }
+            )
+
+    packet = {
+        "has_contradictions": bool(contradictions or decision_discrepancy),
+        "current_facts": {
+            "runtime_status": runtime_status,
+            "output_contract_status": output_status,
+            "required_missing_count": len(required_missing),
+            "scoring_row_count": scoring_rows,
+            "primary_metric_value": metric_value,
+        },
+        "contradictions": contradictions,
+        "decision_discrepancy": decision_discrepancy if isinstance(decision_discrepancy, dict) else None,
+    }
+    return packet
+
+
+def _build_stale_or_rejected_history(
+    *,
+    review_board_verdict: Optional[Dict[str, Any]],
+    ml_review_stack: Optional[Dict[str, Any]],
+    governance_contradiction_packet: Optional[Dict[str, Any]],
+    decision_discrepancy: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    verdict = review_board_verdict if isinstance(review_board_verdict, dict) else {}
+    stack = ml_review_stack if isinstance(ml_review_stack, dict) else {}
+    history: Dict[str, Any] = {
+        "decision_discrepancy": decision_discrepancy if isinstance(decision_discrepancy, dict) else None,
+        "board_status_history": {
+            "final_review_verdict": verdict.get("final_review_verdict") or verdict.get("status"),
+            "candidate_assessment_status": verdict.get("candidate_assessment_status"),
+            "review_verdict_before_board": verdict.get("review_verdict_before_board"),
+        },
+        "stale_feedback_excerpts": [],
+        "contradiction_ids": [],
+    }
+    stale_feedback_excerpts: List[Dict[str, str]] = []
+    for source, text in [
+        ("review_board_verdict.summary", verdict.get("summary")),
+        ("ml_review_stack.result_evaluator.feedback", ((stack.get("result_evaluator") or {}).get("feedback") if isinstance(stack.get("result_evaluator"), dict) else None)),
+        ("ml_review_stack.final_pre_board.feedback", ((stack.get("final_pre_board") or {}).get("feedback") if isinstance(stack.get("final_pre_board"), dict) else None)),
+    ]:
+        value = str(text or "").strip()
+        if value:
+            stale_feedback_excerpts.append({"source": source, "excerpt": value[:320]})
+    history["stale_feedback_excerpts"] = stale_feedback_excerpts[:4]
+    if isinstance(governance_contradiction_packet, dict):
+        history["contradiction_ids"] = [
+            str(item.get("id"))
+            for item in (governance_contradiction_packet.get("contradictions") or [])
+            if isinstance(item, dict) and item.get("id")
+        ][:8]
+    return history
 
 
 def _prepare_translator_metric_views(
@@ -2498,6 +2825,57 @@ def _validate_report_structure(content: str, expected_language: str) -> List[str
     return issues
 
 
+def _strip_evidence_tail_for_validation(content: str) -> str:
+    if not content:
+        return ""
+    split_match = re.split(r"(?im)^\s*##\s*(evidence|evidencia|artifacts)\b", content, maxsplit=1)
+    return split_match[0] if split_match else content
+
+
+def _detect_contradicted_current_state_claims(
+    content: str,
+    governance_contradiction_packet: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    packet = governance_contradiction_packet if isinstance(governance_contradiction_packet, dict) else {}
+    contradictions = packet.get("contradictions") if isinstance(packet.get("contradictions"), list) else []
+    if not contradictions:
+        return []
+    text = _normalize_text_for_search(_strip_evidence_tail_for_validation(content))
+    if not text:
+        return []
+    issues: List[str] = []
+    pattern_map = {
+        "pipeline_aborted_before_metrics_stale": [
+            r"pipeline (was )?aborted",
+            r"pipeline fue interrumpido",
+            r"interrumpido antes de completar.*m[eé]tric",
+        ],
+        "missing_scoring_output_stale": [
+            r"scoring csv",
+            r"archivo de scores?",
+            r"scores? operativos?.*(missing|falt|ausent)",
+            r"faltan?.*scores?",
+            r"failing to produce.*scoring",
+        ],
+        "missing_required_outputs_stale": [
+            r"missing operational artifacts",
+            r"required outputs?.*missing",
+            r"faltan?\s+artefactos?",
+            r"artefactos? de salida.*falt",
+            r"impidi[oó] generar algunos artefactos",
+        ],
+    }
+    for item in contradictions:
+        contradiction_id = str(item.get("id") or "").strip()
+        if not contradiction_id:
+            continue
+        for pattern in pattern_map.get(contradiction_id, []):
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                issues.append(f"contradicted_current_state_claim:{contradiction_id}")
+                break
+    return list(dict.fromkeys(issues))
+
+
 def _validate_report(
     content: str,
     expected_decision: str,
@@ -2506,6 +2884,7 @@ def _validate_report(
     plots: List[str],
     expected_language: str,
     decision_discrepancy: Optional[Dict[str, Any]] = None,
+    governance_contradiction_packet: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     structure_issues = _validate_report_structure(content, expected_language=expected_language)
     decision_in_report = _extract_report_decision(content)
@@ -2541,6 +2920,10 @@ def _validate_report(
         if allowed_plots and normalized not in allowed_plots:
             invalid_plots.append(normalized)
     reasoning_warnings = _detect_overconfident_operational_claims(content)
+    contradicted_current_state_claims = _detect_contradicted_current_state_claims(
+        content,
+        governance_contradiction_packet=governance_contradiction_packet,
+    )
 
     critical_issues: List[str] = []
     for issue in structure_issues:
@@ -2553,6 +2936,8 @@ def _validate_report(
         critical_issues.append("unsupported_evidence_claims")
     if invalid_plots:
         critical_issues.append("invalid_plot_reference")
+    if contradicted_current_state_claims:
+        critical_issues.append("contradicted_current_state_claims")
 
     context_warnings: List[str] = []
     if isinstance(decision_discrepancy, dict) and decision_discrepancy:
@@ -2567,6 +2952,7 @@ def _validate_report(
         "unsupported_evidence_claims": unsupported_evidence_claims,
         "invalid_plots": invalid_plots,
         "reasoning_warnings": reasoning_warnings,
+        "contradicted_current_state_claims": contradicted_current_state_claims,
         "context_warnings": context_warnings,
         "decision_discrepancy": decision_discrepancy if isinstance(decision_discrepancy, dict) else None,
         "critical_issues": critical_issues,
@@ -2582,6 +2968,7 @@ def _score_report_quality(validation: Dict[str, Any]) -> int:
     score -= 10 * min(3, len(validation.get("unsupported_evidence_claims", [])))
     score -= 6 * len(validation.get("invalid_plots", []))
     score -= 7 * min(3, len(validation.get("reasoning_warnings", [])))
+    score -= 12 * min(2, len(validation.get("contradicted_current_state_claims", [])))
     score -= 15 * min(1, len(validation.get("context_warnings", [])))
     return max(0, min(100, score))
 
@@ -3711,6 +4098,11 @@ class BusinessTranslatorAgent:
         output_contract_report = _safe_load_json("data/output_contract_report.json") or {}
         case_alignment_report = _safe_load_json("data/case_alignment_report.json") or {}
         data_adequacy_report = _safe_load_json("data/data_adequacy_report.json") or {}
+        ml_review_stack = _safe_load_json_candidates(
+            "data/ml_review_stack.json",
+            os.path.join(work_dir, "data", "ml_review_stack.json"),
+            os.path.join("work", "data", "ml_review_stack.json"),
+        ) or {}
         review_board_verdict = _safe_load_json_candidates(
             "data/review_board_verdict.json",
             os.path.join(work_dir, "data", "review_board_verdict.json"),
@@ -4159,11 +4551,22 @@ class BusinessTranslatorAgent:
             _canonical_metric_name,
             _canonical_metric_value,
         )
+        final_incumbent_state = _build_final_incumbent_state(
+            executive_decision_label=executive_decision_label,
+            run_outcome_token=run_outcome_token,
+            review_board_verdict=review_board_verdict if isinstance(review_board_verdict, dict) else {},
+            output_contract_report=output_contract_report if isinstance(output_contract_report, dict) else {},
+            slot_payloads=slot_payloads if isinstance(slot_payloads, dict) else {},
+            canonical_metric_name=_canonical_metric_name,
+            canonical_metric_value=_canonical_metric_value,
+            run_summary=run_summary if isinstance(run_summary, dict) else {},
+        )
         ml_engineer_change_summary = _summarize_ml_engineer_change_summary(
             metric_loop_context=metric_loop_context if isinstance(metric_loop_context, dict) else {},
             canonical_metric_name=_canonical_metric_name,
             canonical_metric_value=_canonical_metric_value,
             review_board_verdict=sanitized_review_board_verdict,
+            final_incumbent_state=final_incumbent_state,
         )
         final_incumbent_metric_records = []
         if isinstance(slot_payloads, dict):
@@ -4233,6 +4636,12 @@ class BusinessTranslatorAgent:
                 json.dump(ml_engineer_change_summary or {}, f_ml, indent=2, ensure_ascii=False)
             with open("data/run_causal_impact_summary.json", "w", encoding="utf-8") as f_causal:
                 json.dump(run_causal_impact_summary or {}, f_causal, indent=2, ensure_ascii=False)
+            with open("data/final_incumbent_state.json", "w", encoding="utf-8") as f_incumbent:
+                json.dump(final_incumbent_state or {}, f_incumbent, indent=2, ensure_ascii=False)
+            with open("data/governance_contradiction_packet.json", "w", encoding="utf-8") as f_contradictions:
+                json.dump(governance_contradiction_packet or {}, f_contradictions, indent=2, ensure_ascii=False)
+            with open("data/stale_or_rejected_history.json", "w", encoding="utf-8") as f_history:
+                json.dump(stale_or_rejected_history or {}, f_history, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
@@ -4293,11 +4702,28 @@ class BusinessTranslatorAgent:
                 "note": "derived reviewer/adequacy decision differs from authoritative run outcome",
             }
 
+        governance_contradiction_packet = _build_governance_contradiction_packet(
+            review_board_verdict=review_board_verdict if isinstance(review_board_verdict, dict) else {},
+            ml_review_stack=ml_review_stack if isinstance(ml_review_stack, dict) else {},
+            data_adequacy_report=data_adequacy_report if isinstance(data_adequacy_report, dict) else {},
+            final_incumbent_state=final_incumbent_state,
+            decision_discrepancy=decision_discrepancy,
+        )
+        stale_or_rejected_history = _build_stale_or_rejected_history(
+            review_board_verdict=review_board_verdict if isinstance(review_board_verdict, dict) else {},
+            ml_review_stack=ml_review_stack if isinstance(ml_review_stack, dict) else {},
+            governance_contradiction_packet=governance_contradiction_packet,
+            decision_discrepancy=decision_discrepancy,
+        )
+
         facts_block = {
             "executive_decision_label": executive_decision_label,
             "authoritative_run_outcome": run_outcome_token,
             "derived_decision_label": derived_decision_label,
             "decision_discrepancy": decision_discrepancy,
+            "final_incumbent_state": final_incumbent_state,
+            "governance_contradiction_packet": governance_contradiction_packet,
+            "stale_or_rejected_history": stale_or_rejected_history,
             "business_objective": business_objective,
             "strategy_title": strategy_title,
             "review_verdict": review_verdict or compliance,
@@ -4340,6 +4766,7 @@ class BusinessTranslatorAgent:
             "artifact_manifest": manifest,
             "data_adequacy_report_json": data_adequacy_report,
             "review_board_verdict_json": sanitized_review_board_verdict,
+            "ml_review_stack_json": ml_review_stack,
             "alignment_check": alignment_check_context,
             "model_metrics_context": model_metrics_context,
             "ml_engineer_change_summary": ml_engineer_change_summary,
@@ -4352,6 +4779,9 @@ class BusinessTranslatorAgent:
             "metric_loop_context": metric_loop_context if metric_loop_context else None,
             "metric_progress_summary": metric_progress_summary,
             "run_causal_impact_summary": run_causal_impact_summary,
+            "final_incumbent_state": final_incumbent_state,
+            "governance_contradiction_packet": governance_contradiction_packet,
+            "stale_or_rejected_history": stale_or_rejected_history,
         }
 
         # ── Pipeline scope awareness ─────────────────────────────────
@@ -4413,6 +4843,12 @@ what to do next.
 - FACTS_BLOCK is authoritative for the executive decision label. If it includes
   an authoritative run outcome, it overrides softer signals from reviewer verdicts,
   data adequacy, heuristics, or narrative text.
+- FINAL_INCUMBENT_STATE is authoritative for the current selected system state:
+  current deliverability, incumbent KPI, and whether required outputs exist now.
+- STALE_OR_REJECTED_HISTORY contains reviewer/governance history that may explain
+  disagreements or rejected paths, but it is not the final current state.
+- If GOVERNANCE_CONTRADICTION_PACKET lists contradictions, treat the contradicted
+  blockers as stale or historical unless current deterministic facts independently confirm them.
 - RUN NARRATIVE and DETAILED CONTEXT explain what happened and why; they do not
   override the authoritative executive outcome.
 - Evidence must come from listed artifacts or explicit deterministic facts.
@@ -4513,6 +4949,9 @@ EDA Fact Pack: $eda_fact_pack_json
 Data Engineer Change Summary: $data_engineer_change_summary_json
 ML Engineer Change Summary: $ml_engineer_change_summary_json
 Run Causal Impact Summary: $run_causal_impact_summary_json
+Final Incumbent State: $final_incumbent_state_json
+Governance Contradiction Packet: $governance_contradiction_packet_json
+Stale or Rejected History: $stale_or_rejected_history_json
 Visuals: $visuals_context_json
 Decisioning: $decisioning_context_json
 Decisioning Columns: $decisioning_columns_text
@@ -4628,6 +5067,9 @@ $execution_results
             "data_engineer_change_summary_json": json.dumps(data_engineer_change_summary, ensure_ascii=False),
             "ml_engineer_change_summary_json": json.dumps(ml_engineer_change_summary, ensure_ascii=False),
             "run_causal_impact_summary_json": json.dumps(run_causal_impact_summary, ensure_ascii=False),
+            "final_incumbent_state_json": json.dumps(final_incumbent_state, ensure_ascii=False),
+            "governance_contradiction_packet_json": json.dumps(governance_contradiction_packet, ensure_ascii=False),
+            "stale_or_rejected_history_json": json.dumps(stale_or_rejected_history, ensure_ascii=False),
             "context_appendix_json": json.dumps(context_appendix, ensure_ascii=False),
             "pipeline_scope_section": pipeline_scope_section,
             "embeddable_artifacts_registry_json": artifact_registry_prompt_json,
@@ -4781,6 +5223,7 @@ $execution_results
                     plots=plots,
                     expected_language=target_language_code,
                     decision_discrepancy=decision_discrepancy,
+                    governance_contradiction_packet=governance_contradiction_packet,
                 )
                 best_score = _score_report_quality(validation)
                 best_content = content
@@ -4860,6 +5303,7 @@ $execution_results
                             plots=plots,
                             expected_language=target_language_code,
                             decision_discrepancy=decision_discrepancy,
+                            governance_contradiction_packet=governance_contradiction_packet,
                         )
                         repair_score = _score_report_quality(repair_validation)
                         repair_history.append({
