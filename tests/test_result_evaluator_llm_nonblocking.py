@@ -8,6 +8,7 @@ Policy:
 """
 import json
 import os
+from pathlib import Path
 
 from src.graph import graph as graph_mod
 
@@ -22,6 +23,27 @@ class _StubReviewerApproved:
     """Stub that returns APPROVED."""
     def evaluate_results(self, *_args, **_kwargs):
         return {"status": "APPROVED", "feedback": "All good"}
+
+
+class _StubReviewerStaleDeliverabilityComplaint:
+    def evaluate_results(self, *_args, **_kwargs):
+        return {
+            "status": "NEEDS_IMPROVEMENT",
+            "feedback": (
+                "The run is not deliverable because required scoring CSV and executive report "
+                "are missing or stale, and upstream outputs appear stale."
+            ),
+            "retry_worth_it": True,
+        }
+
+    def review_code(self, *_args, **_kwargs):
+        return {
+            "status": "APPROVED",
+            "feedback": "review ok",
+            "failed_gates": [],
+            "required_fixes": [],
+            "hard_failures": [],
+        }
 
 class _StubQAApproved:
     def review_code(self, *_args, **_kwargs):
@@ -277,6 +299,66 @@ def test_result_evaluator_ignores_stale_runtime_hard_failures_after_clean_retry(
     assert result["review_verdict"] == "APPROVED"
     assert "hard_failures" not in result or result["hard_failures"] == []
     assert result["last_gate_context"].get("hard_failures") in ([], None)
+
+
+def test_result_evaluator_downgrades_stale_non_ml_output_warning_after_clean_success(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("artifacts/ml").mkdir(parents=True, exist_ok=True)
+    Path("artifacts/clean").mkdir(parents=True, exist_ok=True)
+    Path("data").mkdir(parents=True, exist_ok=True)
+
+    Path("artifacts/ml/cv_metrics.json").write_text("{}", encoding="utf-8")
+    Path("artifacts/ml/churn_risk_scores.csv").write_text("account_id,score\nA,0.9\n", encoding="utf-8")
+    Path("artifacts/ml/model.pkl").write_text("stub", encoding="utf-8")
+    Path("artifacts/clean/churn_snapshots_ml_ready.csv").write_text("x\n1\n", encoding="utf-8")
+    Path("artifacts/clean/cleaning_manifest.json").write_text("{}", encoding="utf-8")
+    Path("data/metrics.json").write_text('{"metric": 0.9}', encoding="utf-8")
+
+    state = {
+        "execution_output": (
+            "HEAVY_RUNNER: status=success reason=local_runner_mode\n"
+            "VALIDATION_WARNING: STALE_OUTPUTS: ['artifacts/clean/churn_snapshots_ml_ready.csv', "
+            "'artifacts/clean/cleaning_manifest.json']"
+        ),
+        "execution_error": False,
+        "sandbox_failed": False,
+        "selected_strategy": {},
+        "business_objective": "",
+        "generated_code": "print('hello')",
+        "execution_contract": {
+            "required_outputs": [
+                {"path": "artifacts/ml/cv_metrics.json", "owner": "ml_engineer"},
+                {"path": "artifacts/ml/churn_risk_scores.csv", "owner": "ml_engineer"},
+                {"path": "artifacts/ml/model.pkl", "owner": "ml_engineer"},
+                {"path": "artifacts/clean/churn_snapshots_ml_ready.csv", "owner": "data_engineer"},
+                {"path": "artifacts/clean/cleaning_manifest.json", "owner": "data_engineer"},
+            ],
+            "spec_extraction": {"case_taxonomy": []},
+        },
+        "output_contract_report": {
+            "overall_status": "ok",
+            "missing": [],
+            "present": [
+                "artifacts/ml/cv_metrics.json",
+                "artifacts/ml/churn_risk_scores.csv",
+                "artifacts/ml/model.pkl",
+                "artifacts/clean/churn_snapshots_ml_ready.csv",
+                "artifacts/clean/cleaning_manifest.json",
+            ],
+        },
+        "evaluation_spec": {},
+        "iteration_count": 0,
+        "feedback_history": [],
+    }
+
+    monkeypatch.setattr(graph_mod, "reviewer", _StubReviewerStaleDeliverabilityComplaint())
+    monkeypatch.setattr(graph_mod, "qa_reviewer", _StubQAApproved())
+    result = graph_mod.run_result_evaluator(state)
+
+    assert result["review_verdict"] == "APPROVE_WITH_WARNINGS"
+    assert any("NONBLOCKING_STALE_OUTPUTS_IGNORED" in item for item in result["feedback_history"])
+    assert result["iteration_handoff"].get("source") == "result_evaluator"
+    assert result["iteration_handoff"].get("repair_policy") in (None, {})
 
 
 def test_check_evaluation_advisory_needs_improvement_stops_without_retry():

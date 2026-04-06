@@ -52,6 +52,22 @@ class _StubBoardMetricOnlyNeedsImprovement:
         }
 
 
+class _StubBoardStaleBlockingNeedsImprovement:
+    def __init__(self):
+        self.last_prompt = None
+        self.last_response = None
+
+    def adjudicate(self, _context):
+        return {
+            "status": "NEEDS_IMPROVEMENT",
+            "summary": "Required scoring CSV and executive report appear missing or stale.",
+            "failed_areas": ["results_quality"],
+            "required_actions": ["Regenerate missing deliverables before approval."],
+            "confidence": "high",
+            "evidence": [],
+        }
+
+
 class _StubBoardSpuriousAreas:
     def __init__(self):
         self.last_prompt = None
@@ -645,3 +661,41 @@ def test_collect_board_deterministic_blockers_ignores_advisory_consistency_signa
     blockers = graph_mod._collect_board_deterministic_blockers(board_context)
 
     assert blockers == []
+
+
+def test_run_review_board_downgrades_stale_needs_improvement_when_current_facts_are_clean(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardStaleBlockingNeedsImprovement())
+
+    state = {
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "review_feedback": "Current attempt is clean.",
+        "feedback_history": [],
+        "last_gate_context": {"failed_gates": [], "required_fixes": [], "hard_failures": []},
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False, "sandbox_failed": False},
+            "result_evaluator": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": [], "hard_failures": []},
+            "reviewer": {"status": "APPROVED", "failed_gates": [], "hard_failures": []},
+            "qa_reviewer": {"status": "APPROVED", "failed_gates": [], "hard_failures": []},
+            "results_advisor": {"status": "APPROVE_WITH_WARNINGS"},
+            "deterministic_facts": {
+                "runtime": {"status": "OK", "runtime_fix_terminal": False, "sandbox_failed": False},
+                "output_contract": {
+                    "overall_status": "ok",
+                    "missing_required_artifacts": [],
+                    "schema_issues": [],
+                },
+            },
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+
+    assert result["review_verdict"] == "APPROVE_WITH_WARNINGS"
+    payload = result["review_board_verdict"]
+    assert payload["status"] == "APPROVE_WITH_WARNINGS"
+    assert payload["candidate_assessment_status"] == "NEEDS_IMPROVEMENT"

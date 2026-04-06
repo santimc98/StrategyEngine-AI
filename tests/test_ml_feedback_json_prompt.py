@@ -35,6 +35,17 @@ class _TraceOpenAI(_FakeOpenAI):
         )
 
 
+def test_runtime_dependency_context_includes_universal_pandas_sklearn_interop_pitfalls():
+    agent = MLEngineerAgent()
+    context = agent._build_runtime_dependency_context(["pandas", "scikit-learn"])
+
+    assert context["version_hints"]["pandas"]
+    assert context["version_hints"]["scikit_learn"]
+    assert context["pandas_sklearn_interop_pitfalls"]
+    assert any("pd.NA" in str(item) for item in context["pandas_sklearn_interop_pitfalls"])
+    assert any("legacy sklearn kwargs" in str(item).lower() for item in context["pandas_sklearn_interop_pitfalls"])
+
+
 def test_editor_mode_prompt_includes_structured_feedback_json(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
     monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)

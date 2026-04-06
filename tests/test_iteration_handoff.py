@@ -1,6 +1,10 @@
 import pytest
 
-from src.graph.graph import _build_iteration_handoff, _extract_verified_gate_feedback
+from src.graph.graph import (
+    _build_iteration_handoff,
+    _extract_verified_gate_feedback,
+    prepare_runtime_fix,
+)
 
 
 def test_iteration_handoff_prioritizes_runtime_and_missing_outputs(tmp_path):
@@ -189,6 +193,74 @@ def test_iteration_handoff_builds_repair_ground_truth_for_runtime_api_misuse():
     assert any(
         "does not accept 'extra'" in str(note or "")
         for note in repair_ground_truth.get("compatibility_notes", [])
+    )
+
+
+def test_prepare_runtime_fix_attaches_authoritative_repair_ground_truth_for_ml_runtime_retry(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "src.graph.graph.failure_explainer.explain_ml_failure",
+        lambda **kwargs: "",
+    )
+    generated_code = (
+        "from sklearn.preprocessing import OneHotEncoder\n"
+        "from sklearn.compose import ColumnTransformer\n"
+        "\n"
+        "def build_preprocessor(cat_cols):\n"
+        "    return ColumnTransformer([\n"
+        "        ('cat', OneHotEncoder(handle_unknown='ignore', sparse=False), cat_cols),\n"
+        "    ])\n"
+    )
+    runtime_output = (
+        "Traceback (most recent call last)\n"
+        "  File \"script.py\", line 6, in <module>\n"
+        "    build_preprocessor(['segment'])\n"
+        "  File \"script.py\", line 5, in build_preprocessor\n"
+        "    ('cat', OneHotEncoder(handle_unknown='ignore', sparse=False), cat_cols),\n"
+        "TypeError: OneHotEncoder.__init__() got an unexpected keyword argument 'sparse'\n"
+    )
+
+    result = prepare_runtime_fix(
+        {
+            "execution_output": runtime_output,
+            "generated_code": generated_code,
+            "last_generated_code": generated_code,
+            "execution_contract": {
+                "required_outputs": [
+                    "artifacts/ml/cv_metrics.json",
+                    "artifacts/ml/model.pkl",
+                ]
+            },
+            "output_contract_report": {
+                "present": ["artifacts/ml/model.pkl"],
+                "missing": ["artifacts/ml/cv_metrics.json"],
+            },
+            "iteration_handoff": {"mode": "build", "feedback": {}},
+        }
+    )
+
+    handoff = result["iteration_handoff"]
+    repair_ground_truth = handoff["repair_ground_truth"]
+    assert repair_ground_truth["root_cause_type"] == "runtime_api_misuse"
+    assert any(
+        fact.get("fact") == "unexpected_keyword_argument" and fact.get("value") == "sparse"
+        for fact in repair_ground_truth.get("verified_facts", [])
+    )
+    assert any(
+        env.get("fact") == "callable_signature"
+        and "sklearn" in str(env.get("resolved_symbol") or "")
+        for env in repair_ground_truth.get("environment_facts", [])
+    )
+    assert any(
+        fact.get("fact") == "unexpected_keyword_callable_mismatch"
+        for fact in repair_ground_truth.get("verified_facts", [])
+    )
+    assert handoff["feedback"]["repair_ground_truth_summary"]["root_cause_type"] == "runtime_api_misuse"
+    assert handoff["feedback"]["verified_environment_facts"]
+    assert any(
+        item.get("kind") == "verified_fact" and item.get("fact") == "unexpected_keyword_argument"
+        for item in handoff["quality_focus"]["evidence"]
     )
 
 

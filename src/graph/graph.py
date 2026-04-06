@@ -5563,6 +5563,87 @@ def _find_stale_outputs(required_outputs: List[str], start_ts: float) -> List[st
             continue
     return stale
 
+
+def _extract_validation_warning_list(output_text: Any, warning_name: str) -> List[str]:
+    text = str(output_text or "")
+    label = str(warning_name or "").strip()
+    if not text or not label:
+        return []
+    pattern = rf"VALIDATION_WARNING:\s*{re.escape(label)}:\s*(\[[^\n\r]*\])"
+    match = re.search(pattern, text, re.IGNORECASE)
+    if not match:
+        return []
+    raw_payload = str(match.group(1) or "").strip()
+    if not raw_payload:
+        return []
+    try:
+        parsed = ast.literal_eval(raw_payload)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    normalized: List[str] = []
+    for item in parsed:
+        token = _normalize_output_path(str(item or ""))
+        if token and token not in normalized:
+            normalized.append(token)
+    return normalized
+
+
+def _strip_validation_warning_line(output_text: Any, warning_name: str) -> str:
+    text = str(output_text or "")
+    label = str(warning_name or "").strip()
+    if not text or not label:
+        return text
+    pattern = rf"\n?VALIDATION_WARNING:\s*{re.escape(label)}:\s*\[[^\n\r]*\]"
+    return re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+
+
+def _sanitize_nonblocking_ml_execution_output(
+    output_text: Any,
+    *,
+    contract: Dict[str, Any] | None,
+    state: Dict[str, Any] | None,
+    output_contract_report: Dict[str, Any] | None,
+) -> Tuple[str, List[str]]:
+    text = str(output_text or "")
+    contract = contract if isinstance(contract, dict) else {}
+    state = state if isinstance(state, dict) else {}
+    oc_report = output_contract_report if isinstance(output_contract_report, dict) else {}
+    stale_outputs = _extract_validation_warning_list(text, "STALE_OUTPUTS")
+    if not stale_outputs:
+        return text, []
+
+    overall_status = str(oc_report.get("overall_status") or "").strip().lower()
+    missing_outputs = [str(x) for x in (oc_report.get("missing") or []) if str(x).strip()]
+    if overall_status == "error" or missing_outputs:
+        return text, []
+
+    ml_owned_outputs = _resolve_ml_heavy_runner_required_outputs(contract, state)
+    ml_owned_norm = {
+        _normalize_output_path(path).lower()
+        for path in (ml_owned_outputs or [])
+        if _normalize_output_path(path)
+    }
+    de_excluded = _resolve_ml_de_input_exclusions(state)
+
+    blocking_stale: List[str] = []
+    nonblocking_stale: List[str] = []
+    for raw_path in stale_outputs:
+        normalized = _normalize_output_path(raw_path)
+        key = normalized.lower()
+        if key in de_excluded:
+            nonblocking_stale.append(normalized)
+            continue
+        if ml_owned_norm and key not in ml_owned_norm:
+            nonblocking_stale.append(normalized)
+            continue
+        blocking_stale.append(normalized)
+
+    if blocking_stale:
+        return text, []
+    return _strip_validation_warning_line(text, "STALE_OUTPUTS"), nonblocking_stale
+
 def _infer_artifact_type(path: str, deliverable_kind: str | None = None) -> str:
     if deliverable_kind:
         return str(deliverable_kind)
@@ -11608,6 +11689,60 @@ def _feedback_claims_missing_evidence(feedback: str | None, evidence: Dict[str, 
         return True
     return False
 
+
+def _feedback_conflicts_with_current_success_facts(
+    feedback: str | None,
+    *,
+    output_contract_report: Dict[str, Any] | None = None,
+    nonblocking_stale_outputs: List[str] | None = None,
+) -> bool:
+    text = str(feedback or "").lower()
+    if not text:
+        return False
+    oc_report = output_contract_report if isinstance(output_contract_report, dict) else {}
+    overall_status = str(oc_report.get("overall_status") or "").strip().lower()
+    missing_required = [str(x) for x in (oc_report.get("missing") or []) if str(x).strip()]
+    nonblocking_stale_outputs = [
+        str(path) for path in (nonblocking_stale_outputs or []) if str(path).strip()
+    ]
+    if overall_status != "ok" or missing_required:
+        return False
+
+    claims_missing_outputs = any(
+        token in text
+        for token in (
+            "missing operational artifacts",
+            "required outputs like",
+            "required scoring csv",
+            "scoring csv",
+            "missing artifacts",
+            "artifacts are missing",
+            "not deliverable",
+        )
+    )
+    claims_runtime_api_failure = any(
+        token in text
+        for token in (
+            "runtime api incompatibil",
+            "scikit-learn api",
+            "unexpected keyword argument 'sparse'",
+            "unexpected keyword argument \"sparse\"",
+        )
+    )
+    claims_stale_outputs_block = any(
+        token in text
+        for token in (
+            "stale_outputs",
+            "outputs are missing or stale",
+            "missing or stale",
+        )
+    )
+    if claims_missing_outputs or claims_runtime_api_failure:
+        return True
+    if claims_stale_outputs_block and nonblocking_stale_outputs:
+        return True
+    return False
+
 def _collect_outputs_state(required_outputs: List[str]) -> Dict[str, List[str]]:
     present: List[str] = []
     missing: List[str] = []
@@ -13922,12 +14057,24 @@ def _build_iteration_handoff(
     if not isinstance(evidence_focus, list):
         evidence_focus = []
 
+    sanitized_execution_output, _nonblocking_stale_outputs = _sanitize_nonblocking_ml_execution_output(
+        state.get("execution_output"),
+        contract=contract,
+        state=state,
+        output_contract_report=oc_report,
+    )
     authoritative_runtime = _resolve_authoritative_runtime_text(state=state)
+    if (
+        sanitized_execution_output
+        and not _has_runtime_failure_marker(sanitized_execution_output)
+        and "VALIDATION_WARNING: STALE_OUTPUTS" not in sanitized_execution_output
+    ):
+        authoritative_runtime = sanitized_execution_output
     runtime_tail = _truncate_handoff_text(
-        authoritative_runtime or state.get("last_runtime_error_tail") or state.get("execution_output"),
+        authoritative_runtime or state.get("last_runtime_error_tail") or sanitized_execution_output,
         max_len=520,
     )
-    execution_output_text = str(state.get("execution_output") or "")
+    execution_output_text = str(sanitized_execution_output or "")
     preflight_failures = extract_preflight_gate_failures(execution_output_text)
     preflight_raw_tail = extract_preflight_gate_tail(execution_output_text, max_chars=700)
     if preflight_failures:
@@ -14139,6 +14286,25 @@ def _build_iteration_handoff(
         required_fixes=required_fixes,
         state=state,
     )
+    if (
+        _is_approved_review_status(normalized_status)
+        and not missing_outputs
+        and not failed_gates
+        and not hard_failures
+        and sanitized_execution_output
+        and not _has_runtime_failure_marker(sanitized_execution_output)
+    ):
+        retry_context = {
+            "error_type": "",
+            "specific_error": "",
+            "blocked_imports": [],
+            "missing_outputs": [],
+            "working_components": present_outputs[:8],
+            "repair_focus": "",
+            "cost_reduction_required": False,
+            "recommended_actions": [],
+            "failed_gates": [],
+        }
     repair_ground_truth = _build_repair_ground_truth(
         state=state,
         retry_context=retry_context,
@@ -18272,7 +18438,11 @@ def _finalize_heavy_execution(
         issue_text = "; ".join(artifact_issues)
         output = f"{output}\nVALIDATION_WARNING: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
 
-    stale_outputs = _find_stale_outputs(required_outputs, exec_start_ts)
+    scoped_required_outputs = _resolve_ml_heavy_runner_required_outputs(contract, state)
+    stale_outputs = _find_stale_outputs(
+        scoped_required_outputs if scoped_required_outputs else required_outputs,
+        exec_start_ts,
+    )
     if stale_outputs:
         output = f"{output}\nVALIDATION_WARNING: STALE_OUTPUTS: {stale_outputs}"
 
@@ -25210,7 +25380,11 @@ def execute_code(state: AgentState) -> AgentState:
             state["artifact_alignment_issue_history"] = []
         state["artifact_alignment_issue_history"].append(artifact_issues)
 
-    stale_outputs = _find_stale_outputs(required_outputs, exec_start_ts)
+    scoped_required_outputs = _resolve_ml_heavy_runner_required_outputs(contract, state)
+    stale_outputs = _find_stale_outputs(
+        scoped_required_outputs if scoped_required_outputs else required_outputs,
+        exec_start_ts,
+    )
     if stale_outputs:
         output = f"{output}\nVALIDATION_WARNING: STALE_OUTPUTS: {stale_outputs}"
 
@@ -25705,7 +25879,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             state["feedback_history"] = history
 
     execution_output = state.get('execution_output', '')
-    runtime_failure_detected = _has_runtime_failure_marker(execution_output) or bool(state.get("sandbox_failed"))
+    execution_output_sanitized, nonblocking_stale_outputs = _sanitize_nonblocking_ml_execution_output(
+        execution_output,
+        contract=contract if isinstance(contract, dict) else {},
+        state=state if isinstance(state, dict) else {},
+        output_contract_report=_resolve_output_contract_report_for_facts(state if isinstance(state, dict) else {}),
+    )
+    runtime_failure_detected = _has_runtime_failure_marker(execution_output_sanitized) or bool(state.get("sandbox_failed"))
     runtime_terminal = bool(state.get("runtime_fix_terminal"))
 
     strategy = state.get('selected_strategy', {}) or {}
@@ -25731,9 +25911,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         metrics_report,
         oc_report_for_eval,
     )
-    execution_output_for_review = execution_output
+    execution_output_for_review = execution_output_sanitized
     if not runtime_failure_detected and reviewer_evidence.get("summary_text"):
-        execution_output_for_review = f"{execution_output}\n\n{reviewer_evidence['summary_text']}"
+        execution_output_for_review = f"{execution_output_sanitized}\n\n{reviewer_evidence['summary_text']}"
 
     if runtime_failure_detected:
         print("Reviewer: Runtime failure markers detected. Applying deterministic failure packet.")
@@ -25778,6 +25958,38 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         if not isinstance(eval_result.get("evidence"), list):
             eval_result = dict(eval_result or {})
             eval_result["evidence"] = []
+        if _feedback_conflicts_with_current_success_facts(
+            eval_result.get("feedback"),
+            output_contract_report=oc_report_for_eval,
+            nonblocking_stale_outputs=nonblocking_stale_outputs,
+        ):
+            normalized_feedback = (
+                "Current deterministic evidence confirms this attempt is deliverable: "
+                "runtime is clean, required ML outputs are present, and any residual stale-output warning "
+                "only concerns non-ML upstream artifacts outside the current owner scope."
+            )
+            eval_result = dict(eval_result or {})
+            eval_result["feedback"] = normalized_feedback
+            eval_result["status"] = "APPROVE_WITH_WARNINGS"
+            eval_result["retry_worth_it"] = False
+            if not isinstance(eval_result.get("evidence"), list):
+                eval_result["evidence"] = []
+            eval_result["evidence"] = _normalize_handoff_evidence(
+                list(eval_result.get("evidence") or [])
+                + [
+                    {
+                        "claim": "Residual validation warnings do not implicate current ML-owned outputs; output_contract is OK for the current attempt.",
+                        "source": "deterministic_reconciliation",
+                    }
+                ],
+                max_items=8,
+            )
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "result_evaluator_evidence_override",
+                    {"reason": "current_success_facts_override_stale_feedback"},
+                )
 
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
@@ -25785,6 +25997,12 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     eval_improvement_suggestions = eval_result.get("improvement_suggestions") if isinstance(eval_result, dict) else None
 
     new_history = list(state.get('feedback_history', []))
+    if nonblocking_stale_outputs:
+        new_history.append(
+            "NONBLOCKING_STALE_OUTPUTS_IGNORED: "
+            + ", ".join(nonblocking_stale_outputs[:6])
+            + " are upstream/non-ML artifacts and do not block the current ML iteration."
+        )
     has_deterministic_error = runtime_failure_detected
     downgraded = False
     if status == "NEEDS_IMPROVEMENT":
@@ -27411,6 +27629,52 @@ def _collect_board_deterministic_blockers(board_context: Dict[str, Any]) -> List
     return blockers
 
 
+def _board_needs_improvement_conflicts_with_current_success(
+    *,
+    board_context: Dict[str, Any] | None,
+    deterministic_blockers: List[str] | None,
+    final_status: str,
+) -> bool:
+    if str(final_status or "").strip().upper() != "NEEDS_IMPROVEMENT":
+        return False
+    board_context = board_context if isinstance(board_context, dict) else {}
+    deterministic_blockers = [str(x) for x in (deterministic_blockers or []) if str(x).strip()]
+    if deterministic_blockers:
+        return False
+
+    runtime = board_context.get("runtime") if isinstance(board_context.get("runtime"), dict) else {}
+    runtime_ok = str(runtime.get("status") or "").strip().upper() == "OK"
+    if not runtime_ok:
+        return False
+
+    deterministic_facts = (
+        board_context.get("deterministic_facts")
+        if isinstance(board_context.get("deterministic_facts"), dict)
+        else {}
+    )
+    output_contract = (
+        deterministic_facts.get("output_contract")
+        if isinstance(deterministic_facts.get("output_contract"), dict)
+        else {}
+    )
+    output_contract_ok = (
+        str(output_contract.get("overall_status") or "").strip().lower() == "ok"
+        and not [str(x) for x in (output_contract.get("missing_required_artifacts") or []) if str(x).strip()]
+        and not [str(x) for x in (output_contract.get("schema_issues") or []) if str(x).strip()]
+    )
+    if not output_contract_ok:
+        return False
+
+    result_packet = board_context.get("result_evaluator") if isinstance(board_context.get("result_evaluator"), dict) else {}
+    reviewer_packet = board_context.get("reviewer") if isinstance(board_context.get("reviewer"), dict) else {}
+    qa_packet = board_context.get("qa_reviewer") if isinstance(board_context.get("qa_reviewer"), dict) else {}
+    return (
+        _is_approved_review_status(result_packet.get("status"))
+        and _is_approved_review_status(reviewer_packet.get("status"))
+        and _is_approved_review_status(qa_packet.get("status"))
+    )
+
+
 def run_review_board(state: AgentState) -> AgentState:
     print("--- [5.6] Review Board: Consolidating reviewer outputs ---")
     abort_state = _abort_if_requested(state, "review_board")
@@ -27523,6 +27787,17 @@ def run_review_board(state: AgentState) -> AgentState:
                 required_actions.append(action)
         board_note = (
             "Board verdict adjusted by deterministic evidence: unresolved runtime/QA/output blockers remain."
+        )
+        board_summary = f"{board_summary} {board_note}".strip() if board_summary else board_note
+    if _board_needs_improvement_conflicts_with_current_success(
+        board_context=board_context,
+        deterministic_blockers=deterministic_blockers,
+        final_status=final_status,
+    ):
+        final_status = "APPROVE_WITH_WARNINGS"
+        board_note = (
+            "Board NEEDS_IMPROVEMENT downgraded because current deterministic evidence shows "
+            "runtime OK, output_contract OK, and reviewer/QA/evaluator already aligned on approval."
         )
         board_summary = f"{board_summary} {board_note}".strip() if board_summary else board_note
     current_feedback = str(state.get("review_feedback") or "")
@@ -28175,15 +28450,44 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
         ),
     )
     existing_handoff = state.get("iteration_handoff") if isinstance(state.get("iteration_handoff"), dict) else {}
+    present_outputs = _normalize_handoff_items(
+        output_contract_report.get("present"),
+        max_items=12,
+        max_len=180,
+    )
     runtime_retry_context = _build_retry_context(
         runtime_tail=authoritative_runtime,
         hard_failures=[],
         failed_gates=[str(item) for item in (error_context.get("failed_gates") or []) if str(item).strip()],
         missing_outputs=missing_outputs,
-        present_outputs=_normalize_handoff_items(output_contract_report.get("present"), max_items=12, max_len=180),
+        present_outputs=present_outputs,
         required_fixes=[str(item) for item in (error_context.get("required_fixes") or []) if str(item).strip()],
         state=state if isinstance(state, dict) else {},
     )
+    repair_ground_truth = _build_repair_ground_truth(
+        state=state if isinstance(state, dict) else {},
+        retry_context=runtime_retry_context,
+        runtime_output=authoritative_runtime,
+        missing_outputs=missing_outputs,
+        present_outputs=present_outputs,
+        failed_gates=[str(item) for item in (error_context.get("failed_gates") or []) if str(item).strip()],
+        required_fixes=[str(item) for item in (error_context.get("required_fixes") or []) if str(item).strip()],
+        evidence_focus=[
+            {
+                "kind": "runtime_failure",
+                "source": "execution_runtime",
+                "failure_type": runtime_failure_type,
+                "summary": runtime_summary,
+            }
+        ],
+    )
+    if isinstance(repair_ground_truth, dict):
+        for directive in repair_ground_truth.get("repair_directives") or []:
+            text = str(directive or "").strip()
+            if text and text not in error_context["required_fixes"]:
+                error_context["required_fixes"].append(text)
+            if len(error_context["required_fixes"]) >= 12:
+                break
     iteration_handoff = _apply_repair_first_handoff(
         existing_handoff,
         repair_focus=runtime_focus if runtime_focus in {"runtime", "persistence"} else "runtime",
@@ -28191,15 +28495,79 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
         source="prepare_runtime_fix",
         reason=f"runtime_fix:{runtime_failure_type}",
     )
+    repair_scope = _build_repair_scope(
+        repair_focus=runtime_focus if runtime_focus in {"runtime", "persistence", "compliance"} else "runtime",
+        repair_ground_truth=repair_ground_truth,
+        required_fixes=[str(item) for item in (error_context.get("required_fixes") or []) if str(item).strip()],
+        failed_gates=[str(item) for item in (error_context.get("failed_gates") or []) if str(item).strip()],
+        evidence_focus=[
+            {
+                "kind": "runtime_failure",
+                "source": "execution_runtime",
+                "failure_type": runtime_failure_type,
+                "summary": runtime_summary,
+            }
+        ],
+        must_preserve=[],
+        missing_outputs=missing_outputs,
+    )
+    quality_evidence: List[Dict[str, Any]] = []
+    if isinstance(repair_ground_truth, dict):
+        for fact in repair_ground_truth.get("verified_facts") or []:
+            if not isinstance(fact, dict):
+                continue
+            quality_evidence.append(
+                {
+                    "kind": "verified_fact",
+                    "fact": fact.get("fact"),
+                    "value": fact.get("value"),
+                    "source": fact.get("source"),
+                }
+            )
+            if len(quality_evidence) >= 6:
+                break
+        for delta in repair_ground_truth.get("causal_deltas") or []:
+            if not isinstance(delta, dict):
+                continue
+            quality_evidence.append(
+                {
+                    "kind": "causal_delta",
+                    "delta_type": delta.get("kind"),
+                    "column": delta.get("column"),
+                    "symptom": delta.get("symptom"),
+                }
+            )
+            if len(quality_evidence) >= 10:
+                break
     iteration_handoff["quality_focus"] = {
         "status": "REJECTED",
         "failed_gates": [str(item) for item in (error_context.get("failed_gates") or []) if str(item).strip()][:12],
         "required_fixes": [str(item) for item in (error_context.get("required_fixes") or []) if str(item).strip()][:12],
         "hard_failures": [],
-        "evidence": [],
+        "evidence": quality_evidence,
     }
+    iteration_handoff["repair_ground_truth"] = (
+        copy.deepcopy(repair_ground_truth) if isinstance(repair_ground_truth, dict) else {}
+    )
+    if repair_scope:
+        merged_scope = (
+            copy.deepcopy(iteration_handoff.get("repair_scope"))
+            if isinstance(iteration_handoff.get("repair_scope"), dict)
+            else {}
+        )
+        merged_scope.update(copy.deepcopy(repair_scope))
+        iteration_handoff["repair_scope"] = merged_scope
     feedback_block = iteration_handoff.get("feedback") if isinstance(iteration_handoff.get("feedback"), dict) else {}
     feedback_block["runtime_error_tail"] = authoritative_runtime[-2000:]
+    if isinstance(repair_ground_truth, dict):
+        verified_environment_facts = repair_ground_truth.get("environment_facts")
+        if isinstance(verified_environment_facts, list) and verified_environment_facts:
+            feedback_block["verified_environment_facts"] = copy.deepcopy(verified_environment_facts[:6])
+        feedback_block["repair_ground_truth_summary"] = {
+            "root_cause_type": repair_ground_truth.get("root_cause_type"),
+            "repair_focus": repair_ground_truth.get("repair_focus"),
+            "failure_signature": repair_ground_truth.get("failure_signature"),
+        }
     iteration_handoff["feedback"] = feedback_block
 
     return {

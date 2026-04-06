@@ -255,6 +255,40 @@ class MLEngineerAgent:
             or "cloudrun"
         ).strip().lower()
         backend_profile = "local" if runtime_mode == "local" else "cloudrun"
+        requirements_path = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "cloudrun",
+                "heavy_runner",
+                "requirements.txt",
+            )
+        )
+        pinned_specs: Dict[str, str] = {}
+        try:
+            if os.path.exists(requirements_path):
+                with open(requirements_path, "r", encoding="utf-8") as f_req:
+                    for raw in f_req:
+                        line = str(raw or "").strip()
+                        if not line or line.startswith("#") or line.startswith("-"):
+                            continue
+                        token = line.split(";", 1)[0].strip()
+                        token = token.split("#", 1)[0].strip()
+                        if not token:
+                            continue
+                        for op in ("==", ">=", "<=", "~=", "!=", ">", "<"):
+                            if op in token:
+                                name, spec = token.split(op, 1)
+                                pkg = name.strip().lower()
+                                if pkg:
+                                    pinned_specs[pkg] = f"{op}{spec.strip()}"
+                                break
+        except Exception:
+            pinned_specs = {}
+
+        pandas_spec = pinned_specs.get("pandas", "unbounded")
+        sklearn_spec = pinned_specs.get("scikit-learn", pinned_specs.get("sklearn", "unbounded"))
 
         return {
             "backend_profile": backend_profile,
@@ -275,10 +309,22 @@ class MLEngineerAgent:
             "blocked_always": sorted(
                 {str(item) for item in BANNED_ALWAYS_ALLOWLIST if str(item).strip()}
             ),
+            "version_hints": {
+                "python": "3.11+",
+                "pandas": pandas_spec or "2.x",
+                "scikit_learn": sklearn_spec or "1.x",
+            },
             "guidance": [
                 "Import only runtime-compatible dependencies.",
                 "When optional dependencies are used, ensure they are contract-declared.",
                 "Prefer robust fallbacks with base stack when optional libs are unavailable.",
+                "Treat pandas nullable extension dtypes and sklearn transformers as an interoperability boundary: normalize missing sentinels and confirm compatible public signatures before fit.",
+            ],
+            "pandas_sklearn_interop_pitfalls": [
+                "pd.NA inside object/string/categorical arrays can trigger ambiguous boolean or dtype coercion errors inside sklearn estimators and imputers. Normalize missing sentinels to np.nan/None before fit/transform when crossing into sklearn.",
+                "Pandas nullable extension dtypes (Int64, Float64, boolean, string) are not always safe to hand directly to sklearn transformers. Convert to sklearn-compatible representations only after preserving the intended semantics.",
+                "When using SimpleImputer, OneHotEncoder, or ColumnTransformer, verify that categorical pipelines receive compatible missing-value representations and stable public APIs for the installed sklearn version.",
+                "Do not assume legacy sklearn kwargs from memory. Verify encoder/transformer signatures against the installed runtime or a known-working incumbent block before patching.",
             ],
         }
 
