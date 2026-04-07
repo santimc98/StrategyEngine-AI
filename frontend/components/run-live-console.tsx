@@ -54,27 +54,39 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
         setStatus(statusPayload);
 
         if (logsResponse.ok) {
-          const logsPayload = (await logsResponse.json()) as RunLogsResponse;
-          if (logsPayload.entries.length) {
-            const newEntries: LogEntry[] = logsPayload.entries.map((e) => ({
-              ...e,
+          const logsPayload = (await logsResponse.json()) as Partial<RunLogsResponse>;
+          const incoming = Array.isArray(logsPayload?.entries) ? logsPayload.entries : [];
+          if (incoming.length) {
+            const newEntries: LogEntry[] = incoming.map((e) => ({
+              ts: String(e?.ts ?? ""),
+              agent: String(e?.agent ?? "Sistema"),
+              msg: String(e?.msg ?? ""),
+              level: String(e?.level ?? "info"),
               source: "worker" as const,
             }));
             setWorkerLogs((current) => [...current, ...newEntries].slice(-300));
           }
-          nextWorkerLineRef.current = logsPayload.next_after_line;
+          if (typeof logsPayload?.next_after_line === "number") {
+            nextWorkerLineRef.current = logsPayload.next_after_line;
+          }
         }
 
         if (eventResponse.ok) {
-          const eventPayload = (await eventResponse.json()) as RunEventLogResponse;
-          if (eventPayload.entries.length) {
-            const newEntries: LogEntry[] = eventPayload.entries.map((e) => ({
-              ...e,
+          const eventPayload = (await eventResponse.json()) as Partial<RunEventLogResponse>;
+          const incoming = Array.isArray(eventPayload?.entries) ? eventPayload.entries : [];
+          if (incoming.length) {
+            const newEntries: LogEntry[] = incoming.map((e) => ({
+              ts: String(e?.ts ?? ""),
+              agent: String(e?.agent ?? "Sistema"),
+              msg: String(e?.msg ?? ""),
+              level: String(e?.level ?? "info"),
               source: "event" as const,
             }));
             setEventLogs((current) => [...current, ...newEntries].slice(-300));
           }
-          nextEventLineRef.current = eventPayload.next_after_line;
+          if (typeof eventPayload?.next_after_line === "number") {
+            nextEventLineRef.current = eventPayload.next_after_line;
+          }
         }
 
         setError(null);
@@ -131,17 +143,20 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
     }
   }
 
-  // Merge and sort both log streams by timestamp
-  const mergedLogs = [...workerLogs, ...eventLogs].sort((a, b) => a.ts.localeCompare(b.ts));
-  // Deduplicate: if worker and event have the same ts+agent+similar message, keep worker only
-  const deduped = mergedLogs.filter((entry, index) => {
+  // Merge and sort both log streams by timestamp (defensive against missing fields)
+  const mergedLogs = [...workerLogs, ...eventLogs]
+    .filter((e): e is LogEntry => Boolean(e) && typeof e.ts === "string")
+    .sort((a, b) => (a.ts || "").localeCompare(b.ts || ""));
+  // Deduplicate: if worker and event have the same ts+agent, keep worker only
+  const deduped = mergedLogs.filter((entry, index, arr) => {
     if (entry.source !== "event") return true;
-    // Check if a worker log with same ts and agent exists nearby
-    for (let i = Math.max(0, index - 3); i < Math.min(mergedLogs.length, index + 3); i++) {
+    const start = Math.max(0, index - 3);
+    const end = Math.min(arr.length, index + 4);
+    for (let i = start; i < end; i++) {
       if (i === index) continue;
-      const other = mergedLogs[i];
-      if (other.source === "worker" && other.ts === entry.ts && other.agent === entry.agent) {
-        return false; // skip this event entry, worker version is present
+      const other = arr[i];
+      if (other && other.source === "worker" && other.ts === entry.ts && other.agent === entry.agent) {
+        return false;
       }
     }
     return true;
