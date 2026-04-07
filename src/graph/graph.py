@@ -1186,6 +1186,211 @@ def _persist_metric_loop_state(
         return existing_index if isinstance(existing_index, list) else []
 
 
+def _load_incumbent_bundle(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    payload = state.get("incumbent_bundle")
+    if isinstance(payload, dict) and payload:
+        return dict(payload)
+    loaded = _load_json_safe("data/incumbent_bundle.json")
+    if isinstance(loaded, dict) and loaded:
+        return loaded
+    return {}
+
+
+def _persist_incumbent_bundle(
+    incumbent_bundle: Dict[str, Any] | None,
+    *,
+    existing_index: Any = None,
+) -> List[Dict[str, Any]]:
+    incumbent_bundle = incumbent_bundle if isinstance(incumbent_bundle, dict) else {}
+    if not incumbent_bundle:
+        return existing_index if isinstance(existing_index, list) else []
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/incumbent_bundle.json", incumbent_bundle)
+        normalized_existing = existing_index if isinstance(existing_index, list) else []
+        additions = _build_artifact_index(["data/incumbent_bundle.json"], None)
+        merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+        dump_json("data/produced_artifact_index.json", merged_index)
+        return merged_index
+    except Exception as incumbent_err:
+        print(f"Warning: failed to persist incumbent_bundle.json: {incumbent_err}")
+        return existing_index if isinstance(existing_index, list) else []
+
+
+def _build_incumbent_bundle(
+    *,
+    state: Dict[str, Any],
+    round_id: int,
+    source: str,
+    generated_code: str,
+    last_generated_code: str | None = None,
+    metrics_payload: Dict[str, Any] | None = None,
+    metric_name: str | None = None,
+    metric_value: Any = None,
+    metrics_path: str | None = None,
+    review_verdict: str | None = None,
+    artifact_snapshot: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    metrics_payload = metrics_payload if isinstance(metrics_payload, dict) else {}
+    metric_name = str(metric_name or "").strip()
+    metric_value = _coerce_float(metric_value)
+    source_token = re.sub(r"[^a-z0-9_]+", "_", str(source or "incumbent").strip().lower()).strip("_") or "incumbent"
+    incumbent_id = f"incumbent_r{int(round_id or 0)}_{source_token}"
+    bundle = {
+        "schema_version": "v1",
+        "incumbent_id": incumbent_id,
+        "round_id": int(round_id or 0),
+        "source": str(source or "incumbent"),
+        "generated_code": str(generated_code or ""),
+        "last_generated_code": str(last_generated_code or generated_code or ""),
+        "metric_name": metric_name or None,
+        "metric_value": float(metric_value) if metric_value is not None else None,
+        "metrics_payload": copy.deepcopy(metrics_payload),
+        "metrics_path": normalize_artifact_path(metrics_path) if metrics_path else None,
+        "review_verdict": normalize_review_status(review_verdict or state.get("review_verdict") or ""),
+        "artifact_snapshot": copy.deepcopy(artifact_snapshot) if isinstance(artifact_snapshot, dict) else {},
+    }
+    return bundle
+
+
+def _load_metric_round_state(state: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    payload = state.get("metric_round_state")
+    if isinstance(payload, dict) and payload:
+        return dict(payload)
+    loaded = _load_json_safe("data/metric_round_state.json")
+    if isinstance(loaded, dict) and loaded:
+        return loaded
+    return {}
+
+
+def _persist_metric_round_state(
+    metric_round_state: Dict[str, Any] | None,
+    *,
+    existing_index: Any = None,
+) -> List[Dict[str, Any]]:
+    metric_round_state = metric_round_state if isinstance(metric_round_state, dict) else {}
+    if not metric_round_state:
+        return existing_index if isinstance(existing_index, list) else []
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/metric_round_state.json", metric_round_state)
+        normalized_existing = existing_index if isinstance(existing_index, list) else []
+        additions = _build_artifact_index(["data/metric_round_state.json"], None)
+        merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+        dump_json("data/produced_artifact_index.json", merged_index)
+        return merged_index
+    except Exception as round_err:
+        print(f"Warning: failed to persist metric_round_state.json: {round_err}")
+        return existing_index if isinstance(existing_index, list) else []
+
+
+def _build_metric_round_state(
+    *,
+    round_id: int,
+    round_base_incumbent_id: str,
+    hypothesis_packet: Dict[str, Any] | None = None,
+    candidate_attempt_index: int = 1,
+    max_attempts: int = 3,
+    status: str = "active",
+    candidate_code: str | None = None,
+    candidate_status: str | None = None,
+) -> Dict[str, Any]:
+    hypothesis_packet = hypothesis_packet if isinstance(hypothesis_packet, dict) else {}
+    hypothesis = hypothesis_packet.get("hypothesis") if isinstance(hypothesis_packet.get("hypothesis"), dict) else {}
+    tracker_context = hypothesis_packet.get("tracker_context") if isinstance(hypothesis_packet.get("tracker_context"), dict) else {}
+    normalized_max_attempts = max(1, int(max_attempts or 1))
+    normalized_attempt = min(max(1, int(candidate_attempt_index or 1)), normalized_max_attempts)
+    return {
+        "schema_version": "v1",
+        "round_id": int(round_id or 0),
+        "status": str(status or "active"),
+        "round_base_incumbent_id": str(round_base_incumbent_id or "").strip() or None,
+        "candidate_attempt_index": int(normalized_attempt),
+        "max_attempts": int(normalized_max_attempts),
+        "repairs_remaining": int(max(0, normalized_max_attempts - normalized_attempt)),
+        "active_hypothesis": {
+            "action": str(hypothesis_packet.get("action") or "").strip() or None,
+            "signature": str(tracker_context.get("signature") or "").strip() or None,
+            "technique": str(hypothesis.get("technique") or "").strip() or None,
+        },
+        "candidate": {
+            "status": str(candidate_status or "pending"),
+            "generated_code": str(candidate_code or ""),
+        },
+    }
+
+
+def _build_metric_round_handoff_context(state: Dict[str, Any] | None) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    metric_round_state = _load_metric_round_state(state)
+    incumbent_bundle = _load_incumbent_bundle(state)
+    if not isinstance(metric_round_state, dict) or not metric_round_state:
+        return {}
+    active_hypothesis = (
+        metric_round_state.get("active_hypothesis")
+        if isinstance(metric_round_state.get("active_hypothesis"), dict)
+        else {}
+    )
+    candidate = (
+        metric_round_state.get("candidate")
+        if isinstance(metric_round_state.get("candidate"), dict)
+        else {}
+    )
+    max_attempts = int(metric_round_state.get("max_attempts") or 3)
+    current_attempt = int(metric_round_state.get("candidate_attempt_index") or 1)
+    return {
+        "round_id": int(metric_round_state.get("round_id") or 0),
+        "status": str(metric_round_state.get("status") or ""),
+        "round_base_incumbent_id": str(metric_round_state.get("round_base_incumbent_id") or ""),
+        "incumbent_id": str(incumbent_bundle.get("incumbent_id") or ""),
+        "candidate_attempt_index": int(current_attempt),
+        "max_attempts": int(max_attempts),
+        "repairs_remaining": int(max(0, int(metric_round_state.get("repairs_remaining") or (max_attempts - current_attempt)))),
+        "same_round_same_hypothesis": True,
+        "active_hypothesis": {
+            "action": str(active_hypothesis.get("action") or "").strip() or None,
+            "signature": str(active_hypothesis.get("signature") or "").strip() or None,
+            "technique": str(active_hypothesis.get("technique") or "").strip() or None,
+        },
+        "candidate_status": str(candidate.get("status") or "").strip() or None,
+    }
+
+
+def _advance_metric_round_retry_state(
+    state: Dict[str, Any] | None,
+    *,
+    failure_source: str,
+    preserve_attempt_on_exhaustion: bool = True,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    if not bool(state.get("ml_improvement_round_active")):
+        return {}
+    metric_round_state = _load_metric_round_state(state)
+    if not isinstance(metric_round_state, dict) or not metric_round_state:
+        return {}
+    current_attempt = int(metric_round_state.get("candidate_attempt_index") or 1)
+    max_attempts = int(metric_round_state.get("max_attempts") or 3)
+    next_attempt = current_attempt
+    if current_attempt < max_attempts:
+        next_attempt = current_attempt + 1
+    elif not preserve_attempt_on_exhaustion:
+        next_attempt = current_attempt + 1
+    candidate = (
+        metric_round_state.get("candidate")
+        if isinstance(metric_round_state.get("candidate"), dict)
+        else {}
+    )
+    updated = copy.deepcopy(metric_round_state)
+    updated["candidate_attempt_index"] = int(next_attempt)
+    updated["repairs_remaining"] = int(max(0, max_attempts - next_attempt))
+    updated_candidate = dict(candidate)
+    updated_candidate["status"] = str(failure_source or "repair_pending")
+    updated["candidate"] = updated_candidate
+    return updated
+
+
 def _load_declared_artifact_payload(
     contract: Dict[str, Any] | None,
     state: Dict[str, Any] | None,
@@ -2074,6 +2279,21 @@ def _sync_metric_loop_legacy_fields(
         state["ml_improvement_output_paths"] = list(artifacts.get("output_paths") or [])
     if artifacts.get("snapshot_dir"):
         state["ml_improvement_snapshot_dir"] = str(artifacts.get("snapshot_dir"))
+    incumbent_bundle = _load_incumbent_bundle(state)
+    if isinstance(incumbent_bundle, dict) and incumbent_bundle:
+        state["incumbent_bundle"] = copy.deepcopy(incumbent_bundle)
+    metric_round_state = _load_metric_round_state(state)
+    if isinstance(metric_round_state, dict) and metric_round_state:
+        state["metric_round_state"] = copy.deepcopy(metric_round_state)
+        state["ml_improvement_round_base_incumbent_id"] = str(
+            metric_round_state.get("round_base_incumbent_id") or ""
+        )
+        state["ml_improvement_candidate_attempt_index"] = int(
+            metric_round_state.get("candidate_attempt_index") or 0
+        )
+        state["ml_improvement_round_max_attempts"] = int(
+            metric_round_state.get("max_attempts") or state.get("ml_improvement_round_max_attempts", 3) or 3
+        )
     if final_entry.get("label"):
         final_label = str(final_entry.get("label"))
         state["ml_improvement_kept"] = "improved" if final_label == "candidate" else final_label
@@ -14429,6 +14649,9 @@ def _build_iteration_handoff(
         )
         if repair_scope:
             handoff["repair_scope"] = repair_scope
+    metric_round_context = _build_metric_round_handoff_context(state)
+    if metric_round_context:
+        handoff["metric_round_context"] = metric_round_context
     if preflight_failures:
         handoff["preflight_gates"] = {
             "fails": preflight_failures[:10],
@@ -15432,6 +15655,8 @@ class AgentState(TypedDict):
     primary_metric_state: Dict[str, Any]
     primary_metric_snapshot: Dict[str, Any]
     metric_loop_state: Dict[str, Any]
+    incumbent_bundle: Dict[str, Any]
+    metric_round_state: Dict[str, Any]
     metric_history: List[Dict[str, Any]]
     execution_output_stale: bool
     sandbox_failed: bool
@@ -15603,6 +15828,9 @@ class AgentState(TypedDict):
     ml_improvement_round_baseline_qa_packet: Dict[str, Any]
     ml_improvement_round_baseline_generated_code: str
     ml_improvement_round_baseline_last_generated_code: str
+    ml_improvement_round_base_incumbent_id: str
+    ml_improvement_candidate_attempt_index: int
+    ml_improvement_round_max_attempts: int
     ml_improvement_incumbent_metric: float
     ml_improvement_baseline_metric: float
     ml_improvement_baseline_metrics: Dict[str, Any]
@@ -16432,6 +16660,8 @@ def run_steward(state: AgentState) -> AgentState:
         "primary_metric_state": {},
         "primary_metric_snapshot": {},
         "metric_loop_state": {},
+        "incumbent_bundle": {},
+        "metric_round_state": {},
         "metric_history": [],
         "feedback_history": [],
         "has_partial_visuals": False,
@@ -16487,6 +16717,9 @@ def run_steward(state: AgentState) -> AgentState:
         "ml_improvement_round_baseline_error_message": "",
         "ml_improvement_round_baseline_generated_code": "",
         "ml_improvement_round_baseline_last_generated_code": "",
+        "ml_improvement_round_base_incumbent_id": "",
+        "ml_improvement_candidate_attempt_index": 0,
+        "ml_improvement_round_max_attempts": 3,
         "ml_improvement_incumbent_metric": None,
         "ml_improvement_baseline_metric": None,
         "ml_improvement_baseline_metrics": {},
@@ -22949,7 +23182,7 @@ def run_engineer(state: AgentState) -> AgentState:
         data_audit_context = _merge_de_audit_override(data_audit_context, checklist_payload)
 
     # Patch Mode Inputs
-    previous_code = state.get('generated_code') or state.get('last_generated_code')
+    previous_code = _resolve_metric_round_previous_code(state) or state.get('generated_code') or state.get('last_generated_code')
     gate_context = state.get('last_gate_context')
     metric_round_active = bool(state.get("ml_improvement_round_active"))
     editor_mode_active = _should_use_ml_editor_mode(
@@ -23616,6 +23849,25 @@ def run_engineer(state: AgentState) -> AgentState:
             "ml_execution_profile": execution_profile,
             "ml_improvement_apply_guard_report": apply_guard_report,
         }
+        if metric_round_active:
+            metric_round_state = _load_metric_round_state(state)
+            if isinstance(metric_round_state, dict) and metric_round_state:
+                candidate_block = (
+                    metric_round_state.get("candidate")
+                    if isinstance(metric_round_state.get("candidate"), dict)
+                    else {}
+                )
+                candidate_block = dict(candidate_block)
+                candidate_block["generated_code"] = str(code or "")
+                candidate_block["status"] = "generated"
+                metric_round_state["candidate"] = candidate_block
+                result["metric_round_state"] = metric_round_state
+                result["ml_improvement_candidate_attempt_index"] = int(
+                    metric_round_state.get("candidate_attempt_index") or state.get("ml_improvement_candidate_attempt_index", 1) or 1
+                )
+                result["ml_improvement_round_max_attempts"] = int(
+                    metric_round_state.get("max_attempts") or state.get("ml_improvement_round_max_attempts", 3) or 3
+                )
         merged_state = dict(state or {})
         merged_state.update(result)
         _refresh_run_facts_pack(merged_state)
@@ -25635,6 +25887,46 @@ def retry_handler(state: AgentState) -> AgentState:
     # Single-strategy mode: no alternative strategies to reselect from.
     # The retry handler keeps the current strategy and retries with feedback.
     route_reason = "single_strategy_retry"
+
+    if bool(state.get("ml_improvement_round_active")) and _is_blocking_retry_reason(state if isinstance(state, dict) else {}):
+        advanced_round_state = _advance_metric_round_retry_state(
+            state if isinstance(state, dict) else {},
+            failure_source="review_or_board_repair_pending",
+        )
+        if advanced_round_state:
+            result["metric_round_state"] = advanced_round_state
+            result["ml_improvement_candidate_attempt_index"] = int(
+                advanced_round_state.get("candidate_attempt_index") or 1
+            )
+            result["ml_improvement_round_max_attempts"] = int(
+                advanced_round_state.get("max_attempts") or state.get("ml_improvement_round_max_attempts", 3) or 3
+            )
+            handoff = (
+                copy.deepcopy(state.get("iteration_handoff"))
+                if isinstance(state.get("iteration_handoff"), dict)
+                else {}
+            )
+            if handoff:
+                round_state_for_handoff = dict(state if isinstance(state, dict) else {})
+                round_state_for_handoff["metric_round_state"] = advanced_round_state
+                handoff["metric_round_context"] = _build_metric_round_handoff_context(round_state_for_handoff)
+                optimization_lane = (
+                    dict(handoff.get("optimization_lane"))
+                    if isinstance(handoff.get("optimization_lane"), dict)
+                    else {}
+                )
+                optimization_lane["resume_after_repair"] = True
+                optimization_lane["same_round_same_hypothesis"] = True
+                handoff["optimization_lane"] = optimization_lane
+                result["iteration_handoff"] = handoff
+            round_id = int(advanced_round_state.get("round_id") or state.get("ml_improvement_current_round_id", 0) or 0)
+            current_history.append(
+                "METRIC_ROUND_RETRY: "
+                + f"round={round_id} "
+                + f"attempt={int(advanced_round_state.get('candidate_attempt_index') or 1)}/{int(advanced_round_state.get('max_attempts') or 3)} "
+                + "same_hypothesis=true"
+            )
+            route_reason = "metric_round_same_hypothesis_repair"
 
     route = "replan" if bool(result.get("strategy_reselected")) else "engineer"
     current_history.append(f"RETRY_ROUTE_DECISION: {route} (reason={route_reason})")
@@ -27990,10 +28282,16 @@ def run_review_board(state: AgentState) -> AgentState:
             optimization_context = state.get("ml_optimization_context")
             if isinstance(optimization_context, dict) and optimization_context:
                 iteration_handoff["optimization_context"] = optimization_context
+        metric_round_context = _build_metric_round_handoff_context(state)
+        if metric_round_context:
+            iteration_handoff["metric_round_context"] = metric_round_context
     else:
         iteration_handoff["source"] = "review_board"
         iteration_handoff["mode"] = str(iteration_handoff.get("mode") or "patch").strip().lower() or "patch"
         iteration_handoff["patch_objectives"] = patch_objectives
+        metric_round_context = _build_metric_round_handoff_context(state)
+        if metric_round_context:
+            iteration_handoff["metric_round_context"] = metric_round_context
     if final_status == "NEEDS_IMPROVEMENT" and blocking_retry and repair_focus:
         iteration_handoff = _apply_repair_first_handoff(
             iteration_handoff,
@@ -28255,6 +28553,22 @@ def check_execution_status(state: AgentState):
                 + f"root_cause={runtime_root_cause[:120]} streak={predicted_streak} limit={repeat_limit}"
             )
             return "failed_runtime"
+        if bool(state.get("ml_improvement_round_active")):
+            metric_round_state = _load_metric_round_state(state if isinstance(state, dict) else {})
+            current_round_attempt = int(metric_round_state.get("candidate_attempt_index") or 1)
+            max_round_attempts = int(metric_round_state.get("max_attempts") or 3)
+            next_round_attempt = current_round_attempt + 1
+            if current_round_attempt < max_round_attempts:
+                print(
+                    "Metric-round runtime error detected "
+                    f"(Attempt {next_round_attempt}/{max_round_attempts}). Preparing candidate repair."
+                )
+                return "retry_fix"
+            print(
+                "Metric-round runtime error detected "
+                f"(Attempt {current_round_attempt}/{max_round_attempts}). Max candidate repairs reached."
+            )
+            return "failed_runtime"
         max_runtime_fixes = int(state.get("max_runtime_fix_attempts", 3))
         next_attempt = runtime_fix_count + 1
         if runtime_fix_count < max_runtime_fixes:
@@ -28274,6 +28588,26 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     fix_attempt = base_fix_count if terminal_fix else base_fix_count + 1
     max_runtime_fixes = int(state.get("max_runtime_fix_attempts", 3))
     terminal_reason = str(state.get("runtime_fix_terminal_reason") or "").strip().lower()
+    metric_round_active = bool(state.get("ml_improvement_round_active"))
+    metric_round_state = _load_metric_round_state(state if isinstance(state, dict) else {})
+    metric_round_next_state: Dict[str, Any] = {}
+    if metric_round_active and isinstance(metric_round_state, dict) and metric_round_state:
+        current_round_attempt = int(metric_round_state.get("candidate_attempt_index") or 1)
+        max_round_attempts = int(metric_round_state.get("max_attempts") or 3)
+        next_round_attempt = min(max_round_attempts, current_round_attempt + (0 if terminal_fix else 1))
+        candidate_block = (
+            metric_round_state.get("candidate")
+            if isinstance(metric_round_state.get("candidate"), dict)
+            else {}
+        )
+        candidate_block = dict(candidate_block)
+        candidate_block["status"] = "runtime_failed_terminal" if terminal_fix else "runtime_failed"
+        metric_round_next_state = copy.deepcopy(metric_round_state)
+        metric_round_next_state["candidate_attempt_index"] = int(next_round_attempt)
+        metric_round_next_state["repairs_remaining"] = int(max(0, max_round_attempts - next_round_attempt))
+        metric_round_next_state["candidate"] = candidate_block
+        if terminal_fix:
+            metric_round_next_state["status"] = "failed"
     output_contract_report = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
     missing_outputs = _normalize_handoff_items(output_contract_report.get("missing"), max_items=12, max_len=180)
     runtime_details = _classify_runtime_failure_details(
@@ -28584,6 +28918,15 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
         "runtime_iterations": ledger_state.get("runtime_iterations"),
         "metric_iterations": ledger_state.get("metric_iterations", state.get("metric_iterations", 0)),
         "ml_journal_written_ids": written_ids,
+        "metric_round_state": metric_round_next_state if metric_round_next_state else state.get("metric_round_state"),
+        "ml_improvement_candidate_attempt_index": int(
+            (metric_round_next_state.get("candidate_attempt_index") if isinstance(metric_round_next_state, dict) else state.get("ml_improvement_candidate_attempt_index"))
+            or 0
+        ),
+        "ml_improvement_round_max_attempts": int(
+            (metric_round_next_state.get("max_attempts") if isinstance(metric_round_next_state, dict) else state.get("ml_improvement_round_max_attempts"))
+            or 3
+        ),
     }
 
 def finalize_runtime_failure(state: AgentState) -> AgentState:
@@ -30373,6 +30716,30 @@ def _build_incumbent_brief(
     return brief
 
 
+def _resolve_metric_round_previous_code(state: Dict[str, Any]) -> str | None:
+    if not isinstance(state, dict) or not bool(state.get("ml_improvement_round_active")):
+        return None
+    metric_round_state = _load_metric_round_state(state)
+    candidate = (
+        metric_round_state.get("candidate")
+        if isinstance(metric_round_state.get("candidate"), dict)
+        else {}
+    )
+    candidate_attempt_index = int(metric_round_state.get("candidate_attempt_index") or 0)
+    candidate_code = str(candidate.get("generated_code") or "").strip()
+    if candidate_attempt_index > 1 and candidate_code:
+        return candidate_code
+    incumbent_bundle = _load_incumbent_bundle(state)
+    incumbent_code = str(incumbent_bundle.get("generated_code") or "").strip()
+    if incumbent_code:
+        return incumbent_code
+    baseline_code = str(state.get("ml_improvement_round_baseline_generated_code") or "").strip()
+    if baseline_code:
+        return baseline_code
+    fallback_code = str(state.get("generated_code") or state.get("last_generated_code") or "").strip()
+    return fallback_code or None
+
+
 def _build_metric_improvement_patch_objectives(hypothesis_packet: Dict[str, Any]) -> List[str]:
     hypothesis_packet = hypothesis_packet if isinstance(hypothesis_packet, dict) else {}
     hypothesis = hypothesis_packet.get("hypothesis") if isinstance(hypothesis_packet.get("hypothesis"), dict) else {}
@@ -30752,6 +31119,49 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     if isinstance(merged_index, list) and merged_index:
         state["artifact_index"] = merged_index
         state["produced_artifact_index"] = merged_index
+    incumbent_entry = (
+        metric_loop_state.get("incumbent")
+        if isinstance(metric_loop_state.get("incumbent"), dict)
+        else {}
+    )
+    incumbent_snapshot = (
+        incumbent_entry.get("artifact_snapshot")
+        if isinstance(incumbent_entry.get("artifact_snapshot"), dict)
+        else {}
+    )
+    existing_incumbent_bundle = _load_incumbent_bundle(state)
+    baseline_code = str(
+        existing_incumbent_bundle.get("generated_code")
+        or state.get("generated_code")
+        or state.get("last_generated_code")
+        or ""
+    )
+    incumbent_bundle = _build_incumbent_bundle(
+        state=state,
+        round_id=max(0, int(round_id) - 1),
+        source="metric_round_incumbent",
+        generated_code=baseline_code,
+        last_generated_code=str(
+            existing_incumbent_bundle.get("last_generated_code")
+            or state.get("last_generated_code")
+            or baseline_code
+            or ""
+        ),
+        metrics_payload=baseline_metrics if isinstance(baseline_metrics, dict) else {},
+        metric_name=metric_name,
+        metric_value=baseline_value,
+        metrics_path=metrics_path,
+        review_verdict=normalize_review_status(state.get("review_verdict")),
+        artifact_snapshot=incumbent_snapshot,
+    )
+    state["incumbent_bundle"] = incumbent_bundle
+    merged_index = _persist_incumbent_bundle(
+        incumbent_bundle,
+        existing_index=state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else state.get("produced_artifact_index"),
+    )
+    if isinstance(merged_index, list) and merged_index:
+        state["artifact_index"] = merged_index
+        state["produced_artifact_index"] = merged_index
     if run_id:
         try:
             log_run_event(
@@ -30778,7 +31188,6 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     if not isinstance(feature_engineering_plan, dict):
         feature_engineering_plan = {"techniques": [], "derived_columns": [], "notes": ""}
 
-    baseline_code = str(state.get("generated_code") or state.get("last_generated_code") or "")
     advisor_context = {
         "baseline_metrics": baseline_metrics,
         "primary_metric_name": metric_name,
@@ -30915,6 +31324,31 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         feature_engineering_plan=feature_engineering_plan,
         tracker_entries=tracker_entries,
     )
+    metric_round_state = _build_metric_round_state(
+        round_id=int(round_id),
+        round_base_incumbent_id=str(incumbent_bundle.get("incumbent_id") or ""),
+        hypothesis_packet=hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
+        candidate_attempt_index=1,
+        max_attempts=3,
+        status="active",
+        candidate_code="",
+        candidate_status="pending",
+    )
+    state["metric_round_state"] = metric_round_state
+    state["ml_improvement_round_base_incumbent_id"] = str(
+        metric_round_state.get("round_base_incumbent_id") or ""
+    )
+    state["ml_improvement_candidate_attempt_index"] = int(
+        metric_round_state.get("candidate_attempt_index") or 1
+    )
+    state["ml_improvement_round_max_attempts"] = int(metric_round_state.get("max_attempts") or 3)
+    merged_index = _persist_metric_round_state(
+        metric_round_state,
+        existing_index=state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else state.get("produced_artifact_index"),
+    )
+    if isinstance(merged_index, list) and merged_index:
+        state["artifact_index"] = merged_index
+        state["produced_artifact_index"] = merged_index
     # --- Monotonic degradation detection ---
     degradation_threshold = float(os.environ.get("OPT_DEGRADATION_THRESHOLD", "0.0"))
     degradation_info = _detect_monotonic_degradation(
@@ -31335,10 +31769,15 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         else {}
     )
     state["ml_improvement_round_baseline_generated_code"] = str(
-        state.get("generated_code") or ""
+        incumbent_bundle.get("generated_code") or baseline_code or state.get("generated_code") or ""
     )
     state["ml_improvement_round_baseline_last_generated_code"] = str(
-        state.get("last_generated_code") or state.get("generated_code") or ""
+        incumbent_bundle.get("last_generated_code")
+        or state.get("last_generated_code")
+        or incumbent_bundle.get("generated_code")
+        or baseline_code
+        or state.get("generated_code")
+        or ""
     )
     state["ml_improvement_round_baseline_gate_context"] = (
         copy.deepcopy(state.get("last_successful_gate_context"))
@@ -31965,6 +32404,68 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         force_finalize_reason=force_finalize_reason if force_finalize else "",
         round_history=round_history,
     )
+    incumbent_bundle = _build_incumbent_bundle(
+        state=state if isinstance(state, dict) else {},
+        round_id=int(round_id if improved else max(0, int(round_id) - 1)),
+        source="candidate_kept" if improved else "restored_round_baseline",
+        generated_code=(
+            str(state.get("generated_code") or state.get("last_generated_code") or "")
+            if improved
+            else str(
+                state.get("ml_improvement_round_baseline_generated_code")
+                or state.get("ml_improvement_round_baseline_last_generated_code")
+                or (_load_incumbent_bundle(state).get("generated_code") if isinstance(_load_incumbent_bundle(state), dict) else "")
+                or ""
+            )
+        ),
+        last_generated_code=(
+            str(state.get("last_generated_code") or state.get("generated_code") or "")
+            if improved
+            else str(
+                state.get("ml_improvement_round_baseline_last_generated_code")
+                or state.get("ml_improvement_round_baseline_generated_code")
+                or ""
+            )
+        ),
+        metrics_payload=final_metrics_payload if isinstance(final_metrics_payload, dict) else {},
+        metric_name=metric_name,
+        metric_value=final_metric_value,
+        metrics_path=final_metrics_path,
+        review_verdict=(state.get("review_verdict") if improved else baseline_verdict),
+        artifact_snapshot=final_metrics_snapshot,
+    )
+    state["incumbent_bundle"] = incumbent_bundle
+    finalized_round_state = _load_metric_round_state(state if isinstance(state, dict) else {})
+    if not isinstance(finalized_round_state, dict) or not finalized_round_state:
+        finalized_round_state = _build_metric_round_state(
+            round_id=int(round_id),
+            round_base_incumbent_id=str(incumbent_bundle.get("incumbent_id") or ""),
+            candidate_attempt_index=1,
+            max_attempts=3,
+            status="promoted" if improved else "discarded",
+        )
+    finalized_round_state = copy.deepcopy(finalized_round_state)
+    finalized_round_state["status"] = "promoted" if improved else "discarded"
+    finalized_round_state["repairs_remaining"] = int(
+        max(0, int(finalized_round_state.get("max_attempts") or 3) - int(finalized_round_state.get("candidate_attempt_index") or 1))
+    )
+    candidate_block = (
+        finalized_round_state.get("candidate")
+        if isinstance(finalized_round_state.get("candidate"), dict)
+        else {}
+    )
+    candidate_block = dict(candidate_block)
+    candidate_block["status"] = "promoted" if improved else "discarded"
+    candidate_block["generated_code"] = str(state.get("generated_code") or state.get("last_generated_code") or candidate_block.get("generated_code") or "")
+    finalized_round_state["candidate"] = candidate_block
+    state["metric_round_state"] = finalized_round_state
+    state["ml_improvement_round_base_incumbent_id"] = str(
+        finalized_round_state.get("round_base_incumbent_id") or ""
+    )
+    state["ml_improvement_candidate_attempt_index"] = int(
+        finalized_round_state.get("candidate_attempt_index") or 1
+    )
+    state["ml_improvement_round_max_attempts"] = int(finalized_round_state.get("max_attempts") or 3)
     hypothesis_packet_for_round = (
         state.get("ml_improvement_hypothesis_packet")
         if isinstance(state.get("ml_improvement_hypothesis_packet"), dict)
@@ -32122,6 +32623,20 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
     _sync_metric_loop_legacy_fields(state, finalized_metric_loop_state)
     merged_index = _persist_metric_loop_state(
         finalized_metric_loop_state,
+        existing_index=state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else state.get("produced_artifact_index"),
+    )
+    if isinstance(merged_index, list) and merged_index:
+        state["artifact_index"] = merged_index
+        state["produced_artifact_index"] = merged_index
+    merged_index = _persist_incumbent_bundle(
+        incumbent_bundle,
+        existing_index=state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else state.get("produced_artifact_index"),
+    )
+    if isinstance(merged_index, list) and merged_index:
+        state["artifact_index"] = merged_index
+        state["produced_artifact_index"] = merged_index
+    merged_index = _persist_metric_round_state(
+        finalized_round_state,
         existing_index=state.get("artifact_index") if isinstance(state.get("artifact_index"), list) else state.get("produced_artifact_index"),
     )
     if isinstance(merged_index, list) and merged_index:

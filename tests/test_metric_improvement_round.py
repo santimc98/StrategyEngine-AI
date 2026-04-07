@@ -26,6 +26,7 @@ from src.graph.graph import (
     _snapshot_ml_outputs,
     _restore_ml_outputs,
     _evaluate_metric_round_hypothesis_application,
+    retry_handler,
 )
 from src.graph import graph as graph_mod
 from src.utils.governance import build_run_summary
@@ -184,6 +185,15 @@ def test_bootstrap_metric_improvement_round_supports_nested_metric_aliases(tmp_p
     assert state.get("ml_improvement_round_baseline_metric") == pytest.approx(0.9160376006743025, abs=1e-12)
     assert state.get("ml_improvement_round_baseline_generated_code") == "def train():\n    return None\n"
     assert state.get("ml_improvement_round_baseline_last_generated_code") == "def train():\n    return None\n"
+    incumbent_bundle = state.get("incumbent_bundle") if isinstance(state.get("incumbent_bundle"), dict) else {}
+    assert incumbent_bundle.get("generated_code") == "def train():\n    return None\n"
+    assert incumbent_bundle.get("metric_value") == pytest.approx(0.9160376006743025, abs=1e-12)
+    round_state = state.get("metric_round_state") if isinstance(state.get("metric_round_state"), dict) else {}
+    assert round_state.get("candidate_attempt_index") == 1
+    assert round_state.get("max_attempts") == 3
+    assert round_state.get("round_base_incumbent_id") == incumbent_bundle.get("incumbent_id")
+    assert Path("data/incumbent_bundle.json").exists()
+    assert Path("data/metric_round_state.json").exists()
     handoff = state.get("iteration_handoff", {})
     assert handoff.get("optimization_focus", {}).get("primary_metric_name") == "ROC-AUC"
 
@@ -312,6 +322,85 @@ def test_restore_metric_round_baseline_state_realigns_final_governance(tmp_path,
     assert state["review_board_verdict"]["deterministic_blockers"] == []
     assert summary["status"] == "APPROVED"
     assert summary["run_outcome"] == "GO"
+
+
+def test_check_execution_status_metric_round_uses_local_attempt_budget() -> None:
+    retry_state = {
+        "execution_output": "Traceback (most recent call last)\nValueError: boom",
+        "runtime_fix_count": 0,
+        "ml_improvement_round_active": True,
+        "metric_round_state": {
+            "candidate_attempt_index": 1,
+            "max_attempts": 3,
+        },
+    }
+    assert graph_mod.check_execution_status(retry_state) == "retry_fix"
+
+    terminal_state = {
+        "execution_output": "Traceback (most recent call last)\nValueError: boom",
+        "runtime_fix_count": 0,
+        "ml_improvement_round_active": True,
+        "metric_round_state": {
+            "candidate_attempt_index": 3,
+            "max_attempts": 3,
+        },
+    }
+    assert graph_mod.check_execution_status(terminal_state) == "failed_runtime"
+
+
+def test_retry_handler_advances_metric_round_attempt_and_preserves_hypothesis_context() -> None:
+    state = {
+        "feedback_history": [],
+        "review_verdict": "NEEDS_IMPROVEMENT",
+        "ml_improvement_round_active": True,
+        "last_gate_context": {
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Fix the candidate implementation."],
+            "hard_failures": ["runtime_failure"],
+        },
+        "iteration_handoff": {
+            "optimization_lane": {
+                "active": True,
+                "resume_after_repair": False,
+            },
+            "hypothesis_packet": {
+                "action": "APPLY",
+                "hypothesis": {"technique": "feature_interactions"},
+                "tracker_context": {"signature": "sig_r1"},
+            },
+        },
+        "metric_round_state": {
+            "schema_version": "v1",
+            "round_id": 1,
+            "status": "active",
+            "round_base_incumbent_id": "incumbent_r0_metric_round_incumbent",
+            "candidate_attempt_index": 1,
+            "max_attempts": 3,
+            "repairs_remaining": 2,
+            "active_hypothesis": {
+                "action": "APPLY",
+                "signature": "sig_r1",
+                "technique": "feature_interactions",
+            },
+            "candidate": {"status": "pending", "generated_code": "print('candidate')\n"},
+        },
+        "incumbent_bundle": {
+            "incumbent_id": "incumbent_r0_metric_round_incumbent",
+            "generated_code": "print('baseline')\n",
+        },
+    }
+
+    updates = retry_handler(state)
+
+    round_state = updates.get("metric_round_state") if isinstance(updates.get("metric_round_state"), dict) else {}
+    assert round_state.get("candidate_attempt_index") == 2
+    assert round_state.get("repairs_remaining") == 1
+    assert round_state.get("candidate", {}).get("status") == "review_or_board_repair_pending"
+    handoff = updates.get("iteration_handoff") if isinstance(updates.get("iteration_handoff"), dict) else {}
+    metric_round_context = handoff.get("metric_round_context") if isinstance(handoff.get("metric_round_context"), dict) else {}
+    assert metric_round_context.get("same_round_same_hypothesis") is True
+    assert metric_round_context.get("candidate_attempt_index") == 2
+    assert metric_round_context.get("active_hypothesis", {}).get("signature") == "sig_r1"
 
 
 def test_bootstrap_metric_round_active_gates_context_excludes_baseline_only_gates(tmp_path, monkeypatch) -> None:
@@ -822,6 +911,9 @@ def test_finalize_round_restores_baseline_when_review_board_rejects_candidate(tm
     assert state["generated_code"] == "print('baseline incumbent')\n"
     assert state["last_generated_code"] == "print('baseline incumbent')\n"
     assert state["last_successful_generated_code"] == "print('baseline incumbent')\n"
+    incumbent_bundle = state.get("incumbent_bundle") if isinstance(state.get("incumbent_bundle"), dict) else {}
+    assert incumbent_bundle.get("generated_code") == "print('baseline incumbent')\n"
+    assert incumbent_bundle.get("metric_value") == pytest.approx(0.8000, abs=1e-12)
     assert json.loads(metrics_path.read_text(encoding="utf-8"))["roc_auc"] == pytest.approx(0.8000, abs=1e-12)
 
 
@@ -918,6 +1010,8 @@ def test_finalize_round_keeps_canonical_candidate_when_advisor_delta_signal_is_w
     assert selection.get("advisor_meets_min_delta") is False
     assert final_entry.get("label") == "candidate"
     assert final_entry.get("metric_value") == pytest.approx(0.330041811925438, abs=1e-12)
+    incumbent_bundle = state.get("incumbent_bundle") if isinstance(state.get("incumbent_bundle"), dict) else {}
+    assert incumbent_bundle.get("metric_value") == pytest.approx(0.330041811925438, abs=1e-12)
     synced_payload = state.get("review_board_verdict") if isinstance(state.get("review_board_verdict"), dict) else {}
     finalization = synced_payload.get("metric_round_finalization") if isinstance(synced_payload.get("metric_round_finalization"), dict) else {}
     assert finalization.get("kept") == "candidate"
