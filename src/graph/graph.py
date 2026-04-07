@@ -11250,6 +11250,11 @@ def _normalize_feedback_record_payload(record: Dict[str, Any] | None) -> Dict[st
         "hard_failures": [str(x) for x in (record.get("hard_failures") or []) if x],
         "runtime_error_tail": str(record.get("runtime_error_tail") or ""),
         "evidence": _normalize_handoff_evidence(record.get("evidence"), max_items=10),
+        "retry_context": record.get("retry_context") if isinstance(record.get("retry_context"), dict) else {},
+        "repair_ground_truth": (
+            record.get("repair_ground_truth") if isinstance(record.get("repair_ground_truth"), dict) else {}
+        ),
+        "repair_scope": record.get("repair_scope") if isinstance(record.get("repair_scope"), dict) else {},
     }
     normalized["failed_gates"] = list(dict.fromkeys(normalized["failed_gates"]))[:20]
     normalized["required_fixes"] = list(dict.fromkeys(normalized["required_fixes"]))[:20]
@@ -11338,6 +11343,9 @@ def _set_latest_feedback_record(
     hard_failures: List[str] | None = None,
     runtime_error_tail: str = "",
     evidence: List[Dict[str, str]] | None = None,
+    retry_context: Dict[str, Any] | None = None,
+    repair_ground_truth: Dict[str, Any] | None = None,
+    repair_scope: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     record = _normalize_feedback_record_payload(
         {
@@ -11351,6 +11359,9 @@ def _set_latest_feedback_record(
             "hard_failures": hard_failures or [],
             "runtime_error_tail": runtime_error_tail,
             "evidence": evidence or [],
+            "retry_context": retry_context if isinstance(retry_context, dict) else {},
+            "repair_ground_truth": repair_ground_truth if isinstance(repair_ground_truth, dict) else {},
+            "repair_scope": repair_scope if isinstance(repair_scope, dict) else {},
         }
     )
     if not record:
@@ -11407,6 +11418,9 @@ def _merge_de_override_with_feedback_record(
     hard_failures: List[str] | None = None,
     runtime_error_tail: str = "",
     evidence: List[Dict[str, str]] | None = None,
+    retry_context: Dict[str, Any] | None = None,
+    repair_ground_truth: Dict[str, Any] | None = None,
+    repair_scope: Dict[str, Any] | None = None,
 ) -> None:
     merged = _merge_de_audit_override(base_override, payload)
     de_record = _set_latest_feedback_record(
@@ -11421,6 +11435,9 @@ def _merge_de_override_with_feedback_record(
         hard_failures=[str(x) for x in (hard_failures or []) if str(x).strip()],
         runtime_error_tail=str(runtime_error_tail or "")[:1400],
         evidence=_normalize_handoff_evidence(evidence, max_items=8),
+        retry_context=retry_context if isinstance(retry_context, dict) else {},
+        repair_ground_truth=repair_ground_truth if isinstance(repair_ground_truth, dict) else {},
+        repair_scope=repair_scope if isinstance(repair_scope, dict) else {},
     )
     if de_record:
         merged = _merge_de_audit_override(merged, _build_latest_feedback_record_block(de_record))
@@ -20962,7 +20979,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 )
                     except Exception as explainer_err:
                         print(f"Warning: heavy-runner DE failure explainer failed: {explainer_err}")
-                    payload, _, _, _ = _append_data_engineer_structured_repair_context(
+                    payload, retry_context, repair_ground_truth, repair_scope = _append_data_engineer_structured_repair_context(
                         payload,
                         state=state,
                         runtime_output=runtime_error_text,
@@ -21008,6 +21025,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 "source": "heavy_runner_error",
                             }
                         ],
+                        retry_context=retry_context,
+                        repair_ground_truth=repair_ground_truth,
+                        repair_scope=repair_scope,
                     )
                     print("Runtime error guard (heavy runner code): retrying Data Engineer with error context.")
                     if run_id:
@@ -21550,7 +21570,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
                                 except Exception:
                                     pass
-                                payload, _, _, _ = _append_data_engineer_structured_repair_context(
+                                payload, retry_context, repair_ground_truth, repair_scope = _append_data_engineer_structured_repair_context(
                                     payload,
                                     state=state,
                                     runtime_output=error_details,
@@ -21596,6 +21616,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             "source": "sandbox_error",
                                         }
                                     ],
+                                    retry_context=retry_context,
+                                    repair_ground_truth=repair_ground_truth,
+                                    repair_scope=repair_scope,
                                 )
                                 print("Runtime error guard: retrying Data Engineer with error context.")
                                 if run_id:
@@ -22493,7 +22516,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         )
                                         if len(gate_evidence_items) >= 8:
                                             break
-                                payload, _, _, _ = _append_data_engineer_structured_repair_context(
+                                payload, retry_context, repair_ground_truth, repair_scope = _append_data_engineer_structured_repair_context(
                                     payload,
                                     state=state,
                                     runtime_output=str(review_result.get("feedback") or ""),
@@ -22523,6 +22546,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     runtime_error_tail=str(review_result.get("feedback") or "")[-1400:],
                                     evidence=gate_evidence_items
                                     or [{"claim": "Cleaning reviewer rejected DE output.", "source": "cleaning_reviewer_report.json"}],
+                                    retry_context=retry_context,
+                                    repair_ground_truth=repair_ground_truth,
+                                    repair_scope=repair_scope,
                                 )
                                 print("Cleaning reviewer rejected output: retrying Data Engineer with guidance.")
                                 return run_data_engineer(new_state)

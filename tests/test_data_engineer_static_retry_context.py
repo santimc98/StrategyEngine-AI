@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("OPENROUTER_API_KEY", "test-key")
+
 from src.graph import graph as graph_module
 from src.utils.run_bundle import init_run_bundle
 
@@ -98,3 +102,34 @@ def test_failure_explainer_fix_hints_are_promoted_to_runtime_required_fixes():
 
     assert any("_dedup_group_key" in item for item in hints)
     assert any("minimal diagnostic" in item.lower() for item in hints)
+
+
+def test_merge_de_feedback_record_preserves_structured_repair_context():
+    state = {}
+
+    graph_module._merge_de_override_with_feedback_record(
+        state,
+        base_override="RUNTIME_ERROR_CONTEXT:\nValueError: arr_current parse coverage below threshold",
+        payload="RUNTIME_ERROR_CONTEXT:\nValueError: arr_current parse coverage below threshold",
+        source="runtime_retry",
+        status="REJECTED",
+        iteration=2,
+        feedback="Repair arr_current without regressing snapshot parsing.",
+        failed_gates=["runtime_failure"],
+        required_fixes=["Patch arr_current mixed-format normalization only."],
+        hard_failures=["runtime_failure"],
+        runtime_error_tail="ValueError: arr_current parse coverage below threshold",
+        retry_context={"error_type": "runtime_error", "repair_focus": "runtime"},
+        repair_ground_truth={
+            "root_cause_type": "runtime_error",
+            "causal_deltas": [{"kind": "mixed_format_input", "column": "arr_current"}],
+            "repair_goal": ["Repair arr_current only."],
+            "stable_regions": ["parse_logic:snapshot_month_end"],
+        },
+        repair_scope={"phase": "compliance_runtime", "protected_regions": ["parse_logic:snapshot_month_end"]},
+    )
+
+    record = state["data_engineer_feedback_record"]
+    assert record["retry_context"]["repair_focus"] == "runtime"
+    assert record["repair_ground_truth"]["causal_deltas"][0]["column"] == "arr_current"
+    assert record["repair_scope"]["protected_regions"] == ["parse_logic:snapshot_month_end"]

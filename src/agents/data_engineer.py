@@ -5,7 +5,7 @@ import json
 import logging
 import csv
 import warnings
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 from src.utils.code_extract import extract_code_block
 from src.utils.contract_accessors import (
@@ -509,6 +509,11 @@ class DataEngineerAgent:
             "hard_failures": [str(x) for x in (record.get("hard_failures") or []) if str(x).strip()],
             "runtime_error_tail": str(record.get("runtime_error_tail") or ""),
             "evidence": record.get("evidence") if isinstance(record.get("evidence"), list) else [],
+            "retry_context": record.get("retry_context") if isinstance(record.get("retry_context"), dict) else {},
+            "repair_ground_truth": (
+                record.get("repair_ground_truth") if isinstance(record.get("repair_ground_truth"), dict) else {}
+            ),
+            "repair_scope": record.get("repair_scope") if isinstance(record.get("repair_scope"), dict) else {},
         }
         normalized["failed_gates"] = list(dict.fromkeys(normalized["failed_gates"]))[:12]
         normalized["required_fixes"] = list(dict.fromkeys(normalized["required_fixes"]))[:12]
@@ -679,10 +684,23 @@ class DataEngineerAgent:
         lines.append("---")
         return "\n".join(lines)
 
-    def _extract_structured_repair_context(self, data_audit: str) -> Dict[str, Any]:
+    def _extract_structured_repair_context(
+        self,
+        data_audit: str,
+        feedback_record: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         retry_context = self._extract_json_after_marker(data_audit, "RETRY_CONTEXT_JSON:")
         repair_ground_truth = self._extract_json_after_marker(data_audit, "REPAIR_GROUND_TRUTH_JSON:")
         repair_scope = self._extract_json_after_marker(data_audit, "REPAIR_SCOPE_JSON:")
+        if not isinstance(retry_context, dict) or not retry_context:
+            candidate = feedback_record.get("retry_context") if isinstance(feedback_record, dict) else {}
+            retry_context = candidate if isinstance(candidate, dict) else {}
+        if not isinstance(repair_ground_truth, dict) or not repair_ground_truth:
+            candidate = feedback_record.get("repair_ground_truth") if isinstance(feedback_record, dict) else {}
+            repair_ground_truth = candidate if isinstance(candidate, dict) else {}
+        if not isinstance(repair_scope, dict) or not repair_scope:
+            candidate = feedback_record.get("repair_scope") if isinstance(feedback_record, dict) else {}
+            repair_scope = candidate if isinstance(candidate, dict) else {}
         rethink_required = bool(
             (isinstance(repair_ground_truth, dict) and repair_ground_truth.get("rethink_required"))
             or "RETHINK_MODE:" in str(data_audit or "")
@@ -708,7 +726,7 @@ class DataEngineerAgent:
         current_attempt: int = 1,
     ) -> Dict[str, Any]:
         normalized = self._normalize_feedback_record(feedback_record, data_audit)
-        structured = self._extract_structured_repair_context(data_audit)
+        structured = self._extract_structured_repair_context(data_audit, normalized)
         retry_context_payload = structured.get("retry_context") if isinstance(structured.get("retry_context"), dict) else {}
         repair_ground_truth = (
             structured.get("repair_ground_truth") if isinstance(structured.get("repair_ground_truth"), dict) else {}
@@ -853,6 +871,131 @@ class DataEngineerAgent:
         except Exception:
             return []
 
+    @staticmethod
+    def _normalize_numeric_like_token(raw_value: Any) -> Optional[float]:
+        token = str(raw_value or "").strip()
+        if not token:
+            return None
+        lowered = token.lower()
+        if lowered in {"nan", "none", "null", "<na>", "n/a", "na"}:
+            return None
+
+        negative = False
+        if token.startswith("(") and token.endswith(")"):
+            negative = True
+            token = token[1:-1].strip()
+
+        percent = token.endswith("%")
+        if percent:
+            token = token[:-1].strip()
+
+        scale = 1.0
+        suffix_match = re.search(r"([kmb])\s*$", token, re.IGNORECASE)
+        if suffix_match:
+            scale = {"k": 1_000.0, "m": 1_000_000.0, "b": 1_000_000_000.0}.get(
+                suffix_match.group(1).lower(),
+                1.0,
+            )
+            token = token[: suffix_match.start()].strip()
+
+        token = token.replace("\u00a0", " ").replace(" ", "")
+        token = token.replace("'", "")
+        token = re.sub(
+            r"(?i)^(usd|eur|gbp|aud|cad|mxn|brl|inr|jpy|chf|sek|nok|dkk|sgd|hkd|zar|pln|nzd)",
+            "",
+            token,
+        )
+        token = re.sub(
+            r"(?i)(usd|eur|gbp|aud|cad|mxn|brl|inr|jpy|chf|sek|nok|dkk|sgd|hkd|zar|pln|nzd)$",
+            "",
+            token,
+        )
+        token = re.sub(r"[€$£¥₹₽₩₪₫₴₦]", "", token)
+
+        if "," in token and "." in token:
+            if re.search(r"\.\d{3},\d+$", token):
+                token = token.replace(".", "").replace(",", ".")
+            elif re.search(r",\d{3}\.\d+$", token):
+                token = token.replace(",", "")
+            else:
+                token = token.replace(",", "")
+        elif "," in token:
+            if token.count(",") == 1 and re.search(r",\d{1,4}$", token):
+                token = token.replace(",", ".")
+            else:
+                token = token.replace(",", "")
+        elif token.count(".") > 1:
+            if re.fullmatch(r"[-+]?\d{1,3}(?:\.\d{3})+", token):
+                token = token.replace(".", "")
+            else:
+                return None
+
+        token = re.sub(r"[^0-9+\-\.]", "", token)
+        if token in {"", "+", "-", ".", "+.", "-."}:
+            return None
+        try:
+            value = float(token)
+        except Exception:
+            return None
+        if percent:
+            value *= 0.01
+        value *= scale
+        if negative and value > 0:
+            value *= -1.0
+        return value
+
+    @staticmethod
+    def _build_format_family_hints(sample_values: List[str]) -> List[Dict[str, Any]]:
+        families: Dict[str, List[str]] = {}
+
+        def _record(label: str, example: str) -> None:
+            example = str(example or "").strip()
+            if not example:
+                return
+            bucket = families.setdefault(label, [])
+            if example not in bucket:
+                bucket.append(example)
+
+        for raw in sample_values:
+            value = str(raw or "").strip()
+            if not value:
+                continue
+            compact = value.replace("\u00a0", " ").strip()
+            lower = compact.lower()
+
+            if re.search(r"(?i)([€$£¥₹₽₩₪₫₴₦]|^(usd|eur|gbp|aud|cad|mxn|brl|inr|jpy|chf)\b|\b(usd|eur|gbp|aud|cad|mxn|brl|inr|jpy|chf)$)", compact):
+                _record("currency_symbol_or_code", value)
+            if re.search(r"(?i)\d[\d.,\s]*[kmb]\s*$", compact):
+                _record("magnitude_suffix", value)
+            if "%" in compact:
+                _record("percent_suffix", value)
+            if compact.startswith("(") and compact.endswith(")"):
+                _record("parentheses_negative", value)
+            if re.search(r"\d{1,3}(,\d{3})+(\.\d+)?", compact):
+                _record("thousands_comma", value)
+            if re.search(r"\d{1,3}(\.\d{3})+(,\d+)?", compact):
+                _record("thousands_dot", value)
+            if re.search(r"\d,\d", compact):
+                _record("decimal_comma", value)
+            if re.search(r"\d\.\d", compact):
+                _record("decimal_point", value)
+            if re.search(r"\d+\s*[-–]\s*\d+", compact):
+                _record("range_token", value)
+            if re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", compact):
+                _record("iso_like_date", value)
+            elif re.search(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", compact):
+                _record("day_or_month_first_date", value)
+            if re.search(r"\d{1,2}:\d{2}", compact):
+                _record("time_component", value)
+            if re.search(r"(utc|gmt|[+-]\d{2}:?\d{2}|z$)", lower):
+                _record("timezone_token", value)
+
+        return [
+            {"family": label, "examples": examples[:3]}
+            for label, examples in sorted(families.items())
+            if examples
+        ][:8]
+
     def _build_data_sample_context(
         self,
         input_path: str,
@@ -893,12 +1036,24 @@ class DataEngineerAgent:
                 series = df_full[col]
                 null_count = int(series.isna().sum())
                 non_null = series.dropna()
+                non_null_strings = [str(item).strip() for item in non_null.astype(str).head(200).tolist() if str(item).strip()]
                 n_unique = int(non_null.nunique())
                 profile: Dict[str, Any] = {
                     "null_pct": round(null_count / total_rows * 100, 1) if total_rows else 0,
                     "null_count": null_count,
                     "unique_count": n_unique,
                 }
+                sample_values: List[str] = []
+                for token in non_null_strings:
+                    if token not in sample_values:
+                        sample_values.append(token)
+                    if len(sample_values) >= 8:
+                        break
+                if sample_values:
+                    profile["example_values_sample"] = sample_values[:6]
+                format_family_hints = self._build_format_family_hints(non_null_strings[:40])
+                if format_family_hints:
+                    profile["format_family_hints"] = format_family_hints
 
                 # Top values with frequency (capped for prompt size)
                 if 0 < n_unique <= 30:
@@ -926,6 +1081,30 @@ class DataEngineerAgent:
                     unparsed_count = len(non_null) - len(numeric_valid)
                     if unparsed_count > 0:
                         profile["numeric_unparsed_count"] = unparsed_count
+                else:
+                    normalized_numeric_values = [
+                        self._normalize_numeric_like_token(item) for item in non_null_strings[:120]
+                    ]
+                    normalized_numeric_valid = [value for value in normalized_numeric_values if value is not None]
+                    if len(non_null_strings) > 0 and len(normalized_numeric_valid) >= max(3, int(len(non_null_strings[:120]) * 0.35)):
+                        profile["looks_numeric"] = True
+                        profile["numeric_format_requires_normalization"] = True
+                        profile["mixed_numeric_parse_rate_sample"] = round(
+                            len(normalized_numeric_valid) / max(len(non_null_strings[:120]), 1) * 100,
+                            1,
+                        )
+                        profile["numeric_min"] = float(min(normalized_numeric_valid))
+                        profile["numeric_max"] = float(max(normalized_numeric_valid))
+                        profile["numeric_mean"] = round(
+                            float(sum(normalized_numeric_valid) / len(normalized_numeric_valid)),
+                            4,
+                        )
+                        profile["numeric_examples_after_normalization"] = [
+                            round(float(item), 6) for item in normalized_numeric_valid[:4]
+                        ]
+                        unparsed_count = max(len(non_null_strings[:120]) - len(normalized_numeric_valid), 0)
+                        if unparsed_count > 0:
+                            profile["numeric_unparsed_count"] = unparsed_count
 
                 # Detect datetime-like columns
                 if not profile.get("looks_numeric"):
@@ -1553,7 +1732,8 @@ class DataEngineerAgent:
             "Then reason about the correct operation order for THIS specific dataset — "
             "use the column_profiles when available to decide: which columns need null handling "
             "(check null_pct), which look numeric vs datetime (check looks_numeric, looks_datetime), "
-            "what format patterns exist (check observed_format_patterns), and what the actual cardinality "
+            "what format patterns and raw format families exist (check observed_format_patterns, format_family_hints, "
+            "example_values_sample, numeric_format_requires_normalization), and what the actual cardinality "
             "and value distribution is (check unique_count, top_values). If DATA_SAMPLE_CONTEXT is unavailable, "
             "reason from COLUMN_RESOLUTION_CONTEXT and DATA AUDIT instead of guessing hidden raw patterns. "
             "Treat dtype targets as downstream goals that must be justified by evidence, not as blind coercion instructions. "
@@ -1601,7 +1781,8 @@ class DataEngineerAgent:
           Fix the verified deltas and the verified repair goal, not just the symptom wording.
         - Consult the column_profiles in DATA_SAMPLE_CONTEXT when available to verify your
           parsing approach matches the actual data patterns (null_pct, looks_datetime,
-          observed_format_patterns, looks_numeric). If the profile is unavailable, reason
+          observed_format_patterns, format_family_hints, example_values_sample,
+          looks_numeric, numeric_format_requires_normalization). If the profile is unavailable, reason
           from COLUMN_RESOLUTION_CONTEXT + DATA AUDIT and avoid unsupported assumptions.
         - Treat dtype targets as downstream goals to be reconciled with evidence, not as
           automatic permission for destructive coercion.

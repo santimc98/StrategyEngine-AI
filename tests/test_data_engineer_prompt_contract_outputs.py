@@ -460,6 +460,62 @@ def test_data_engineer_prompt_profiles_real_csv_while_preserving_remote_executio
     )
 
 
+def test_data_engineer_prompt_surfaces_mixed_numeric_format_families(tmp_path):
+    csv_path = tmp_path / "mixed_amounts.csv"
+    csv_path.write_text(
+        "arr_current;segment\n"
+        "\"EUR 279,981\";Enterprise\n"
+        "\"0.03m\";SMB\n"
+        "\"$278,656\";MidMarket\n"
+        "\"(3,400)\";SMB\n"
+        "\"12.5k\";Enterprise\n",
+        encoding="utf-8",
+    )
+    agent = DataEngineerAgent(api_key="fake")
+    execution_contract = {
+        "scope": "cleaning_only",
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer", "required": True},
+        ],
+    }
+    de_view = {
+        "required_columns": ["arr_current", "segment"],
+        "output_path": "artifacts/clean/dataset_cleaned.csv",
+        "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+        "cleaning_gates": [],
+        "column_dtype_targets": {
+            "arr_current": {"target_dtype": "float64"},
+            "segment": {"target_dtype": "object"},
+        },
+        "data_engineer_runbook": {"steps": ["profile", "resolve formats", "persist"]},
+    }
+
+    with patch(
+        "src.agents.data_engineer.call_chat_with_fallback",
+        return_value=(_mock_response("print('ok')"), "mock/model"),
+    ):
+        agent.generate_cleaning_script(
+            data_audit="audit",
+            strategy={"required_columns": ["arr_current", "segment"]},
+            input_path="data/raw.csv",
+            prompt_input_path=str(csv_path),
+            csv_sep=";",
+            execution_contract=execution_contract,
+            de_view=de_view,
+        )
+
+    prompt = agent.last_prompt or ""
+    _assert_contains_all(
+        prompt,
+        "format_family_hints",
+        "currency_symbol_or_code",
+        "magnitude_suffix",
+        "numeric_format_requires_normalization",
+        "0.03m",
+        "EUR 279,981",
+    )
+
+
 def test_data_engineer_prompt_treats_temporal_completeness_as_explicit_contractual_requirement():
     agent = DataEngineerAgent(api_key="fake")
     execution_contract = {
@@ -799,3 +855,80 @@ def test_data_engineer_repair_mode_promotes_failure_explainer_fix_and_compacts_e
     assert "ITERATION_FEEDBACK_CONTEXT:" not in repair_context
     assert "Runtime retry required after sandbox failure." in repair_context
     assert "print('patched')" in code
+
+
+def test_data_engineer_repair_prompt_uses_structured_feedback_record_fallback():
+    agent = DataEngineerAgent(api_key="fake")
+    execution_contract = {
+        "scope": "cleaning_only",
+        "required_outputs": [
+            {"path": "artifacts/clean/dataset_cleaned.csv", "owner": "data_engineer", "required": True},
+        ],
+    }
+    de_view = {
+        "scope": "cleaning_only",
+        "required_columns": ["arr_current", "snapshot_month_end"],
+        "output_path": "artifacts/clean/dataset_cleaned.csv",
+        "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+        "required_outputs": ["artifacts/clean/dataset_cleaned.csv"],
+        "cleaning_gates": [],
+        "data_engineer_runbook": {"steps": ["clean", "persist"]},
+    }
+    feedback_record = {
+        "agent": "data_engineer",
+        "source": "runtime_retry",
+        "status": "REJECTED",
+        "iteration": 2,
+        "feedback": "Repair arr_current without regressing snapshot parsing.",
+        "failed_gates": ["runtime_failure"],
+        "required_fixes": ["Patch arr_current mixed-format normalization only."],
+        "runtime_error_tail": "ValueError: arr_current parse coverage below threshold",
+        "retry_context": {
+            "error_type": "runtime_error",
+            "repair_focus": "runtime",
+            "specific_error": "arr_current parse coverage below threshold",
+        },
+        "repair_ground_truth": {
+            "root_cause_type": "runtime_error",
+            "repair_focus": "runtime",
+            "causal_deltas": [
+                {"kind": "mixed_format_input", "column": "arr_current"},
+            ],
+            "repair_goal": [
+                "Repair arr_current mixed-format normalization without touching already-working snapshot_month_end parsing.",
+            ],
+            "stable_regions": ["parse_logic:snapshot_month_end"],
+            "rethink_required": False,
+        },
+        "repair_scope": {
+            "phase": "compliance_runtime",
+            "protected_regions": ["parse_logic:snapshot_month_end"],
+        },
+    }
+
+    with patch(
+        "src.agents.data_engineer.call_chat_with_fallback",
+        return_value=(_mock_response("print('patched')"), "mock/model"),
+    ):
+        agent.generate_cleaning_script(
+            data_audit="RUNTIME_ERROR_CONTEXT:\nValueError: arr_current parse coverage below threshold",
+            strategy={"required_columns": ["arr_current", "snapshot_month_end"]},
+            input_path="data/raw.csv",
+            execution_contract=execution_contract,
+            de_view=de_view,
+            repair_mode=True,
+            previous_code="print('prev')",
+            feedback_record=feedback_record,
+        )
+
+    prompt = agent.last_prompt or ""
+    _assert_contains_all(
+        prompt,
+        "STRUCTURED_RETRY_CONTEXT_JSON",
+        "STRUCTURED_REPAIR_GROUND_TRUTH_JSON",
+        "STRUCTURED_REPAIR_SCOPE_JSON",
+        "arr_current",
+        "parse_logic:snapshot_month_end",
+        "mixed_format_input",
+    )
+    assert "Repair arr_current mixed-format normalization without touching already-working snapshot_month_end parsing." in prompt
