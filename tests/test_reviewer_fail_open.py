@@ -75,3 +75,46 @@ def test_reviewer_prompt_is_context_relative_not_recipe_driven():
     assert "generic preferred methodology from memory" in prompt
     assert "Baseline Check:" not in prompt
     assert '"Black Box" Neural Net is bad' not in prompt
+
+
+def test_reviewer_prompt_includes_hard_blocker_packet_for_restored_candidates():
+    reviewer = ReviewerAgent(api_key=None)
+
+    reviewer.review_code(
+        "\n".join(
+            [
+                "if int(holdout_mask.sum()) < 400:",
+                "    raise ValueError('holdout too small')",
+                "scored_output['churn_risk_score'] = baseline_model.predict_proba(X_score)[:, 1]",
+            ]
+        ),
+        business_objective="Mantener credibilidad del holdout y scoring operativo",
+        strategy_context="Usar el contexto de la run",
+        evaluation_spec={
+            "reviewer_gates": [
+                {
+                    "name": "temporal_validation_credibility",
+                    "severity": "HARD",
+                    "params": {"min_rows": 1000},
+                }
+            ],
+            "review_history_context": {
+                "best_attempt_restored_recently": True,
+                "feedback_history_tail": [
+                    "BEST_ATTEMPT_RESTORED[result_evaluator]: restored attempt 2 as authoritative state after a later degraded execution."
+                ],
+                "last_gate_context": {
+                    "failed_gates": ["temporal_validation_credibility"],
+                    "required_fixes": [
+                        "Use primary_model.predict_proba for scoring.",
+                    ],
+                },
+            },
+        },
+        reviewer_view={"subject_code_path_hint": "artifacts/ml_engineer_last.py"},
+    )
+
+    prompt = reviewer.last_prompt or ""
+    assert "HARD_BLOCKER_PACKET" in prompt
+    assert "best_attempt_restored_recently" in prompt
+    assert "baseline_model.predict_proba" in prompt

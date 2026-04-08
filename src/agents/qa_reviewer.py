@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 from src.utils.ml_plan_validation import validate_ml_plan_constraints
+from src.utils.review_context_packets import build_review_context_packet
 from src.utils.reviewer_response_schema import build_qa_response_schema
 from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
 from src.utils.metric_eval import (
@@ -1037,7 +1038,6 @@ class QAReviewerAgent:
         metric_round_context = _extract_metric_round_context(evaluation_spec)
         metric_round_active = bool(metric_round_context.get("metric_round_active"))
         augmentation_requested = bool(metric_round_context.get("augmentation_requested"))
-
         SYSTEM_PROMPT_TEMPLATE = """
         You are the Lead QA Engineer.
 
@@ -1127,6 +1127,7 @@ class QAReviewerAgent:
         - ACTIVE_QA_GATES (names only): $active_qa_gates
         - Execution Diagnostics (JSON): $execution_diagnostics_json
         - Deterministic Metric Facts (JSON, authoritative when present): $deterministic_metric_facts_json
+        - HARD_BLOCKER_PACKET (JSON): $hard_blocker_packet_json
         - Metric Improvement Round Active: $metric_round_active
         - Augmentation Requested (from hypothesis/plan): $augmentation_requested
         
@@ -1143,6 +1144,10 @@ class QAReviewerAgent:
         - If Deterministic Metric Facts provide a primary metric value, treat that as the authoritative metric evidence.
           Do not use stddev/variance fields as the primary metric unless the declared primary metric is explicitly a
           variability metric.
+        - Treat HARD_BLOCKER_PACKET as prioritized focus context, not as an automatic failure list.
+        - Before APPROVED or APPROVE_WITH_WARNINGS, re-check code_lines_of_interest against active_hard_gates_summary.
+        - If known_restored_candidate_risks is non-empty, explicitly verify those risks before approving a restored or recycled candidate.
+        - If you approve despite an item in HARD_BLOCKER_PACKET, explain why it is resolved or unsupported by evidence.
         - SELF-CHECK BEFORE FAILING ANY GATE: verify the gate name appears verbatim in ACTIVE_QA_GATES.
           If it does not, you MUST NOT include it in failed_gates or hard_failures — report it as a
           warning in feedback text only. The gate families above (1-8) are reasoning aids for active gates,
@@ -1168,6 +1173,16 @@ class QAReviewerAgent:
         execution_diagnostics = (evaluation_spec or {}).get("execution_diagnostics")
         if not isinstance(execution_diagnostics, dict):
             execution_diagnostics = {}
+        review_context_packet = build_review_context_packet(
+            code,
+            qa_gate_specs,
+            code_path_hint=subject_code_path_hint or "artifacts/ml_engineer_last.py",
+            context_blocks=[
+                evaluation_spec if isinstance(evaluation_spec, dict) else {},
+                execution_diagnostics,
+            ],
+        )
+        hard_blocker_packet_json = json.dumps(review_context_packet, indent=2, ensure_ascii=True)
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
             business_objective=business_objective,
@@ -1183,6 +1198,7 @@ class QAReviewerAgent:
             active_qa_gates=active_qa_gates_json,
             execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2, ensure_ascii=True),
             deterministic_metric_facts_json=json.dumps(deterministic_metric_prompt_facts, indent=2, ensure_ascii=True),
+            hard_blocker_packet_json=hard_blocker_packet_json,
             metric_round_active=str(metric_round_active).lower(),
             augmentation_requested=str(augmentation_requested).lower(),
             output_format_instructions=output_format_instructions,

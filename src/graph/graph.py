@@ -25003,6 +25003,45 @@ def _resolve_qa_subject_code(
     return ""
 
 
+def _build_review_history_context(state: Dict[str, Any] | None) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    history = [
+        str(item).strip()
+        for item in (state.get("feedback_history") or [])
+        if str(item).strip()
+    ]
+    history_tail = history[-8:]
+    last_gate_context = state.get("last_gate_context")
+    summary: Dict[str, Any] = {}
+    if isinstance(last_gate_context, dict):
+        summary = {
+            "source": str(last_gate_context.get("source") or "").strip(),
+            "status": str(last_gate_context.get("status") or "").strip(),
+            "failed_gates": [
+                str(item).strip()
+                for item in (last_gate_context.get("failed_gates") or [])[:8]
+                if str(item).strip()
+            ],
+            "required_fixes": [
+                str(item).strip()
+                for item in (last_gate_context.get("required_fixes") or [])[:8]
+                if str(item).strip()
+            ],
+            "hard_failures": [
+                str(item).strip()
+                for item in (last_gate_context.get("hard_failures") or [])[:8]
+                if str(item).strip()
+            ],
+        }
+    return {
+        "best_attempt_restored_recently": any(
+            "BEST_ATTEMPT_RESTORED" in item for item in history_tail
+        ),
+        "feedback_history_tail": history_tail,
+        "last_gate_context": summary,
+    }
+
+
 def _persist_qa_validation_report(
     qa_context: Dict[str, Any] | None,
     qa_result: Dict[str, Any] | None,
@@ -25172,6 +25211,9 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         dataset_semantics_summary = state.get("dataset_semantics_summary")
         if dataset_semantics_summary:
             qa_context["dataset_semantics_summary"] = dataset_semantics_summary
+        review_history_context = _build_review_history_context(state if isinstance(state, dict) else {})
+        if review_history_context:
+            qa_context["review_history_context"] = review_history_context
         iteration_handoff_ctx = state.get("iteration_handoff")
         if isinstance(iteration_handoff_ctx, dict) and iteration_handoff_ctx:
             qa_context["iteration_handoff"] = iteration_handoff_ctx
@@ -27664,6 +27706,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         )
     )
     qa_context["execution_diagnostics"] = review_diagnostics
+    review_history_context = _build_review_history_context(state if isinstance(state, dict) else {})
+    if review_history_context:
+        qa_context["review_history_context"] = review_history_context
     qa_context_prompt = compress_long_lists(qa_context)[0] if isinstance(qa_context, dict) else qa_context
 
     qa_gate_specs = _merge_qa_gate_specs(
@@ -27752,10 +27797,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                     if isinstance(reviewer_view, dict):
                         reviewer_view = dict(reviewer_view)
                         reviewer_view["execution_diagnostics"] = review_diagnostics
+                        if review_history_context:
+                            reviewer_view["review_history_context"] = review_history_context
                         ml_data_path_for_review = _resolve_ml_input_path(state if isinstance(state, dict) else {}, require_exists=False)
                         if ml_data_path_for_review:
                             reviewer_view["ml_data_path"] = ml_data_path_for_review
                         reviewer_view = compress_long_lists(reviewer_view)[0]
+                    if review_history_context:
+                        evaluation_spec_code_audit["review_history_context"] = review_history_context
                     review_result = reviewer.review_code(
                         code,
                         analysis_type,

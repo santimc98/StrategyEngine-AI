@@ -11,6 +11,7 @@ from src.utils.reviewer_response_schema import (
     build_reviewer_eval_response_schema,
     build_reviewer_response_schema,
 )
+from src.utils.review_context_packets import build_review_context_packet
 from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
 from src.utils.contract_first_gates import apply_contract_first_gate_policy
 
@@ -717,6 +718,21 @@ class ReviewerAgent:
         expected_metrics = reviewer_view.get("expected_metrics") or []
         metric_round_active = _extract_metric_round_context(evaluation_spec, reviewer_view)
         deterministic_prechecks_json = json.dumps(deterministic_prechecks, indent=2)
+        review_context_packet = build_review_context_packet(
+            code,
+            reviewer_gates,
+            code_path_hint=str(
+                reviewer_view.get("subject_code_path_hint")
+                or reviewer_view.get("code_path_hint")
+                or "artifacts/ml_engineer_last.py"
+            ),
+            context_blocks=[
+                reviewer_view,
+                evaluation_spec,
+                execution_diagnostics,
+            ],
+        )
+        hard_blocker_packet_json = json.dumps(review_context_packet, indent=2)
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Technical Lead and Security Auditor.
@@ -736,6 +752,7 @@ class ReviewerAgent:
         - Metric Improvement Round Active: $metric_round_active
         - Execution Diagnostics (JSON): $execution_diagnostics_json
         - Deterministic Prechecks (JSON): $deterministic_prechecks_json
+        - HARD_BLOCKER_PACKET (JSON): $hard_blocker_packet_json
         
         ### CRITERIA FOR APPROVAL (QUALITY FIRST PRINCIPLES)
 
@@ -780,6 +797,12 @@ class ReviewerAgent:
         - If Reviewer Gates is empty, fall back to the general criteria but prefer APPROVE_WITH_WARNINGS when uncertain.
         - If Metric Improvement Round Active=true, do NOT emit warnings about canonical baseline simplicity, single-model baseline establishment, or preferred baseline model family unless those constraints are present in ACTIVE_REVIEWER_GATES.
 
+        ### PRIORITY REVIEW FOCUS
+        - Treat HARD_BLOCKER_PACKET as prioritized evidence, not as an automatic rejection list.
+        - Re-check active_hard_gates_summary against code_lines_of_interest before approving.
+        - If known_restored_candidate_risks is non-empty, assume the candidate may have reintroduced an older blocker and verify that risk explicitly.
+        - If you return APPROVED or APPROVE_WITH_WARNINGS despite an item in HARD_BLOCKER_PACKET, explain why that item is resolved or unsupported by evidence.
+
         ### EVIDENCE REQUIREMENT
         - Any REJECT or warning must cite evidence from the provided artifacts or code.
         - Include evidence in feedback using: EVIDENCE: <artifact_path>#<key> -> <short snippet>
@@ -806,6 +829,7 @@ class ReviewerAgent:
             metric_round_active=str(bool(metric_round_active)).lower(),
             execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2),
             deterministic_prechecks_json=deterministic_prechecks_json,
+            hard_blocker_packet_json=hard_blocker_packet_json,
             output_format_instructions=output_format_instructions,
             senior_evidence_rule=SENIOR_EVIDENCE_RULE,
         )
