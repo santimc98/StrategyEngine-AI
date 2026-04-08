@@ -11255,7 +11255,14 @@ def _normalize_feedback_record_payload(record: Dict[str, Any] | None) -> Dict[st
             record.get("repair_ground_truth") if isinstance(record.get("repair_ground_truth"), dict) else {}
         ),
         "repair_scope": record.get("repair_scope") if isinstance(record.get("repair_scope"), dict) else {},
+        "incumbent_brief": (
+            record.get("incumbent_brief") if isinstance(record.get("incumbent_brief"), dict) else {}
+        ),
     }
+    if isinstance(record.get("feedback_json"), dict):
+        normalized["feedback_json"] = copy.deepcopy(record.get("feedback_json") or {})
+    if isinstance(record.get("repair_hints"), list):
+        normalized["repair_hints"] = [str(x) for x in (record.get("repair_hints") or []) if str(x).strip()][:4]
     normalized["failed_gates"] = list(dict.fromkeys(normalized["failed_gates"]))[:20]
     normalized["required_fixes"] = list(dict.fromkeys(normalized["required_fixes"]))[:20]
     normalized["hard_failures"] = list(dict.fromkeys(normalized["hard_failures"]))[:15]
@@ -11346,6 +11353,7 @@ def _set_latest_feedback_record(
     retry_context: Dict[str, Any] | None = None,
     repair_ground_truth: Dict[str, Any] | None = None,
     repair_scope: Dict[str, Any] | None = None,
+    incumbent_brief: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     record = _normalize_feedback_record_payload(
         {
@@ -11362,6 +11370,7 @@ def _set_latest_feedback_record(
             "retry_context": retry_context if isinstance(retry_context, dict) else {},
             "repair_ground_truth": repair_ground_truth if isinstance(repair_ground_truth, dict) else {},
             "repair_scope": repair_scope if isinstance(repair_scope, dict) else {},
+            "incumbent_brief": incumbent_brief if isinstance(incumbent_brief, dict) else {},
         }
     )
     if not record:
@@ -11369,6 +11378,29 @@ def _set_latest_feedback_record(
     key = "data_engineer_feedback_record" if str(agent).lower() == "data_engineer" else "ml_feedback_record"
     state[key] = record
     return record
+
+
+def _hydrate_feedback_record_from_handoff(
+    state: Dict[str, Any] | None,
+    *,
+    agent: str,
+    feedback_record: Dict[str, Any] | None,
+    handoff: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    feedback_record = feedback_record if isinstance(feedback_record, dict) else {}
+    handoff = handoff if isinstance(handoff, dict) else {}
+    if not feedback_record:
+        return {}
+    merged = dict(feedback_record)
+    for key in ("retry_context", "repair_ground_truth", "repair_scope", "incumbent_brief"):
+        value = handoff.get(key)
+        if isinstance(value, dict) and value:
+            merged[key] = copy.deepcopy(value)
+    normalized = _normalize_feedback_record_payload(merged)
+    store_key = "data_engineer_feedback_record" if str(agent).lower() == "data_engineer" else "ml_feedback_record"
+    state[store_key] = normalized
+    return normalized
 
 
 def _build_review_progress_tracker(state: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -12369,6 +12401,83 @@ def _build_retry_context(
             {"gate": g, "evidence": "see quality_focus for details"}
             for g in failed_gates[:8]
         ],
+    }
+
+
+def _build_review_guided_retry_context(
+    *,
+    failed_gates: List[str] | None,
+    hard_failures: List[str] | None,
+    missing_outputs: List[str] | None,
+    present_outputs: List[str] | None,
+    required_fixes: List[str] | None,
+    evidence_focus: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    failed_gates = [str(item) for item in (failed_gates or []) if str(item).strip()]
+    hard_failures = [str(item) for item in (hard_failures or []) if str(item).strip()]
+    missing_outputs = [str(item) for item in (missing_outputs or []) if str(item).strip()]
+    present_outputs = [str(item) for item in (present_outputs or []) if str(item).strip()]
+    required_fixes = [str(item) for item in (required_fixes or []) if str(item).strip()]
+    evidence_focus = evidence_focus if isinstance(evidence_focus, list) else []
+
+    repair_focus = "persistence" if missing_outputs else "compliance"
+    summary_parts: List[str] = []
+    if hard_failures:
+        summary_parts.append("Hard failures: " + ", ".join(hard_failures[:5]))
+    elif failed_gates:
+        summary_parts.append("Failed gates: " + ", ".join(failed_gates[:5]))
+    if missing_outputs:
+        summary_parts.append("Missing outputs: " + ", ".join(missing_outputs[:5]))
+    specific_error = "; ".join(summary_parts) or "Reviewer/QA feedback requires targeted repair."
+
+    gate_evidence: List[Dict[str, Any]] = []
+    for gate_name in failed_gates[:8]:
+        evidence_claim = ""
+        evidence_source = "quality_focus"
+        gate_name_lower = gate_name.lower()
+        for item in evidence_focus:
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim") or "").strip()
+            source = str(item.get("source") or "").strip()
+            haystack = f"{claim} {source}".lower()
+            if gate_name_lower and gate_name_lower in haystack:
+                evidence_claim = claim[:220]
+                evidence_source = source or evidence_source
+                break
+        gate_evidence.append(
+            {
+                "gate": gate_name,
+                "evidence": evidence_claim or "see quality_focus for reviewer/QA evidence",
+                "source": evidence_source,
+            }
+        )
+
+    recommended_actions: List[str] = []
+    for item in required_fixes:
+        if item not in recommended_actions:
+            recommended_actions.append(item)
+        if len(recommended_actions) >= 6:
+            break
+    if missing_outputs and not recommended_actions:
+        recommended_actions.append(
+            "Restore required outputs at exact contract paths without changing unrelated working logic."
+        )
+    if not recommended_actions and failed_gates:
+        recommended_actions.append(
+            "Address the verified reviewer/QA gate failures with minimal edits to the current candidate."
+        )
+
+    return {
+        "error_type": "review_gate_failure",
+        "specific_error": specific_error,
+        "blocked_imports": [],
+        "missing_outputs": missing_outputs[:10],
+        "working_components": present_outputs[:8],
+        "repair_focus": repair_focus,
+        "cost_reduction_required": False,
+        "recommended_actions": recommended_actions[:6],
+        "failed_gates": gate_evidence,
     }
 
 
@@ -14305,6 +14414,7 @@ def _build_iteration_handoff(
         sanitized_execution_output
         and not _has_runtime_failure_marker(sanitized_execution_output)
         and "VALIDATION_WARNING: STALE_OUTPUTS" not in sanitized_execution_output
+        and not authoritative_runtime
     ):
         authoritative_runtime = sanitized_execution_output
     runtime_tail = _truncate_handoff_text(
@@ -14509,12 +14619,22 @@ def _build_iteration_handoff(
         )
         if metric_loop_state:
             optimization_context["metric_loop_state"] = metric_loop_state
+    incumbent_brief = _build_incumbent_brief(
+        state,
+        metric_snapshot if isinstance(metric_snapshot, dict) else {},
+        baseline_metrics_override=state.get("metrics_report") if isinstance(state.get("metrics_report"), dict) else None,
+    )
+    if incumbent_brief:
+        if not isinstance(optimization_context, dict):
+            optimization_context = {}
+        if not isinstance(optimization_context.get("incumbent_brief"), dict) or not optimization_context.get("incumbent_brief"):
+            optimization_context["incumbent_brief"] = copy.deepcopy(incumbent_brief)
     optimization_blueprint = _resolve_cached_optimization_blueprint(
         state,
         run_id=str(state.get("run_id") or ""),
     )
     # ── Retry context: structured error classification for targeted retries ──
-    retry_context = _build_retry_context(
+    runtime_retry_context = _build_retry_context(
         runtime_tail=runtime_tail,
         hard_failures=hard_failures,
         failed_gates=failed_gates,
@@ -14523,6 +14643,32 @@ def _build_iteration_handoff(
         required_fixes=required_fixes,
         state=state,
     )
+    runtime_error_type = str(runtime_retry_context.get("error_type") or "").strip().lower()
+    has_runtime_failure = (
+        _has_runtime_failure_marker(authoritative_runtime or runtime_tail or "")
+        or runtime_error_type in {
+            "runtime_api_misuse",
+            "runtime_contract_assertion",
+            "timeout",
+            "oom",
+            "import_error",
+            "shape_or_dtype",
+            "security_violation",
+            "artifact_io",
+            "output_missing",
+        }
+    )
+    if has_runtime_failure:
+        retry_context = runtime_retry_context
+    else:
+        retry_context = _build_review_guided_retry_context(
+            failed_gates=failed_gates,
+            hard_failures=hard_failures,
+            missing_outputs=missing_outputs,
+            present_outputs=present_outputs,
+            required_fixes=required_fixes,
+            evidence_focus=evidence_focus,
+        )
     if (
         _is_approved_review_status(normalized_status)
         and not missing_outputs
@@ -14605,7 +14751,7 @@ def _build_iteration_handoff(
         "feedback": {
             "reviewer": reviewer_feedback,
             "qa": qa_feedback,
-            "runtime_error_tail": runtime_tail,
+            "runtime_error_tail": runtime_tail if has_runtime_failure else "",
             "evidence": evidence_focus,
         },
         "must_preserve": must_preserve[:8],
@@ -14633,6 +14779,7 @@ def _build_iteration_handoff(
         ),
         "hypothesis_packet": hypothesis_packet if isinstance(hypothesis_packet, dict) else {},
         "optimization_blueprint": optimization_blueprint if isinstance(optimization_blueprint, dict) else {},
+        "incumbent_brief": incumbent_brief if isinstance(incumbent_brief, dict) else {},
         "editor_constraints": {
             "must_apply_hypothesis": bool(enforce_apply_hypothesis and not repair_first_focus),
             "forbid_noop": bool(enforce_apply_hypothesis and not repair_first_focus),
@@ -27281,6 +27428,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         eval_result=eval_result,
         evaluation_spec=evaluation_spec_for_review if isinstance(evaluation_spec_for_review, dict) else {},
     )
+    hydrated_ml_feedback_record = _hydrate_feedback_record_from_handoff(
+        state if isinstance(state, dict) else {},
+        agent="ml_engineer",
+        feedback_record=gate_context.get("feedback_record"),
+        handoff=iteration_handoff,
+    )
+    if hydrated_ml_feedback_record:
+        gate_context["feedback_record"] = hydrated_ml_feedback_record
 
     print(f"Reviewer Verdict: {status}")
     if status == "NEEDS_IMPROVEMENT":
@@ -28270,23 +28425,50 @@ def run_review_board(state: AgentState) -> AgentState:
         "evidence": _normalize_handoff_evidence(evidence, max_items=8),
     }
     iteration_handoff["quality_focus"] = handoff_quality
-    repair_retry_context = _build_retry_context(
-        runtime_tail=_resolve_authoritative_runtime_text(state=state),
-        hard_failures=[str(x) for x in (gate_context.get("hard_failures") or []) if str(x).strip()],
-        failed_gates=[str(x) for x in current_failed if str(x).strip()],
-        missing_outputs=_normalize_handoff_items(
-            ((state.get("output_contract_report") or {}).get("missing") if isinstance(state.get("output_contract_report"), dict) else []),
-            max_items=12,
-            max_len=180,
-        ),
-        present_outputs=_normalize_handoff_items(
-            ((state.get("output_contract_report") or {}).get("present") if isinstance(state.get("output_contract_report"), dict) else []),
-            max_items=12,
-            max_len=180,
-        ),
+    repair_runtime_tail = _resolve_authoritative_runtime_text(state=state)
+    repair_missing_outputs = _normalize_handoff_items(
+        ((state.get("output_contract_report") or {}).get("missing") if isinstance(state.get("output_contract_report"), dict) else []),
+        max_items=12,
+        max_len=180,
+    )
+    repair_present_outputs = _normalize_handoff_items(
+        ((state.get("output_contract_report") or {}).get("present") if isinstance(state.get("output_contract_report"), dict) else []),
+        max_items=12,
+        max_len=180,
+    )
+    repair_hard_failures = [str(x) for x in (gate_context.get("hard_failures") or []) if str(x).strip()]
+    repair_failed_gates = [str(x) for x in current_failed if str(x).strip()]
+    runtime_candidate_retry_context = _build_retry_context(
+        runtime_tail=repair_runtime_tail,
+        hard_failures=repair_hard_failures,
+        failed_gates=repair_failed_gates,
+        missing_outputs=repair_missing_outputs,
+        present_outputs=repair_present_outputs,
         required_fixes=current_required,
         state=state if isinstance(state, dict) else {},
     )
+    runtime_candidate_error = str(runtime_candidate_retry_context.get("error_type") or "").strip().lower()
+    if _has_runtime_failure_marker(repair_runtime_tail) or runtime_candidate_error in {
+        "runtime_api_misuse",
+        "runtime_contract_assertion",
+        "timeout",
+        "oom",
+        "import_error",
+        "shape_or_dtype",
+        "security_violation",
+        "artifact_io",
+        "output_missing",
+    }:
+        repair_retry_context = runtime_candidate_retry_context
+    else:
+        repair_retry_context = _build_review_guided_retry_context(
+            failed_gates=repair_failed_gates,
+            hard_failures=repair_hard_failures,
+            missing_outputs=repair_missing_outputs,
+            present_outputs=repair_present_outputs,
+            required_fixes=current_required,
+            evidence_focus=_normalize_handoff_evidence(evidence, max_items=8),
+        )
     repair_focus = _resolve_repair_first_focus(
         retry_context=repair_retry_context,
         failed_gates=current_failed,
@@ -28326,6 +28508,14 @@ def run_review_board(state: AgentState) -> AgentState:
             source="review_board_repair_first",
             reason=f"review_board_blocking:{repair_focus}",
         )
+    hydrated_board_feedback_record = _hydrate_feedback_record_from_handoff(
+        state if isinstance(state, dict) else {},
+        agent="ml_engineer",
+        feedback_record=gate_context.get("feedback_record"),
+        handoff=iteration_handoff,
+    )
+    if hydrated_board_feedback_record:
+        gate_context["feedback_record"] = hydrated_board_feedback_record
 
     board_payload = {
         "status": final_status,
@@ -30669,7 +30859,11 @@ def _build_incumbent_brief(
 
     # 1. Metric performance
     metric_name = str(metric_snapshot.get("primary_metric_name") or "").strip()
-    incumbent_value = metric_snapshot.get("incumbent_metric") or metric_snapshot.get("baseline_metric")
+    incumbent_value = (
+        metric_snapshot.get("incumbent_metric")
+        or metric_snapshot.get("baseline_metric")
+        or metric_snapshot.get("primary_metric_value")
+    )
     best_so_far = metric_snapshot.get("best_metric_so_far")
     higher_is_better = metric_snapshot.get("higher_is_better", True)
     if metric_name:

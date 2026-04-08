@@ -10,6 +10,12 @@ from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 from src.utils.ml_plan_validation import validate_ml_plan_constraints
 from src.utils.reviewer_response_schema import build_qa_response_schema
 from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
+from src.utils.metric_eval import (
+    canonicalize_metric_name,
+    canonicalize_metrics_report_file,
+    normalize_metrics_report_payload,
+    resolve_metric_value,
+)
 
 load_dotenv()
 
@@ -252,6 +258,417 @@ def _resolve_ml_data_path(evaluation_spec: Dict[str, Any] | None) -> str:
                 if isinstance(path, str) and path.strip().lower().endswith(".csv"):
                     return path.strip()
     return ""
+
+
+def _extract_artifact_path(item: Any) -> str:
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return ""
+    for key in ("path", "file", "artifact_path", "output_path", "metrics_path"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _collect_metric_artifact_paths(
+    evaluation_spec: Dict[str, Any] | None,
+    subject_required_outputs: List[Any] | None,
+    qa_required_outputs: List[Any] | None,
+) -> List[str]:
+    evaluation_spec = evaluation_spec if isinstance(evaluation_spec, dict) else {}
+    paths: List[str] = []
+
+    def _consider(value: Any, *, intent: str = "") -> None:
+        path = _extract_artifact_path(value)
+        if not path:
+            return
+        lower_path = path.lower()
+        intent_text = str(intent or "").strip().lower()
+        if not lower_path.endswith(".json"):
+            return
+        metric_like = (
+            "metric" in lower_path
+            or "cv_" in lower_path
+            or "metrics" in intent_text
+            or "cv_metrics" in intent_text
+        )
+        if metric_like and path not in paths:
+            paths.append(path)
+
+    explicit_path_keys = (
+        "metrics_path",
+        "metrics_report_path",
+        "cv_metrics_path",
+        "primary_metrics_path",
+    )
+    for key in explicit_path_keys:
+        value = evaluation_spec.get(key)
+        if isinstance(value, str) and value.strip():
+            _consider(value, intent=key)
+
+    for container in (
+        subject_required_outputs or [],
+        qa_required_outputs or [],
+        evaluation_spec.get("subject_required_outputs") or [],
+        evaluation_spec.get("qa_required_outputs") or [],
+        evaluation_spec.get("artifacts_to_verify") or [],
+        evaluation_spec.get("required_outputs") or [],
+    ):
+        if not isinstance(container, list):
+            continue
+        for item in container:
+            if isinstance(item, dict):
+                intent = str(
+                    item.get("intent")
+                    or item.get("kind")
+                    or item.get("type")
+                    or ""
+                )
+            else:
+                intent = ""
+            _consider(item, intent=intent)
+    return paths[:8]
+
+
+def _resolve_primary_metric_name_from_context(
+    evaluation_spec: Dict[str, Any] | None,
+    qa_gates: List[Dict[str, Any]] | None,
+) -> str:
+    evaluation_spec = evaluation_spec if isinstance(evaluation_spec, dict) else {}
+    qa_gates = qa_gates if isinstance(qa_gates, list) else []
+
+    candidate_paths = [
+        ("primary_metric", evaluation_spec.get("primary_metric")),
+        ("metric_name", evaluation_spec.get("metric_name")),
+    ]
+    for parent_key in ("validation_requirements", "evaluation_spec", "metric_policy"):
+        parent = evaluation_spec.get(parent_key)
+        if isinstance(parent, dict):
+            for key in ("primary_metric", "metric", "metric_name"):
+                candidate_paths.append((f"{parent_key}.{key}", parent.get(key)))
+    for gate in qa_gates:
+        if not isinstance(gate, dict):
+            continue
+        params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+        candidate_paths.append((f"qa_gate:{gate.get('name')}.metric", params.get("metric")))
+        candidate_paths.append((f"qa_gate:{gate.get('name')}.field", params.get("field")))
+
+    for _source, value in candidate_paths:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _build_deterministic_metric_facts(
+    evaluation_spec: Dict[str, Any] | None,
+    qa_gates: List[Dict[str, Any]] | None,
+    subject_required_outputs: List[Any] | None,
+    qa_required_outputs: List[Any] | None,
+) -> Dict[str, Any]:
+    evaluation_spec = evaluation_spec if isinstance(evaluation_spec, dict) else {}
+    qa_gates = qa_gates if isinstance(qa_gates, list) else []
+
+    payload_candidates: List[tuple[str, Dict[str, Any]]] = []
+    for key in ("metrics_report", "metrics_payload", "cv_metrics", "metrics_json"):
+        payload = evaluation_spec.get(key)
+        if isinstance(payload, dict) and payload:
+            normalized = normalize_metrics_report_payload(payload)
+            payload_candidates.append((f"evaluation_spec.{key}", normalized or payload))
+
+    for path in _collect_metric_artifact_paths(
+        evaluation_spec,
+        subject_required_outputs,
+        qa_required_outputs,
+    ):
+        normalized = canonicalize_metrics_report_file(path)
+        if isinstance(normalized, dict) and normalized:
+            payload_candidates.append((path, normalized))
+
+    primary_metric_name = _resolve_primary_metric_name_from_context(evaluation_spec, qa_gates)
+    best_payload: Dict[str, Any] = {}
+    best_source = ""
+    best_resolved: Dict[str, Any] = {}
+    best_score = -1
+
+    for source, payload in payload_candidates:
+        if not isinstance(payload, dict) or not payload:
+            continue
+        metric_name = primary_metric_name or str(payload.get("primary_metric_name") or payload.get("primary_metric") or "").strip()
+        resolved: Dict[str, Any] = {}
+        canonical_metric = canonicalize_metric_name(metric_name) if metric_name else ""
+        explicit_primary_value = _coerce_float_maybe(payload.get("primary_metric_value"))
+        if (
+            canonical_metric
+            and isinstance(payload.get("metrics_mean"), dict)
+            and _coerce_float_maybe((payload.get("metrics_mean") or {}).get(metric_name)) is not None
+        ):
+            resolved = {
+                "value": float(_coerce_float_maybe((payload.get("metrics_mean") or {}).get(metric_name))),
+                "matched_key": f"metrics_mean.{metric_name}",
+                "score": 90000,
+            }
+        elif (
+            canonical_metric
+            and isinstance(payload.get("metrics_mean"), dict)
+            and _coerce_float_maybe((payload.get("metrics_mean") or {}).get(canonical_metric)) is not None
+        ):
+            resolved = {
+                "value": float(_coerce_float_maybe((payload.get("metrics_mean") or {}).get(canonical_metric))),
+                "matched_key": f"metrics_mean.{canonical_metric}",
+                "score": 90000,
+            }
+        elif metric_name and explicit_primary_value is not None:
+            resolved = {
+                "value": float(explicit_primary_value),
+                "matched_key": "primary_metric_value",
+                "score": 100000,
+            }
+        else:
+            resolved = resolve_metric_value(payload, metric_name or primary_metric_name or "")
+        score = int(resolved.get("score") or 0) if isinstance(resolved, dict) else 0
+        if not metric_name and isinstance(payload.get("primary_metric_name"), str):
+            metric_name = str(payload.get("primary_metric_name") or "").strip()
+            canonical_metric = canonicalize_metric_name(metric_name)
+            if (
+                canonical_metric
+                and isinstance(payload.get("metrics_mean"), dict)
+                and _coerce_float_maybe((payload.get("metrics_mean") or {}).get(canonical_metric)) is not None
+            ):
+                resolved = {
+                    "value": float(_coerce_float_maybe((payload.get("metrics_mean") or {}).get(canonical_metric))),
+                    "matched_key": f"metrics_mean.{canonical_metric}",
+                    "score": 90000,
+                }
+            elif _coerce_float_maybe(payload.get("primary_metric_value")) is not None:
+                resolved = {
+                    "value": float(_coerce_float_maybe(payload.get("primary_metric_value"))),
+                    "matched_key": "primary_metric_value",
+                    "score": 100000,
+                }
+            else:
+                resolved = resolve_metric_value(payload, metric_name)
+            score = int(resolved.get("score") or 0) if isinstance(resolved, dict) else 0
+        if resolved and score >= best_score:
+            best_payload = payload
+            best_source = source
+            best_resolved = resolved
+            best_score = score
+            if metric_name and not primary_metric_name:
+                primary_metric_name = metric_name
+
+    primary_metric_value = best_resolved.get("value") if isinstance(best_resolved, dict) else None
+    higher_is_better = best_payload.get("higher_is_better") if isinstance(best_payload, dict) else None
+    return {
+        "available": bool(best_payload),
+        "primary_metric_name": primary_metric_name or None,
+        "primary_metric_canonical_name": canonicalize_metric_name(primary_metric_name) if primary_metric_name else None,
+        "primary_metric_value": float(primary_metric_value) if isinstance(primary_metric_value, (int, float)) else None,
+        "primary_metric_source": best_source or None,
+        "matched_key": best_resolved.get("matched_key") if isinstance(best_resolved, dict) else None,
+        "higher_is_better": bool(higher_is_better) if isinstance(higher_is_better, bool) else None,
+        "metric_artifacts_considered": [source for source, _payload in payload_candidates[:8]],
+        "_metrics_payload": best_payload if isinstance(best_payload, dict) else {},
+    }
+
+
+def _looks_metric_gate(gate_spec: Dict[str, Any] | None) -> bool:
+    if not isinstance(gate_spec, dict):
+        return False
+    params = gate_spec.get("params") if isinstance(gate_spec.get("params"), dict) else {}
+    name = str(gate_spec.get("name") or "").strip().lower()
+    if any(key in params for key in ("metric", "field", "threshold", "target", "min", "max", "operator", "direction")):
+        return True
+    metric_tokens = (
+        "metric",
+        "auc",
+        "lift",
+        "logloss",
+        "loss",
+        "rmse",
+        "mae",
+        "mape",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "brier",
+        "r2",
+        "gini",
+        "ndcg",
+        "map",
+        "mrr",
+    )
+    return any(token in name for token in metric_tokens)
+
+
+def _coerce_float_maybe(value: Any) -> Optional[float]:
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+def _infer_metric_gate_threshold(
+    gate_spec: Dict[str, Any],
+    metric_name: str,
+    higher_is_better: Optional[bool],
+) -> tuple[Optional[str], Optional[float]]:
+    params = gate_spec.get("params") if isinstance(gate_spec.get("params"), dict) else {}
+    operator = str(params.get("operator") or "").strip()
+    condition = str(params.get("condition") or "").strip()
+    if not operator and condition:
+        match = re.search(r"(>=|<=|>|<|==)", condition)
+        if match:
+            operator = match.group(1)
+
+    min_value = _coerce_float_maybe(params.get("min"))
+    max_value = _coerce_float_maybe(params.get("max"))
+    target_value = _coerce_float_maybe(params.get("target"))
+    threshold_value = _coerce_float_maybe(params.get("threshold"))
+    direction = str(params.get("direction") or "").strip().lower()
+    if min_value is not None:
+        return operator or ">=", min_value
+    if max_value is not None:
+        return operator or "<=", max_value
+    if threshold_value is not None:
+        if operator:
+            return operator, threshold_value
+        if direction in {"decrease", "minimize", "lower_is_better"}:
+            return "<=", threshold_value
+        if direction in {"increase", "maximize", "higher_is_better"}:
+            return ">=", threshold_value
+        if isinstance(higher_is_better, bool):
+            return (">=" if higher_is_better else "<="), threshold_value
+        return None, threshold_value
+    if target_value is not None:
+        if operator:
+            return operator, target_value
+        if isinstance(higher_is_better, bool):
+            return (">=" if higher_is_better else "<="), target_value
+        return None, target_value
+
+    gate_name = str(gate_spec.get("name") or "").strip().lower()
+    canonical_metric = canonicalize_metric_name(metric_name)
+    metric_norm = re.sub(r"[^a-z0-9]+", "", str(metric_name or "").lower())
+    if "positive" in gate_name:
+        return ">", 0.0
+    if "above_random_baseline" in gate_name or "better_than_random" in gate_name:
+        if canonical_metric in {"top_decile_lift", "lift"} or "lift" in canonical_metric or "lift" in metric_norm:
+            return ">", 1.0
+        if canonical_metric in {"roc_auc", "auc"}:
+            return ">", 0.5
+    return None, None
+
+
+def _compare_metric_value(value: float, operator: str, threshold: float) -> Optional[bool]:
+    if operator == ">":
+        return value > threshold
+    if operator == ">=":
+        return value >= threshold
+    if operator == "<":
+        return value < threshold
+    if operator == "<=":
+        return value <= threshold
+    if operator == "==":
+        return value == threshold
+    return None
+
+
+def _apply_metric_gate_consistency_guard(
+    result: Dict[str, Any],
+    qa_gates: List[Dict[str, Any]],
+    metric_facts: Dict[str, Any] | None,
+) -> tuple[Dict[str, Any], List[str]]:
+    result = dict(result or {})
+    metric_facts = metric_facts if isinstance(metric_facts, dict) else {}
+    payload = metric_facts.get("_metrics_payload") if isinstance(metric_facts.get("_metrics_payload"), dict) else {}
+    if not payload:
+        return result, []
+
+    failed_gates = [str(g) for g in (result.get("failed_gates") or []) if str(g).strip()]
+    if not failed_gates:
+        return result, []
+
+    gate_lookup = _gate_lookup(qa_gates)
+    primary_metric_name = str(metric_facts.get("primary_metric_name") or "").strip()
+    removed_gates: List[str] = []
+    guard_notes: List[str] = []
+
+    for gate_name in failed_gates:
+        gate_spec = gate_lookup.get(gate_name.lower())
+        if not _looks_metric_gate(gate_spec):
+            continue
+        params = gate_spec.get("params") if isinstance(gate_spec, dict) else {}
+        gate_metric_name = str(
+            params.get("metric")
+            or params.get("field")
+            or primary_metric_name
+            or ""
+        ).strip()
+        if not gate_metric_name:
+            continue
+        same_metric = (
+            str(primary_metric_name or "").strip()
+            and str(gate_metric_name or "").strip()
+            and canonicalize_metric_name(primary_metric_name) == canonicalize_metric_name(gate_metric_name)
+        )
+        if same_metric and _coerce_float_maybe(metric_facts.get("primary_metric_value")) is not None:
+            resolved = {
+                "value": float(_coerce_float_maybe(metric_facts.get("primary_metric_value"))),
+                "matched_key": metric_facts.get("matched_key") or "primary_metric_value",
+            }
+        else:
+            resolved = resolve_metric_value(payload, gate_metric_name)
+        metric_value = _coerce_float_maybe(resolved.get("value") if isinstance(resolved, dict) else None)
+        if metric_value is None:
+            continue
+        higher_is_better = metric_facts.get("higher_is_better")
+        operator, threshold = _infer_metric_gate_threshold(gate_spec, gate_metric_name, higher_is_better)
+        if threshold is None or not operator:
+            continue
+        passed = _compare_metric_value(metric_value, operator, float(threshold))
+        if passed is not True:
+            continue
+        removed_gates.append(gate_name)
+        guard_notes.append(
+            f"QA_METRIC_FACT_OVERRIDE: removed gate '{gate_name}' because deterministic metric facts show "
+            f"{gate_metric_name}={metric_value:.6g} satisfies {operator} {float(threshold):.6g} "
+            f"(source={metric_facts.get('primary_metric_source') or 'metrics_payload'} key={resolved.get('matched_key')})."
+        )
+
+    if not removed_gates:
+        return result, []
+
+    removed_set = {gate.lower() for gate in removed_gates}
+    result["failed_gates"] = [
+        gate for gate in failed_gates if str(gate).lower() not in removed_set
+    ]
+    required_fixes = result.get("required_fixes")
+    if isinstance(required_fixes, list):
+        filtered_fixes: List[str] = []
+        for fix in required_fixes:
+            text = str(fix or "").strip()
+            lower = text.lower()
+            if any(gate in lower for gate in removed_set):
+                continue
+            filtered_fixes.append(text)
+        result["required_fixes"] = filtered_fixes
+    if not result["failed_gates"] and str(result.get("status") or "").upper() == "REJECTED":
+        result["status"] = "APPROVE_WITH_WARNINGS"
+        feedback = str(result.get("feedback") or "").strip()
+        note = "Deterministic metric facts overrode unsupported metric-gate failures."
+        result["feedback"] = f"{feedback}\n{note}".strip() if feedback else note
+    return result, guard_notes
 
 
 class QAReviewerAgent:
@@ -574,6 +991,22 @@ class QAReviewerAgent:
         qa_required_outputs = (evaluation_spec or {}).get("qa_required_outputs") or []
         if not isinstance(qa_required_outputs, list):
             qa_required_outputs = []
+        deterministic_metric_facts = _build_deterministic_metric_facts(
+            evaluation_spec,
+            qa_gate_specs,
+            subject_required_outputs,
+            qa_required_outputs,
+        )
+        deterministic_metric_prompt_facts = {
+            "available": bool(deterministic_metric_facts.get("available")),
+            "primary_metric_name": deterministic_metric_facts.get("primary_metric_name"),
+            "primary_metric_canonical_name": deterministic_metric_facts.get("primary_metric_canonical_name"),
+            "primary_metric_value": deterministic_metric_facts.get("primary_metric_value"),
+            "primary_metric_source": deterministic_metric_facts.get("primary_metric_source"),
+            "matched_key": deterministic_metric_facts.get("matched_key"),
+            "higher_is_better": deterministic_metric_facts.get("higher_is_better"),
+            "metric_artifacts_considered": deterministic_metric_facts.get("metric_artifacts_considered") or [],
+        }
         subject_code_path_hint = str((evaluation_spec or {}).get("subject_code_path_hint") or "").strip()
         if review_subject == "data_engineer":
             subject_specific_guidance = (
@@ -693,6 +1126,7 @@ class QAReviewerAgent:
         - QA Gates (contract-driven, with severity/params): $qa_gates
         - ACTIVE_QA_GATES (names only): $active_qa_gates
         - Execution Diagnostics (JSON): $execution_diagnostics_json
+        - Deterministic Metric Facts (JSON, authoritative when present): $deterministic_metric_facts_json
         - Metric Improvement Round Active: $metric_round_active
         - Augmentation Requested (from hypothesis/plan): $augmentation_requested
         
@@ -706,6 +1140,9 @@ class QAReviewerAgent:
         - Only fail gates listed in QA Gates; otherwise mention as warnings.
         - When listing failed_gates, use the gate "name" values from QA Gates.
         - failed_gates/hard_failures MUST be an exact subset of ACTIVE_QA_GATES.
+        - If Deterministic Metric Facts provide a primary metric value, treat that as the authoritative metric evidence.
+          Do not use stddev/variance fields as the primary metric unless the declared primary metric is explicitly a
+          variability metric.
         - SELF-CHECK BEFORE FAILING ANY GATE: verify the gate name appears verbatim in ACTIVE_QA_GATES.
           If it does not, you MUST NOT include it in failed_gates or hard_failures — report it as a
           warning in feedback text only. The gate families above (1-8) are reasoning aids for active gates,
@@ -745,6 +1182,7 @@ class QAReviewerAgent:
             qa_gates=qa_gates_json,
             active_qa_gates=active_qa_gates_json,
             execution_diagnostics_json=json.dumps(execution_diagnostics, indent=2, ensure_ascii=True),
+            deterministic_metric_facts_json=json.dumps(deterministic_metric_prompt_facts, indent=2, ensure_ascii=True),
             metric_round_active=str(metric_round_active).lower(),
             augmentation_requested=str(augmentation_requested).lower(),
             output_format_instructions=output_format_instructions,
@@ -886,6 +1324,13 @@ class QAReviewerAgent:
                 if str(g).lower() in allowed:
                     filtered.append(g)
             result["failed_gates"] = filtered
+            result, metric_guard_notes = _apply_metric_gate_consistency_guard(
+                result,
+                qa_gate_specs,
+                deterministic_metric_facts,
+            )
+            filtered = [str(g) for g in (result.get("failed_gates") or []) if str(g).strip()]
+            result["failed_gates"] = filtered
 
             hard_failures: List[str] = []
             soft_failures: List[str] = []
@@ -912,6 +1357,8 @@ class QAReviewerAgent:
             static_warnings = static_result.get("warnings", []) if static_result else []
             if static_warnings:
                 warnings.extend(static_warnings)
+            if metric_guard_notes:
+                warnings.extend(metric_guard_notes)
             if warnings:
                 if result.get("status") == "APPROVED":
                     result["status"] = "APPROVE_WITH_WARNINGS"

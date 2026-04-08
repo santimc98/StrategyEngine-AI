@@ -720,3 +720,44 @@ def test_generate_code_records_subcall_trace_with_completion_reprompt(monkeypatc
     assert trace[1]["stage"] == "completion_reprompt"
     _assert_contains_terms(trace[1]["prompt"], "complete runnable python script")
     assert "print('completed')" in trace[1]["response"]
+
+
+def test_normalize_iteration_handoff_falls_back_to_feedback_record():
+    agent = MLEngineerAgent()
+    normalized = agent._normalize_iteration_handoff(
+        iteration_handoff={
+            "mode": "patch",
+            "source": "result_evaluator",
+            "contract_focus": {"required_outputs": ["artifacts/ml/cv_metrics.json"]},
+            "quality_focus": {"failed_gates": ["metric_above_random_baseline"]},
+            "feedback": {"reviewer": "review ok", "qa": "qa mismatch"},
+        },
+        gate_context={
+            "feedback_record": {
+                "retry_context": {
+                    "error_type": "review_gate_failure",
+                    "repair_focus": "compliance",
+                },
+                "repair_ground_truth": {
+                    "root_cause_type": "review_gate_failure",
+                    "repair_focus": "compliance",
+                    "failure_signature": "Failed gates: metric_above_random_baseline",
+                },
+                "repair_scope": {
+                    "phase": "compliance_runtime",
+                    "scope_policy": "patch_only",
+                },
+                "incumbent_brief": {
+                    "primary_metric": "top_decile_lift",
+                    "incumbent_score": 9.995,
+                    "model_info": "LightGBM",
+                },
+            }
+        },
+        required_deliverables=["artifacts/ml/cv_metrics.json"],
+    )
+
+    assert normalized["retry_context"]["error_type"] == "review_gate_failure"
+    assert normalized["repair_ground_truth"]["root_cause_type"] == "review_gate_failure"
+    assert normalized["repair_scope"]["scope_policy"] == "patch_only"
+    assert normalized["incumbent_brief"]["incumbent_score"] == 9.995

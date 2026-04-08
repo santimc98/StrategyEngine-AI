@@ -767,3 +767,51 @@ def test_extract_verified_gate_feedback_filters_retry_packet_to_blocking_verifie
     assert verified["required_fixes"] == [
         "arr_current_numeric_conversion_verified: Column remains object type with currency strings"
     ]
+
+
+def test_iteration_handoff_uses_review_guided_retry_context_without_runtime_failure(tmp_path):
+    metrics_path = tmp_path / "cv_metrics.json"
+    metrics_path.write_text("{}", encoding="utf-8")
+    state = {
+        "iteration_count": 1,
+        "execution_contract": {"required_outputs": [str(metrics_path)]},
+        "execution_output": "HEAVY_RUNNER: status=success reason=local_runner_mode",
+        "last_runtime_error_tail": "HEAVY_RUNNER: status=success reason=local_runner_mode",
+        "primary_metric_snapshot": {
+            "primary_metric_name": "top_decile_lift",
+            "primary_metric_value": 9.92,
+            "baseline_value": 9.80,
+            "higher_is_better": True,
+        },
+        "reviewer_last_result": {
+            "status": "APPROVED",
+            "warnings": ["Temporal CV should stay grouped by snapshot month."],
+        },
+        "metrics_report": {
+            "primary_metric_name": "top_decile_lift",
+            "primary_metric_value": 9.92,
+            "model_family": "LightGBM",
+        },
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["metric_above_random_baseline"],
+            "required_fixes": ["Use the metric facts from cv_metrics.json and explain the reviewer/QA mismatch."],
+            "feedback": "QA rejected on metric evidence.",
+                "feedback_record": {},
+            },
+        oc_report={"present": [str(metrics_path)], "missing": []},
+        review_result={"feedback": "Reviewer approved the baseline."},
+        qa_result={"feedback": "QA rejected on metric evidence."},
+        evaluation_spec={"primary_metric": "top_decile_lift"},
+    )
+
+    assert handoff["retry_context"]["error_type"] == "review_gate_failure"
+    assert handoff["retry_context"]["repair_focus"] == "compliance"
+    assert handoff["repair_ground_truth"]["root_cause_type"] == "review_gate_failure"
+    assert handoff["feedback"]["runtime_error_tail"] == ""
+    assert handoff["incumbent_brief"]["primary_metric"] == "top_decile_lift"
+    assert handoff["incumbent_brief"]["incumbent_score"] == pytest.approx(9.92)

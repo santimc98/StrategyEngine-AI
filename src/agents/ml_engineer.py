@@ -785,6 +785,11 @@ class MLEngineerAgent:
     ) -> Dict[str, Any]:
         raw = iteration_handoff if isinstance(iteration_handoff, dict) else {}
         gate_context = gate_context if isinstance(gate_context, dict) else {}
+        feedback_record = (
+            gate_context.get("feedback_record")
+            if isinstance(gate_context.get("feedback_record"), dict)
+            else {}
+        )
         contract_focus = raw.get("contract_focus") if isinstance(raw.get("contract_focus"), dict) else {}
         quality_focus = raw.get("quality_focus") if isinstance(raw.get("quality_focus"), dict) else {}
         optimization_focus_raw = raw.get("optimization_focus") if isinstance(raw.get("optimization_focus"), dict) else {}
@@ -813,12 +818,30 @@ class MLEngineerAgent:
         )
         repair_policy = raw.get("repair_policy") if isinstance(raw.get("repair_policy"), dict) else {}
         retry_context = raw.get("retry_context") if isinstance(raw.get("retry_context"), dict) else {}
+        if not retry_context:
+            retry_context = (
+                feedback_record.get("retry_context")
+                if isinstance(feedback_record.get("retry_context"), dict)
+                else {}
+            )
         repair_ground_truth = (
             raw.get("repair_ground_truth")
             if isinstance(raw.get("repair_ground_truth"), dict)
             else {}
         )
+        if not repair_ground_truth:
+            repair_ground_truth = (
+                feedback_record.get("repair_ground_truth")
+                if isinstance(feedback_record.get("repair_ground_truth"), dict)
+                else {}
+            )
         repair_scope = raw.get("repair_scope") if isinstance(raw.get("repair_scope"), dict) else {}
+        if not repair_scope:
+            repair_scope = (
+                feedback_record.get("repair_scope")
+                if isinstance(feedback_record.get("repair_scope"), dict)
+                else {}
+            )
         deferred_optimization = (
             raw.get("deferred_optimization")
             if isinstance(raw.get("deferred_optimization"), dict)
@@ -962,6 +985,15 @@ class MLEngineerAgent:
                     else {}
                 ),
             }
+        if (
+            isinstance(feedback_record.get("incumbent_brief"), dict)
+            and feedback_record.get("incumbent_brief")
+            and not (
+                isinstance(optimization_context.get("incumbent_brief"), dict)
+                and optimization_context.get("incumbent_brief")
+            )
+        ):
+            optimization_context["incumbent_brief"] = dict(feedback_record.get("incumbent_brief") or {})
         keep_optimization_lane = bool(optimization_lane.get("active")) and (
             optimization_context or hypothesis_packet or deferred_optimization
         )
@@ -1010,7 +1042,11 @@ class MLEngineerAgent:
             "incumbent_brief": (
                 raw.get("incumbent_brief")
                 if isinstance(raw.get("incumbent_brief"), dict)
-                else {}
+                else (
+                    feedback_record.get("incumbent_brief")
+                    if isinstance(feedback_record.get("incumbent_brief"), dict)
+                    else {}
+                )
             ),
             "editor_constraints": {
                 "must_apply_hypothesis": bool(editor_constraints.get("must_apply_hypothesis")),
