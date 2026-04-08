@@ -1,6 +1,14 @@
 from src.agents.ml_engineer import MLEngineerAgent
 
 
+class _FakeOpenAI:
+    def __init__(self, api_key=None, base_url=None, timeout=None, default_headers=None):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.timeout = timeout
+        self.default_headers = default_headers
+
+
 def _assert_contains_all(text: str, *needles: str) -> None:
     for needle in needles:
         assert needle in text
@@ -107,3 +115,96 @@ def test_ml_engineer_partitioning_context_renders_rules_without_row_counts():
     context = agent._build_data_partitioning_context(contract, {}, {})
     _assert_contains_all(context, "DATA PARTITIONING CONTEXT", "resolved", "target")
     _assert_contains_terms(context, "split resolution status", "train filter rule", "not null")
+
+
+def test_ml_engineer_compacts_cleaned_ml_fact_packet_for_prompt():
+    agent = MLEngineerAgent.__new__(MLEngineerAgent)
+    packet = agent._compact_cleaned_ml_fact_packet_for_prompt(
+        {
+            "row_count_total": 7447,
+            "target_column": "churn_60d",
+            "rows_labeled_target": 6667,
+            "rows_unlabeled_target": 780,
+            "expected_scoring_row_count": 780,
+            "split_value_counts": [
+                {"split_value": "train", "rows": 6261},
+                {"split_value": "holdout", "rows": 406},
+                {"split_value": "scoring", "rows": 780},
+            ],
+            "feature_readiness": {
+                "scope": "allowed_feature_sets.model_features",
+                "candidate_feature_count": 3,
+                "buckets": {
+                    "numeric_ready": {"count": 1, "sample_columns": ["arr_current"]},
+                    "categorical_ready": {"count": 1, "sample_columns": ["region"]},
+                    "boolean_ready": {"count": 1, "sample_columns": ["executive_sponsor_present"]},
+                },
+            },
+            "validation_relevant_facts": {
+                "validation_method": "temporal_holdout_with_cv",
+                "primary_metric": "pr_auc",
+            },
+        }
+    )
+
+    assert packet["expected_scoring_row_count"] == 780
+    assert packet["feature_readiness"]["candidate_feature_count"] == 3
+    assert packet["feature_readiness"]["buckets"]["numeric_ready"]["sample_columns"] == ["arr_current"]
+    assert packet["validation_relevant_facts"]["validation_method"] == "temporal_holdout_with_cv"
+
+
+def test_generate_code_prompt_includes_cleaned_ml_fact_packet(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={"title": "Churn Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        execution_contract={
+            "required_outputs": ["artifacts/ml/cv_metrics.json"],
+            "evaluation_spec": {"primary_metric": "pr_auc"},
+            "validation_requirements": {"method": "temporal_holdout_with_cv"},
+        },
+        ml_view={"required_outputs": ["artifacts/ml/cv_metrics.json"]},
+        cleaned_data_summary_min={
+            "row_count": 7447,
+            "column_count": 34,
+            "cleaned_ml_fact_packet": {
+                "row_count_total": 7447,
+                "target_column": "churn_60d",
+                "rows_labeled_target": 6667,
+                "rows_unlabeled_target": 780,
+                "expected_scoring_row_count": 780,
+                "split_value_counts": [
+                    {"split_value": "train", "rows": 6261},
+                    {"split_value": "holdout", "rows": 406},
+                    {"split_value": "scoring", "rows": 780},
+                ],
+                "validation_relevant_facts": {
+                    "validation_method": "temporal_holdout_with_cv",
+                    "primary_metric": "pr_auc",
+                },
+            },
+        },
+    )
+
+    prompt = str(agent.last_prompt or "")
+    _assert_contains_all(
+        prompt,
+        "Cleaned ML Fact Packet",
+        "expected_scoring_row_count",
+        "temporal_holdout_with_cv",
+        "pr_auc",
+        "7447",
+        "780",
+    )

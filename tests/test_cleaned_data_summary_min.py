@@ -84,3 +84,72 @@ def test_cleaned_data_summary_min_includes_outlier_treatment_advisory():
     assert outlier.get("report_present") is True
     assert outlier.get("status") == "applied"
     assert "feature_a" in (outlier.get("columns_touched") or [])
+
+
+def test_cleaned_data_summary_min_includes_cleaned_ml_fact_packet():
+    df = pd.DataFrame(
+        {
+            "account_id": ["a1", "a2", "a3", "a4"],
+            "snapshot_month_end": pd.to_datetime(
+                ["2025-08-31", "2025-09-30", "2025-10-31", "2025-11-30"]
+            ),
+            "churn_60d": [0, 1, 0, None],
+            "cohort_split": ["train", "train", "holdout", "scoring"],
+            "arr_current": [1000.0, 1500.0, 2000.0, 2500.0],
+            "region": ["emea", "na", "emea", "latam"],
+            "executive_sponsor_present": [True, False, True, None],
+        }
+    )
+    contract = {
+        "allowed_feature_sets": {
+            "model_features": ["arr_current", "region", "executive_sponsor_present"]
+        },
+        "task_semantics": {
+            "target_columns": ["churn_60d"],
+            "prediction_unit": "account-snapshot",
+            "temporal_ordering_column": "snapshot_month_end",
+        },
+        "evaluation_spec": {"primary_metric": "pr_auc"},
+        "validation_requirements": {"method": "temporal_holdout_with_cv"},
+        "column_roles": {
+            "identifiers": ["account_id", "snapshot_month_end"],
+            "target": ["churn_60d"],
+            "split_indicator": ["cohort_split"],
+            "numerical_features": ["arr_current"],
+            "categorical_features": ["region"],
+            "boolean_features": ["executive_sponsor_present"],
+        },
+    }
+
+    summary = _build_cleaned_data_summary_min(
+        df_clean=df,
+        contract=contract,
+        required_columns=["account_id", "snapshot_month_end", "churn_60d", "cohort_split"],
+        cleaning_manifest={
+            "conversions": [
+                "parsed_numeric:arr_current",
+                "parsed_datetime:snapshot_month_end",
+                "parsed_target:churn_60d",
+            ],
+            "final_columns_ml_ready": list(df.columns),
+        },
+    )
+
+    packet = summary.get("cleaned_ml_fact_packet") or {}
+    assert packet.get("target_column") == "churn_60d"
+    assert packet.get("row_count_total") == 4
+    assert packet.get("rows_labeled_target") == 3
+    assert packet.get("rows_unlabeled_target") == 1
+    assert packet.get("expected_scoring_row_count") == 1
+    assert packet.get("validation_relevant_facts", {}).get("validation_method") == "temporal_holdout_with_cv"
+
+    split_counts = packet.get("split_value_counts") or []
+    assert any(entry.get("split_value") == "holdout" for entry in split_counts)
+
+    readiness = (packet.get("feature_readiness") or {}).get("buckets") or {}
+    assert readiness.get("numeric_ready", {}).get("count") == 1
+    assert readiness.get("categorical_ready", {}).get("count") == 1
+    assert readiness.get("boolean_ready", {}).get("count") == 1
+
+    normalization = packet.get("data_engineer_normalization") or []
+    assert any(item.get("action") == "parsed_numeric" for item in normalization)

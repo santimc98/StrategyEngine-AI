@@ -449,6 +449,76 @@ class MLEngineerAgent:
             compact["family_aggregate"] = groups
         return compact
 
+    def _compact_cleaned_ml_fact_packet_for_prompt(
+        self,
+        packet: Dict[str, Any] | None,
+        max_splits: int = 8,
+        max_actions: int = 8,
+        max_sample_columns: int = 8,
+    ) -> Dict[str, Any]:
+        if not isinstance(packet, dict):
+            return {}
+
+        compact: Dict[str, Any] = {}
+        for key in (
+            "version",
+            "source",
+            "row_count_total",
+            "target_column",
+            "rows_labeled_target",
+            "rows_unlabeled_target",
+            "expected_scoring_row_count",
+            "target_positive_rate_labeled",
+            "final_ml_ready_column_count",
+        ):
+            if key in packet:
+                compact[key] = packet.get(key)
+
+        split_value_counts = packet.get("split_value_counts")
+        if isinstance(split_value_counts, list) and split_value_counts:
+            compact["split_value_counts"] = split_value_counts[:max_splits]
+
+        observability = packet.get("target_observability_by_split")
+        if isinstance(observability, list) and observability:
+            compact["target_observability_by_split"] = observability[:max_splits]
+
+        readiness = packet.get("feature_readiness")
+        if isinstance(readiness, dict) and readiness:
+            buckets = readiness.get("buckets")
+            compact_buckets: Dict[str, Any] = {}
+            if isinstance(buckets, dict):
+                for bucket_name, bucket_meta in buckets.items():
+                    if not isinstance(bucket_meta, dict):
+                        continue
+                    compact_buckets[str(bucket_name)] = {
+                        "count": int(bucket_meta.get("count") or 0),
+                        "sample_columns": (
+                            bucket_meta.get("sample_columns")[:max_sample_columns]
+                            if isinstance(bucket_meta.get("sample_columns"), list)
+                            else []
+                        ),
+                    }
+            compact["feature_readiness"] = {
+                "scope": readiness.get("scope"),
+                "candidate_feature_count": int(readiness.get("candidate_feature_count") or 0),
+                "buckets": compact_buckets,
+            }
+
+        normalization = packet.get("data_engineer_normalization")
+        if isinstance(normalization, list) and normalization:
+            compact["data_engineer_normalization"] = normalization[:max_actions]
+
+        validation_facts = packet.get("validation_relevant_facts")
+        if isinstance(validation_facts, dict) and validation_facts:
+            compact["validation_relevant_facts"] = {
+                "validation_method": validation_facts.get("validation_method"),
+                "primary_metric": validation_facts.get("primary_metric"),
+                "temporal_ordering_column": validation_facts.get("temporal_ordering_column"),
+                "prediction_unit": validation_facts.get("prediction_unit"),
+            }
+
+        return compact
+
     def _compact_execution_contract(self, contract: Dict[str, Any] | None) -> Dict[str, Any]:
         """
         Extract relevant V4.1 fields for ML Engineer prompt.
@@ -2496,6 +2566,7 @@ class MLEngineerAgent:
         - Strategy Hypothesis: $hypothesis
         - Strategy Techniques (compact): $strategy_techniques_compact
         - Required Outputs: $deliverables_json
+        - Cleaned ML Fact Packet (compact observed facts): $cleaned_ml_fact_packet_json
         - Optimization Authoritative State: $optimization_authoritative_state
         - Treat that state as the single execution truth for targets, features, split rules, metrics, and output schema.
         - Use $cleaning_manifest_path only for CSV dialect and cleaning metadata unless the authoritative state explicitly says otherwise.
@@ -2752,6 +2823,7 @@ class MLEngineerAgent:
             ("iteration_memory_json", 3000),
             ("iteration_memory_block", 2500),
             ("signal_summary_json", 2500),
+            ("cleaned_ml_fact_packet_json", 2800),
             ("cleaned_data_summary_min_json", 3500),
             ("feature_semantics_json", 3000),
             ("business_sanity_checks_json", 2500),
@@ -4358,9 +4430,10 @@ class MLEngineerAgent:
         - REPAIR MODE: when runtime/reviewer feedback exists, patch root cause first, preserve working blocks, and return a full script (not a diff).
 
         SOURCE OF TRUTH AND PRECEDENCE
-        1) ML_VIEW_CONTEXT + EXECUTION_CONTRACT_CONTEXT (authoritative)
-        2) ITERATION_HANDOFF / reviewer feedback (for repair priorities)
-        3) CLEANED_DATA_SUMMARY_MIN and SIGNAL_SUMMARY (advisory only)
+        1) ML_VIEW_CONTEXT + EXECUTION_CONTRACT_CONTEXT (authoritative policies and gates)
+        2) CLEANED_ML_FACT_PACKET (authoritative observed post-clean facts from the ML-ready CSV)
+        3) ITERATION_HANDOFF / reviewer feedback (for repair priorities when present)
+        4) CLEANED_DATA_SUMMARY_MIN, DATA_SAMPLE_CONTEXT, and SIGNAL_SUMMARY (advisory detail)
         - Never let advisory context override contract targets, required outputs, gates, or policies.
 
         ENGINEERING DECISION WORKFLOW
@@ -4508,6 +4581,7 @@ class MLEngineerAgent:
         - Artifact-required Clean Columns: $artifact_required_columns
         - Column Dtype Targets: $column_dtype_targets_json
         - Data Sample Context: $data_sample_context_json
+        - Cleaned ML Fact Packet (observed post-clean facts): $cleaned_ml_fact_packet_json
         - Cleaned Data Summary (advisory): $cleaned_data_summary_min_json
         - Execution Profile Context: $execution_profile_json
         $optional_context_block
@@ -4898,7 +4972,20 @@ class MLEngineerAgent:
             max_str_len=600,
             max_list_items=60,
         )
+        cleaned_ml_fact_packet_payload = self._compact_cleaned_ml_fact_packet_for_prompt(
+            (cleaned_data_summary_min or {}).get("cleaned_ml_fact_packet")
+        )
         cleaned_data_summary_payload = self._compact_cleaned_data_summary_for_prompt(cleaned_data_summary_min or {})
+        if optimization_round_hint and isinstance(cleaned_ml_fact_packet_payload, dict):
+            cleaned_ml_fact_packet_payload = {
+                "row_count_total": cleaned_ml_fact_packet_payload.get("row_count_total"),
+                "target_column": cleaned_ml_fact_packet_payload.get("target_column"),
+                "rows_labeled_target": cleaned_ml_fact_packet_payload.get("rows_labeled_target"),
+                "rows_unlabeled_target": cleaned_ml_fact_packet_payload.get("rows_unlabeled_target"),
+                "expected_scoring_row_count": cleaned_ml_fact_packet_payload.get("expected_scoring_row_count"),
+                "split_value_counts": cleaned_ml_fact_packet_payload.get("split_value_counts", []),
+                "validation_relevant_facts": cleaned_ml_fact_packet_payload.get("validation_relevant_facts", {}),
+            }
         if optimization_round_hint and isinstance(cleaned_data_summary_payload, dict):
             cleaned_data_summary_payload = {
                 "row_count": cleaned_data_summary_payload.get("row_count"),
@@ -5010,6 +5097,12 @@ class MLEngineerAgent:
             ml_view_context=ml_view_json,
             evaluation_spec_json=evaluation_spec_json,
             ml_engineer_runbook=ml_runbook_json,
+            cleaned_ml_fact_packet_json=self._serialize_json_for_prompt(
+                cleaned_ml_fact_packet_payload,
+                max_chars=4000,
+                max_str_len=500,
+                max_list_items=80,
+            ),
             cleaned_data_summary_min_json=self._serialize_json_for_prompt(
                 cleaned_data_summary_payload,
                 max_chars=5000,

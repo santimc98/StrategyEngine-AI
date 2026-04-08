@@ -4535,6 +4535,296 @@ def _pick_split_column(df: pd.DataFrame, column_roles: Dict[str, Any]) -> str | 
     return None
 
 
+def _ordered_unique_strings(values: List[Any]) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ordered
+
+
+def _resolve_cleaned_summary_primary_target_column(
+    contract: Dict[str, Any],
+    column_roles: Dict[str, Any] | None,
+) -> str | None:
+    candidates: List[Any] = []
+    task_semantics = contract.get("task_semantics")
+    if isinstance(task_semantics, dict):
+        target_columns = task_semantics.get("target_columns")
+        if isinstance(target_columns, list):
+            candidates.extend(target_columns)
+        candidates.extend(
+            [
+                task_semantics.get("primary_target"),
+                task_semantics.get("target_column"),
+            ]
+        )
+
+    evaluation_spec = contract.get("evaluation_spec")
+    if isinstance(evaluation_spec, dict):
+        label_columns = evaluation_spec.get("label_columns")
+        if isinstance(label_columns, list):
+            candidates.extend(label_columns)
+        candidates.extend(
+            [
+                evaluation_spec.get("primary_target"),
+                evaluation_spec.get("target_column"),
+            ]
+        )
+
+    validation_requirements = contract.get("validation_requirements")
+    if isinstance(validation_requirements, dict):
+        val_targets = validation_requirements.get("target_columns")
+        if isinstance(val_targets, list):
+            candidates.extend(val_targets)
+        label_columns = validation_requirements.get("label_columns")
+        if isinstance(label_columns, list):
+            candidates.extend(label_columns)
+        candidates.extend(
+            [
+                validation_requirements.get("primary_target"),
+                validation_requirements.get("target_column"),
+            ]
+        )
+
+    if isinstance(column_roles, dict):
+        for role_name in ("target", "outcome"):
+            cols = column_roles.get(role_name)
+            if isinstance(cols, list):
+                candidates.extend(cols)
+
+    ordered = _ordered_unique_strings(candidates)
+    return ordered[0] if ordered else None
+
+
+def _binary_positive_rate(series: pd.Series) -> float | None:
+    try:
+        non_null = series.dropna()
+    except Exception:
+        return None
+    if non_null.empty:
+        return None
+    if pd.api.types.is_bool_dtype(non_null):
+        return round(float(non_null.astype(int).mean()), 6)
+    if pd.api.types.is_numeric_dtype(non_null):
+        try:
+            values = pd.to_numeric(non_null, errors="coerce").dropna()
+        except Exception:
+            return None
+        uniques = {float(v) for v in values.unique().tolist()}
+        if uniques and uniques.issubset({0.0, 1.0}):
+            return round(float(values.mean()), 6)
+        return None
+    try:
+        normalized = non_null.astype(str).str.strip().str.lower()
+    except Exception:
+        return None
+    mapping = {
+        "1": 1.0,
+        "1.0": 1.0,
+        "true": 1.0,
+        "yes": 1.0,
+        "y": 1.0,
+        "t": 1.0,
+        "0": 0.0,
+        "0.0": 0.0,
+        "false": 0.0,
+        "no": 0.0,
+        "n": 0.0,
+        "f": 0.0,
+    }
+    mapped = normalized.map(mapping).dropna()
+    if mapped.empty or mapped.shape[0] != normalized.shape[0]:
+        return None
+    return round(float(mapped.mean()), 6)
+
+
+def _build_cleaned_ml_fact_packet(
+    df_clean: pd.DataFrame,
+    contract: Dict[str, Any],
+    column_roles: Dict[str, Any] | None,
+    role_by_column: Dict[str, List[str]],
+    split_column: str | None,
+    cleaning_manifest: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    packet: Dict[str, Any] = {
+        "version": "v1",
+        "source": "system_after_data_engineer",
+        "row_count_total": int(len(df_clean)),
+    }
+
+    target_column = _resolve_cleaned_summary_primary_target_column(contract, column_roles)
+    if target_column:
+        packet["target_column"] = target_column
+
+    split_labels = None
+    if split_column and split_column in df_clean.columns:
+        try:
+            split_raw = df_clean[split_column]
+            split_labels = split_raw.where(split_raw.notna(), "<NA>").astype(str).str.strip()
+            split_counts = split_labels.value_counts(dropna=False)
+            packet["split_value_counts"] = [
+                {"split_value": str(name), "rows": int(count)}
+                for name, count in split_counts.head(12).items()
+            ]
+        except Exception:
+            split_labels = None
+
+    if target_column and target_column in df_clean.columns:
+        target_series = df_clean[target_column]
+        try:
+            labeled_mask = target_series.notna()
+            labeled_rows = int(labeled_mask.sum())
+            unlabeled_rows = int((~labeled_mask).sum())
+            packet["rows_labeled_target"] = labeled_rows
+            packet["rows_unlabeled_target"] = unlabeled_rows
+            packet["expected_scoring_row_count"] = unlabeled_rows
+            positive_rate = _binary_positive_rate(target_series[labeled_mask])
+            if positive_rate is not None:
+                packet["target_positive_rate_labeled"] = positive_rate
+        except Exception:
+            pass
+
+        if split_labels is not None:
+            try:
+                split_facts: List[Dict[str, Any]] = []
+                for split_value, rows in split_labels.value_counts(dropna=False).head(12).items():
+                    mask = split_labels.eq(split_value)
+                    split_target = target_series[mask]
+                    labeled_rows = int(split_target.notna().sum())
+                    unlabeled_rows = int(split_target.isna().sum())
+                    split_fact: Dict[str, Any] = {
+                        "split_value": str(split_value),
+                        "rows": int(rows),
+                        "labeled_rows": labeled_rows,
+                        "unlabeled_rows": unlabeled_rows,
+                    }
+                    positive_rate = _binary_positive_rate(split_target[split_target.notna()])
+                    if positive_rate is not None:
+                        split_fact["target_positive_rate_labeled"] = positive_rate
+                    split_facts.append(split_fact)
+                if split_facts:
+                    packet["target_observability_by_split"] = split_facts
+            except Exception:
+                pass
+
+    disallowed_roles = {
+        "target",
+        "outcome",
+        "identifier",
+        "identifiers",
+        "id",
+        "split_indicator",
+        "audit_only_features",
+        "forbidden_for_modeling",
+    }
+    feature_candidates: List[str] = []
+    allowed_feature_sets = contract.get("allowed_feature_sets")
+    if isinstance(allowed_feature_sets, dict):
+        model_features = allowed_feature_sets.get("model_features")
+        if isinstance(model_features, list):
+            feature_candidates = [str(col) for col in model_features if str(col) in df_clean.columns]
+    if not feature_candidates:
+        for col in df_clean.columns:
+            roles = {str(role) for role in role_by_column.get(str(col), [])}
+            if roles.intersection(disallowed_roles):
+                continue
+            if target_column and str(col) == target_column:
+                continue
+            feature_candidates.append(str(col))
+
+    if feature_candidates:
+        readiness: Dict[str, Dict[str, Any]] = {}
+        buckets: Dict[str, List[str]] = {
+            "numeric_ready": [],
+            "boolean_ready": [],
+            "temporal_ready": [],
+            "categorical_ready": [],
+        }
+        for col in feature_candidates:
+            try:
+                series = df_clean[col]
+                roles = {str(role).lower() for role in role_by_column.get(str(col), [])}
+                if "boolean_features" in roles or "boolean" in roles or pd.api.types.is_bool_dtype(series):
+                    buckets["boolean_ready"].append(col)
+                elif pd.api.types.is_numeric_dtype(series):
+                    buckets["numeric_ready"].append(col)
+                elif pd.api.types.is_datetime64_any_dtype(series):
+                    buckets["temporal_ready"].append(col)
+                else:
+                    buckets["categorical_ready"].append(col)
+            except Exception:
+                buckets["categorical_ready"].append(col)
+        for bucket_name, cols in buckets.items():
+            readiness[bucket_name] = {
+                "count": int(len(cols)),
+                "sample_columns": cols[:10],
+            }
+        packet["feature_readiness"] = {
+            "scope": "allowed_feature_sets.model_features" if isinstance(allowed_feature_sets, dict) and isinstance(allowed_feature_sets.get("model_features"), list) else "inferred_model_candidates",
+            "candidate_feature_count": int(len(feature_candidates)),
+            "buckets": readiness,
+        }
+
+    if isinstance(cleaning_manifest, dict) and cleaning_manifest:
+        conversions = cleaning_manifest.get("conversions")
+        if isinstance(conversions, list) and conversions:
+            by_action: Dict[str, List[str]] = {}
+            for item in conversions:
+                if not item:
+                    continue
+                raw_item = str(item)
+                action, _, column = raw_item.partition(":")
+                action_key = action.strip() or "other"
+                column_name = column.strip() or raw_item.strip()
+                cols = by_action.setdefault(action_key, [])
+                if column_name and column_name not in cols:
+                    cols.append(column_name)
+            if by_action:
+                packet["data_engineer_normalization"] = [
+                    {
+                        "action": action,
+                        "count": int(len(cols)),
+                        "sample_columns": cols[:10],
+                    }
+                    for action, cols in sorted(by_action.items())
+                ]
+        final_ml_ready = cleaning_manifest.get("final_columns_ml_ready")
+        if isinstance(final_ml_ready, list):
+            packet["final_ml_ready_column_count"] = int(len(final_ml_ready))
+
+    evaluation_spec = contract.get("evaluation_spec")
+    validation_requirements = contract.get("validation_requirements")
+    task_semantics = contract.get("task_semantics")
+    packet["validation_relevant_facts"] = {
+        "validation_method": (
+            str(validation_requirements.get("method") or "").strip()
+            if isinstance(validation_requirements, dict)
+            else ""
+        ),
+        "primary_metric": (
+            str((evaluation_spec or {}).get("primary_metric") or (validation_requirements or {}).get("primary_metric") or "").strip()
+            if isinstance(evaluation_spec, dict) or isinstance(validation_requirements, dict)
+            else ""
+        ),
+        "temporal_ordering_column": (
+            str((task_semantics or {}).get("temporal_ordering_column") or (validation_requirements or {}).get("temporal_ordering_column") or "").strip()
+            if isinstance(task_semantics, dict) or isinstance(validation_requirements, dict)
+            else ""
+        ),
+        "prediction_unit": (
+            str((task_semantics or {}).get("prediction_unit") or "").strip()
+            if isinstance(task_semantics, dict)
+            else ""
+        ),
+    }
+    return packet
+
+
 def _build_cleaned_data_summary_min(
     df_clean: pd.DataFrame,
     contract: Dict[str, Any] | None,
@@ -4717,6 +5007,15 @@ def _build_cleaned_data_summary_min(
         if manifest_outlier:
             outlier_summary["manifest_outlier_treatment"] = manifest_outlier
 
+    cleaned_ml_fact_packet = _build_cleaned_ml_fact_packet(
+        df_clean=df_clean,
+        contract=contract,
+        column_roles=column_roles if isinstance(column_roles, dict) else {},
+        role_by_column=role_by_column,
+        split_column=split_column,
+        cleaning_manifest=cleaning_manifest if isinstance(cleaning_manifest, dict) else {},
+    )
+
     return {
         "version": "v1",
         "source": "system_after_data_engineer",
@@ -4731,6 +5030,7 @@ def _build_cleaned_data_summary_min(
         "omitted_columns_count": omitted_columns_count,
         "role_dtype_warnings": role_dtype_warnings,
         "column_summaries": column_summaries,
+        "cleaned_ml_fact_packet": cleaned_ml_fact_packet,
         "outlier_treatment": outlier_summary,
     }
 
