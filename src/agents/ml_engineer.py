@@ -980,6 +980,18 @@ class MLEngineerAgent:
         if not must_preserve and present_outputs:
             must_preserve = [f"Preserve generation for {path}" for path in present_outputs[:6]]
         patch_objectives = self._normalize_handoff_items(raw.get("patch_objectives"), max_items=8, max_len=260)
+        governance_conflicts = (
+            repair_ground_truth.get("governance_conflicts")
+            if isinstance(repair_ground_truth, dict)
+            else []
+        )
+        if isinstance(governance_conflicts, list) and governance_conflicts:
+            governance_note = (
+                "Resolve the blocker without weakening hard reviewer/QA/contract gates. "
+                "Treat the contract thresholds as authoritative and preserve them in code."
+            )
+            if governance_note not in patch_objectives:
+                patch_objectives.insert(0, governance_note)
         if bool(editor_constraints.get("must_apply_hypothesis")):
             enforce_msg = (
                 "Test the active metric-improvement hypothesis with a material but minimal edit. "

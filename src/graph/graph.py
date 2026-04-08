@@ -13830,6 +13830,348 @@ def _build_repair_ground_truth(
     }
 
 
+_ML_MIN_THRESHOLD_KEY_TOKENS = (
+    "min_rows",
+    "minimum_rows",
+    "min_row_count",
+    "minimum_row_count",
+    "min_samples",
+    "minimum_samples",
+    "min_sample_count",
+    "minimum_sample_count",
+    "min_observations",
+    "minimum_observations",
+    "min_records",
+    "minimum_records",
+    "min_examples",
+    "minimum_examples",
+    "min_count",
+    "minimum_count",
+)
+_ML_MIN_THRESHOLD_CONTEXT_TOKENS = (
+    "row",
+    "rows",
+    "sample",
+    "samples",
+    "count",
+    "counts",
+    "observation",
+    "observations",
+    "record",
+    "records",
+    "example",
+    "examples",
+    "holdout",
+    "validation",
+    "threshold",
+)
+_ML_THRESHOLD_LOWERING_TOKENS = (
+    "lower",
+    "reduce",
+    "decrease",
+    "drop",
+    "relax",
+    "loosen",
+    "shrink",
+    "cut",
+    "down to",
+)
+
+
+def _looks_like_ml_minimum_threshold_key(key_path: str) -> bool:
+    key_path = str(key_path or "").strip().lower()
+    if not key_path:
+        return False
+    if any(token in key_path for token in _ML_MIN_THRESHOLD_KEY_TOKENS):
+        return True
+    if ("min" in key_path or "minimum" in key_path) and any(
+        token in key_path for token in _ML_MIN_THRESHOLD_CONTEXT_TOKENS
+    ):
+        return True
+    return False
+
+
+def _extract_ml_minimum_threshold_values(payload: Any, *, prefix: str = "") -> List[Tuple[str, float]]:
+    results: List[Tuple[str, float]] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if _looks_like_ml_minimum_threshold_key(path):
+                    results.append((path, float(value)))
+            else:
+                results.extend(_extract_ml_minimum_threshold_values(value, prefix=path))
+    elif isinstance(payload, list):
+        for idx, value in enumerate(payload):
+            path = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            results.extend(_extract_ml_minimum_threshold_values(value, prefix=path))
+    return results
+
+
+def _collect_ml_hard_gate_constraints(state: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    state = state if isinstance(state, dict) else {}
+    contract, _ = _resolve_contract_pair_from_state(state)
+    if not isinstance(contract, dict):
+        return []
+    constraints: List[Dict[str, Any]] = []
+    for actor, gates in (
+        ("qa", get_qa_gates(contract)),
+        ("reviewer", get_reviewer_gates(contract)),
+    ):
+        if not isinstance(gates, list):
+            continue
+        for gate in gates:
+            if not isinstance(gate, dict):
+                continue
+            severity = str(gate.get("severity") or "").strip().upper()
+            if severity != "HARD":
+                continue
+            gate_name = str(gate.get("name") or "").strip() or f"{actor}_gate"
+            params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+            for path, value in _extract_ml_minimum_threshold_values(params, prefix="params"):
+                match_terms = {
+                    "min",
+                    "minimum",
+                    "threshold",
+                }
+                for token in re.split(r"[^a-z0-9]+", f"{gate_name}.{path}".lower()):
+                    if token and len(token) >= 3:
+                        match_terms.add(token)
+                constraints.append(
+                    {
+                        "actor": actor,
+                        "gate_name": gate_name,
+                        "constraint_path": path,
+                        "minimum_required": float(value),
+                        "match_terms": sorted(match_terms),
+                    }
+                )
+    return constraints
+
+
+def _find_ml_governance_conflicts_in_text(
+    text: str,
+    constraints: List[Dict[str, Any]] | None,
+) -> List[Dict[str, Any]]:
+    text = str(text or "").strip()
+    lowered = text.lower()
+    constraints = constraints if isinstance(constraints, list) else []
+    if not text or not constraints:
+        return []
+    if not any(token in lowered for token in _ML_THRESHOLD_LOWERING_TOKENS):
+        return []
+    candidate_numbers = [
+        float(match)
+        for match in re.findall(r"(?<![A-Za-z0-9_])\d+(?:\.\d+)?", lowered)
+    ]
+    conflicts: List[Dict[str, Any]] = []
+    for constraint in constraints:
+        minimum_required = constraint.get("minimum_required")
+        if not isinstance(minimum_required, (int, float)):
+            continue
+        match_terms = [
+            str(item).strip().lower()
+            for item in (constraint.get("match_terms") or [])
+            if str(item).strip()
+        ]
+        if match_terms and not any(term in lowered for term in match_terms):
+            continue
+        violating_values = [
+            value for value in candidate_numbers
+            if float(value) < float(minimum_required)
+        ]
+        if not violating_values:
+            continue
+        suggested_value = min(violating_values)
+        conflicts.append(
+            {
+                "actor": constraint.get("actor"),
+                "gate_name": constraint.get("gate_name"),
+                "constraint_path": constraint.get("constraint_path"),
+                "minimum_required": float(minimum_required),
+                "suggested_value": float(suggested_value),
+                "conflicting_guidance": text[:260],
+                "reason": (
+                    f"Conflicting repair guidance would weaken hard {constraint.get('actor')} gate "
+                    f"{constraint.get('gate_name')} from {float(minimum_required):g} to {float(suggested_value):g}."
+                ),
+            }
+        )
+    return conflicts
+
+
+def _dedupe_ml_governance_conflicts(conflicts: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
+    conflicts = conflicts if isinstance(conflicts, list) else []
+    deduped: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, str, float]] = set()
+    for item in conflicts:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("actor") or "").strip().lower(),
+            str(item.get("gate_name") or "").strip().lower(),
+            str(item.get("constraint_path") or "").strip().lower(),
+            float(item.get("minimum_required") or 0.0),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _sanitize_repair_text_items_against_ml_constraints(
+    items: List[str] | None,
+    constraints: List[Dict[str, Any]] | None,
+) -> Tuple[List[str], List[Dict[str, Any]], List[str]]:
+    items = [str(item).strip() for item in (items or []) if str(item).strip()]
+    constraints = constraints if isinstance(constraints, list) else []
+    kept: List[str] = []
+    removed: List[str] = []
+    conflicts: List[Dict[str, Any]] = []
+    for item in items:
+        item_conflicts = _find_ml_governance_conflicts_in_text(item, constraints)
+        if item_conflicts:
+            removed.append(item)
+            conflicts.extend(item_conflicts)
+            continue
+        kept.append(item)
+    return kept, _dedupe_ml_governance_conflicts(conflicts), removed
+
+
+def _sanitize_repair_text_block_against_ml_constraints(
+    text: str,
+    constraints: List[Dict[str, Any]] | None,
+) -> Tuple[str, List[Dict[str, Any]], List[str]]:
+    text = str(text or "")
+    constraints = constraints if isinstance(constraints, list) else []
+    if not text or not constraints:
+        return text, [], []
+    kept_lines: List[str] = []
+    removed_lines: List[str] = []
+    conflicts: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line_conflicts = _find_ml_governance_conflicts_in_text(line, constraints)
+        if line_conflicts:
+            removed_lines.append(line)
+            conflicts.extend(line_conflicts)
+            continue
+        kept_lines.append(line)
+    sanitized = "\n".join(kept_lines).strip()
+    if removed_lines:
+        sanitized = (
+            (sanitized + "\n\n" if sanitized else "")
+            + "GOVERNANCE_CONFLICT_NOTE: conflicting repair advice that would weaken active hard reviewer/QA gates "
+              "was removed. Keep hard gates intact while resolving the blocker."
+        )
+    return sanitized, _dedupe_ml_governance_conflicts(conflicts), removed_lines
+
+
+def _reconcile_ml_repair_feedback_against_contract(
+    *,
+    state: Dict[str, Any] | None,
+    retry_context: Dict[str, Any] | None,
+    repair_ground_truth: Dict[str, Any] | None,
+    required_fixes: List[str] | None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+    state = state if isinstance(state, dict) else {}
+    retry_context = copy.deepcopy(retry_context) if isinstance(retry_context, dict) else {}
+    repair_ground_truth = copy.deepcopy(repair_ground_truth) if isinstance(repair_ground_truth, dict) else {}
+    required_fixes = [str(item).strip() for item in (required_fixes or []) if str(item).strip()]
+    constraints = _collect_ml_hard_gate_constraints(state)
+    if not constraints:
+        return retry_context, repair_ground_truth, required_fixes
+
+    sanitized_required_fixes, fix_conflicts, _ = _sanitize_repair_text_items_against_ml_constraints(
+        required_fixes,
+        constraints,
+    )
+    sanitized_actions, action_conflicts, _ = _sanitize_repair_text_items_against_ml_constraints(
+        retry_context.get("recommended_actions"),
+        constraints,
+    )
+    sanitized_directives, directive_conflicts, _ = _sanitize_repair_text_items_against_ml_constraints(
+        repair_ground_truth.get("repair_directives"),
+        constraints,
+    )
+    governance_conflicts = _dedupe_ml_governance_conflicts(
+        fix_conflicts + action_conflicts + directive_conflicts
+    )
+    retry_context["recommended_actions"] = sanitized_actions[:8]
+    repair_ground_truth["repair_directives"] = sanitized_directives[:8]
+    if not governance_conflicts:
+        return retry_context, repair_ground_truth, sanitized_required_fixes
+
+    governance_note = (
+        "Resolve the active blocker without weakening hard reviewer/QA/contract gates in code."
+    )
+    governance_goal = (
+        "Keep hard reviewer/QA thresholds intact; resolve the blocker through a contract-compliant validation, "
+        "cohort, or implementation change instead of lowering gate thresholds."
+    )
+    verified_facts = repair_ground_truth.get("verified_facts")
+    if not isinstance(verified_facts, list):
+        verified_facts = []
+    for conflict in governance_conflicts:
+        verified_facts.append(
+            {
+                "fact": "governance_conflict_detected",
+                "value": {
+                    "actor": conflict.get("actor"),
+                    "gate_name": conflict.get("gate_name"),
+                    "constraint_path": conflict.get("constraint_path"),
+                    "minimum_required": conflict.get("minimum_required"),
+                    "suggested_value": conflict.get("suggested_value"),
+                },
+                "source": "contract_gate_reconciliation",
+            }
+        )
+    repair_ground_truth["verified_facts"] = verified_facts[:12]
+    repair_ground_truth["governance_conflicts"] = governance_conflicts[:6]
+    directives = repair_ground_truth.get("repair_directives")
+    if not isinstance(directives, list):
+        directives = []
+    if governance_note not in directives:
+        directives.insert(0, governance_note)
+    repair_ground_truth["repair_directives"] = list(dict.fromkeys([str(item) for item in directives if str(item).strip()]))[:8]
+    goals = repair_ground_truth.get("repair_goal")
+    if not isinstance(goals, list):
+        goals = []
+    if governance_goal not in goals:
+        goals.insert(0, governance_goal)
+    repair_ground_truth["repair_goal"] = list(dict.fromkeys([str(item) for item in goals if str(item).strip()]))[:6]
+    do_not_change = repair_ground_truth.get("do_not_change")
+    if not isinstance(do_not_change, list):
+        do_not_change = []
+    for conflict in governance_conflicts:
+        freeze_note = (
+            f"Do not weaken hard {conflict.get('actor')} gate {conflict.get('gate_name')} "
+            f"below {float(conflict.get('minimum_required') or 0.0):g}."
+        )
+        if freeze_note not in do_not_change:
+            do_not_change.append(freeze_note)
+    repair_ground_truth["do_not_change"] = do_not_change[:8]
+    stable_regions = repair_ground_truth.get("stable_regions")
+    if not isinstance(stable_regions, list):
+        stable_regions = []
+    for conflict in governance_conflicts:
+        region = f"hard_gate:{conflict.get('actor')}:{conflict.get('gate_name')}"
+        if region not in stable_regions:
+            stable_regions.append(region)
+    repair_ground_truth["stable_regions"] = stable_regions[:8]
+    retry_context["governance_conflicts"] = governance_conflicts[:6]
+    if governance_note not in retry_context["recommended_actions"]:
+        retry_context["recommended_actions"].insert(0, governance_note)
+    retry_context["recommended_actions"] = retry_context["recommended_actions"][:8]
+    sanitized_required_fixes = [
+        item for item in sanitized_required_fixes
+        if item != governance_note
+    ]
+    sanitized_required_fixes.insert(0, governance_note)
+    sanitized_required_fixes = list(dict.fromkeys(sanitized_required_fixes))[:12]
+    return retry_context, repair_ground_truth, sanitized_required_fixes
+
+
 def _extract_repair_scope_targets_from_evidence(
     evidence_focus: List[Dict[str, Any]] | None,
 ) -> List[str]:
@@ -13967,6 +14309,27 @@ def _build_repair_scope(
             target = f"artifact_schema:{gate or 'unknown_gate'}"
             if target not in editable_targets:
                 editable_targets.append(target)
+
+    for conflict in repair_ground_truth.get("governance_conflicts") or []:
+        if not isinstance(conflict, dict):
+            continue
+        gate_name = str(conflict.get("gate_name") or "").strip()
+        actor = str(conflict.get("actor") or "").strip()
+        minimum_required = conflict.get("minimum_required")
+        suggested_value = conflict.get("suggested_value")
+        if gate_name and isinstance(minimum_required, (int, float)):
+            finding = (
+                f"{gate_name}: conflicting repair guidance tried to weaken the hard {actor or 'review'} gate "
+                f"from {float(minimum_required):g}"
+            )
+            if isinstance(suggested_value, (int, float)):
+                finding += f" to {float(suggested_value):g}"
+            finding += "; keep the normative threshold intact."
+            if finding not in active_findings:
+                active_findings.append(finding)
+            protected = f"hard_gate:{actor or 'review'}:{gate_name}"
+            if protected not in protected_regions:
+                protected_regions.append(protected)
 
     for call_site in repair_ground_truth.get("candidate_call_sites") or []:
         if not isinstance(call_site, dict):
@@ -14998,6 +15361,21 @@ def _build_iteration_handoff(
         required_fixes=required_fixes,
         evidence_focus=evidence_focus,
     )
+    retry_context, repair_ground_truth, required_fixes = _reconcile_ml_repair_feedback_against_contract(
+        state=state,
+        retry_context=retry_context,
+        repair_ground_truth=repair_ground_truth,
+        required_fixes=required_fixes,
+    )
+    patch_objectives, _, _ = _sanitize_repair_text_items_against_ml_constraints(
+        patch_objectives,
+        _collect_ml_hard_gate_constraints(state),
+    )
+    for fix in required_fixes:
+        if fix not in patch_objectives:
+            patch_objectives.append(fix)
+        if len(patch_objectives) >= 8:
+            break
     repair_first_focus = _resolve_repair_first_focus(
         retry_context=retry_context,
         failed_gates=failed_gates,
@@ -29331,6 +29709,13 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
             }
         ],
     )
+    runtime_retry_context, repair_ground_truth, reconciled_required_fixes = _reconcile_ml_repair_feedback_against_contract(
+        state=state if isinstance(state, dict) else {},
+        retry_context=runtime_retry_context,
+        repair_ground_truth=repair_ground_truth,
+        required_fixes=[str(item) for item in (error_context.get("required_fixes") or []) if str(item).strip()],
+    )
+    error_context["required_fixes"] = reconciled_required_fixes
     if isinstance(repair_ground_truth, dict):
         for directive in repair_ground_truth.get("repair_directives") or []:
             text = str(directive or "").strip()
@@ -29338,6 +29723,19 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
                 error_context["required_fixes"].append(text)
             if len(error_context["required_fixes"]) >= 12:
                 break
+    ml_override, override_conflicts, _ = _sanitize_repair_text_block_against_ml_constraints(
+        ml_override,
+        _collect_ml_hard_gate_constraints(state if isinstance(state, dict) else {}),
+    )
+    if override_conflicts and isinstance(repair_ground_truth, dict):
+        existing_conflicts = (
+            repair_ground_truth.get("governance_conflicts")
+            if isinstance(repair_ground_truth.get("governance_conflicts"), list)
+            else []
+        )
+        repair_ground_truth["governance_conflicts"] = _dedupe_ml_governance_conflicts(
+            existing_conflicts + override_conflicts
+        )[:6]
     iteration_handoff = _apply_repair_first_handoff(
         existing_handoff,
         repair_focus=runtime_focus if runtime_focus in {"runtime", "persistence"} else "runtime",

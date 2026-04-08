@@ -264,6 +264,64 @@ def test_prepare_runtime_fix_attaches_authoritative_repair_ground_truth_for_ml_r
     )
 
 
+def test_prepare_runtime_fix_reconciles_conflicting_ml_threshold_repair_guidance(monkeypatch):
+    monkeypatch.setattr(
+        "src.graph.graph.failure_explainer.explain_ml_failure",
+        lambda **kwargs: (
+            "WHERE: holdout validation guard\n"
+            "WHY: holdout split has only 406 rows.\n"
+            "FIX: Lower the minimum row threshold from 1000 to 400 to match the observed holdout size."
+        ),
+    )
+    runtime_output = (
+        "Traceback (most recent call last)\n"
+        "  File \"script.py\", line 10, in <module>\n"
+        "    raise ValueError('Temporal validation holdout has insufficient rows: 406 < 1000')\n"
+        "ValueError: Temporal validation holdout has insufficient rows: 406 < 1000\n"
+    )
+
+    result = prepare_runtime_fix(
+        {
+            "execution_output": runtime_output,
+            "generated_code": "print('baseline')\n",
+            "last_generated_code": "print('baseline')\n",
+            "execution_contract": {
+                "required_outputs": ["artifacts/ml/cv_metrics.json"],
+                "qa_gates": [
+                    {
+                        "name": "holdout_sample_credible",
+                        "severity": "HARD",
+                        "params": {"min_rows": 1000},
+                    }
+                ],
+            },
+            "output_contract_report": {
+                "present": [],
+                "missing": ["artifacts/ml/cv_metrics.json"],
+            },
+            "iteration_handoff": {"mode": "build", "feedback": {}},
+        }
+    )
+
+    handoff = result["iteration_handoff"]
+    repair_ground_truth = handoff["repair_ground_truth"]
+    assert repair_ground_truth.get("governance_conflicts")
+    assert any(
+        fact.get("fact") == "governance_conflict_detected"
+        for fact in repair_ground_truth.get("verified_facts", [])
+    )
+    assert all("400" not in str(item) for item in handoff["quality_focus"]["required_fixes"])
+    assert any(
+        "without weakening hard reviewer/qa/contract gates" in str(item).lower()
+        for item in handoff["quality_focus"]["required_fixes"]
+    )
+    assert all(
+        "400" not in str(item)
+        for item in handoff["retry_context"].get("recommended_actions", [])
+    )
+    assert "Lower the minimum row threshold" not in str(result.get("ml_engineer_audit_override") or "")
+
+
 def test_iteration_handoff_builds_callable_compatibility_facts_for_sklearn_api_misuse():
     generated_code = (
         "from sklearn.preprocessing import OneHotEncoder\n"
@@ -815,3 +873,45 @@ def test_iteration_handoff_uses_review_guided_retry_context_without_runtime_fail
     assert handoff["feedback"]["runtime_error_tail"] == ""
     assert handoff["incumbent_brief"]["primary_metric"] == "top_decile_lift"
     assert handoff["incumbent_brief"]["incumbent_score"] == pytest.approx(9.92)
+
+
+def test_iteration_handoff_reconciles_review_guided_fix_that_weakens_hard_ml_gate():
+    state = {
+        "iteration_count": 1,
+        "execution_contract": {
+            "required_outputs": [],
+            "qa_gates": [
+                {
+                    "name": "holdout_sample_credible",
+                    "severity": "HARD",
+                    "params": {"min_rows": 1000},
+                }
+            ],
+        },
+        "primary_metric_snapshot": {
+            "primary_metric_name": "pr_auc",
+            "primary_metric_value": 0.8772,
+        },
+    }
+
+    handoff = _build_iteration_handoff(
+        state=state,
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["holdout_sample_credible"],
+            "required_fixes": ["Lower the minimum row threshold from 1000 to 400."],
+            "feedback": "Reviewer requested a repair.",
+            "feedback_record": {},
+        },
+        oc_report={"present": [], "missing": []},
+        review_result={"feedback": "Holdout credibility gate failed."},
+        qa_result={"feedback": "Holdout credibility gate failed."},
+        evaluation_spec={"primary_metric": "pr_auc"},
+    )
+
+    assert all("400" not in str(item) for item in handoff["quality_focus"]["required_fixes"])
+    assert handoff["repair_ground_truth"].get("governance_conflicts")
+    assert any(
+        "without weakening hard reviewer/qa/contract gates" in str(item).lower()
+        for item in handoff["quality_focus"]["required_fixes"]
+    )
