@@ -30,7 +30,7 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
   const nextWorkerLineRef = useRef(0);
   const nextEventLineRef = useRef(0);
   const finishedRef = useRef(false);
-  const consoleEndRef = useRef<HTMLDivElement>(null);
+  const logsFrameRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     async function poll(): Promise<void> {
@@ -112,9 +112,12 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
     return () => window.clearInterval(interval);
   }, [runId, router]);
 
-  // Auto-scroll to bottom when new logs arrive
+  // Auto-scroll the console (not the page) to bottom when new logs arrive
   useEffect(() => {
-    consoleEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = logsFrameRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [workerLogs, eventLogs]);
 
   async function handleAbort(): Promise<void> {
@@ -269,21 +272,18 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
             {deduped.length} entradas
           </span>
         </div>
-        <div className="logs-frame">
+        <div className="logs-frame" ref={logsFrameRef}>
           {deduped.length ? (
-            <>
-              {deduped.map((entry, index) => (
-                <div
-                  key={`${entry.ts}-${entry.agent}-${entry.source}-${index}`}
-                  className={`log-entry ${levelClass(entry.level)}`}
-                >
-                  <span className="log-time">{entry.ts}</span>
-                  <span className="log-agent">{entry.agent}</span>
-                  <span className="log-message">{entry.msg}</span>
-                </div>
-              ))}
-              <div ref={consoleEndRef} />
-            </>
+            deduped.map((entry, index) => (
+              <div
+                key={`${entry.ts}-${entry.agent}-${entry.source}-${index}`}
+                className={`log-entry ${levelClass(entry.level)}`}
+              >
+                <span className="log-time">{entry.ts}</span>
+                <span className="log-agent">{entry.agent}</span>
+                <span className="log-message">{entry.msg}</span>
+              </div>
+            ))
           ) : (
             <p className="muted-copy">{loading ? "Cargando logs..." : "Todavia no hay logs visibles."}</p>
           )}
