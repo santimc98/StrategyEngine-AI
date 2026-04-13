@@ -297,6 +297,54 @@ def _metric_names_match(requested_metric: str, candidate_metric: str) -> bool:
     return False
 
 
+def _metric_alias_norms(metric_name: str) -> set[str]:
+    norms = {_norm_token(metric_name)}
+    canonical = canonicalize_metric_name(metric_name)
+    if canonical:
+        norms.add(_norm_token(canonical))
+        for alias in _METRIC_CANONICAL_ALIASES.get(canonical, ()):
+            norms.add(_norm_token(alias))
+    return {item for item in norms if item}
+
+
+def _metric_names_exact_or_alias_match(requested_metric: str, candidate_metric: str) -> bool:
+    requested = str(requested_metric or "").strip()
+    candidate = str(candidate_metric or "").strip()
+    if not requested or not candidate:
+        return False
+    requested_norm = _norm_token(requested)
+    candidate_norm = _norm_token(candidate)
+    if requested_norm and requested_norm == candidate_norm:
+        return True
+    return bool(candidate_norm and candidate_norm in _metric_alias_norms(requested))
+
+
+def _resolve_direct_named_metric(metrics_json: Dict[str, Any], metric_name: str) -> Dict[str, Any]:
+    metric_name = str(metric_name or "").strip()
+    if not isinstance(metrics_json, dict) or not metric_name:
+        return {}
+    requested_norms = _metric_alias_norms(metric_name)
+    if not requested_norms:
+        return {}
+    for key, value in flatten_numeric_metrics(metrics_json):
+        key_text = str(key or "").strip()
+        if not key_text:
+            continue
+        key_norm = _norm_token(key_text)
+        final_key = key_text.split(".")[-1].strip()
+        final_norm = _norm_token(final_key)
+        if key_norm not in requested_norms and final_norm not in requested_norms:
+            continue
+        return {
+            "metric_name": metric_name,
+            "canonical_name": canonicalize_metric_name(metric_name),
+            "matched_key": key_text,
+            "value": float(value),
+            "score": 100500,
+        }
+    return {}
+
+
 def _resolve_explicit_primary_metric(metrics_json: Dict[str, Any], metric_name: str) -> Dict[str, Any]:
     if not isinstance(metrics_json, dict):
         return {}
@@ -374,6 +422,11 @@ def resolve_metric_value(metrics_json: Dict[str, Any], metric_name: str) -> Dict
 
     explicit_primary = _resolve_explicit_primary_metric(metrics_json, metric_name)
     if explicit_primary:
+        explicit_name = str(explicit_primary.get("metric_name") or "")
+        if metric_name and explicit_name and not _metric_names_exact_or_alias_match(metric_name, explicit_name):
+            direct_metric = _resolve_direct_named_metric(metrics_json, metric_name)
+            if direct_metric:
+                return direct_metric
         return explicit_primary
 
     flat = flatten_numeric_metrics(metrics_json)
@@ -538,6 +591,8 @@ def normalize_metrics_report_payload(payload: Dict[str, Any] | None) -> Dict[str
         if "fold_metrics[" in metric_key:
             model_performance.setdefault(metric_key, float(metric_value))
         elif canonicalize_metric_name(final_key):
+            if "." in metric_key and any(token in _norm_token(final_key) for token in ("metric", "score", "auc", "gini", "logloss", "loss", "error", "rmse", "mae", "mape", "smape", "accuracy", "precision", "recall", "f1")):
+                model_performance.setdefault(metric_key, float(metric_value))
             model_performance.setdefault(final_key, float(metric_value))
 
     primary_metric_name = _infer_primary_metric_name(normalized, model_performance)

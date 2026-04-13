@@ -15107,38 +15107,52 @@ def _candidate_optimization_blueprint_paths(state: Dict[str, Any], run_id: str) 
     token = str(run_id or "").strip()
     if not token:
         return []
-    rel_parts = ["runs", token, "agents", "model_analyst", "optimization_blueprint.json"]
-    rel_path = os.path.join(*rel_parts)
-    candidates: List[str] = [rel_path]
+    blueprint_rel = os.path.join("agents", "model_analyst", "optimization_blueprint.json")
+    candidates: List[str] = []
+    root_candidates: List[str] = []
+
+    def _append_root(raw: Any) -> None:
+        path = str(raw or "").strip()
+        if not path:
+            return
+        abs_path = os.path.abspath(path)
+        if abs_path not in root_candidates:
+            root_candidates.append(abs_path)
+
+    for key in ("run_bundle_dir", "run_dir"):
+        _append_root(state.get(key))
+
+    registered_run_dir = get_run_dir(token)
+    if registered_run_dir:
+        _append_root(registered_run_dir)
 
     work_dir = state.get("work_dir")
     if isinstance(work_dir, str) and work_dir.strip():
-        candidates.append(os.path.join(work_dir, *rel_parts))
+        work_abs = os.path.abspath(work_dir)
+        if os.path.basename(work_abs).lower() == "work":
+            parent = os.path.dirname(work_abs)
+            if os.path.basename(parent) == token:
+                _append_root(parent)
+        candidates.append(os.path.join(work_abs, "runs", token, blueprint_rel))
 
     orig_cwd = state.get("orig_cwd")
     if isinstance(orig_cwd, str) and orig_cwd.strip():
-        candidates.append(os.path.join(orig_cwd, *rel_parts))
-        candidates.append(
-            os.path.join(
-                orig_cwd,
-                "runs",
-                token,
-                "work",
-                *rel_parts,
-            )
-        )
+        orig_abs = os.path.abspath(orig_cwd)
+        if os.path.basename(orig_abs) == token and os.path.basename(os.path.dirname(orig_abs)).lower() == "runs":
+            _append_root(orig_abs)
 
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    candidates.append(os.path.join(project_root, *rel_parts))
-    candidates.append(
-        os.path.join(
-            project_root,
-            "runs",
-            token,
-            "work",
-            *rel_parts,
-        )
-    )
+    cwd_abs = os.path.abspath(os.getcwd())
+    if os.path.basename(cwd_abs).lower() == "work":
+        parent = os.path.dirname(cwd_abs)
+        if os.path.basename(parent) == token and os.path.basename(os.path.dirname(parent)).lower() == "runs":
+            _append_root(parent)
+            candidates.append(os.path.join(cwd_abs, "runs", token, blueprint_rel))
+    elif os.path.basename(cwd_abs) == token and os.path.basename(os.path.dirname(cwd_abs)).lower() == "runs":
+        _append_root(cwd_abs)
+
+    for root in root_candidates:
+        candidates.append(os.path.join(root, blueprint_rel))
+        candidates.append(os.path.join(root, "work", "runs", token, blueprint_rel))
 
     deduped: List[str] = []
     seen: set[str] = set()
@@ -31433,6 +31447,14 @@ def _resolve_metric_round_hybrid_policy(
     diversity_recovery_applied = False
     diversity_recovery_reason = ""
     diversity_alternate = ""
+    tracker_context_current = (
+        dict(packet.get("tracker_context"))
+        if isinstance(packet.get("tracker_context"), dict)
+        else {}
+    )
+    is_duplicate_packet = bool(tracker_context_current.get("is_duplicate")) or bool(
+        str(tracker_context_current.get("duplicate_of") or "").strip()
+    )
 
     successful_ranked: List[str] = []
     seen_success: set[str] = set()
@@ -31469,7 +31491,7 @@ def _resolve_metric_round_hybrid_policy(
         bundle_techniques = [current_technique]
 
     bundle_techniques: List[str] = []
-    if safe_round_id == 1 and action != "APPLY" and plan_entries:
+    if safe_round_id == 1 and action != "APPLY" and plan_entries and not is_duplicate_packet:
         selected_entry = None
         selected_signature = ""
         for entry in plan_entries:
@@ -31584,11 +31606,6 @@ def _resolve_metric_round_hybrid_policy(
             or not current_technique
             or current_technique.upper() == "NO_OP"
             or is_duplicate_packet
-            or (
-                negative_delta_streak >= 2
-                and current_technique
-                and current_technique.lower() in recent_negative_keys
-            )
         )
     )
     if should_recover_diversity and plan_entries:

@@ -2669,6 +2669,7 @@ class MLEngineerAgent:
         critical_section = ""
         if critical_errors:
             critical_section = (
+                "CRITICAL ERRORS FROM PREVIOUS ATTEMPTS\n"
                 "PREVIOUS ATTEMPT CONTEXT (understand what failed and why)\n" +
                 "\n".join(critical_errors) +
                 "\n---\n"
@@ -3626,10 +3627,61 @@ class MLEngineerAgent:
         csv_decimal: str,
         csv_encoding: str,
     ) -> str:
+        if not self._needs_universal_script_guards(code):
+            return str(code or "")
         guarded = self._inject_universal_prologue(code, csv_sep, csv_decimal, csv_encoding)
         guarded = self._fix_to_csv_dialect_in_code(guarded)
         guarded = self._ensure_json_dump_default_serializer(guarded)
         return guarded
+
+    def _needs_universal_script_guards(self, code: str) -> bool:
+        text = str(code or "")
+        if not text.strip():
+            return False
+        if UNIVERSAL_PROLOGUE_START in text:
+            return True
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            lowered = text.lower()
+            return any(
+                token in lowered
+                for token in ("read_csv(", ".to_csv(", "json.dump(", "open(")
+            )
+
+        def _constant_path_arg(node: ast.Call) -> str:
+            if not node.args:
+                return ""
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                return first.value.replace("\\", "/").strip().lower()
+            return ""
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                if func.attr in {"read_csv", "to_csv"}:
+                    return True
+                if (
+                    func.attr == "dump"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "json"
+                ):
+                    return True
+                if func.attr == "open":
+                    path = _constant_path_arg(node)
+                    if not path or path.startswith(("data/", "static/", "artifacts/", "reports/")):
+                        return True
+            elif isinstance(func, ast.Name):
+                if func.id == "read_csv":
+                    return True
+                if func.id == "open":
+                    path = _constant_path_arg(node)
+                    if not path or path.startswith(("data/", "static/", "artifacts/", "reports/")):
+                        return True
+        return False
 
     def _fix_to_csv_dialect_in_code(self, code: str) -> str:
         try:
@@ -5292,8 +5344,14 @@ class MLEngineerAgent:
         """
 
         USER_EDITOR_OPTIMIZATION_TEMPLATE = """
-        MODE: METRIC_IMPROVEMENT (phase: $phase_classification)
+        MODE: CODE_EDITOR_MODE_OPTIMIZATION
+        CURRENT PHASE: $phase_classification
         You are editing an incumbent script to improve its metric. Do not regenerate from zero.
+
+        OPTIMIZATION EDITOR CONTRACT
+        - Patch the incumbent script; do not replace it with a new solution.
+        - Runtime/compliance repair takes priority when active, then metric improvement resumes.
+        - Treat the active hypothesis as a proposal to test, not a literal recipe.
 
         ===================================================================
         YOUR OBJECTIVE
@@ -5306,11 +5364,13 @@ class MLEngineerAgent:
         What the script you are editing currently achieves:
         $incumbent_brief
 
-        Round context: $optimization_round_brief
+        CURRENT ROUND BRIEF:
+        $optimization_round_brief
 
         ===================================================================
-        HYPOTHESIS TO IMPLEMENT
+        ACTIVE HYPOTHESIS
         ===================================================================
+        ACTIVE HYPOTHESIS (proposal to test, not a literal recipe):
         $active_hypothesis_brief
 
         Optional blueprint (advisory, not a recipe):
@@ -5320,7 +5380,8 @@ class MLEngineerAgent:
         EVIDENCE & FEEDBACK
         ===================================================================
         Recent attempts: $recent_tracker
-        Analysis: $current_evidence_brief
+        CURRENT EVIDENCE BRIEF:
+        $current_evidence_brief
         Feedback: $optimization_feedback_brief
 
         ===================================================================
