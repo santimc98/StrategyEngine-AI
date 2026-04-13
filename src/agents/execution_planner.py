@@ -1921,9 +1921,59 @@ def _build_semantic_guard_validation(
             issue.update(extras)
         issues.append(issue)
 
+    def _direct_compiled_role_bucket(bucket: str, compiled_roles_payload: Dict[str, Any]) -> set[str]:
+        bucket = str(bucket or "").strip().lower()
+        return set(x.lower() for x in _canonicalize_string_list(compiled_roles_payload.get(bucket)))
+
+    def _compiled_gate_forbidden_or_audit_norms() -> set[str]:
+        norms: set[str] = set()
+        gate_sources: List[Any] = [
+            compiled_contract.get("cleaning_gates"),
+            compiled_contract.get("qa_gates"),
+            compiled_contract.get("reviewer_gates"),
+        ]
+        for section_name in ("data_engineer", "ml_engineer", "reviewer", "qa_reviewer"):
+            section = compiled_contract.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            for key in ("cleaning_gates", "qa_gates", "reviewer_gates", "validation_gates"):
+                gate_sources.append(section.get(key))
+        for gates in gate_sources:
+            if not isinstance(gates, list):
+                continue
+            for gate in gates:
+                if not isinstance(gate, dict):
+                    continue
+                params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+                for key in (
+                    "forbidden_columns",
+                    "forbidden_features",
+                    "forbidden_in_ml_ready",
+                    "audit_only_columns",
+                    "audit_only_features",
+                    "leakage_columns",
+                    "post_decision_columns",
+                ):
+                    norms.update(x.lower() for x in _canonicalize_string_list(params.get(key)))
+        return norms
+
+    def _compiled_safe_outcome_reclassification_bucket(compiled_roles_payload: Dict[str, Any]) -> set[str]:
+        safe: set[str] = set()
+        for source in (
+            compiled_roles_payload.get("post_decision_audit_only"),
+            compiled_allowed_sets.get("audit_only_features"),
+            compiled_allowed_sets.get("forbidden_for_modeling"),
+            compiled_allowed_sets.get("forbidden_features"),
+        ):
+            safe.update(x.lower() for x in _canonicalize_string_list(source))
+        safe.update(_compiled_gate_forbidden_or_audit_norms())
+        return safe
+
     def _resolved_compiled_role_bucket(bucket: str, compiled_roles_payload: Dict[str, Any]) -> set[str]:
         bucket = str(bucket or "").strip().lower()
-        direct = set(x.lower() for x in _canonicalize_string_list(compiled_roles_payload.get(bucket)))
+        direct = _direct_compiled_role_bucket(bucket, compiled_roles_payload)
+        if bucket == "outcome":
+            return direct | _compiled_safe_outcome_reclassification_bucket(compiled_roles_payload)
         if bucket != "pre_decision":
             return direct
         refined_union: set[str] = set()
@@ -1984,6 +2034,31 @@ def _build_semantic_guard_validation(
             anchors.update(x.lower() for x in _canonicalize_string_list(source))
 
         return anchors
+
+    def _semantic_target_column_norms() -> set[str]:
+        targets: set[str] = set()
+
+        def _add(source: Any) -> None:
+            targets.update(x.lower() for x in _canonicalize_string_list(source))
+
+        _add(semantic_core.get("primary_target"))
+        _add(semantic_core.get("target_column"))
+        _add(semantic_core.get("target_columns"))
+        _add(semantic_core.get("label_columns"))
+        for section_name in (
+            "task_semantics",
+            "future_ml_handoff",
+            "evaluation_spec",
+            "validation_requirements",
+        ):
+            section = semantic_core.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            _add(section.get("primary_target"))
+            _add(section.get("target_column"))
+            _add(section.get("target_columns"))
+            _add(section.get("label_columns"))
+        return targets
 
     semantic_resolved_workstreams = resolve_contract_active_workstreams(semantic_core)
     compiled_resolved_workstreams = resolve_contract_active_workstreams(compiled_contract)
@@ -2246,6 +2321,7 @@ def _build_semantic_guard_validation(
     semantic_roles = semantic_core.get("column_roles")
     compiled_roles = compiled_contract.get("column_roles")
     semantic_pre_decision_anchors = _semantic_pre_decision_anchor_columns()
+    semantic_target_norms = _semantic_target_column_norms()
     if isinstance(semantic_roles, dict):
         if not isinstance(compiled_roles, dict):
             _record_conflict(
@@ -2265,14 +2341,24 @@ def _build_semantic_guard_validation(
                 semantic_bucket = set(x.lower() for x in _canonicalize_string_list(semantic_roles.get(bucket)))
                 if bucket == "pre_decision" and semantic_pre_decision_anchors:
                     semantic_bucket = semantic_bucket.intersection(semantic_pre_decision_anchors)
-                compiled_bucket = _resolved_compiled_role_bucket(bucket, compiled_roles)
-                if semantic_bucket and not semantic_bucket.issubset(compiled_bucket):
+                if bucket == "outcome" and not semantic_target_norms:
+                    compiled_bucket = _direct_compiled_role_bucket(bucket, compiled_roles)
+                else:
+                    compiled_bucket = _resolved_compiled_role_bucket(bucket, compiled_roles)
+                if bucket == "outcome" and semantic_target_norms:
+                    compiled_outcomes = _direct_compiled_role_bucket(bucket, compiled_roles)
+                    semantic_targets = semantic_bucket.intersection(semantic_target_norms)
+                    semantic_non_targets = semantic_bucket - semantic_target_norms
+                    missing = (semantic_targets - compiled_outcomes) | (semantic_non_targets - compiled_bucket)
+                else:
+                    missing = semantic_bucket - compiled_bucket
+                if semantic_bucket and missing:
                     _record_conflict(
                         "semantic_guard.column_roles_changed",
                         "Compiled contract dropped semantic_core column role assignments.",
                         {
                             "bucket": bucket,
-                            "missing": sorted(list(semantic_bucket - compiled_bucket)),
+                            "missing": sorted(list(missing)),
                         },
                     )
 

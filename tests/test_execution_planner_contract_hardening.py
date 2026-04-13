@@ -1272,6 +1272,128 @@ def test_semantic_guard_allows_pre_decision_role_refinement_into_structural_buck
     )
 
 
+def test_semantic_guard_allows_non_target_outcomes_reclassified_as_audit_forbidden():
+    semantic_core = {
+        "task_semantics": {
+            "primary_target": "churn_60d",
+            "target_columns": ["churn_60d"],
+        },
+        "model_features": ["arr_current"],
+        "column_roles": {
+            "pre_decision": ["arr_current"],
+            "outcome": ["churn_60d", "cancelled_at", "final_account_status"],
+        },
+    }
+    compiled_contract = {
+        "task_semantics": {
+            "primary_target": "churn_60d",
+            "target_columns": ["churn_60d"],
+        },
+        "model_features": ["arr_current"],
+        "column_roles": {
+            "pre_decision": ["arr_current"],
+            "outcome": ["churn_60d"],
+            "post_decision_audit_only": ["cancelled_at", "final_account_status"],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["arr_current"],
+            "audit_only_features": ["cancelled_at", "final_account_status"],
+            "forbidden_features": ["cancelled_at", "final_account_status"],
+        },
+        "ml_engineer": {
+            "qa_gates": [
+                {
+                    "name": "no_leakage_columns_in_feature_matrix",
+                    "params": {"forbidden_columns": ["cancelled_at", "final_account_status"]},
+                }
+            ]
+        },
+    }
+
+    result = _build_semantic_guard_validation(semantic_core, compiled_contract)
+
+    assert result.get("accepted") is True
+    assert not any(
+        issue.get("rule") == "semantic_guard.column_roles_changed"
+        for issue in (result.get("issues") or [])
+        if isinstance(issue, dict)
+    )
+
+
+def test_semantic_guard_rejects_target_reclassified_as_audit_only():
+    semantic_core = {
+        "task_semantics": {
+            "primary_target": "churn_60d",
+            "target_columns": ["churn_60d"],
+        },
+        "model_features": ["arr_current"],
+        "column_roles": {
+            "pre_decision": ["arr_current"],
+            "outcome": ["churn_60d"],
+        },
+    }
+    compiled_contract = {
+        "task_semantics": {
+            "primary_target": "churn_60d",
+            "target_columns": ["churn_60d"],
+        },
+        "model_features": ["arr_current"],
+        "column_roles": {
+            "pre_decision": ["arr_current"],
+            "outcome": [],
+            "post_decision_audit_only": ["churn_60d"],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["arr_current"],
+            "audit_only_features": ["churn_60d"],
+            "forbidden_features": ["churn_60d"],
+        },
+    }
+
+    result = _build_semantic_guard_validation(semantic_core, compiled_contract)
+
+    assert result.get("accepted") is False
+    issues = [issue for issue in (result.get("issues") or []) if isinstance(issue, dict)]
+    assert any(
+        issue.get("rule") == "semantic_guard.column_roles_changed"
+        and ((issue.get("item") or {}).get("missing") == ["churn_60d"])
+        for issue in issues
+    )
+
+
+def test_semantic_guard_rejects_outcome_reclassification_when_target_semantics_missing():
+    semantic_core = {
+        "model_features": ["arr_current"],
+        "column_roles": {
+            "pre_decision": ["arr_current"],
+            "outcome": ["label_or_proxy"],
+        },
+    }
+    compiled_contract = {
+        "model_features": ["arr_current"],
+        "column_roles": {
+            "pre_decision": ["arr_current"],
+            "outcome": [],
+            "post_decision_audit_only": ["label_or_proxy"],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["arr_current"],
+            "audit_only_features": ["label_or_proxy"],
+            "forbidden_features": ["label_or_proxy"],
+        },
+    }
+
+    result = _build_semantic_guard_validation(semantic_core, compiled_contract)
+
+    assert result.get("accepted") is False
+    issues = [issue for issue in (result.get("issues") or []) if isinstance(issue, dict)]
+    assert any(
+        issue.get("rule") == "semantic_guard.column_roles_changed"
+        and ((issue.get("item") or {}).get("missing") == ["label_or_proxy"])
+        for issue in issues
+    )
+
+
 def test_reconcile_compiled_feature_surfaces_preserves_semantic_model_features_and_promotes_derived_extras():
     semantic_core = {
         "model_features": ["region", "country", "industry"],

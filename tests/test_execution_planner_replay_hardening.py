@@ -51,6 +51,17 @@ def test_replay_569fff4a_semantic_guard_keeps_refined_required_outputs_nonblocki
     )
 
 
+def test_replay_ee2c6cbd_semantic_guard_accepts_outcome_leakage_quarantine():
+    semantic_core = _load_run_json("ee2c6cbd", "semantic_core.json")
+    contract_canonical = _load_run_json("ee2c6cbd", "contract_canonical.json")
+
+    result = _build_semantic_guard_validation(semantic_core, contract_canonical)
+
+    assert result.get("accepted") is True
+    issues = [issue for issue in (result.get("issues") or []) if isinstance(issue, dict)]
+    assert not any(issue.get("rule") == "semantic_guard.column_roles_changed" for issue in issues)
+
+
 def test_replay_2a1e9a11_truncated_contract_response_is_structurally_recoverable():
     response_path = _REPO_ROOT / "runs" / "2a1e9a11" / "agents" / "execution_planner" / "response_attempt_1.txt"
     semantic_core = _load_run_json("2a1e9a11", "semantic_core.json")
