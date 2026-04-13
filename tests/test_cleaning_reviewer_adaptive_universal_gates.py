@@ -812,3 +812,186 @@ def test_arr_current_numeric_conversion_fails_when_object_currency_strings_are_u
         if normalize_gate_name(gr.get("name", "")) == "arr_current_numeric_conversion_verified"
     )
     assert gate_entry.get("passed") is False
+
+
+def test_outlier_policy_applied_accepts_treatments_list_report():
+    df = pd.DataFrame(
+        {
+            "employees": [10, 20, 30],
+            "annual_revenue": [1000, 2000, 3000],
+        }
+    )
+    gates = [
+        {
+            "name": "outlier_policy_applied",
+            "severity": "HARD",
+            "params": {"strict": True},
+        }
+    ]
+    outlier_policy = {
+        "enabled": True,
+        "apply_stage": "data_engineer",
+        "target_columns": ["employees", "annual_revenue"],
+        "strict": True,
+    }
+    outlier_report = {
+        "enabled": True,
+        "treatments": [
+            {"column": "employees", "method": "winsorize_1pct_99pct", "rows_capped": 2},
+            {"column": "annual_revenue", "method": "winsorize_1pct_99pct", "rows_capped": 1},
+        ],
+    }
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=[],
+        cleaned_header=list(df.columns),
+        cleaned_csv_path="data/cleaned_data.csv",
+        sample_str=df.astype(str),
+        sample_infer=df,
+        manifest={},
+        raw_sample=None,
+        column_roles={},
+        allowed_feature_sets={},
+        outlier_policy=outlier_policy,
+        outlier_report=outlier_report,
+        outlier_report_path="data/outlier_treatment_report.json",
+    )
+
+    gate_entry = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "outlier_policy_applied"
+    )
+    evidence = gate_entry.get("evidence") or {}
+    assert result["status"] == "APPROVED"
+    assert gate_entry.get("passed") is True
+    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+
+
+def test_cleaning_reviewer_deterministically_evaluates_temporal_contract_gates(tmp_path: Path):
+    csv_path = tmp_path / "account_snapshots_ml_ready.csv"
+    cleaned = pd.DataFrame(
+        {
+            "account_id": ["A1", "A2", "A3", "A4"],
+            "snapshot_month_end": ["2025-08-31", "2025-09-30", "2025-10-31", "2025-11-30"],
+            "churn_60d": [0.0, 1.0, 0.0, None],
+            "arr_current": [1000.0, 2000.0, 3000.0, 4000.0],
+            "seat_utilization_30d": [0.7, 0.8, 0.9, 0.6],
+        }
+    )
+    cleaned.to_csv(csv_path, index=False)
+    gates = [
+        {
+            "name": "snapshot_month_end_parseable",
+            "severity": "HARD",
+            "params": {"column": "snapshot_month_end", "required_parse_ratio": 1.0},
+        },
+        {
+            "name": "training_rows_churn_label_not_null",
+            "severity": "HARD",
+            "params": {
+                "partition": "training",
+                "filter": "snapshot_month_end <= '2025-09-30'",
+                "column": "churn_60d",
+                "condition": "IS NOT NULL",
+            },
+        },
+        {
+            "name": "exact_duplicates_removed_from_training",
+            "severity": "HARD",
+            "params": {
+                "partition": "training",
+                "filter": "snapshot_month_end <= '2025-09-30'",
+                "condition": "is_exact_duplicate = FALSE",
+            },
+        },
+        {
+            "name": "leakage_columns_excluded_from_feature_matrix",
+            "severity": "HARD",
+            "params": {"forbidden_columns": ["final_account_status", "cancelled_at", "health_score"]},
+        },
+        {
+            "name": "training_partition_temporal_ceiling",
+            "severity": "HARD",
+            "params": {
+                "column": "snapshot_month_end",
+                "max_allowed_date": "2025-09-30",
+                "partition": "training",
+            },
+        },
+        {
+            "name": "arr_current_numeric_parseable",
+            "severity": "SOFT",
+            "params": {"column": "arr_current", "required_parse_ratio": 1.0},
+        },
+    ]
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=[],
+        cleaned_header=list(cleaned.columns),
+        cleaned_csv_path=str(csv_path),
+        sample_str=cleaned.astype("string"),
+        sample_infer=cleaned,
+        manifest={},
+        raw_sample=None,
+        column_roles={"identifier": ["account_id"], "outcome": ["churn_60d"]},
+        allowed_feature_sets={},
+    )
+
+    assert result["status"] == "APPROVED"
+    gate_map = {
+        normalize_gate_name(entry.get("name", "")): entry
+        for entry in result.get("gate_results", [])
+        if isinstance(entry, dict)
+    }
+    for gate_name in [
+        "snapshot_month_end_parseable",
+        "training_rows_churn_label_not_null",
+        "exact_duplicates_removed_from_training",
+        "leakage_columns_excluded_from_feature_matrix",
+        "training_partition_temporal_ceiling",
+        "arr_current_numeric_parseable",
+    ]:
+        assert gate_map[gate_name]["passed"] is True
+
+
+def test_training_label_gate_fails_only_for_nulls_inside_filtered_partition(tmp_path: Path):
+    csv_path = tmp_path / "account_snapshots_ml_ready.csv"
+    cleaned = pd.DataFrame(
+        {
+            "snapshot_month_end": ["2025-08-31", "2025-09-30", "2025-11-30"],
+            "churn_60d": [0.0, None, None],
+        }
+    )
+    cleaned.to_csv(csv_path, index=False)
+
+    result = _evaluate_gates_deterministic(
+        gates=[
+            {
+                "name": "training_rows_churn_label_not_null",
+                "severity": "HARD",
+                "params": {
+                    "partition": "training",
+                    "filter": "snapshot_month_end <= '2025-09-30'",
+                    "column": "churn_60d",
+                },
+            }
+        ],
+        required_columns=[],
+        cleaned_header=list(cleaned.columns),
+        cleaned_csv_path=str(csv_path),
+        sample_str=cleaned.astype("string"),
+        sample_infer=cleaned,
+        manifest={},
+        raw_sample=None,
+        column_roles={},
+        allowed_feature_sets={},
+    )
+
+    gate_entry = result["gate_results"][0]
+    evidence = gate_entry.get("evidence") or {}
+    assert result["status"] == "REJECTED"
+    assert gate_entry.get("passed") is False
+    assert evidence.get("null_rows_in_partition") == 1

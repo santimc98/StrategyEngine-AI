@@ -2,6 +2,7 @@ import pytest
 
 from src.graph.graph import (
     _build_iteration_handoff,
+    _build_review_guided_retry_context,
     _extract_verified_gate_feedback,
     prepare_runtime_fix,
 )
@@ -48,6 +49,21 @@ def test_iteration_handoff_prioritizes_runtime_and_missing_outputs(tmp_path):
     assert any("runtime root cause" in item.lower() for item in handoff["patch_objectives"])
     assert any("missing contract outputs" in item.lower() for item in handoff["patch_objectives"])
     assert any(str(metrics_path) in item for item in handoff["must_preserve"])
+
+
+def test_review_guided_retry_context_rejects_string_output_status_as_path_list():
+    context = _build_review_guided_retry_context(
+        failed_gates=["outlier_policy_applied"],
+        hard_failures=["outlier_policy_applied"],
+        missing_outputs="missing",
+        present_outputs="present",
+        required_fixes=["outlier_policy_applied: report schema mismatch"],
+        evidence_focus=[],
+    )
+
+    assert context["missing_outputs"] == []
+    assert context["working_components"] == []
+    assert "Missing outputs: m" not in context["specific_error"]
 
 
 def test_iteration_handoff_extracts_target_from_qa_gate_params():

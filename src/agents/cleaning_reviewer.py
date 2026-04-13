@@ -1605,6 +1605,35 @@ def _evaluate_gates_deterministic(
                 params=params,
                 column_roles=column_roles,
             )
+        elif gate_key.endswith("_numeric_parseable") or "numeric_parseable" in gate_key:
+            issues, evidence = _check_numeric_parseable_gate(
+                cleaned_csv_path=cleaned_csv_path,
+                cleaned_header=cleaned_header,
+                sample_str=sample_str,
+                sample_infer=sample_infer,
+                params=params,
+                manifest=manifest,
+                gate_key=gate_key,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    f"{gate_key} skipped: {evidence.get('skip_reason', 'not_applicable')}"
+                )
+                evaluated = False
+        elif gate_key.endswith("_parseable") and _is_datetime_parseable_gate(gate_key, params):
+            issues, evidence = _check_datetime_parseable_gate(
+                cleaned_csv_path=cleaned_csv_path,
+                cleaned_header=cleaned_header,
+                sample_str=sample_str,
+                params=params,
+                manifest=manifest,
+                gate_key=gate_key,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    f"{gate_key} skipped: {evidence.get('skip_reason', 'not_applicable')}"
+                )
+                evaluated = False
         elif gate_key == "target_null_alignment_with_split":
             issues, evidence = _check_target_null_alignment_with_split(
                 sample_str=sample_str,
@@ -1690,7 +1719,42 @@ def _evaluate_gates_deterministic(
                 warnings.append(
                     f"{gate_key} skipped: {evidence.get('skip_reason', 'not_applicable')}"
                 )
-        elif gate_key == "identifier_columns_excluded_from_features":
+        elif (
+            gate_key == "target_not_null_in_training"
+            or ("not_null" in gate_key and str(params.get("partition") or "").strip().lower() == "training")
+            or ("training" in gate_key and "not_null" in gate_key)
+        ):
+            if _resolve_partition_filter(params) or gate_key != "target_not_null_in_training":
+                issues, evidence = _check_target_not_null_under_filter(
+                    cleaned_csv_path=cleaned_csv_path,
+                    cleaned_header=cleaned_header,
+                    params=params,
+                )
+            else:
+                issues, evidence = _check_target_not_null_in_training(
+                    cleaned_csv_path=cleaned_csv_path,
+                    cleaned_header=cleaned_header,
+                    params=params,
+                    column_roles=column_roles,
+                    training_rows_context=training_rows_context,
+                )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    f"{gate_key} skipped: {evidence.get('skip_reason', 'not_applicable')}"
+                )
+                evaluated = False
+        elif "duplicate" in gate_key and ("training" in gate_key or params.get("partition")):
+            issues, evidence = _check_no_exact_duplicates_under_filter(
+                cleaned_csv_path=cleaned_csv_path,
+                cleaned_header=cleaned_header,
+                params=params,
+            )
+            if not bool(evidence.get("applies_if", True)):
+                warnings.append(
+                    f"{gate_key} skipped: {evidence.get('skip_reason', 'not_applicable')}"
+                )
+                evaluated = False
+        elif gate_key in {"identifier_columns_excluded_from_features", "leakage_columns_excluded_from_feature_matrix"}:
             issues, evidence = _check_identifier_columns_excluded_from_features(
                 cleaned_csv_path=cleaned_csv_path,
                 cleaned_header=cleaned_header,
@@ -1732,7 +1796,7 @@ def _evaluate_gates_deterministic(
                     "nps_forward_fill_temporal_integrity skipped: "
                     + str(evidence.get("skip_reason", "not_applicable"))
                 )
-        elif gate_key == "enforce_temporal_training_mask":
+        elif gate_key == "enforce_temporal_training_mask" or "temporal_ceiling" in gate_key:
             issues, evidence, training_rows_context = _check_enforce_temporal_training_mask(
                 cleaned_csv_path=cleaned_csv_path,
                 cleaned_header=cleaned_header,
@@ -1742,18 +1806,6 @@ def _evaluate_gates_deterministic(
             if not bool(evidence.get("applies_if", True)):
                 warnings.append(
                     f"enforce_temporal_training_mask skipped: {evidence.get('skip_reason', 'not_applicable')}"
-                )
-        elif gate_key == "target_not_null_in_training":
-            issues, evidence = _check_target_not_null_in_training(
-                cleaned_csv_path=cleaned_csv_path,
-                cleaned_header=cleaned_header,
-                params=params,
-                column_roles=column_roles,
-                training_rows_context=training_rows_context,
-            )
-            if not bool(evidence.get("applies_if", True)):
-                warnings.append(
-                    f"target_not_null_in_training skipped: {evidence.get('skip_reason', 'not_applicable')}"
                 )
         elif gate_key == "outlier_policy_applied":
             issues, evidence = _check_outlier_policy_applied(
@@ -2775,6 +2827,7 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
       - {"targets": ["col1", ...] | {"col1": {...}}}    (alternative contract variant)
       - {"columns": ["col1", ...] | {"col1": {...}}}    (legacy)
       - {"applied": [{"column": "col1", ...}, ...]}     (per-column detail variant)
+      - {"treatments": [{"column": "col1", ...}, ...]}  (treatment log variant)
 
     This function must handle all of them to avoid false-positive gate failures.
     """
@@ -2801,13 +2854,23 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
         report_columns = [str(key).strip() for key in raw_columns.keys() if str(key).strip()]
     # per-column detail variant: {"applied": [{"column": "employees", ...}, ...]}
     if not report_columns:
-        applied = report.get("applied")
-        if isinstance(applied, list):
-            for entry in applied:
+        for list_key in ("applied", "treatments", "treatment_records", "operations"):
+            entries = report.get(list_key)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
                 if isinstance(entry, dict):
-                    col = str(entry.get("column") or "").strip()
+                    col = str(
+                        entry.get("column")
+                        or entry.get("field")
+                        or entry.get("feature")
+                        or entry.get("name")
+                        or ""
+                    ).strip()
                     if col:
                         report_columns.append(col)
+            if report_columns:
+                break
     if not report_columns:
         for list_key in ("decisions", "columns_analyzed"):
             entries = report.get(list_key)
@@ -2836,6 +2899,9 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
             "targets",
             "columns",
             "applied",
+            "treatments",
+            "treatment_records",
+            "operations",
         }
         detail_markers = {
             "action",
@@ -3187,9 +3253,173 @@ def _read_csv_selected_columns(path: str, columns: List[str]) -> Optional[pd.Dat
         return None
 
 
+def _manifest_gate_status(manifest: Dict[str, Any], *gate_keys: Any) -> str:
+    statuses = manifest.get("cleaning_gates_status") if isinstance(manifest, dict) else {}
+    if not isinstance(statuses, dict):
+        return ""
+    normalized_keys = {_normalize_gate_name(key) for key in gate_keys if str(key or "").strip()}
+    for key, value in statuses.items():
+        if _normalize_gate_name(key) in normalized_keys:
+            return str(value or "")
+    return ""
+
+
+def _manifest_status_passed(status: Any) -> bool:
+    token = str(status or "").strip().lower()
+    return token.startswith("passed") or token in {"pass", "ok", "true", "verified"}
+
+
+def _is_datetime_parseable_gate(gate_key: str, params: Dict[str, Any]) -> bool:
+    declared = " ".join(
+        str(value or "")
+        for value in (
+            gate_key,
+            params.get("column"),
+            params.get("dtype"),
+            params.get("target_dtype"),
+            params.get("parse_type"),
+        )
+    ).lower()
+    return any(token in declared for token in ("date", "time", "timestamp", "month", "snapshot"))
+
+
+def _check_datetime_parseable_gate(
+    *,
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    sample_str: Optional[pd.DataFrame],
+    params: Dict[str, Any],
+    manifest: Dict[str, Any],
+    gate_key: str,
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+    column_candidates = _list_str(params.get("column")) + _list_str(params.get("columns"))
+    column = _pick_first_existing(column_candidates, cleaned_header)
+    threshold_raw = params.get("required_parse_ratio", params.get("min_parse_ratio", 1.0))
+    try:
+        threshold = float(threshold_raw)
+    except Exception:
+        threshold = 1.0
+    evidence["column"] = column or None
+    evidence["required_parse_ratio"] = threshold
+    if not column:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "parseable_column_missing"
+        return issues, evidence
+
+    manifest_status = _manifest_gate_status(manifest, gate_key, f"{column}_parseable")
+    if manifest_status:
+        evidence["manifest_gate_status"] = manifest_status
+
+    frame = _read_csv_selected_columns(cleaned_csv_path, [column])
+    source = "full_cleaned_csv"
+    if frame is None or column not in frame.columns:
+        if isinstance(sample_str, pd.DataFrame) and column in sample_str.columns:
+            frame = sample_str[[column]].copy()
+            source = "cleaned_sample"
+        else:
+            if _manifest_status_passed(manifest_status):
+                evidence["source"] = "manifest_gate_status"
+                return issues, evidence
+            evidence["applies_if"] = False
+            evidence["skip_reason"] = "parseable_column_unavailable"
+            return issues, evidence
+
+    series = frame[column]
+    non_null_mask = ~series.map(_is_null_like_text)
+    non_null = series[non_null_mask]
+    parsed = _parse_datetime_series_robust(non_null) if len(non_null) else pd.Series([], dtype="datetime64[ns]")
+    ratio = float(parsed.notna().sum()) / float(len(non_null)) if len(non_null) else 1.0
+    evidence.update(
+        {
+            "source": source,
+            "rows_checked": int(len(frame)),
+            "non_null_rows_checked": int(len(non_null)),
+            "parseable_ratio": round(ratio, 6),
+            "parse_failures": int(parsed.isna().sum()),
+            "sample_values": _string_values(frame, column)[:8],
+        }
+    )
+    if ratio + 1e-12 < threshold:
+        issues.append(f"{column} datetime parseable_ratio={ratio:.4f} < {threshold:.4f}")
+    return issues, evidence
+
+
+def _check_numeric_parseable_gate(
+    *,
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    params: Dict[str, Any],
+    manifest: Dict[str, Any],
+    gate_key: str,
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+    column_candidates = _list_str(params.get("column")) + _list_str(params.get("columns"))
+    column = _pick_first_existing(column_candidates, cleaned_header)
+    threshold_raw = params.get("required_parse_ratio", params.get("min_parse_ratio", 1.0))
+    try:
+        threshold = float(threshold_raw)
+    except Exception:
+        threshold = 1.0
+    evidence["column"] = column or None
+    evidence["required_parse_ratio"] = threshold
+    if not column:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "numeric_column_missing"
+        return issues, evidence
+
+    manifest_status = _manifest_gate_status(manifest, gate_key, f"{column}_numeric_parseable", f"{column}_numeric_conversion_verified")
+    if manifest_status:
+        evidence["manifest_gate_status"] = manifest_status
+
+    if isinstance(sample_infer, pd.DataFrame) and column in sample_infer.columns:
+        inferred_dtype = str(sample_infer[column].dtype)
+        evidence["sample_inferred_dtype"] = inferred_dtype
+
+    frame = _read_csv_selected_columns(cleaned_csv_path, [column])
+    source = "full_cleaned_csv"
+    if frame is None or column not in frame.columns:
+        if isinstance(sample_str, pd.DataFrame) and column in sample_str.columns:
+            frame = sample_str[[column]].copy()
+            source = "cleaned_sample"
+        elif isinstance(sample_infer, pd.DataFrame) and column in sample_infer.columns and pd.api.types.is_numeric_dtype(sample_infer[column]):
+            evidence["source"] = "sample_inferred_dtype"
+            evidence["parseable_ratio"] = 1.0
+            return issues, evidence
+        else:
+            if _manifest_status_passed(manifest_status):
+                evidence["source"] = "manifest_gate_status"
+                return issues, evidence
+            evidence["applies_if"] = False
+            evidence["skip_reason"] = "numeric_column_unavailable"
+            return issues, evidence
+
+    ratio = _best_numeric_parse_ratio(frame[column])
+    evidence.update(
+        {
+            "source": source,
+            "rows_checked": int(len(frame)),
+            "parseable_ratio": round(float(ratio), 6),
+            "sample_values": _string_values(frame, column)[:8],
+        }
+    )
+    if float(ratio) + 1e-12 < threshold:
+        issues.append(f"{column} numeric parseable_ratio={float(ratio):.4f} < {threshold:.4f}")
+    return issues, evidence
+
+
 def _parse_datetime_series_robust(values: pd.Series) -> pd.Series:
     base = values.astype("string").fillna("")
     parsed = pd.to_datetime(base, errors="coerce")
+    try:
+        mixed = pd.to_datetime(base, errors="coerce", format="mixed")
+        parsed = mixed.where(mixed.notna(), parsed)
+    except (TypeError, ValueError):
+        pass
     needs_dayfirst = base.str.contains(r"/", regex=True, na=False) | base.str.contains(
         r"^\d{2}-\d{2}-\d{4}", regex=True, na=False
     )
@@ -3242,9 +3472,9 @@ def _normalize_training_indicator_mask(series: pd.Series) -> Optional[pd.Series]
 
 
 def _resolve_temporal_cutoff(params: Dict[str, Any]) -> Optional[pd.Timestamp]:
-    raw = params.get("training_cutoff") or params.get("cutoff")
+    raw = params.get("training_cutoff") or params.get("cutoff") or params.get("max_allowed_date")
     if not raw:
-        rule = str(params.get("rule") or "")
+        rule = str(params.get("rule") or params.get("filter") or params.get("required_condition") or "")
         match = re.search(r"(\d{4}-\d{2}-\d{2})", rule)
         raw = match.group(1) if match else None
     if not raw:
@@ -3550,6 +3780,121 @@ def _evaluate_required_condition_mask(
     return mask.astype("boolean"), evidence
 
 
+def _resolve_partition_filter(params: Dict[str, Any]) -> str:
+    return str(
+        params.get("filter")
+        or params.get("partition_filter")
+        or params.get("row_filter")
+        or ""
+    ).strip()
+
+
+def _check_target_not_null_under_filter(
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+    target_candidates = _list_str(params.get("column")) + _list_str(params.get("target_columns"))
+    target_col = _pick_first_existing(target_candidates, cleaned_header)
+    filter_text = _resolve_partition_filter(params)
+    evidence["target_column"] = target_col or None
+    evidence["partition_filter"] = filter_text or None
+    if not filter_text and str(params.get("partition") or "").strip().lower() == "training":
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "training_partition_filter_missing"
+        return issues, evidence
+    if not target_col:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "target_column_missing"
+        return issues, evidence
+    columns = _extract_condition_columns(filter_text)
+    if target_col not in columns:
+        columns.append(target_col)
+    frame = _read_csv_selected_columns(cleaned_csv_path, columns)
+    if frame is None or target_col not in frame.columns:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "cleaned_csv_target_or_filter_columns_unavailable"
+        return issues, evidence
+    if filter_text:
+        partition_mask, condition_evidence = _evaluate_required_condition_mask(frame, filter_text)
+        evidence["condition_evidence"] = condition_evidence
+        if partition_mask is None:
+            evidence["applies_if"] = False
+            evidence["skip_reason"] = "partition_filter_unparseable"
+            return issues, evidence
+    else:
+        partition_mask = pd.Series([True] * len(frame), index=frame.index, dtype="boolean")
+        evidence["condition_evidence"] = {"required_condition": "", "note": "no_partition_filter_all_rows"}
+
+    target_null = frame[target_col].map(_is_null_like_text)
+    partition_bool = partition_mask.fillna(False).astype(bool)
+    violating = partition_bool & target_null.fillna(True).astype(bool)
+    evidence["rows_checked"] = int(len(frame))
+    evidence["partition_rows"] = int(partition_bool.sum())
+    evidence["null_rows_in_partition"] = int(violating.sum())
+    if violating.any():
+        issues.append(f"{target_col} contains null values inside filtered partition rows")
+    return issues, evidence
+
+
+def _check_no_exact_duplicates_under_filter(
+    cleaned_csv_path: str,
+    cleaned_header: List[str],
+    params: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"applies_if": True}
+    filter_text = _resolve_partition_filter(params)
+    evidence["partition_filter"] = filter_text or None
+    if not filter_text and str(params.get("partition") or "").strip().lower() == "training":
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "training_partition_filter_missing"
+        return issues, evidence
+    if not cleaned_csv_path or not os.path.exists(cleaned_csv_path):
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "cleaned_csv_unavailable"
+        return issues, evidence
+    try:
+        delimiter = _infer_delimiter_from_file(cleaned_csv_path) or ","
+        encoding = _infer_encoding(cleaned_csv_path)
+        frame = pd.read_csv(cleaned_csv_path, dtype="string", sep=delimiter, encoding=encoding, low_memory=False)
+    except Exception as exc:
+        evidence["applies_if"] = False
+        evidence["skip_reason"] = "cleaned_csv_read_failed"
+        evidence["exception"] = str(exc)[:220]
+        return issues, evidence
+
+    if filter_text:
+        filter_columns = _extract_condition_columns(filter_text)
+        missing = [col for col in filter_columns if col not in frame.columns]
+        if missing:
+            evidence["applies_if"] = False
+            evidence["skip_reason"] = "partition_filter_columns_missing"
+            evidence["missing_columns"] = missing
+            return issues, evidence
+        partition_mask, condition_evidence = _evaluate_required_condition_mask(frame, filter_text)
+        evidence["condition_evidence"] = condition_evidence
+        if partition_mask is None:
+            evidence["applies_if"] = False
+            evidence["skip_reason"] = "partition_filter_unparseable"
+            return issues, evidence
+        scoped = frame.loc[partition_mask.fillna(False).astype(bool)]
+    else:
+        scoped = frame
+        evidence["condition_evidence"] = {"required_condition": "", "note": "no_partition_filter_all_rows"}
+
+    duplicate_mask = scoped.duplicated(keep=False)
+    duplicate_rows = int(duplicate_mask.sum())
+    evidence["rows_checked"] = int(len(frame))
+    evidence["partition_rows"] = int(len(scoped))
+    evidence["duplicate_rows_in_partition"] = duplicate_rows
+    if duplicate_rows:
+        issues.append(f"Exact duplicate rows remain in filtered partition: {duplicate_rows}")
+    return issues, evidence
+
+
 def _check_split_condition_enforced(
     cleaned_csv_path: str,
     cleaned_header: List[str],
@@ -3623,7 +3968,11 @@ def _check_identifier_columns_excluded_from_features(
 ) -> Tuple[List[str], Dict[str, Any]]:
     issues: List[str] = []
     evidence: Dict[str, Any] = {"applies_if": True}
-    forbidden = _list_str(params.get("forbidden_as_features")) or _list_str(params.get("columns"))
+    forbidden = (
+        _list_str(params.get("forbidden_as_features"))
+        or _list_str(params.get("forbidden_columns"))
+        or _list_str(params.get("columns"))
+    )
     evidence["forbidden_as_features"] = forbidden
     if not forbidden:
         evidence["applies_if"] = False

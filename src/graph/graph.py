@@ -12533,7 +12533,7 @@ def _truncate_handoff_text(text: Any, max_len: int = 360) -> str:
 
 def _normalize_handoff_items(values: Any, max_items: int = 10, max_len: int = 180) -> List[str]:
     out: List[str] = []
-    if not isinstance(values, list):
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple, set)):
         return out
     for value in values:
         text = _truncate_handoff_text(value, max_len=max_len)
@@ -12854,6 +12854,11 @@ def _build_retry_context(
     Build a structured retry_context for targeted error recovery.
     Classifies the error type so downstream agents know exactly what to fix.
     """
+    hard_failures = _normalize_handoff_items(hard_failures, max_items=12, max_len=180)
+    failed_gates = _normalize_handoff_items(failed_gates, max_items=12, max_len=180)
+    missing_outputs = _normalize_handoff_items(missing_outputs, max_items=12, max_len=220)
+    present_outputs = _normalize_handoff_items(present_outputs, max_items=12, max_len=220)
+    required_fixes = _normalize_handoff_items(required_fixes, max_items=12, max_len=260)
     authoritative_runtime = _resolve_authoritative_runtime_text(runtime_tail, state=state)
     runtime_details = _classify_runtime_failure_details(
         authoritative_runtime or runtime_tail,
@@ -12911,11 +12916,11 @@ def _build_review_guided_retry_context(
     required_fixes: List[str] | None,
     evidence_focus: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
-    failed_gates = [str(item) for item in (failed_gates or []) if str(item).strip()]
-    hard_failures = [str(item) for item in (hard_failures or []) if str(item).strip()]
-    missing_outputs = [str(item) for item in (missing_outputs or []) if str(item).strip()]
-    present_outputs = [str(item) for item in (present_outputs or []) if str(item).strip()]
-    required_fixes = [str(item) for item in (required_fixes or []) if str(item).strip()]
+    failed_gates = _normalize_handoff_items(failed_gates, max_items=12, max_len=180)
+    hard_failures = _normalize_handoff_items(hard_failures, max_items=12, max_len=180)
+    missing_outputs = _normalize_handoff_items(missing_outputs, max_items=12, max_len=220)
+    present_outputs = _normalize_handoff_items(present_outputs, max_items=12, max_len=220)
+    required_fixes = _normalize_handoff_items(required_fixes, max_items=12, max_len=260)
     evidence_focus = evidence_focus if isinstance(evidence_focus, list) else []
 
     repair_focus = "persistence" if missing_outputs else "compliance"
@@ -13742,6 +13747,10 @@ def _build_repair_ground_truth(
     evidence_focus: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     retry_context = retry_context if isinstance(retry_context, dict) else {}
+    missing_outputs = _normalize_handoff_items(missing_outputs, max_items=12, max_len=220)
+    present_outputs = _normalize_handoff_items(present_outputs, max_items=12, max_len=220)
+    failed_gates = _normalize_handoff_items(failed_gates, max_items=12, max_len=180)
+    required_fixes = _normalize_handoff_items(required_fixes, max_items=12, max_len=260)
     runtime_text = _resolve_authoritative_runtime_text(runtime_output, state=state) or str(runtime_output or "").strip()
     error_type = str(retry_context.get("error_type") or "").strip().lower()
     repair_focus = str(retry_context.get("repair_focus") or "").strip().lower()
@@ -14408,8 +14417,10 @@ def _build_repair_scope(
 
     repair_ground_truth = repair_ground_truth if isinstance(repair_ground_truth, dict) else {}
     evidence_focus = evidence_focus if isinstance(evidence_focus, list) else []
-    must_preserve = [str(item) for item in (must_preserve or []) if str(item).strip()]
-    missing_outputs = [str(item) for item in (missing_outputs or []) if str(item).strip()]
+    must_preserve = _normalize_handoff_items(must_preserve, max_items=16, max_len=260)
+    missing_outputs = _normalize_handoff_items(missing_outputs, max_items=12, max_len=220)
+    required_fixes = _normalize_handoff_items(required_fixes, max_items=12, max_len=260)
+    failed_gates = _normalize_handoff_items(failed_gates, max_items=12, max_len=180)
     optimization_context = optimization_context if isinstance(optimization_context, dict) else {}
     hypothesis_packet = hypothesis_packet if isinstance(hypothesis_packet, dict) else {}
     phase = "compliance_runtime" if repair_focus in {"runtime", "compliance"} else "contract_persistence"
@@ -21949,7 +21960,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         token = str(path or "").strip()
                         if token and token not in required_de_outputs:
                             required_de_outputs.append(token)
-                    present_de_outputs, missing_de_outputs = _collect_outputs_state(required_de_outputs)
+                    de_outputs_state = _collect_outputs_state(required_de_outputs)
+                    present_de_outputs = de_outputs_state.get("present", [])
+                    missing_de_outputs = de_outputs_state.get("missing", [])
                     error_snippet = _extract_error_snippet(code, runtime_error_text)
                     traceback_tail = _tail_lines(runtime_error_text, 20)
                     payload = "RUNTIME_ERROR_CONTEXT:\n" + runtime_error_text[-3000:]
@@ -22536,7 +22549,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     token = str(path or "").strip()
                                     if token and token not in required_de_outputs:
                                         required_de_outputs.append(token)
-                                present_de_outputs, missing_de_outputs = _collect_outputs_state(required_de_outputs)
+                                de_outputs_state = _collect_outputs_state(required_de_outputs)
+                                present_de_outputs = de_outputs_state.get("present", [])
+                                missing_de_outputs = de_outputs_state.get("missing", [])
                                 error_snippet = _extract_error_snippet(code, error_details)
                                 payload = "RUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
                                 traceback_tail = _tail_lines(error_details, 20)
@@ -23496,7 +23511,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     token = str(path or "").strip()
                                     if token and token not in required_de_outputs:
                                         required_de_outputs.append(token)
-                                present_de_outputs, missing_de_outputs = _collect_outputs_state(required_de_outputs)
+                                de_outputs_state = _collect_outputs_state(required_de_outputs)
+                                present_de_outputs = de_outputs_state.get("present", [])
+                                missing_de_outputs = de_outputs_state.get("missing", [])
                                 verified_retry_packet = _extract_verified_gate_feedback(
                                     review_result,
                                     hard_only=True,
