@@ -597,6 +597,100 @@ def test_promote_best_attempt_clears_runtime_blockers(tmp_path, monkeypatch) -> 
     assert updates["last_runtime_error_tail"] is None
 
 
+def test_hybrid_policy_recovers_first_round_noop_from_plan() -> None:
+    packet, policy_meta = _resolve_metric_round_hybrid_policy(
+        round_id=1,
+        rounds_allowed=3,
+        no_improve_streak=0,
+        patience=2,
+        min_delta=0.0005,
+        higher_is_better=True,
+        hypothesis_packet={
+            "action": "NO_OP",
+            "hypothesis": {"technique": "NO_OP", "params": {}},
+            "tracker_context": {"signature": "llm_noop_round_1"},
+        },
+        feature_engineering_plan={
+            "techniques": [
+                {"technique": "missing_indicators", "columns": ["arr_current"], "params": {"limit": 20}},
+            ],
+        },
+        tracker_entries=[],
+    )
+
+    assert packet["action"] == "APPLY"
+    assert packet["hypothesis"]["technique"] == "missing_indicators"
+    assert packet["hypothesis"]["target_columns"] == ["arr_current"]
+    assert packet["hypothesis"]["params"] == {"limit": 20}
+    assert policy_meta["first_round_apply_forced"] is True
+    assert policy_meta["strategist_packet_preserved"] is False
+
+
+def test_hybrid_policy_recovers_noop_from_blueprint_actions_when_plan_empty() -> None:
+    packet, policy_meta = _resolve_metric_round_hybrid_policy(
+        round_id=1,
+        rounds_allowed=3,
+        no_improve_streak=0,
+        patience=2,
+        min_delta=0.0005,
+        higher_is_better=True,
+        hypothesis_packet={
+            "action": "NO_OP",
+            "hypothesis": {"technique": "NO_OP", "params": {}},
+            "tracker_context": {"signature": "llm_noop_round_1"},
+        },
+        feature_engineering_plan={
+            "techniques": [],
+            "improvement_actions": [
+                {
+                    "technique": "target_encoding",
+                    "target_columns": ["segment"],
+                    "concrete_params": {"smoothing": 10},
+                },
+            ],
+        },
+        tracker_entries=[],
+    )
+
+    assert packet["action"] == "APPLY"
+    assert packet["hypothesis"]["technique"] == "target_encoding"
+    assert packet["hypothesis"]["target_columns"] == ["segment"]
+    assert packet["hypothesis"]["params"] == {"smoothing": 10}
+    assert policy_meta["first_round_apply_forced"] is True
+
+
+def test_hybrid_policy_preserves_valid_llm_apply_hypothesis() -> None:
+    packet, policy_meta = _resolve_metric_round_hybrid_policy(
+        round_id=3,
+        rounds_allowed=4,
+        no_improve_streak=0,
+        patience=2,
+        min_delta=0.0005,
+        higher_is_better=True,
+        hypothesis_packet={
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "optuna_hpo",
+                "target_columns": ["ALL_NUMERIC"],
+                "params": {"n_trials": 20},
+            },
+            "tracker_context": {"signature": "hyp_llm_optuna"},
+        },
+        feature_engineering_plan={
+            "techniques": [
+                {"technique": "target_encoding", "columns": ["segment"], "params": {}},
+            ],
+        },
+        tracker_entries=[],
+    )
+
+    assert packet["action"] == "APPLY"
+    assert packet["hypothesis"]["technique"] == "optuna_hpo"
+    assert packet["hypothesis"]["params"] == {"n_trials": 20}
+    assert policy_meta["first_round_apply_forced"] is False
+    assert policy_meta["phase"] == "exploit"
+
+
 def test_hybrid_policy_dedup_uses_merged_target_signature() -> None:
     hypothesis_packet = {
         "action": "APPLY",

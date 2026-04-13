@@ -155,3 +155,70 @@ def test_promote_best_attempt_restores_metrics_report_and_primary_metric_state(t
     persisted = json.loads((tmp_path / "data" / "metric_state.json").read_text(encoding="utf-8"))
     assert persisted["primary_metric_value"] == 40.3429
     assert (tmp_path / "artifacts" / "ml_engineer_last.py").read_text(encoding="utf-8") == "print('best candidate')\n"
+
+
+def test_promote_best_attempt_syncs_metric_loop_state_and_incumbent_bundle(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    best_dir = tmp_path / "artifacts" / "best_attempt"
+    metrics_path = best_dir / "artifacts" / "ml" / "cv_metrics.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_payload = {
+        "primary_metric_name": "mae",
+        "primary_metric_value": 40.3429,
+        "metrics": {"mae": 40.3429},
+    }
+    metrics_path.write_text(json.dumps(metrics_payload), encoding="utf-8")
+    metadata = {
+        "attempt_id": 2,
+        "artifact_index": [{"path": "artifacts/ml/cv_metrics.json"}],
+        "output_contract_report": {"overall_status": "ok", "missing": [], "present": ["artifacts/ml/cv_metrics.json"]},
+        "execution_output": "Recovered execution output",
+        "plots_local": [],
+        "generated_code": "print('best candidate')\n",
+        "metrics_payload": metrics_payload,
+        "metrics_path": "artifacts/ml/cv_metrics.json",
+        "primary_metric_state": {
+            "primary_metric_name": "mae",
+            "primary_metric_canonical_name": "mae",
+            "primary_metric_value": 40.3429,
+            "primary_metric_source": "artifacts/ml/cv_metrics.json",
+            "primary_metric_path": "metrics.mae",
+            "higher_is_better": False,
+        },
+    }
+    (best_dir / "best_attempt.json").write_text(json.dumps(metadata), encoding="utf-8")
+    stale_loop_state = {
+        "schema_version": "v1",
+        "target": {"name": "mae", "canonical_name": "mae", "higher_is_better": False, "min_delta": 0.001},
+        "round": {"round_id": 3, "rounds_allowed": 4, "patience": 2, "no_improve_streak": 1, "status": "active"},
+        "incumbent": {"label": "incumbent", "metric_name": "mae", "metric_value": 99.0},
+        "candidate": {"label": "candidate", "metric_name": "mae", "metric_value": 120.0},
+        "best_observed": {"label": "candidate", "metric_name": "mae", "metric_value": 120.0, "round_id": 3},
+        "final": {"label": "candidate", "metric_name": "mae", "metric_value": 120.0},
+        "controller": {"active": True, "status": "active", "continue_round": True},
+        "artifacts": {"metrics_path": "artifacts/ml/cv_metrics.json", "snapshots": {}},
+    }
+
+    updates = graph_mod._promote_best_attempt(
+        {
+            "best_attempt_dir": str(best_dir),
+            "best_attempt_id": 2,
+            "execution_attempt": 6,
+            "metric_loop_state": stale_loop_state,
+            "execution_contract": {"validation_requirements": {"primary_metric": "mae"}},
+        }
+    )
+
+    assert updates["incumbent_bundle"]["generated_code"] == "print('best candidate')\n"
+    assert updates["incumbent_bundle"]["metric_value"] == 40.3429
+    assert updates["incumbent_bundle"]["attempt_id"] == 2
+    loop_state = updates["metric_loop_state"]
+    assert loop_state["final"]["label"] == "best_attempt"
+    assert loop_state["final"]["metric_value"] == 40.3429
+    assert loop_state["final"]["attempt_id"] == 2
+    assert loop_state["incumbent"]["metric_value"] == 40.3429
+    assert loop_state["selection"]["reason"] == "best_attempt_promoted_after_degraded_execution"
+    persisted_loop_state = json.loads((tmp_path / "data" / "metric_loop_state.json").read_text(encoding="utf-8"))
+    persisted_bundle = json.loads((tmp_path / "data" / "incumbent_bundle.json").read_text(encoding="utf-8"))
+    assert persisted_loop_state["final"]["metric_value"] == 40.3429
+    assert persisted_bundle["attempt_id"] == 2

@@ -9771,6 +9771,203 @@ def _snapshot_best_attempt(
     except Exception:
         return None
 
+
+def _sync_best_attempt_authoritative_metric_state(
+    state: Dict[str, Any],
+    updated: Dict[str, Any],
+    meta: Dict[str, Any],
+) -> None:
+    """Keep canonical metric-loop artifacts aligned after restoring a best attempt."""
+    if not isinstance(state, dict) or not isinstance(updated, dict) or not isinstance(meta, dict):
+        return
+    generated_code = updated.get("generated_code")
+    metrics_payload = updated.get("metrics_report")
+    if not isinstance(generated_code, str) or not generated_code.strip():
+        return
+    if not isinstance(metrics_payload, dict) or not metrics_payload:
+        return
+    try:
+        restored_state = {**state, **updated}
+        primary_metric_state = (
+            updated.get("primary_metric_state")
+            if isinstance(updated.get("primary_metric_state"), dict)
+            else _load_primary_metric_state(restored_state)
+        )
+        metric_name = str(
+            primary_metric_state.get("primary_metric_name")
+            or primary_metric_state.get("target_metric_name")
+            or metrics_payload.get("primary_metric_name")
+            or metrics_payload.get("primary_metric")
+            or ""
+        ).strip()
+        resolved_metric = _resolve_metric_payload(
+            metrics_payload,
+            metric_name,
+            source_hint=str(meta.get("metrics_path") or metrics_payload.get("source") or "best_attempt"),
+        )
+        if resolved_metric:
+            metric_name = str(metric_name or resolved_metric.get("name") or "").strip()
+        metric_value = _coerce_float(
+            primary_metric_state.get("primary_metric_value")
+            if isinstance(primary_metric_state, dict)
+            else None
+        )
+        if metric_value is None and resolved_metric:
+            metric_value = _coerce_float(resolved_metric.get("value"))
+        if metric_value is None:
+            return
+        metrics_path = normalize_artifact_path(meta.get("metrics_path") or metrics_payload.get("source") or "")
+        attempt_id = _coerce_nonnegative_int(
+            meta.get("attempt_id")
+            or restored_state.get("best_attempt_id")
+            or restored_state.get("execution_attempt"),
+            default=0,
+        )
+        state_for_snapshot = dict(restored_state)
+        if attempt_id > 0:
+            state_for_snapshot["execution_attempt"] = int(attempt_id)
+        loop_state = _load_metric_loop_state(restored_state, restored_state.get("execution_contract"))
+        has_metric_loop_context = isinstance(loop_state, dict) and bool(loop_state)
+        round_payload = loop_state.get("round") if isinstance(loop_state.get("round"), dict) else {}
+        round_id = _coerce_nonnegative_int(
+            round_payload.get("round_id")
+            or restored_state.get("ml_improvement_current_round_id")
+            or restored_state.get("ml_improvement_round_count"),
+            default=0,
+        )
+        artifact_snapshot = _build_metrics_artifact_snapshot(
+            state=state_for_snapshot,
+            role="best_attempt",
+            metrics_payload=metrics_payload,
+            path=metrics_path,
+            source=f"best_attempt:{metrics_path}" if metrics_path else "best_attempt",
+            metric_name=metric_name,
+            higher_is_better=(
+                primary_metric_state.get("higher_is_better")
+                if isinstance(primary_metric_state, dict) and isinstance(primary_metric_state.get("higher_is_better"), bool)
+                else None
+            ),
+            round_id=round_id or None,
+        )
+        incumbent_bundle = _build_incumbent_bundle(
+            state=state_for_snapshot,
+            round_id=round_id,
+            source="best_attempt",
+            generated_code=generated_code,
+            last_generated_code=updated.get("last_generated_code") if isinstance(updated.get("last_generated_code"), str) else generated_code,
+            metrics_payload=metrics_payload,
+            metric_name=metric_name,
+            metric_value=metric_value,
+            metrics_path=metrics_path,
+            review_verdict=str(restored_state.get("review_verdict") or restored_state.get("last_successful_review_verdict") or ""),
+            artifact_snapshot=artifact_snapshot,
+        )
+        if attempt_id > 0:
+            incumbent_bundle["attempt_id"] = int(attempt_id)
+        existing_index = (
+            updated.get("artifact_index")
+            if isinstance(updated.get("artifact_index"), list)
+            else (
+                state.get("artifact_index")
+                if isinstance(state.get("artifact_index"), list)
+                else state.get("produced_artifact_index")
+            )
+        )
+        merged_index = _persist_incumbent_bundle(incumbent_bundle, existing_index=existing_index)
+        if isinstance(merged_index, list) and merged_index:
+            updated["artifact_index"] = merged_index
+            updated["produced_artifact_index"] = merged_index
+        updated["incumbent_bundle"] = incumbent_bundle
+
+        if not has_metric_loop_context:
+            return
+
+        loop_state = copy.deepcopy(loop_state)
+        target = loop_state.get("target") if isinstance(loop_state.get("target"), dict) else {}
+        canonical_name = str(
+            target.get("canonical_name")
+            or (resolved_metric.get("canonical_name") if isinstance(resolved_metric, dict) else "")
+            or _metric_canonical_name(metric_name)
+        ).strip()
+        higher_is_better = _resolve_metric_loop_higher_is_better(
+            metric_name,
+            loop_target=target,
+            primary_metric_state=primary_metric_state if isinstance(primary_metric_state, dict) else {},
+        )
+        best_entry = _build_metric_loop_entry(
+            label="best_attempt",
+            metric_name=metric_name,
+            canonical_name=canonical_name,
+            metrics_payload=metrics_payload,
+            fallback_value=metric_value,
+            path=metrics_path,
+            source="best_attempt_restored",
+            round_id=round_id,
+            status="selected",
+            review_verdict=str(restored_state.get("review_verdict") or restored_state.get("last_successful_review_verdict") or ""),
+            artifact_snapshot=artifact_snapshot,
+        )
+        if attempt_id > 0:
+            best_entry["attempt_id"] = int(attempt_id)
+        incumbent_entry = copy.deepcopy(best_entry)
+        incumbent_entry["label"] = "incumbent"
+        loop_state["incumbent"] = incumbent_entry
+        loop_state["best_observed"] = {
+            "label": "best_attempt",
+            "metric_name": metric_name or None,
+            "canonical_name": canonical_name or None,
+            "metric_value": float(metric_value),
+            "round_id": int(round_id),
+            "source": "best_attempt_restored",
+            "attempt_id": int(attempt_id) if attempt_id > 0 else None,
+        }
+        loop_state["final"] = best_entry
+        loop_state["selection"] = {
+            "selected_label": "best_attempt",
+            "selected_source": "best_attempt_restored",
+            "selected_metric": float(metric_value),
+            "reason": "best_attempt_promoted_after_degraded_execution",
+            "attempt_id": int(attempt_id) if attempt_id > 0 else None,
+        }
+        loop_state.setdefault("controller", {})
+        if isinstance(loop_state["controller"], dict):
+            loop_state["controller"]["active"] = False
+            loop_state["controller"]["status"] = "complete"
+            loop_state["controller"]["continue_round"] = False
+            loop_state["controller"]["force_finalize_reason"] = (
+                str(loop_state["controller"].get("force_finalize_reason") or "").strip()
+                or "best_attempt_restored"
+            )
+        loop_state.setdefault("round", {})
+        if isinstance(loop_state["round"], dict):
+            loop_state["round"]["status"] = "complete"
+        loop_state.setdefault("artifacts", {})
+        if isinstance(loop_state["artifacts"], dict):
+            loop_state["artifacts"]["metrics_path"] = metrics_path or loop_state["artifacts"].get("metrics_path")
+            snapshots = loop_state["artifacts"].get("snapshots")
+            if not isinstance(snapshots, dict):
+                snapshots = {}
+            snapshots["incumbent"] = copy.deepcopy(artifact_snapshot)
+            snapshots["final"] = copy.deepcopy(artifact_snapshot)
+            loop_state["artifacts"]["snapshots"] = snapshots
+        if isinstance(loop_state.get("target"), dict):
+            loop_state["target"]["name"] = metric_name or loop_state["target"].get("name")
+            loop_state["target"]["canonical_name"] = canonical_name or loop_state["target"].get("canonical_name")
+            loop_state["target"]["higher_is_better"] = bool(higher_is_better)
+        merged_index = _persist_metric_loop_state(loop_state, existing_index=updated.get("artifact_index"))
+        if isinstance(merged_index, list) and merged_index:
+            updated["artifact_index"] = merged_index
+            updated["produced_artifact_index"] = merged_index
+        updated["metric_loop_state"] = loop_state
+        sync_state = {**restored_state, **updated}
+        _sync_metric_loop_legacy_fields(sync_state, loop_state)
+        for key, value in sync_state.items():
+            if key.startswith("ml_improvement_") or key in {"metric_loop_state", "opt_incumbent_selection"}:
+                updated[key] = value
+    except Exception:
+        return
+
+
 def _promote_best_attempt(state: Dict[str, Any]) -> Dict[str, Any]:
     best_dir = state.get("best_attempt_dir")
     if not best_dir or not os.path.isdir(best_dir):
@@ -9870,6 +10067,7 @@ def _promote_best_attempt(state: Dict[str, Any]) -> Dict[str, Any]:
                         f_code.write(generated_code)
                 except Exception:
                     pass
+            _sync_best_attempt_authoritative_metric_state(state, updated, meta)
     except Exception:
         return updated
     return updated
@@ -15618,6 +15816,7 @@ def _persist_ml_iteration_trace_summary(
 
     stage_counts: Dict[str, int] = {}
     iterations: set[int] = set()
+    attempts: set[int] = set()
     metric_round_map: Dict[int, Dict[str, Any]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
@@ -15628,6 +15827,12 @@ def _persist_ml_iteration_trace_summary(
             iterations.add(int(entry.get("iteration_id")))
         except Exception:
             pass
+        try:
+            attempt_id = int(entry.get("attempt_id") or 0)
+        except Exception:
+            attempt_id = 0
+        if attempt_id > 0:
+            attempts.add(attempt_id)
         metric_round = entry.get("metric_round")
         if isinstance(metric_round, dict):
             try:
@@ -15644,6 +15849,8 @@ def _persist_ml_iteration_trace_summary(
                     "kept": str(metric_round.get("kept") or "").strip(),
                     "reason": str(metric_round.get("reason") or "").strip(),
                 }
+                if attempt_id > 0:
+                    metric_round_map[round_id]["attempt_id"] = attempt_id
 
     last_entry = entries[-1] if entries else {}
     outputs_missing = last_entry.get("outputs_missing") if isinstance(last_entry, dict) else []
@@ -15656,10 +15863,12 @@ def _persist_ml_iteration_trace_summary(
         "entries_count": len(entries),
         "stages_count": stage_counts,
         "iterations_observed": sorted(iterations),
+        "attempts_observed": sorted(attempts),
         "metric_rounds_count": len(metric_rounds),
         "metric_rounds": metric_rounds[-24:],
         "last_entry": {
             "iteration_id": last_entry.get("iteration_id") if isinstance(last_entry, dict) else None,
+            "attempt_id": last_entry.get("attempt_id") if isinstance(last_entry, dict) else None,
             "stage": last_entry.get("stage") if isinstance(last_entry, dict) else None,
             "reviewer_verdict": last_entry.get("reviewer_verdict") if isinstance(last_entry, dict) else None,
             "qa_verdict": last_entry.get("qa_verdict") if isinstance(last_entry, dict) else None,
@@ -15692,6 +15901,10 @@ def _append_ml_iteration_journal(
             iter_token = str(int(iter_value))
         except Exception:
             iter_token = str(iter_value or "")
+        try:
+            attempt_id = int(payload.get("attempt_id") or 0)
+        except Exception:
+            attempt_id = 0
         metric_round = payload.get("metric_round")
         round_id = 0
         if isinstance(metric_round, dict):
@@ -15699,9 +15912,12 @@ def _append_ml_iteration_journal(
                 round_id = int(metric_round.get("round_id") or 0)
             except Exception:
                 round_id = 0
+        base_key = iter_token + ":" + stage_value
+        if attempt_id > 0:
+            base_key += ":a" + str(attempt_id)
         if round_id > 0:
-            return iter_token + ":" + stage_value + ":r" + str(round_id)
-        return iter_token + ":" + stage_value
+            return base_key + ":r" + str(round_id)
+        return base_key
 
     known: set[str] = set()
     for item in written_ids or []:
@@ -15731,6 +15947,7 @@ def _append_ml_iteration_journal(
             "ml_iteration_trace",
             {
                 "iteration_id": int(entry.get("iteration_id")) if entry.get("iteration_id") is not None else None,
+                "attempt_id": _coerce_nonnegative_int(entry.get("attempt_id"), default=0) or None,
                 "stage": stage,
                 "reviewer_verdict": entry.get("reviewer_verdict"),
                 "qa_verdict": entry.get("qa_verdict"),
@@ -15776,6 +15993,7 @@ def _refresh_ml_iteration_trace_summary(
         else []
     )
     iteration_id = int(state_payload.get("iteration_count", 0) or 0) + 1
+    attempt_id = _coerce_nonnegative_int(state_payload.get("execution_attempt"), default=0)
     reviewer_verdict = str(state_payload.get("review_verdict") or "UNKNOWN")
     qa_packet = (
         state_payload.get("qa_last_result")
@@ -15798,6 +16016,7 @@ def _refresh_ml_iteration_trace_summary(
             {
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "iteration_id": int(iteration_id),
+                "attempt_id": int(attempt_id) if attempt_id > 0 else None,
                 "stage": "review_complete",
                 "reviewer_verdict": reviewer_verdict,
                 "qa_verdict": qa_verdict,
@@ -16131,6 +16350,7 @@ def _build_ml_iteration_journal_entry(
         except Exception:
             return None
 
+    attempt_id = _safe_int(state.get("execution_attempt"))
     handoff_meta = {
         "source": str(handoff_obj.get("source") or ""),
         "mode": str(handoff_obj.get("mode") or ""),
@@ -16247,6 +16467,7 @@ def _build_ml_iteration_journal_entry(
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "iteration_id": iter_id,
+        "attempt_id": attempt_id if attempt_id > 0 else None,
         "stage": stage_value,
         "code_hash": code_hash,
         "preflight_issues": preflight_issues or [],
@@ -30931,28 +31152,53 @@ def _normalize_fe_technique_entries(feature_engineering_plan: Dict[str, Any]) ->
         techniques_raw = []
     entries: List[Dict[str, Any]] = []
     seen: set[str] = set()
+
+    def _push_entry(technique: Any, target_columns: Any, params: Any, *, source: str = "") -> None:
+        technique_name = str(technique or "").strip()
+        if not technique_name:
+            return
+        key = technique_name.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        if not isinstance(target_columns, list):
+            target_columns = []
+        if not isinstance(params, dict):
+            params = {}
+        entry = {
+            "technique": technique_name,
+            "target_columns": [str(col) for col in target_columns[:12] if str(col).strip()],
+            "params": params,
+        }
+        if source:
+            entry["source"] = source
+        entries.append(entry)
+
     for item in techniques_raw:
         if isinstance(item, dict):
             technique = str(item.get("technique") or item.get("name") or "").strip()
-            target_columns = item.get("columns") if isinstance(item.get("columns"), list) else []
+            target_columns = item.get("columns") if isinstance(item.get("columns"), list) else item.get("target_columns")
             params = item.get("params") if isinstance(item.get("params"), dict) else {}
         else:
             technique = str(item or "").strip()
             target_columns = []
             params = {}
-        if not technique:
-            continue
-        key = technique.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append(
-            {
-                "technique": technique,
-                "target_columns": [str(col) for col in target_columns[:12] if str(col).strip()],
-                "params": params,
-            }
-        )
+        _push_entry(technique, target_columns, params)
+
+    blueprint_actions = plan.get("improvement_actions")
+    if isinstance(blueprint_actions, list):
+        for item in blueprint_actions:
+            if not isinstance(item, dict):
+                continue
+            technique = (
+                item.get("technique")
+                or item.get("action_type")
+                or item.get("name")
+                or item.get("title")
+            )
+            target_columns = item.get("target_columns") if isinstance(item.get("target_columns"), list) else item.get("columns")
+            params = item.get("concrete_params") if isinstance(item.get("concrete_params"), dict) else item.get("params")
+            _push_entry(technique, target_columns, params, source="optimization_blueprint")
     return entries
 
 
@@ -31205,32 +31451,6 @@ def _resolve_metric_round_hybrid_policy(
     if not bundle_techniques and action == "APPLY" and current_technique and current_technique.upper() != "NO_OP":
         bundle_techniques = [current_technique]
 
-    policy_meta = {
-        "policy": "strategist_reasoned_hypothesis_v1",
-        "phase": phase,
-        "explore_rounds": int(explore_rounds),
-        "round_id": int(safe_round_id),
-        "rounds_allowed": int(safe_rounds_allowed),
-        "min_delta": float(min_delta),
-        "patience": int(safe_patience),
-        "no_improve_streak": int(safe_no_improve),
-        "bundle_size": int(len(bundle_techniques)),
-        "bundle_techniques": bundle_techniques[:3],
-        "compatibility_rule": "strategist_selected_bundle",
-        "first_round_apply_forced": False,
-        "first_round_force_reason": "",
-        "negative_delta_streak": int(negative_delta_streak),
-        "recent_negative_techniques": recent_negative_techniques[:6],
-        "successful_techniques": successful_ranked[:6],
-        "diversity_recovery_applied": False,
-        "diversity_recovery_reason": "",
-        "diversity_alternate_technique": "",
-        "strategist_action": action,
-        "strategist_technique": current_technique or None,
-        "strategist_packet_preserved": True,
-    }
-    return packet, policy_meta
-
     bundle_techniques: List[str] = []
     if safe_round_id == 1 and action != "APPLY" and plan_entries:
         selected_entry = None
@@ -31408,32 +31628,6 @@ def _resolve_metric_round_hybrid_policy(
     if action == "APPLY" and current_technique and current_technique.upper() != "NO_OP":
         bundle_techniques.append(current_technique)
 
-    if phase == "exploit":
-        candidates: List[str] = []
-        for technique in successful_ranked:
-            if technique.lower() not in {x.lower() for x in bundle_techniques}:
-                candidates.append(technique)
-        for entry in plan_entries:
-            technique = str(entry.get("technique") or "").strip()
-            if not technique:
-                continue
-            if technique.lower() in {x.lower() for x in bundle_techniques}:
-                continue
-            if technique not in candidates:
-                candidates.append(technique)
-
-        if not bundle_techniques and candidates:
-            bundle_techniques.append(candidates[0])
-        if bundle_techniques:
-            primary = bundle_techniques[0]
-            secondary = ""
-            for candidate in candidates:
-                if _techniques_are_compatible(primary, candidate):
-                    secondary = candidate
-                    break
-            if secondary:
-                bundle_techniques.append(secondary)
-
     # ── Dedup: skip hybrid bundles that were already tried and failed ──
     # Compute the would-be bundle signature and check the tracker for prior
     # failed attempts with the same signature.  This prevents the system from
@@ -31523,14 +31717,18 @@ def _resolve_metric_round_hybrid_policy(
         "no_improve_streak": int(safe_no_improve),
         "bundle_size": int(len(bundle_techniques)) if bundle_techniques else 1,
         "bundle_techniques": bundle_techniques[:3],
-        "compatibility_rule": "family_key_and_token_overlap_v1",
+        "compatibility_rule": "single_hypothesis_preserve_llm_v1",
         "first_round_apply_forced": bool(first_round_apply_forced),
         "first_round_force_reason": first_round_force_reason,
         "negative_delta_streak": int(negative_delta_streak),
         "recent_negative_techniques": recent_negative_techniques[:6],
+        "successful_techniques": successful_ranked[:6],
         "diversity_recovery_applied": bool(diversity_recovery_applied),
         "diversity_recovery_reason": diversity_recovery_reason,
         "diversity_alternate_technique": diversity_alternate,
+        "strategist_action": action,
+        "strategist_technique": current_technique or None,
+        "strategist_packet_preserved": not bool(first_round_apply_forced or diversity_recovery_applied),
     }
     return packet, policy_meta
 
@@ -32262,6 +32460,21 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             state["ml_improvement_patience"] = int(patience)
             state["ml_improvement_rounds_allowed"] = int(rounds)
 
+    hybrid_feature_engineering_plan = copy.deepcopy(feature_engineering_plan) if isinstance(feature_engineering_plan, dict) else {}
+    blueprint_actions = (
+        optimization_blueprint.get("improvement_actions")
+        if isinstance(optimization_blueprint, dict) and isinstance(optimization_blueprint.get("improvement_actions"), list)
+        else []
+    )
+    if blueprint_actions:
+        existing_blueprint_actions = (
+            hybrid_feature_engineering_plan.get("improvement_actions")
+            if isinstance(hybrid_feature_engineering_plan.get("improvement_actions"), list)
+            else []
+        )
+        if not existing_blueprint_actions:
+            hybrid_feature_engineering_plan["improvement_actions"] = copy.deepcopy(blueprint_actions)
+
     strategist_context = {
         "run_id": run_id,
         "iteration": int(state.get("iteration_count", 0) or 0) + 1,
@@ -32288,7 +32501,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         min_delta=float(min_delta),
         higher_is_better=bool(metric_higher_is_better),
         hypothesis_packet=hypothesis_packet,
-        feature_engineering_plan=feature_engineering_plan,
+        feature_engineering_plan=hybrid_feature_engineering_plan,
         tracker_entries=tracker_entries,
     )
     metric_round_state = _build_metric_round_state(
@@ -32433,123 +32646,6 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
                 },
             )
         return False
-        # Before terminating, attempt blueprint fallback recovery: if the
-        # optimization_blueprint still has untried actions, synthesize a
-        # hypothesis directly from the next blueprint action.  This is
-        # universal — it works for any blueprint regardless of task type.
-        _bp_recovery_done = False
-        if isinstance(optimization_blueprint, dict) and optimization_blueprint:
-            _bp_actions = optimization_blueprint.get("improvement_actions")
-            if isinstance(_bp_actions, list) and _bp_actions:
-                # Collect all signatures already tried from the experiment tracker
-                _tried_sigs: set = set()
-                if isinstance(tracker_entries, list):
-                    for _te in tracker_entries:
-                        if not isinstance(_te, dict):
-                            continue
-                        _s = str(_te.get("signature") or "").strip()
-                        if _s:
-                            _tried_sigs.add(_s)
-                        _extra = _te.get("extra") if isinstance(_te.get("extra"), dict) else {}
-                        _s2 = str(_extra.get("signature") or "").strip()
-                        if _s2:
-                            _tried_sigs.add(_s2)
-                        _tc = _te.get("tracker_context") if isinstance(_te.get("tracker_context"), dict) else {}
-                        _s3 = str(_tc.get("signature") or "").strip()
-                        if _s3:
-                            _tried_sigs.add(_s3)
-                for _bp_action in _bp_actions:
-                    if not isinstance(_bp_action, dict):
-                        continue
-                    _bp_sig = str(_bp_action.get("signature") or "").strip()
-                    _bp_technique = str(
-                        _bp_action.get("action_type")
-                        or _bp_action.get("technique")
-                        or ""
-                    ).strip()
-                    if _bp_sig and _bp_sig in _tried_sigs:
-                        continue
-                    if _bp_technique and _bp_technique in _tried_sigs:
-                        continue
-                    # Found an untried blueprint action — synthesize hypothesis
-                    _recovery_sig = _bp_sig or f"bp_recovery_{int(round_id)}_{_bp_technique[:20]}"
-                    hypothesis_packet = {
-                        "action": "APPLY",
-                        "hypothesis": {
-                            "technique": _bp_technique or "blueprint_action",
-                            "rationale": str(_bp_action.get("rationale") or _bp_action.get("description") or ""),
-                            "params": _bp_action.get("concrete_params") or _bp_action.get("params") or {},
-                        },
-                        "tracker_context": {
-                            "signature": _recovery_sig,
-                            "_source": "blueprint_fallback_recovery",
-                        },
-                    }
-                    print(
-                        f"BLUEPRINT_RECOVERY: recovered from NO_OP with blueprint action: "
-                        f"{_bp_technique} (sig={_recovery_sig})"
-                    )
-                    _bp_recovery_done = True
-                    break
-
-        if not _bp_recovery_done:
-            state["ml_improvement_round_active"] = False
-            state["ml_improvement_continue"] = False
-            state["ml_improvement_attempted"] = True
-            state["ml_improvement_loop_complete"] = True
-            state["ml_improvement_kept"] = "baseline"
-            state["ml_improvement_force_finalize_reason"] = "duplicate_noop_hypothesis"
-            state["stop_reason"] = "IMPROVEMENT_ROUND_DUPLICATE_NOOP"
-            state["last_iteration_type"] = None
-            _append_feedback_history(
-                state,
-                (
-                    "METRIC_IMPROVEMENT_LOOP_STOP: duplicate NO_OP hypothesis detected; "
-                    "terminating loop to avoid token waste."
-                ),
-            )
-            if run_id:
-                tracker_context = (
-                    hypothesis_packet.get("tracker_context")
-                    if isinstance(hypothesis_packet.get("tracker_context"), dict)
-                    else {}
-                )
-                hypothesis = (
-                    hypothesis_packet.get("hypothesis")
-                    if isinstance(hypothesis_packet.get("hypothesis"), dict)
-                    else {}
-                )
-                try:
-                    log_run_event(
-                        run_id,
-                        "metric_improvement_round_terminated",
-                        {
-                            "reason": "duplicate_noop_hypothesis",
-                            "round_id": int(round_id),
-                            "round_count_current": int(round_index_before),
-                            "rounds_allowed": int(rounds),
-                            "action": str(hypothesis_packet.get("action") or ""),
-                            "technique": str(hypothesis.get("technique") or ""),
-                            "signature": str(tracker_context.get("signature") or ""),
-                            "duplicate_of": str(tracker_context.get("duplicate_of") or ""),
-                        },
-                    )
-                except Exception:
-                    pass
-                append_experiment_entry(
-                    run_id,
-                    {
-                        "iter": int(state.get("iteration_count", 0) or 0),
-                        "event": "hypothesis_terminated",
-                        "phase": "metric_improvement_round",
-                        "round_id": int(round_id),
-                        "action": str(hypothesis_packet.get("action") or ""),
-                        "signature": str(tracker_context.get("signature") or ""),
-                        "duplicate_of": str(tracker_context.get("duplicate_of") or ""),
-                        "reason": "duplicate_noop_hypothesis",
-                    },
-                )
-            return False
     hypothesis_meta = (
         strategist.last_iteration_meta
         if isinstance(getattr(strategist, "last_iteration_meta", None), dict)

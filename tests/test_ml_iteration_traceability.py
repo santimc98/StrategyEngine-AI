@@ -57,6 +57,48 @@ def test_append_ml_iteration_journal_uses_run_bundle_dir(tmp_path, monkeypatch) 
     assert "ml_iteration_trace" in events_text
 
 
+def test_append_ml_iteration_journal_traces_attempt_id(tmp_path, monkeypatch) -> None:
+    run_id = "trace_attempt_run"
+    run_dir = init_run_bundle(
+        run_id,
+        state={},
+        base_dir=str(tmp_path / "runs"),
+        enable_tee=False,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(workspace)
+
+    entry = {
+        "iteration_id": 2,
+        "attempt_id": 5,
+        "stage": "runtime_fix",
+        "reviewer_verdict": "UNKNOWN",
+        "qa_verdict": "UNKNOWN",
+        "outputs_missing": ["artifacts/ml/cv_metrics.json"],
+    }
+    written_ids = graph_mod._append_ml_iteration_journal(run_id, entry, [])
+
+    assert "2:runtime_fix:a5" in written_ids
+    journal_path = Path(run_dir) / "report" / "governance" / "ml_iteration_journal.jsonl"
+    journal_rows = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert journal_rows[0]["attempt_id"] == 5
+
+    summary_path = Path(run_dir) / "report" / "governance" / "ml_iteration_trace_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["attempts_observed"] == [5]
+    assert summary["last_entry"]["attempt_id"] == 5
+
+    events_path = Path(run_dir) / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any(
+        event.get("event") == "ml_iteration_trace"
+        and event.get("payload", {}).get("attempt_id") == 5
+        for event in events
+    )
+
+
 def test_append_ml_iteration_journal_keeps_multiple_metric_rounds_same_iteration(tmp_path) -> None:
     run_id = "trace_rounds_same_iteration"
     run_dir = init_run_bundle(
