@@ -188,6 +188,8 @@ def _parse_legacy_context(context: Dict[str, Any]) -> Dict[str, Any]:
     raw_csv_path = context.get("raw_csv_path") or context.get("raw_path")
     failure_context = context.get("failure_context") if isinstance(context, dict) else None
     artifact_obligations = context.get("artifact_obligations") if isinstance(context.get("artifact_obligations"), dict) else None
+    if artifact_obligations is None and isinstance(context.get("artifact_obligations_context"), dict):
+        artifact_obligations = context.get("artifact_obligations_context")
     return {
         "cleaning_view": cleaning_view,
         "cleaned_csv_path": str(cleaned_csv_path),
@@ -366,6 +368,7 @@ def _review_cleaning_impl(
         or "data/outlier_treatment_report.json"
     )
     outlier_report = _load_json(outlier_report_path) if outlier_report_path else {}
+    gates_contract = _build_gates_contract(gates, view)
 
     facts = _build_facts(
         cleaned_header=cleaned_header,
@@ -381,6 +384,10 @@ def _review_cleaning_impl(
         outlier_report=outlier_report,
         outlier_report_path=outlier_report_path,
         cleaned_csv_path=cleaned_csv_path,
+        cleaning_manifest_path=cleaning_manifest_path,
+        dialect=dialect_cleaned,
+        cleaning_view=view,
+        artifact_obligations=artifact_obligations,
     )
 
     deterministic = _evaluate_gates_deterministic(
@@ -440,6 +447,7 @@ def _review_cleaning_impl(
         column_resolution_context=column_resolution_context,
         artifact_obligations=artifact_obligations,
         cleaning_quality_summary=cleaning_quality_summary,
+        gates_contract=gates_contract,
     )
     print(f"DEBUG: Cleaning Reviewer calling OpenRouter ({model_name})...")
     try:
@@ -448,15 +456,15 @@ def _review_cleaning_impl(
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": (
-                    "Analyze this evidence payload. Treat cleaning_quality_summary (if present) as supplementary "
-                    "evidence for null inflation or datetime parsing issues, but keep header, manifest, gate params, "
-                    "and deterministic results as the primary anchors for your judgment. "
-                    "Then evaluate each cleaning gate and return your JSON verdict.\n\n"
+                    "Analyze this evidence payload as a senior auditor. Read cleaning_code, gates_contract, full "
+                    "manifest facts, raw artifact JSON, and secondary_outputs before deciding. Reject only with "
+                    "specific positive evidence citations; otherwise use INSUFFICIENT_EVIDENCE as a warning verdict. "
+                    "Return the JSON schema requested in the system prompt.\n\n"
                     + json.dumps(payload, ensure_ascii=True)
                 )},
             ],
             response_format={"type": "json_object"},
-            temperature=0.2,
+            temperature=0,
         )
         content = response.choices[0].message.content
     except Exception as exc:
@@ -1275,6 +1283,216 @@ def _coerce_roles(raw: Any) -> Dict[str, List[str]]:
     return out
 
 
+def _build_gates_contract(gates: List[Dict[str, Any]], view: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Preserve gate intent for the LLM while keeping deterministic checks normalized."""
+    raw_gates = view.get("cleaning_gates") if isinstance(view, dict) else None
+    raw_by_name: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw_gates, list):
+        for raw_gate in raw_gates:
+            if not isinstance(raw_gate, dict):
+                continue
+            key = _normalize_gate_name(raw_gate.get("name") or raw_gate.get("id") or raw_gate.get("gate"))
+            if key and key not in raw_by_name:
+                raw_by_name[key] = raw_gate
+
+    contract: List[Dict[str, Any]] = []
+    for gate in gates or []:
+        if not isinstance(gate, dict):
+            continue
+        name = _normalize_gate_name(gate.get("name") or gate.get("id") or gate.get("gate"))
+        if not name:
+            continue
+        raw_gate = raw_by_name.get(name, {})
+        params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+        raw_params = raw_gate.get("params") if isinstance(raw_gate.get("params"), dict) else {}
+        merged_params = dict(raw_params)
+        merged_params.update(params)
+        intent = (
+            raw_gate.get("intent")
+            or raw_gate.get("description")
+            or raw_gate.get("rationale")
+            or raw_gate.get("action_if_fail")
+            or raw_gate.get("reviewer_action")
+            or raw_gate.get("reason")
+        )
+        contract.append(
+            {
+                "name": name,
+                "severity": gate.get("severity") or raw_gate.get("severity") or "HARD",
+                "rule": raw_gate.get("rule") or merged_params.get("rule"),
+                "intent": intent,
+                "params": merged_params,
+            }
+        )
+    return contract
+
+
+def _iter_candidate_output_specs(
+    cleaning_view: Optional[Dict[str, Any]],
+    artifact_obligations: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+
+    def _append_spec(path: Any, source: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        token = str(path or "").strip()
+        if not token or "*" in token or not token.lower().endswith(".csv"):
+            return
+        meta = payload if isinstance(payload, dict) else {}
+        kind = str(meta.get("kind") or meta.get("artifact_type") or "dataset").strip().lower()
+        if kind and kind not in {"dataset", "csv", "table"}:
+            return
+        specs.append(
+            {
+                "path": token,
+                "source": source,
+                "intent": meta.get("intent") or meta.get("binding_name") or meta.get("binding_contract_key"),
+                "primary": meta.get("primary"),
+                "required": meta.get("required"),
+            }
+        )
+
+    view = cleaning_view if isinstance(cleaning_view, dict) else {}
+    for entry in view.get("required_outputs") or []:
+        if isinstance(entry, dict):
+            _append_spec(entry.get("path") or entry.get("output_path"), "cleaning_view.required_outputs", entry)
+
+    artifact_requirements = view.get("artifact_requirements")
+    if isinstance(artifact_requirements, dict):
+        for name, entry in artifact_requirements.items():
+            if not isinstance(entry, dict):
+                continue
+            meta = dict(entry)
+            meta.setdefault("binding_name", name)
+            _append_spec(entry.get("output_path") or entry.get("path"), f"cleaning_view.artifact_requirements.{name}", meta)
+
+    obligations = artifact_obligations if isinstance(artifact_obligations, dict) else {}
+    for binding in obligations.get("artifact_bindings") or []:
+        if not isinstance(binding, dict):
+            continue
+        declared = binding.get("declared_binding")
+        if not isinstance(declared, dict):
+            continue
+        meta = dict(declared)
+        meta["binding_name"] = binding.get("binding_name")
+        meta["binding_contract_key"] = binding.get("binding_contract_key")
+        _append_spec(
+            declared.get("output_path") or declared.get("path"),
+            str(binding.get("source_contract_path") or "artifact_obligations"),
+            meta,
+        )
+
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for spec in specs:
+        key = spec["path"].replace("\\", "/").strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(spec)
+    return deduped
+
+
+def _derive_output_roots(
+    cleaned_csv_path: Optional[str],
+    cleaning_manifest_path: Optional[str],
+    candidate_specs: List[Dict[str, Any]],
+) -> List[str]:
+    roots: List[str] = []
+
+    def _add(path: Any) -> None:
+        token = str(path or "").strip()
+        if token and token not in roots:
+            roots.append(token)
+
+    _add(os.getcwd())
+    for absolute_path in (cleaned_csv_path, cleaning_manifest_path):
+        if not absolute_path:
+            continue
+        abs_norm = os.path.abspath(str(absolute_path))
+        _add(os.path.dirname(abs_norm))
+        abs_parts = abs_norm.replace("\\", "/")
+        for spec in candidate_specs:
+            rel = str(spec.get("path") or "").replace("\\", "/").lstrip("/")
+            if rel and abs_parts.lower().endswith(rel.lower()):
+                root = abs_parts[: -len(rel)].rstrip("/\\")
+                if root:
+                    _add(root)
+
+    return roots
+
+
+def _resolve_candidate_output_path(spec_path: str, roots: List[str]) -> str:
+    if os.path.isabs(spec_path) and os.path.exists(spec_path):
+        return spec_path
+    candidates = [spec_path]
+    for root in roots:
+        candidates.append(os.path.join(root, spec_path))
+    normalized_seen: set[str] = set()
+    for candidate in candidates:
+        abs_candidate = os.path.abspath(candidate)
+        key = abs_candidate.lower()
+        if key in normalized_seen:
+            continue
+        normalized_seen.add(key)
+        if os.path.exists(abs_candidate):
+            return abs_candidate
+    return os.path.abspath(candidates[-1]) if candidates else spec_path
+
+
+def _count_csv_data_rows(path: str, dialect: Dict[str, Any]) -> Optional[int]:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding=dialect.get("encoding", "utf-8"), errors="replace", newline="") as handle:
+            reader = csv.reader(handle, delimiter=dialect.get("sep", ","))
+            count = sum(1 for _ in reader)
+        return max(0, count - 1)
+    except Exception:
+        return None
+
+
+def _build_secondary_outputs_fact(
+    cleaning_view: Optional[Dict[str, Any]],
+    artifact_obligations: Optional[Dict[str, Any]],
+    cleaned_csv_path: Optional[str],
+    cleaning_manifest_path: Optional[str],
+    dialect: Dict[str, Any],
+) -> Dict[str, Any]:
+    specs = _iter_candidate_output_specs(cleaning_view, artifact_obligations)
+    if not specs and cleaned_csv_path:
+        parent = os.path.dirname(os.path.abspath(cleaned_csv_path))
+        try:
+            for filename in sorted(os.listdir(parent)):
+                if filename.lower().endswith(".csv"):
+                    specs.append({"path": os.path.join(parent, filename), "source": "cleaned_output_directory"})
+        except Exception:
+            pass
+    roots = _derive_output_roots(cleaned_csv_path, cleaning_manifest_path, specs)
+    outputs: Dict[str, Any] = {}
+    cleaned_abs = os.path.abspath(cleaned_csv_path) if cleaned_csv_path else ""
+    for spec in specs:
+        rel_path = str(spec.get("path") or "").strip()
+        if not rel_path:
+            continue
+        resolved_path = _resolve_candidate_output_path(rel_path, roots)
+        if not os.path.exists(resolved_path):
+            continue
+        header = _read_csv_header(resolved_path, dialect)
+        sample = _read_csv_sample(resolved_path, dialect, header, dtype=str, nrows=20)
+        key = rel_path.replace("\\", "/") if not os.path.isabs(rel_path) else resolved_path
+        outputs[key] = {
+            "resolved_path": resolved_path,
+            "source": spec.get("source"),
+            "intent": spec.get("intent"),
+            "primary": bool(spec.get("primary")) if spec.get("primary") is not None else (os.path.abspath(resolved_path) == cleaned_abs),
+            "required": spec.get("required"),
+            "header": header[:200],
+            "sample_rows": _sample_rows(sample, max_rows=20),
+            "row_count": _count_csv_data_rows(resolved_path, dialect),
+        }
+    return outputs
+
+
 def _build_facts(
     cleaned_header: List[str],
     required_columns: List[str],
@@ -1289,6 +1507,10 @@ def _build_facts(
     outlier_report: Optional[Dict[str, Any]] = None,
     outlier_report_path: Optional[str] = None,
     cleaned_csv_path: Optional[str] = None,
+    cleaning_manifest_path: Optional[str] = None,
+    dialect: Optional[Dict[str, Any]] = None,
+    cleaning_view: Optional[Dict[str, Any]] = None,
+    artifact_obligations: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     facts: Dict[str, Any] = {}
     facts["cleaned_header"] = cleaned_header[:200]
@@ -1344,10 +1566,18 @@ def _build_facts(
     dropped = manifest.get("dropped_columns") if isinstance(manifest, dict) else {}
     warnings = manifest.get("warnings") if isinstance(manifest, dict) else []
     facts["manifest_summary"] = {
-        "conversions_count": len(conversions) if isinstance(conversions, dict) else 0,
+        "conversions_count": len(conversions) if isinstance(conversions, (dict, list)) else 0,
         "dropped_columns_count": len(dropped) if isinstance(dropped, (list, dict)) else 0,
         "warnings": [str(w) for w in warnings[:5]] if isinstance(warnings, list) else [],
+        "deprecated": True,
     }
+    if isinstance(manifest, dict):
+        facts["manifest_deduplication"] = manifest.get("deduplication")
+        facts["manifest_cleaning_gates_status"] = manifest.get("cleaning_gates_status")
+        facts["manifest_partition_counts"] = manifest.get("partition_counts")
+        facts["manifest_imputation_params"] = manifest.get("imputation_params")
+        facts["manifest_conversions"] = manifest.get("conversions")
+        facts["manifest_warnings"] = manifest.get("warnings")
     facts["column_stats_sample"] = _build_column_stats(sample_str, sample_infer, max_cols=40)
     facts["cleaned_sample_rows"] = _sample_rows(sample_str, max_rows=5)
     facts["raw_sample_rows"] = _sample_rows(raw_sample, max_rows=5)
@@ -1371,7 +1601,6 @@ def _build_facts(
     if isinstance(outlier_policy, dict) and outlier_policy:
         policy_enabled = _outlier_policy_enabled(outlier_policy)
         report_present = isinstance(outlier_report, dict) and bool(outlier_report)
-        report_columns_touched = _extract_outlier_report_columns(outlier_report)
         policy_summary: Dict[str, Any] = {
             "enabled": policy_enabled,
             "apply_stage": outlier_policy.get("apply_stage"),
@@ -1380,8 +1609,6 @@ def _build_facts(
             "report_present": report_present,
         }
         if report_present:
-            if report_columns_touched:
-                policy_summary["columns_touched"] = report_columns_touched
             if outlier_report.get("rows_affected") is not None:
                 policy_summary["rows_affected"] = outlier_report.get("rows_affected")
             if outlier_report.get("flags_created") is not None:
@@ -1392,6 +1619,17 @@ def _build_facts(
         if manifest_outlier:
             policy_summary["manifest_outlier_treatment"] = manifest_outlier
         facts["outlier_policy"] = policy_summary
+        facts["outlier_report_raw"] = outlier_report if isinstance(outlier_report, dict) else {}
+
+    secondary_outputs = _build_secondary_outputs_fact(
+        cleaning_view=cleaning_view,
+        artifact_obligations=artifact_obligations,
+        cleaned_csv_path=cleaned_csv_path,
+        cleaning_manifest_path=cleaning_manifest_path,
+        dialect=dialect or {},
+    )
+    if secondary_outputs:
+        facts["secondary_outputs"] = secondary_outputs
 
     return facts
 
@@ -1815,6 +2053,8 @@ def _evaluate_gates_deterministic(
                 manifest=manifest,
                 params=params,
             )
+            if not issues and evidence.get("semantic_review_required"):
+                evaluated = False
         else:
             evaluated = False
             evidence["deterministic_support"] = "not_implemented"
@@ -1975,6 +2215,7 @@ def _build_llm_prompt(
     column_resolution_context: Optional[Dict[str, Any]] = None,
     artifact_obligations: Optional[Dict[str, Any]] = None,
     cleaning_quality_summary: Optional[Dict[str, Any]] = None,
+    gates_contract: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     system_prompt = (
         "You are a Senior Data Scientist reviewing data cleaning output.\n\n"
@@ -2044,6 +2285,63 @@ def _build_llm_prompt(
         "}\n"
     )
 
+    system_prompt = (
+        "You are a SENIOR DATA QUALITY AUDITOR reviewing a Data Engineer's cleaning work.\n\n"
+        "MENTAL MODEL\n"
+        "You read primary sources: the executed cleaning SCRIPT, the MANIFEST, and output ARTIFACTS. "
+        "You are not a key-name checker. Reason like a senior human auditor reviewing a pull request.\n\n"
+        "PRINCIPLES\n"
+        "1. Presume competence. The DE is a senior LLM and the default verdict is APPROVED unless you can cite POSITIVE evidence of a problem.\n"
+        "2. 'I do not see proof of X' is never grounds for rejection. Search cleaning_code, all manifest sections, raw artifact JSON, secondary outputs, deterministic evidence, and context. If evidence remains absent, return INSUFFICIENT_EVIDENCE and warn; do not reject.\n"
+        "3. Reason semantically, not syntactically. If an artifact uses a schema you did not expect, infer meaning from fields and values instead of failing because a key name is different.\n"
+        "4. For each gate, evaluate the gate's rule, intent, params, column scope, and dataset scope. Do not fail a gate using evidence from a different column, file, or cohort.\n"
+        "5. Only reject on positive evidence of violation: contradictory code, contradictory manifest fields, forbidden columns actually present, a filter or dedup key that violates the contract, or data values proving the policy was not applied.\n\n"
+        "EVIDENCE YOU HAVE\n"
+        "- gates_contract: gate name, severity, rule, intent, and params.\n"
+        "- cleaning_code: the DE's script. This is primary evidence for filtering, deduplication, partitioning, imputation, and artifact writes.\n"
+        "- facts.manifest_deduplication, manifest_cleaning_gates_status, manifest_partition_counts, manifest_imputation_params, manifest_conversions, manifest_warnings: full manifest sections.\n"
+        "- facts.outlier_report_raw: the full outlier report JSON. Interpret it semantically.\n"
+        "- facts.cleaned_sample_rows, raw_sample_rows, secondary_outputs: samples from the actual CSV outputs.\n"
+        "- deterministic_gate_results: binary evidence checks. Treat passed/failed binary invariants as strong evidence, but use LLM reasoning for semantic gates that deterministic code marks as not implemented or semantic_review_required.\n"
+        "- data_profile and cleaning_quality_summary: supplementary data evidence.\n\n"
+        "HIGH-RISK GUIDANCE\n"
+        "- no_semantic_rescale: do not infer rescaling from low numeric ranges alone. Reject only with explicit code or data evidence of rescaling.\n"
+        "- leakage_exclusion: missing_required_columns is not proof that forbidden columns remain. Inspect cleaned_header, manifest, and secondary outputs.\n"
+        "- boolean_normalization over CSV: judge value semantics (0/1/null) unless the contract requires a dtype-preserving binary format.\n"
+        "- null inflation: distinguish row filtering from value destruction. Use row_drop_pct, gate params, and cleaning_code before rejecting.\n"
+        "- cohort/split gates: inspect both primary and secondary output samples plus manifest partition counts and script filters.\n\n"
+        "CITATION RULES\n"
+        "- Every PASSED or REJECTED gate must include evidence_citations.\n"
+        "- A rejection without specific citations is invalid. Convert it to INSUFFICIENT_EVIDENCE.\n"
+        "- Specific citations must name an artifact and locator, such as cleaning_code#line615, manifest_deduplication.key, outlier_report_raw.actions[0], or secondary_outputs[artifacts/clean/file.csv].sample_rows[0].\n"
+        "- INSUFFICIENT_EVIDENCE is a warning verdict, never a hard failure.\n\n"
+        "OUTPUT\n"
+        "Return JSON only with this schema:\n"
+        "{\n"
+        '  "status": "APPROVED" | "APPROVE_WITH_WARNINGS" | "REJECTED",\n'
+        '  "feedback": "string",\n'
+        '  "failed_checks": ["gate_name", ...],\n'
+        '  "required_fixes": ["actionable fix", ...],\n'
+        '  "warnings": ["warning", ...],\n'
+        '  "hard_failures": ["gate_name", ...],\n'
+        '  "soft_failures": ["gate_name", ...],\n'
+        '  "gate_results": [\n'
+        "     {\n"
+        '       "name": "gate_name",\n'
+        '       "severity": "HARD|SOFT",\n'
+        '       "verdict": "PASSED" | "REJECTED" | "INSUFFICIENT_EVIDENCE",\n'
+        '       "passed": true|false|null,\n'
+        '       "issues": ["issue", ...],\n'
+        '       "evidence_citations": ["artifact#locator: literal evidence", ...],\n'
+        '       "reasoning": "1-3 sentences explaining the verdict",\n'
+        '       "evidence": "short evidence summary"\n'
+        "     }\n"
+        "  ],\n"
+        '  "evidence_review_log": [{"gate": "gate_name", "verdict": "PASSED|REJECTED|INSUFFICIENT_EVIDENCE", "evidence_citations": []}],\n'
+        '  "contract_source_used": "cleaning_view|fallback|merged"\n'
+        "}\n"
+    )
+
     payload = {
         "cleaning_gates": gates,
         "required_columns": required_columns,
@@ -2052,6 +2350,7 @@ def _build_llm_prompt(
         "facts": facts,
         "deterministic_gate_results": deterministic_gate_results,
         "contract_source_used": contract_source_used,
+        "gates_contract": gates_contract if isinstance(gates_contract, list) and gates_contract else gates,
     }
     if context_pack:
         payload["context_pack"] = context_pack
@@ -2063,15 +2362,18 @@ def _build_llm_prompt(
     # CONTEXT TRIPLET for LLM reasoning
     # 1. Cleaning Code - what did the engineer actually execute?
     if cleaning_code:
-        # Preserve both beginning and ending context for long scripts.
-        max_code_len = 6000
+        max_code_len = 60000
         if len(cleaning_code) > max_code_len:
-            half = max_code_len // 2
-            head = cleaning_code[:half]
-            tail = cleaning_code[-half:]
+            third = max_code_len // 3
+            head = cleaning_code[:third]
+            middle_start = max(0, (len(cleaning_code) // 2) - (third // 2))
+            middle = cleaning_code[middle_start : middle_start + third]
+            tail = cleaning_code[-third:]
             payload["cleaning_code"] = (
                 head
-                + "\n... [TRUNCATED_MIDDLE] ...\n"
+                + "\n... [TRUNCATED_HEAD_TO_MIDDLE] ...\n"
+                + middle
+                + "\n... [TRUNCATED_MIDDLE_TO_TAIL] ...\n"
                 + tail
             )
         else:
@@ -2120,6 +2422,7 @@ def _parse_llm_json(content: str) -> Optional[Dict[str, Any]]:
         "hard_failures",
         "soft_failures",
         "gate_results",
+        "evidence_review_log",
         "contract_source_used",
     }
 
@@ -2145,6 +2448,77 @@ def _parse_llm_json(content: str) -> Optional[Dict[str, Any]]:
                     if _is_reviewer_payload(item):
                         return item
     return None
+
+
+def _list_citations(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _citation_is_specific(citation: str) -> bool:
+    token = str(citation or "").strip()
+    if not token:
+        return False
+    lowered = token.lower()
+    if any(phrase in lowered for phrase in ("no direct evidence", "no evidence", "not found", "missing proof")):
+        return False
+    return any(marker in token for marker in ("#", ".", "[", "==", ":"))
+
+
+def _gate_claims_rejection(gate: Dict[str, Any]) -> bool:
+    verdict = str(gate.get("verdict") or "").strip().upper()
+    if verdict in {"REJECTED", "FAILED", "FAIL"}:
+        return True
+    return gate.get("passed") is False
+
+
+def _enforce_citation_requirement(llm_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Downgrade unsupported LLM rejections to warning-only insufficient evidence."""
+    if not isinstance(llm_result, dict):
+        return {}
+    result = dict(llm_result)
+    gates = result.get("gate_results")
+    if not isinstance(gates, list):
+        return result
+
+    warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+    normalized_gates: List[Any] = []
+    for raw_gate in gates:
+        if not isinstance(raw_gate, dict):
+            normalized_gates.append(raw_gate)
+            continue
+        gate = dict(raw_gate)
+        citations = _list_citations(gate.get("evidence_citations"))
+        if not citations:
+            evidence = gate.get("evidence")
+            if isinstance(evidence, str):
+                citations = _list_citations(evidence)
+            elif isinstance(evidence, dict):
+                citations = _list_citations(evidence.get("evidence_citations") or evidence.get("citations"))
+        specific = [citation for citation in citations if _citation_is_specific(citation)]
+        if _gate_claims_rejection(gate) and not specific:
+            gate["verdict"] = "INSUFFICIENT_EVIDENCE"
+            gate["passed"] = True
+            gate["issues"] = []
+            gate["evidence_citations"] = citations
+            gate["reasoning"] = (
+                "Downgraded by citation enforcement: rejection had no specific positive evidence citation. "
+                + str(gate.get("reasoning") or gate.get("evidence") or "")
+            ).strip()
+            name = str(gate.get("name") or gate.get("gate") or "unknown_gate").strip()
+            warning = f"INSUFFICIENT_EVIDENCE: {name} reviewer rejection lacked specific positive evidence citations"
+            if warning not in warnings:
+                warnings.append(warning)
+        elif citations and "evidence_citations" not in gate:
+            gate["evidence_citations"] = citations
+        normalized_gates.append(gate)
+
+    result["gate_results"] = normalized_gates
+    result["warnings"] = warnings
+    return result
 
 
 def _collect_unresolved_hard_gates(result: Dict[str, Any]) -> List[str]:
@@ -2233,7 +2607,7 @@ def _merge_llm_with_deterministic(
     contract_source_used: str,
     warnings: List[str],
 ) -> Dict[str, Any]:
-    llm = _normalize_llm_result(llm_result)
+    llm = _normalize_llm_result(_enforce_citation_requirement(llm_result))
     det = deterministic
 
     gate_results = _merge_gate_results(
@@ -2245,11 +2619,18 @@ def _merge_llm_with_deterministic(
     merged_warnings = _dedupe_list(
         warnings + det.get("warnings", []) + llm.get("warnings", []) + summary["warning_summaries"]
     )
+    status = summary["status"]
+    feedback = summary["feedback"]
+    if status == "APPROVED" and any(str(w).startswith("INSUFFICIENT_EVIDENCE:") for w in merged_warnings):
+        status = "APPROVE_WITH_WARNINGS"
+        feedback = "Cleaning reviewer approved with warnings: " + " | ".join(
+            str(w) for w in merged_warnings if str(w).startswith("INSUFFICIENT_EVIDENCE:")
+        )
     required_fixes = _dedupe_list(summary["required_fixes"] + det.get("required_fixes", []))
 
-    return {
-        "status": summary["status"],
-        "feedback": summary["feedback"],
+    result = {
+        "status": status,
+        "feedback": feedback,
         "failed_checks": summary["failed_checks"],
         "required_fixes": required_fixes,
         "warnings": merged_warnings,
@@ -2259,6 +2640,9 @@ def _merge_llm_with_deterministic(
         "cleaning_gates_evaluated": gate_names,
         "contract_source_used": contract_source_used,
     }
+    if isinstance(llm.get("evidence_review_log"), list):
+        result["evidence_review_log"] = llm.get("evidence_review_log")
+    return result
 
 
 def _normalize_llm_result(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -2269,6 +2653,38 @@ def _normalize_llm_result(result: Dict[str, Any]) -> Dict[str, Any]:
     out.setdefault("hard_failures", [])
     out.setdefault("soft_failures", [])
     out.setdefault("gate_results", [])
+    normalized_gates: List[Dict[str, Any]] = []
+    for raw_gate in out.get("gate_results", []):
+        if not isinstance(raw_gate, dict):
+            continue
+        gate = dict(raw_gate)
+        if not gate.get("name") and gate.get("gate"):
+            gate["name"] = gate.get("gate")
+        verdict = str(gate.get("verdict") or "").strip().upper()
+        if verdict:
+            if verdict in {"PASSED", "PASS", "APPROVED"}:
+                gate["passed"] = True
+            elif verdict in {"REJECTED", "FAILED", "FAIL"}:
+                gate["passed"] = False
+            elif verdict in {"INSUFFICIENT_EVIDENCE", "INSUFFICIENT", "UNKNOWN"}:
+                gate["passed"] = True
+                gate["insufficient_evidence"] = True
+                name = str(gate.get("name") or "unknown_gate").strip()
+                warning = f"INSUFFICIENT_EVIDENCE: {name}"
+                warnings = out.get("warnings")
+                if isinstance(warnings, list) and warning not in warnings:
+                    warnings.append(warning)
+        citations = _list_citations(gate.get("evidence_citations"))
+        if citations:
+            evidence = gate.get("evidence")
+            if isinstance(evidence, dict):
+                evidence = dict(evidence)
+                evidence["evidence_citations"] = citations
+                gate["evidence"] = evidence
+            elif not evidence:
+                gate["evidence"] = {"evidence_citations": citations}
+        normalized_gates.append(gate)
+    out["gate_results"] = normalized_gates
     return out
 
 
@@ -2778,27 +3194,15 @@ def _check_outlier_policy_applied(
             issues.append("outlier_treatment_report_missing_or_empty")
         else:
             evidence["warning"] = "outlier_treatment_report_missing_or_empty"
+    else:
+        evidence["semantic_review_required"] = True
+        evidence["semantic_review_reason"] = (
+            "Outlier report exists; reviewer LLM must interpret the raw report schema "
+            "against policy target columns."
+        )
 
     policy_targets = _list_str(policy.get("target_columns")) or _list_str(params.get("target_columns"))
     evidence["policy_target_columns"] = policy_targets
-
-    report_columns = _extract_outlier_report_columns(report)
-    evidence["report_columns_touched"] = report_columns
-
-    if policy_targets:
-        if not report_columns:
-            if strict:
-                issues.append("outlier_treatment_columns_missing_in_report")
-        else:
-            policy_norm = {str(col).strip().lower() for col in policy_targets if col}
-            report_norm = {str(col).strip().lower() for col in report_columns if col}
-            missing_targets = sorted([col for col in policy_targets if str(col).strip().lower() not in report_norm])
-            evidence["missing_target_columns_in_report"] = missing_targets
-            if missing_targets and strict:
-                issues.append(
-                    "outlier_treatment_report_missing_target_columns: "
-                    + ", ".join(missing_targets[:10])
-                )
 
     manifest_applied = None
     if manifest_outlier:

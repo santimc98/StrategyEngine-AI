@@ -228,8 +228,9 @@ def test_outlier_policy_applied_accepts_dict_shaped_report_columns():
         if normalize_gate_name(gr.get("name", "")) == "outlier_policy_applied"
     )
     evidence = gate_entry.get("evidence") or {}
-    assert gate_entry.get("passed") is True
-    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+    assert gate_entry.get("passed") is None
+    assert evidence.get("semantic_review_required") is True
+    assert set(evidence.get("policy_target_columns") or []) == {"employees", "annual_revenue"}
 
 
 def test_outlier_policy_applied_accepts_actions_report():
@@ -301,8 +302,9 @@ def test_outlier_policy_applied_accepts_actions_report():
         if normalize_gate_name(gr.get("name", "")) == "outlier_policy_applied"
     )
     evidence = gate_entry.get("evidence") or {}
-    assert gate_entry.get("passed") is True
-    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+    assert gate_entry.get("passed") is None
+    assert evidence.get("semantic_review_required") is True
+    assert set(evidence.get("policy_target_columns") or []) == {"employees", "annual_revenue"}
 
 
 def test_outlier_policy_applied_accepts_flat_top_level_column_report():
@@ -353,8 +355,9 @@ def test_outlier_policy_applied_accepts_flat_top_level_column_report():
         if normalize_gate_name(gr.get("name", "")) == "outlier_policy_applied"
     )
     evidence = gate_entry.get("evidence") or {}
-    assert gate_entry.get("passed") is True
-    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+    assert gate_entry.get("passed") is None
+    assert evidence.get("semantic_review_required") is True
+    assert set(evidence.get("policy_target_columns") or []) == {"employees", "annual_revenue"}
 
 
 def test_outlier_policy_applied_accepts_columns_analyzed_and_decisions_report():
@@ -413,8 +416,9 @@ def test_outlier_policy_applied_accepts_columns_analyzed_and_decisions_report():
         if normalize_gate_name(gr.get("name", "")) == "outlier_policy_applied"
     )
     evidence = gate_entry.get("evidence") or {}
-    assert gate_entry.get("passed") is True
-    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+    assert gate_entry.get("passed") is None
+    assert evidence.get("semantic_review_required") is True
+    assert set(evidence.get("policy_target_columns") or []) == {"employees", "annual_revenue"}
 
 
 def test_outlier_policy_applied_accepts_targets_dict_report():
@@ -469,8 +473,9 @@ def test_outlier_policy_applied_accepts_targets_dict_report():
         if normalize_gate_name(gr.get("name", "")) == "outlier_policy_applied"
     )
     evidence = gate_entry.get("evidence") or {}
-    assert gate_entry.get("passed") is True
-    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+    assert gate_entry.get("passed") is None
+    assert evidence.get("semantic_review_required") is True
+    assert set(evidence.get("policy_target_columns") or []) == {"employees", "annual_revenue"}
 
 
 def test_boolean_normalization_passes_for_nullable_integer_boolean_columns(tmp_path: Path):
@@ -938,8 +943,9 @@ def test_outlier_policy_applied_accepts_treatments_list_report():
     )
     evidence = gate_entry.get("evidence") or {}
     assert result["status"] == "APPROVED"
-    assert gate_entry.get("passed") is True
-    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+    assert gate_entry.get("passed") is None
+    assert evidence.get("semantic_review_required") is True
+    assert set(evidence.get("policy_target_columns") or []) == {"employees", "annual_revenue"}
 
 
 def test_cleaning_reviewer_deterministically_evaluates_temporal_contract_gates(tmp_path: Path):

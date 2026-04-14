@@ -63,5 +63,30 @@ def test_build_data_engineer_artifact_obligations_preserves_legacy_clean_dataset
     assert "must_not_contain" not in bindings[0]
 
 
+def test_build_data_engineer_artifact_obligations_preserves_custom_dataset_bindings():
+    contract = {
+        "artifact_requirements": {
+            "cleaned_dataset": {
+                "output_path": "artifacts/clean/train.csv",
+                "required_columns": ["id", "label"],
+            },
+            "scoring_dataset": {
+                "output_path": "artifacts/clean/score.csv",
+                "required_columns": ["id"],
+            },
+        }
+    }
+
+    obligations = build_data_engineer_artifact_obligations(contract)
+
+    bindings = {entry["binding_name"]: entry for entry in obligations["artifact_bindings"]}
+    assert set(bindings) == {"cleaned_dataset", "scoring_dataset"}
+    assert bindings["scoring_dataset"]["declared_binding"]["output_path"] == "artifacts/clean/score.csv"
+    assert (
+        bindings["scoring_dataset"]["field_source_paths"]["required_columns"]
+        == "artifact_requirements.scoring_dataset.required_columns"
+    )
+
+
 def test_build_data_engineer_artifact_obligations_returns_empty_when_contract_has_no_de_bindings():
     assert build_data_engineer_artifact_obligations({"artifact_requirements": {"scored_rows_schema": {}}}) == {}

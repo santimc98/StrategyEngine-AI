@@ -17,6 +17,7 @@ from src.agents.cleaning_reviewer import (
     CleaningReviewerAgent,
     _build_llm_prompt,
     _build_facts,
+    _enforce_citation_requirement,
     _enforce_contract_strict_rejection,
     _merge_cleaning_gates,
     _resolve_required_columns_for_review,
@@ -70,22 +71,23 @@ class TestContractStrictMode:
 
         _assert_contains_all(
             prompt,
-            "MISSION",
-            "SOURCE OF TRUTH AND PRECEDENCE",
-            "column_resolution_context",
-            "artifact_obligations",
+            "SENIOR DATA QUALITY AUDITOR",
+            "MENTAL MODEL",
+            "gates_contract",
+            "evidence_citations",
+            "INSUFFICIENT_EVIDENCE",
         )
         _assert_contains_terms(
             prompt,
-            "review reasoning",
+            "presume competence",
             "deterministic_gate_results",
-            "authoritative when they directly evaluate a contract gate",
             "guidance",
-            "substitute for reasoning",
+            "raw artifact json",
             "missing_required_columns",
-            "forbidden columns",
+            "secondary outputs",
         )
         assert payload["contract_source_used"] == "cleaning_view"
+        assert "gates_contract" in payload
         assert "column_resolution_context" in payload
         assert "artifact_obligations" in payload
 
@@ -175,6 +177,29 @@ class TestContractStrictMode:
         assert len(gates) > 0
         # Should not have CONTRACT_BROKEN_FALLBACK warning
         assert not any("CONTRACT_BROKEN_FALLBACK" in w for w in warnings)
+
+    def test_enforce_citation_requirement_downgrades_uncited_rejection(self):
+        result = _enforce_citation_requirement(
+            {
+                "status": "REJECTED",
+                "warnings": [],
+                "gate_results": [
+                    {
+                        "name": "custom_contract_gate",
+                        "severity": "HARD",
+                        "verdict": "REJECTED",
+                        "passed": False,
+                        "evidence_citations": [],
+                        "reasoning": "No direct evidence was found.",
+                    }
+                ],
+            }
+        )
+
+        gate = result["gate_results"][0]
+        assert gate["verdict"] == "INSUFFICIENT_EVIDENCE"
+        assert gate["passed"] is True
+        assert any("INSUFFICIENT_EVIDENCE: custom_contract_gate" in warning for warning in result["warnings"])
 
     def test_enforce_contract_strict_rejection_forces_rejected_on_fallback(self):
         """When contract_source_used is 'fallback', result MUST be REJECTED."""

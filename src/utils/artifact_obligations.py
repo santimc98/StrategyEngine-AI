@@ -69,10 +69,12 @@ def build_data_engineer_artifact_obligations(contract: Dict[str, Any]) -> Dict[s
         return {}
 
     bindings: List[Dict[str, Any]] = []
+    emitted_keys: set[str] = set()
     for canonical_name, aliases in _DATA_ENGINEER_BINDING_ALIASES:
         binding_key, binding_payload = _find_binding(artifact_requirements, canonical_name, aliases)
         if not binding_payload:
             continue
+        emitted_keys.add(binding_key)
         source_contract_path = f"artifact_requirements.{binding_key}"
         bindings.append(
             {
@@ -80,6 +82,23 @@ def build_data_engineer_artifact_obligations(contract: Dict[str, Any]) -> Dict[s
                 "binding_contract_key": binding_key,
                 "source_contract_path": source_contract_path,
                 "declared_binding": binding_payload,
+                "field_source_paths": _collect_field_source_paths(
+                    binding_payload,
+                    contract_prefix=source_contract_path,
+                ),
+            }
+        )
+
+    for binding_key, binding_payload in artifact_requirements.items():
+        if binding_key in emitted_keys or not isinstance(binding_payload, dict) or not binding_payload:
+            continue
+        source_contract_path = f"artifact_requirements.{binding_key}"
+        bindings.append(
+            {
+                "binding_name": str(binding_key),
+                "binding_contract_key": str(binding_key),
+                "source_contract_path": source_contract_path,
+                "declared_binding": copy.deepcopy(binding_payload),
                 "field_source_paths": _collect_field_source_paths(
                     binding_payload,
                     contract_prefix=source_contract_path,
