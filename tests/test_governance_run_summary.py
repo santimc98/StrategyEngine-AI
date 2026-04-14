@@ -162,6 +162,32 @@ def test_run_summary_prefers_state_metric_snapshot_over_stale_metrics_file(tmp_p
     assert metric_improvement.get("final_metric_artifact") == 0.330705410118
 
 
+def test_run_summary_does_not_emit_duplicate_model_performance_metric_paths(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"missing": []}, f)
+    with open("data/metrics.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model_performance": {
+                    "average_precision": 0.94,
+                    "baseline_model": {"average_precision": 0.90},
+                    "model_performance": {
+                        "average_precision": 0.94,
+                        "baseline_model": {"average_precision": 0.90},
+                    },
+                }
+            },
+            f,
+        )
+
+    summary = build_run_summary({"review_verdict": "APPROVED"})
+
+    pairs = summary.get("baseline_vs_model") or []
+    assert not any("model_performance.model_performance" in str(pair.get("metric")) for pair in pairs)
+
+
 def test_run_summary_uses_metric_loop_state_to_clear_stale_pipeline_abort_and_build_metric_improvement(
     tmp_path, monkeypatch
 ):

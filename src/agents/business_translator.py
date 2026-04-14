@@ -182,6 +182,130 @@ def _summarize_numeric_columns(rows: List[Dict[str, Any]], columns: List[str], d
             break
     return numeric_summary
 
+
+def _pearson_corr(pairs: List[Tuple[float, float]]) -> Optional[float]:
+    if len(pairs) < 3:
+        return None
+    left = [item[0] for item in pairs]
+    right = [item[1] for item in pairs]
+    mean_left = sum(left) / len(left)
+    mean_right = sum(right) / len(right)
+    cov = sum((a - mean_left) * (b - mean_right) for a, b in pairs)
+    var_left = sum((a - mean_left) ** 2 for a in left)
+    var_right = sum((b - mean_right) ** 2 for b in right)
+    if var_left <= 0 or var_right <= 0:
+        return None
+    return cov / ((var_left ** 0.5) * (var_right ** 0.5))
+
+
+def _summarize_scored_row_semantics(
+    rows: List[Dict[str, Any]],
+    columns: List[str],
+    decimal: str,
+) -> Dict[str, Any]:
+    if not rows or not columns:
+        return {}
+    lower_to_col = {str(col).lower(): col for col in columns}
+    score_priority = [
+        "churn_probability",
+        "probability",
+        "prediction_probability",
+        "predicted_probability",
+        "score",
+        "risk_score",
+    ]
+    score_col = None
+    for candidate in score_priority:
+        if candidate in lower_to_col:
+            score_col = lower_to_col[candidate]
+            break
+    if score_col is None:
+        for col in columns:
+            norm = str(col).lower()
+            if any(token in norm for token in ["prob", "score", "pred"]) and not any(
+                token in norm for token in ["percentile", "rank", "tier", "bucket"]
+            ):
+                score_col = col
+                break
+    rank_col = None
+    for col in columns:
+        norm = str(col).lower()
+        if "risk_percentile" == norm or ("risk" in norm and "percentile" in norm):
+            rank_col = col
+            break
+    if rank_col is None:
+        for col in columns:
+            norm = str(col).lower()
+            if any(token in norm for token in ["percentile", "rank"]) and col != score_col:
+                rank_col = col
+                break
+    if not score_col or not rank_col:
+        return {}
+
+    pairs: List[Tuple[float, float]] = []
+    for row in rows:
+        score_val = coerce_number(row.get(score_col), decimal)
+        rank_val = coerce_number(row.get(rank_col), decimal)
+        if score_val is None or rank_val is None:
+            continue
+        pairs.append((float(score_val), float(rank_val)))
+    corr = _pearson_corr(pairs)
+    if corr is None:
+        return {
+            "score_column": score_col,
+            "rank_column": rank_col,
+            "direction": "unknown",
+            "sample_pairs": len(pairs),
+            "guidance": "Do not infer risk ranking direction from the column name alone.",
+        }
+
+    if corr <= -0.1:
+        direction = "lower_rank_value_means_higher_risk"
+        recommended_sort = [{"column": score_col, "order": "descending"}, {"column": rank_col, "order": "ascending"}]
+        guidance = (
+            f"Use {score_col} descending or {rank_col} ascending for high-risk prioritization; "
+            f"do not describe higher {rank_col} as higher risk."
+        )
+    elif corr >= 0.1:
+        direction = "higher_rank_value_means_higher_risk"
+        recommended_sort = [{"column": rank_col, "order": "descending"}, {"column": score_col, "order": "descending"}]
+        guidance = f"Use {rank_col} descending or {score_col} descending for high-risk prioritization."
+    else:
+        direction = "rank_column_not_monotonic_with_score"
+        recommended_sort = [{"column": score_col, "order": "descending"}]
+        guidance = f"Use {score_col} descending; treat {rank_col} direction as ambiguous."
+
+    tier_col = None
+    for col in columns:
+        if "tier" in str(col).lower() or "priority" in str(col).lower():
+            tier_col = col
+            break
+    tier_score_means: Dict[str, float] = {}
+    if tier_col:
+        grouped: Dict[str, List[float]] = {}
+        for row in rows:
+            tier = str(row.get(tier_col) or "").strip()
+            score_val = coerce_number(row.get(score_col), decimal)
+            if tier and score_val is not None:
+                grouped.setdefault(tier, []).append(float(score_val))
+        tier_score_means = {
+            tier: sum(values) / len(values)
+            for tier, values in grouped.items()
+            if values
+        }
+
+    return {
+        "score_column": score_col,
+        "rank_column": rank_col,
+        "direction": direction,
+        "score_rank_correlation": round(float(corr), 6),
+        "sample_pairs": len(pairs),
+        "recommended_sort": recommended_sort,
+        "guidance": guidance,
+        "tier_column": tier_col,
+        "tier_score_means": tier_score_means,
+    }
+
 def _truncate_cell(text: str, max_len: int) -> str:
     cleaned = str(text).replace("\n", " ").replace("\r", " ").strip()
     cleaned = cleaned.replace("|", "/")
@@ -713,6 +837,9 @@ def _flatten_metrics(metrics: Dict[str, Any], prefix: str = "") -> List[tuple[st
         return items
     for key, value in metrics.items():
         metric_key = f"{prefix}{key}" if prefix else str(key)
+        parts = [part for part in metric_key.split(".") if part]
+        if any(left == right for left, right in zip(parts, parts[1:])):
+            continue
         if isinstance(value, dict):
             items.extend(_flatten_metrics(value, f"{metric_key}."))
         else:
@@ -1994,6 +2121,11 @@ def _build_final_incumbent_state(
                 or predictions.get("rows")
             ),
             "columns": predictions.get("columns") if isinstance(predictions.get("columns"), list) else [],
+            "scoring_semantics": (
+                predictions.get("scoring_semantics")
+                if isinstance(predictions.get("scoring_semantics"), dict)
+                else {}
+            ),
         },
         "data_adequacy_status": str(
             ((run_summary or {}).get("data_adequacy") or {}).get("status")
@@ -4351,11 +4483,13 @@ class BusinessTranslatorAgent:
             decimal = (scored_rows.get("dialect_used") or {}).get("decimal") or "."
             numeric_summary = _summarize_numeric_columns(rows, columns, decimal)
             examples = _pick_top_examples(rows, columns, value_keys=columns, label_keys=columns, decimal=decimal)
+            scoring_semantics = _summarize_scored_row_semantics(rows, columns, decimal)
             return {
                 "row_count_sampled": scored_rows.get("row_count_sampled", 0),
                 "columns": columns,
                 "numeric_summary": numeric_summary,
                 "examples": examples,
+                "scoring_semantics": scoring_semantics,
             }
 
         def _summarize_run():
@@ -4745,6 +4879,12 @@ class BusinessTranslatorAgent:
                 "value": _canonical_metric_value,
                 "source": "primary_metric_state (authoritative)",
             } if _canonical_metric_name and _canonical_metric_value is not None else None,
+            "scoring_output_semantics": (
+                (final_incumbent_state.get("predictions_output") or {}).get("scoring_semantics")
+                if isinstance(final_incumbent_state, dict)
+                and isinstance(final_incumbent_state.get("predictions_output"), dict)
+                else {}
+            ),
             "ml_progress_summary": metric_progress_summary,
             "ml_engineer_change_summary": ml_engineer_change_summary,
             "run_causal_impact_summary": run_causal_impact_summary,
@@ -4845,6 +4985,10 @@ what to do next.
   data adequacy, heuristics, or narrative text.
 - FINAL_INCUMBENT_STATE is authoritative for the current selected system state:
   current deliverability, incumbent KPI, and whether required outputs exist now.
+- If FACTS_BLOCK includes scoring_output_semantics, use it as the authority
+  for rank/percentile direction and recommended sorting. Do not infer that a
+  higher percentile/rank column means higher risk unless the deterministic
+  scoring semantics say so.
 - STALE_OR_REJECTED_HISTORY contains reviewer/governance history that may explain
   disagreements or rejected paths, but it is not the final current state.
 - If GOVERNANCE_CONTRADICTION_PACKET lists contradictions, treat the contradicted

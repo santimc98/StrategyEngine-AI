@@ -121,6 +121,11 @@ def _is_number(value: Any) -> bool:
         return False
 
 
+def _has_adjacent_duplicate_metric_namespace(metric_key: Any) -> bool:
+    parts = [part for part in str(metric_key or "").split(".") if part]
+    return any(left == right for left, right in zip(parts, parts[1:]))
+
+
 def _flatten_metrics(obj: Any, prefix: str = "", out: Dict[str, float] | None = None) -> Dict[str, float]:
     if out is None:
         out = {}
@@ -128,6 +133,8 @@ def _flatten_metrics(obj: Any, prefix: str = "", out: Dict[str, float] | None = 
         return out
     for key, value in obj.items():
         metric_key = f"{prefix}{key}" if prefix else str(key)
+        if _has_adjacent_duplicate_metric_namespace(metric_key):
+            continue
         if _is_number(value):
             out[metric_key] = float(value)
         elif isinstance(value, dict):
@@ -205,7 +212,12 @@ def _extract_metric_value_by_name(metric_pool: Dict[str, float], metric_name: An
 
 def _extract_baseline_vs_model(metric_pool: Dict[str, float]) -> Dict[str, Any]:
     baseline_vs_model = []
-    baseline_keys = [k for k in metric_pool.keys() if any(tok in k.lower() for tok in ["baseline", "dummy", "naive", "null"])]
+    baseline_keys = [
+        k
+        for k in metric_pool.keys()
+        if not _has_adjacent_duplicate_metric_namespace(k)
+        and any(tok in k.lower() for tok in ["baseline", "dummy", "naive", "null"])
+    ]
     for base_key in baseline_keys:
         base_val = metric_pool.get(base_key)
         norm = base_key.lower()

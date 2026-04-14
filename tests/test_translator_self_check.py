@@ -8,6 +8,7 @@ from src.agents.business_translator import (
     _build_metric_progress_summary,
     _score_report_quality,
     _sanitize_review_board_verdict_for_translator,
+    _summarize_scored_row_semantics,
     _summarize_ml_engineer_change_summary,
     _validate_report,
     _validate_report_structure,
@@ -1043,6 +1044,26 @@ evidence:
 
     assert "missing_decision_section" not in issues
     assert "missing_risks_section" not in issues
+
+
+def test_translator_scored_row_semantics_detects_inverse_risk_percentile():
+    rows = [
+        {"churn_probability": "0.99", "risk_percentile": "1.0", "priority_tier": "P1"},
+        {"churn_probability": "0.80", "risk_percentile": "5.0", "priority_tier": "P1"},
+        {"churn_probability": "0.20", "risk_percentile": "75.0", "priority_tier": "P3"},
+        {"churn_probability": "0.01", "risk_percentile": "99.0", "priority_tier": "P4"},
+    ]
+
+    semantics = _summarize_scored_row_semantics(
+        rows,
+        ["churn_probability", "risk_percentile", "priority_tier"],
+        ".",
+    )
+
+    assert semantics["direction"] == "lower_rank_value_means_higher_risk"
+    assert semantics["recommended_sort"][0] == {"column": "churn_probability", "order": "descending"}
+    assert semantics["recommended_sort"][1] == {"column": "risk_percentile", "order": "ascending"}
+    assert "do not describe higher risk_percentile as higher risk" in semantics["guidance"]
 
 
 def test_translator_structure_validation_flags_language_mix_when_english_expected():

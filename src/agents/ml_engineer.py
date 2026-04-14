@@ -3366,6 +3366,11 @@ class MLEngineerAgent:
             " number shown above (e.g., assert written_rows == 95). Do NOT assert against the"
             " DataFrame variable you just wrote — that is a tautology and catches nothing."
         )
+        lines.append(
+            "  - If an observed scoring/test row count is provided as data-profile context rather than"
+            " an explicit contract invariant, compute the expected count from the authoritative row"
+            " filter at runtime; do not hardcode a literal cohort size as the source of truth."
+        )
         return "\n".join(lines)
 
     def _code_mentions_label_filter(self, code: str, target: str | None) -> bool:
@@ -4540,6 +4545,9 @@ class MLEngineerAgent:
         - After writing each artifact, verify the written file has the expected row count by
           reading it back or asserting against the contract-expected number (not against the
           DataFrame you just wrote, which would be a tautology).
+        - Treat row counts from data summaries as run context, not reusable source code constants:
+          unless the contract explicitly declares a fixed row-count invariant, derive expected
+          scoring/test counts from the authoritative row filter at runtime.
         - Use a JSON serializer helper for numpy/pandas scalars, arrays, NaN, and bool types.
 
         CONTRACT EXECUTION PLANNING

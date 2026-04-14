@@ -348,6 +348,24 @@ def test_check_execution_status_metric_round_uses_local_attempt_budget() -> None
     assert graph_mod.check_execution_status(terminal_state) == "failed_runtime"
 
 
+def test_security_block_routes_to_metric_round_candidate_repair() -> None:
+    security_output = "CRITICAL: Security Violations:\nCalling 'os.remove' is not allowed."
+    retry_state = {
+        "execution_output": security_output,
+        "error_message": security_output,
+        "runtime_fix_count": 0,
+        "ml_improvement_round_active": True,
+        "metric_round_state": {
+            "candidate_attempt_index": 1,
+            "max_attempts": 3,
+        },
+    }
+
+    assert graph_mod._has_runtime_failure_marker(security_output) is True
+    assert graph_mod.check_execution_status(retry_state) == "retry_fix"
+    assert _metric_round_has_deterministic_blockers(retry_state, include_review_signals=False) is True
+
+
 def test_retry_handler_advances_metric_round_attempt_and_preserves_hypothesis_context() -> None:
     state = {
         "feedback_history": [],

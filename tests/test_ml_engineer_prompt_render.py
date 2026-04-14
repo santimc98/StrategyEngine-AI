@@ -207,4 +207,6 @@ def test_generate_code_prompt_includes_cleaned_ml_fact_packet(monkeypatch):
         "pr_auc",
         "7447",
         "780",
+        "derive expected",
+        "scoring/test counts from the authoritative row filter",
     )

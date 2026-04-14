@@ -2724,7 +2724,8 @@ def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     # when the latest execution itself signals a problem.
     _latest_exec_error = bool(state.get("execution_error"))
     _latest_sandbox_failed = bool(state.get("sandbox_failed"))
-    _latest_output_has_failure = _has_runtime_failure_marker(state.get("execution_output"))
+    _latest_runtime_text = f"{state.get('execution_output', '')}\n{state.get('error_message', '')}"
+    _latest_output_has_failure = _has_runtime_failure_marker(_latest_runtime_text)
 
     if not _latest_exec_error and not _latest_sandbox_failed and not _latest_output_has_failure:
         # Latest execution completed cleanly — ignore residual text from
@@ -7560,7 +7561,7 @@ def _is_blocking_retry_reason(
         return True
     if state.get("sandbox_failed"):
         return True
-    if _has_runtime_failure_marker(state.get("execution_output")):
+    if _has_runtime_failure_marker(f"{state.get('execution_output', '')}\n{state.get('error_message', '')}"):
         return True
 
     last_iter_type = str(state.get("last_iteration_type") or "").strip().lower()
@@ -10090,7 +10091,7 @@ def _should_restore_best_attempt(
 
     if bool(state.get("execution_error")) or bool(state.get("sandbox_failed")) or bool(state.get("runtime_fix_terminal")):
         return True
-    if _has_runtime_failure_marker(state.get("execution_output")):
+    if _has_runtime_failure_marker(f"{state.get('execution_output', '')}\n{state.get('error_message', '')}"):
         return True
 
     artifact_issues = state.get("artifact_content_issues")
@@ -12109,6 +12110,9 @@ def _has_runtime_failure_marker(output: str | None) -> bool:
         "Traceback (most recent call last)",
         "HEAVY_RUNNER_ERROR",
         "Sandbox Execution Failed",
+        "CRITICAL: Security Violations",
+        "Security Block:",
+        "DEPENDENCY_BLOCKED",
         "peer closed connection",
         "incomplete chunked read",
         "Response 404",
@@ -16455,11 +16459,17 @@ def _build_ml_iteration_journal_entry(
         if isinstance(hypothesis_packet.get("tracker_context"), dict)
         else {}
     )
-    round_id = (
-        _safe_int(latest_round.get("round_id"))
-        or _safe_int(state.get("ml_improvement_current_round_id"))
+    state_round_id = (
+        _safe_int(state.get("ml_improvement_current_round_id"))
         or _safe_int(state.get("ml_improvement_round_count"))
     )
+    latest_round_id = _safe_int(latest_round.get("round_id"))
+    round_id = state_round_id if bool(state.get("ml_improvement_round_active")) and state_round_id > 0 else latest_round_id
+    if round_id <= 0:
+        round_id = latest_round_id or state_round_id
+    if bool(state.get("ml_improvement_round_active")) and state_round_id > 0 and latest_round_id != state_round_id:
+        latest_round = {}
+        latest_hypothesis = {}
     if round_id > 0 or bool(state.get("ml_improvement_round_active")):
         reason = str(
             latest_round.get("reason")
@@ -25180,17 +25190,20 @@ def run_reviewer(state: AgentState) -> AgentState:
         if run_id:
             log_run_event(run_id, "reviewer_complete", {"status": review.get("status")})
         if run_id:
+            snapshot_attempt = int(state.get("ml_engineer_attempt") or state.get("execution_attempt") or 0)
             log_agent_snapshot(
                 run_id,
-            "reviewer",
-            prompt=getattr(reviewer, "last_prompt", None),
-            response=getattr(reviewer, "last_response", None) or review,
-            context={
-                "analysis_type": analysis_type,
-                "business_objective": business_objective,
-                "execution_profile": execution_profile,
-            },
-            verdicts=review,
+                "reviewer",
+                prompt=getattr(reviewer, "last_prompt", None),
+                response=getattr(reviewer, "last_response", None) or review,
+                context={
+                    "analysis_type": analysis_type,
+                    "business_objective": business_objective,
+                    "execution_profile": execution_profile,
+                },
+                verdicts=review,
+                iteration=current_iter + 1,
+                attempt=snapshot_attempt if snapshot_attempt > 0 else None,
         )
         return {
             "review_verdict": review['status'],
@@ -25760,7 +25773,15 @@ def execute_code(state: AgentState) -> AgentState:
         print(f"Security Block: {failure_reason}")
         if run_id:
             log_run_event(run_id, "execution_security_blocked", {"violations": violations[:20]})
-        return {"error_message": failure_reason, "execution_output": failure_reason, "budget_counters": counters}
+        return {
+            "error_message": failure_reason,
+            "execution_output": failure_reason,
+            "execution_error": True,
+            "execution_attempt": attempt_id,
+            "last_runtime_error_tail": failure_reason[-4000:],
+            "sandbox_failed": False,
+            "budget_counters": counters,
+        }
 
     required_deps = contract.get("required_dependencies", []) if isinstance(contract, dict) else []
     dep_result = check_dependency_precheck(code, required_deps or [], backend_profile=dependency_backend)
@@ -25785,7 +25806,16 @@ def execute_code(state: AgentState) -> AgentState:
                 "execution_dependency_blocked",
                 {"banned": banned, "blocked": blocked, "suggestions": suggestions},
             )
-        return {"error_message": msg, "execution_output": msg, "feedback_history": fh, "budget_counters": counters}
+        return {
+            "error_message": msg,
+            "execution_output": msg,
+            "execution_error": True,
+            "execution_attempt": attempt_id,
+            "last_runtime_error_tail": msg[-4000:],
+            "feedback_history": fh,
+            "sandbox_failed": False,
+            "budget_counters": counters,
+        }
 
     # Optional heavy runner path (Cloud Run Job) for large workloads
     if heavy_cfg:
@@ -27648,6 +27678,12 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             print(f"Warning: model metrics consistency validation failed: {consistency_err}")
     iter_id = int(state.get("iteration_count", 0)) + 1
     saved_iter_artifacts = _persist_iteration_artifacts(iter_id, state if isinstance(state, dict) else {})
+    review_snapshot_attempt = int(
+        state.get("ml_engineer_attempt")
+        or state.get("execution_attempt")
+        or iter_id
+        or 0
+    )
 
     if case_alignment_required and case_report.get("status") == "FAIL":
         feedback = f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('explanation')}"
@@ -28095,7 +28131,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                                 "metric_round_review_mode": metric_round_review_mode if metric_improvement_round_active else None,
                             },
                             verdicts=review_result,
-                            attempt=iter_id,
+                            iteration=iter_id,
+                            attempt=review_snapshot_attempt if review_snapshot_attempt > 0 else None,
                         )
                     if review_result and review_result.get("status") != "APPROVED":
                         review_warnings.append(
@@ -28179,7 +28216,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                             response=getattr(qa_reviewer, "last_response", None) or qa_result,
                             context=qa_context_for_call if isinstance(qa_context_for_call, dict) else {"qa_context": qa_context_for_call},
                             verdicts=qa_result,
-                            attempt=iter_id,
+                            iteration=iter_id,
+                            attempt=review_snapshot_attempt if review_snapshot_attempt > 0 else None,
                         )
                     if qa_result and qa_result.get("status") != "APPROVED":
                         review_warnings.append(
@@ -29150,7 +29188,9 @@ def run_review_board(state: AgentState) -> AgentState:
     if not review_stack:
         review_stack = {
             "runtime": {
-                "status": "FAILED_RUNTIME" if _has_runtime_failure_marker(state.get("execution_output")) else "OK",
+                "status": "FAILED_RUNTIME"
+                if _has_runtime_failure_marker(f"{state.get('execution_output', '')}\n{state.get('error_message', '')}")
+                else "OK",
                 "runtime_fix_terminal": bool(state.get("runtime_fix_terminal")),
                 "runtime_fix_count": int(state.get("runtime_fix_count", 0) or 0),
             },
@@ -29651,23 +29691,16 @@ def _detect_target_nan_error(output: str) -> bool:
 
 
 def check_execution_status(state: AgentState):
-    # Check for critical failures first
-    if state.get("error_message") and "Security Block" in state["error_message"]:
-        return "failed"
-
     output = state.get("execution_output", "")
+    error_message = state.get("error_message", "")
+    runtime_text = f"{output}\n{error_message}"
     attempt = state.get("execution_attempt", 1)
     runtime_fix_count = int(state.get("runtime_fix_count", 0))
     skipped_reason = state.get("ml_skipped_reason")
 
     # Traceback check (Runtime Error)
     has_error = (
-        "Traceback (most recent call last)" in output
-        or "HEAVY_RUNNER_ERROR" in output
-        or "Sandbox Execution Failed" in output
-        or "peer closed connection" in output
-        or "incomplete chunked read" in output
-        or "Response 404" in output
+        _has_runtime_failure_marker(runtime_text)
         or state.get("sandbox_failed")
     )
     determinism_error = "DETERMINISTIC_TARGET_RELATION" in output
@@ -30909,7 +30942,8 @@ def _metric_round_has_deterministic_blockers(
         return True
     if bool(state.get("runtime_fix_terminal")) or bool(state.get("sandbox_failed")):
         return True
-    if _has_runtime_failure_marker(state.get("execution_output")):
+    runtime_text = f"{state.get('execution_output', '')}\n{state.get('error_message', '')}"
+    if _has_runtime_failure_marker(runtime_text):
         return True
 
     oc_report = state.get("output_contract_report")
@@ -33188,8 +33222,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         include_review_signals=not advisory_review_mode,
     )
     # Distinguish runtime failure (timeout/crash) from technique inefficacy
+    runtime_text = f"{state.get('execution_output', '')}\n{state.get('error_message', '')}"
     runtime_failed = bool(
-        _has_runtime_failure_marker(state.get("execution_output"))
+        _has_runtime_failure_marker(runtime_text)
         or state.get("runtime_fix_terminal")
         or state.get("sandbox_failed")
     )
@@ -34975,17 +35010,27 @@ def run_translator(state: AgentState) -> AgentState:
     else:
         report_state.pop("final_report_blocks", None)
     if run_id:
-            log_agent_snapshot(
-                run_id,
-                "translator",
-                prompt=getattr(translator, "last_prompt", None),
-                response=getattr(translator, "last_response", None) or report,
-                context={
-                    "error_message": report_error,
-                    "has_partial_visuals": report_has_partial,
-                    "plot_count": len(report_plots) if isinstance(report_plots, list) else 0,
-                },
-            )
+        translator_snapshot_context = {
+            "error_message": report_error,
+            "has_partial_visuals": report_has_partial,
+            "plot_count": len(report_plots) if isinstance(report_plots, list) else 0,
+            "translator_view": translator_view if isinstance(translator_view, dict) else {},
+            "run_narrative": report_state.get("run_narrative") if isinstance(report_state.get("run_narrative"), dict) else {},
+            "run_summary": summary if isinstance(summary, dict) else {},
+            "review_board_verdict": report_state.get("review_board_verdict")
+            if isinstance(report_state.get("review_board_verdict"), dict)
+            else {},
+            "ml_improvement_round_history": report_state.get("ml_improvement_round_history")
+            if isinstance(report_state.get("ml_improvement_round_history"), list)
+            else [],
+        }
+        log_agent_snapshot(
+            run_id,
+            "translator",
+            prompt=getattr(translator, "last_prompt", None),
+            response=getattr(translator, "last_response", None) or report,
+            context=translator_snapshot_context,
+        )
 
     try:
         os.makedirs("data", exist_ok=True)

@@ -187,6 +187,55 @@ def _compact_metric_rounds(state: Dict[str, Any], trace_summary: Dict[str, Any])
     return rounds[-24:]
 
 
+def _resolve_metric_improvement_kept(
+    state: Dict[str, Any],
+    review_board_verdict: Dict[str, Any],
+    metric_rounds: List[Dict[str, Any]],
+) -> Any:
+    for payload in [state.get("review_board_verdict"), review_board_verdict]:
+        if not isinstance(payload, dict):
+            continue
+        finalization = payload.get("metric_round_finalization")
+        if isinstance(finalization, dict):
+            kept = str(finalization.get("kept") or "").strip()
+            if kept:
+                return kept
+        deterministic_facts = payload.get("deterministic_facts")
+        metrics = deterministic_facts.get("metrics") if isinstance(deterministic_facts, dict) else {}
+        primary = metrics.get("primary") if isinstance(metrics, dict) else {}
+        kept = str(primary.get("kept") or "").strip() if isinstance(primary, dict) else ""
+        if kept:
+            return kept
+    if metric_rounds:
+        kept = str((metric_rounds[-1] or {}).get("kept") or "").strip()
+        if kept:
+            return kept
+    return state.get("ml_improvement_kept")
+
+
+def _resolve_manifest_reason(
+    state: Dict[str, Any],
+    run_summary: Dict[str, Any],
+    review_board_verdict: Dict[str, Any],
+) -> Any:
+    if isinstance(run_summary, dict):
+        for key in ("reason", "summary", "run_outcome_reason"):
+            value = run_summary.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    if isinstance(review_board_verdict, dict):
+        for key in ("final_incumbent_summary", "summary", "candidate_assessment_summary"):
+            value = review_board_verdict.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    gate_context = state.get("last_successful_gate_context") or state.get("last_gate_context") or {}
+    if isinstance(gate_context, dict):
+        value = gate_context.get("feedback")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return state.get("review_feedback_normalized")
+
+
 def _scan_run_outputs(run_dir: str) -> List[str]:
     produced: List[str] = []
     if not run_dir:
@@ -621,12 +670,18 @@ def write_run_manifest(
     if not isinstance(trace_summary, dict):
         trace_summary = {}
     trace_journal_path = os.path.join(run_dir, "report", "governance", "ml_iteration_journal.jsonl")
-    entries_count = trace_summary.get("entries_count")
+    journal_entries_count = _count_jsonl_rows(trace_journal_path) if os.path.exists(trace_journal_path) else 0
+    entries_count = journal_entries_count or trace_summary.get("entries_count")
     try:
         entries_count = int(entries_count)
     except Exception:
-        entries_count = _count_jsonl_rows(trace_journal_path)
+        entries_count = journal_entries_count
     metric_rounds = _compact_metric_rounds(state, trace_summary)
+    metric_improvement_kept = _resolve_metric_improvement_kept(
+        state if isinstance(state, dict) else {},
+        review_board_verdict if isinstance(review_board_verdict, dict) else {},
+        metric_rounds,
+    )
     metric_improvement_attempted = bool(state.get("ml_improvement_attempted"))
     if not metric_improvement_attempted:
         metric_improvement_attempted = bool(metric_rounds) or bool(
@@ -636,13 +691,15 @@ def write_run_manifest(
         "journal_exists": os.path.exists(trace_journal_path),
         "journal_relative_path": "report/governance/ml_iteration_journal.jsonl",
         "entries_count": int(entries_count),
+        "journal_entries_count": int(journal_entries_count),
+        "summary_entries_count": trace_summary.get("entries_count") if isinstance(trace_summary, dict) else None,
         "summary_exists": bool(trace_summary),
         "summary_relative_path": "report/governance/ml_iteration_trace_summary.json" if trace_summary else None,
         "stages_count": trace_summary.get("stages_count", {}) if isinstance(trace_summary.get("stages_count"), dict) else {},
         "last_entry": trace_summary.get("last_entry", {}) if isinstance(trace_summary.get("last_entry"), dict) else {},
         "metric_improvement_round_count": int(state.get("ml_improvement_round_count", 0) or 0),
         "metric_improvement_attempted": bool(metric_improvement_attempted),
-        "metric_improvement_kept": state.get("ml_improvement_kept"),
+        "metric_improvement_kept": metric_improvement_kept,
         "metric_rounds_count": len(metric_rounds),
         "metric_rounds": metric_rounds,
         "metric_round_last": metric_rounds[-1] if metric_rounds else {},
@@ -667,7 +724,11 @@ def write_run_manifest(
         or state.get("review_verdict")
     )
     normalized_status = normalize_review_status(raw_status)
-    normalized_reason = state.get("review_feedback_normalized") or (state.get("last_gate_context") or {}).get("feedback")
+    normalized_reason = _resolve_manifest_reason(
+        state if isinstance(state, dict) else {},
+        run_summary if isinstance(run_summary, dict) else {},
+        review_board_verdict if isinstance(review_board_verdict, dict) else {},
+    )
     gates_summary = {
         "status": normalized_status,
         "failed_gates": run_summary.get("failed_gates", []) if isinstance(run_summary, dict) else [],
@@ -698,7 +759,7 @@ def write_run_manifest(
             "produced_outputs": produced_outputs,
             "sandbox_attempts": _RUN_ATTEMPTS.get(run_id, []),
             "required_outputs_missing": output_contract.get("missing", []),
-            "status_final": status_final or existing_dict.get("status_final") or gates_summary.get("status"),
+            "status_final": status_final or gates_summary.get("status") or existing_dict.get("status_final"),
             "gates_summary": gates_summary,
             "iteration_trace": iteration_trace,
             "contracts": {

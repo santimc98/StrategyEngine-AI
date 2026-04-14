@@ -150,6 +150,8 @@ def test_run_manifest_includes_iteration_trace_metadata(tmp_path, monkeypatch):
     assert trace.get("metric_improvement_round_count") == 1
     assert trace.get("metric_improvement_attempted") is True
     assert trace.get("metric_improvement_kept") == "baseline"
+    assert trace.get("journal_entries_count") == 1
+    assert trace.get("summary_entries_count") == 1
 
 
 def test_run_manifest_includes_metric_round_records(tmp_path, monkeypatch):
@@ -252,6 +254,67 @@ def test_run_manifest_gates_summary_prefers_run_summary_status_over_legacy_revie
 
     assert manifest["status_final"] == "NEEDS_IMPROVEMENT"
     assert manifest["gates_summary"]["status"] == "NEEDS_IMPROVEMENT"
+
+
+def test_run_manifest_overwrites_stale_existing_status_and_prefers_board_final_incumbent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run_id = "run_manifest_authority_01"
+    csv_path = tmp_path / "input.csv"
+    csv_path.write_text("a,b\n1,2\n", encoding="utf-8")
+    state = {
+        "run_id": run_id,
+        "run_start_ts": "2026-02-20T00:00:00",
+        "csv_path": str(csv_path),
+        "csv_encoding": "utf-8",
+        "csv_sep": ",",
+        "csv_decimal": ".",
+        "ml_improvement_round_count": 2,
+        "ml_improvement_attempted": True,
+        "ml_improvement_kept": "best_attempt",
+        "last_gate_context": {"feedback": "stale reviewer challenger warning"},
+    }
+    run_dir = init_run_bundle(run_id, state, base_dir=str(tmp_path / "runs"), enable_tee=False)
+    run_dir_path = Path(run_dir)
+    (run_dir_path / "run_manifest.json").write_text(
+        json.dumps({"status_final": "PASS"}),
+        encoding="utf-8",
+    )
+    artifacts_dir = run_dir_path / "artifacts" / "data"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    (artifacts_dir / "run_summary.json").write_text(
+        json.dumps({"status": "APPROVE_WITH_WARNINGS", "failed_gates": []}),
+        encoding="utf-8",
+    )
+    (artifacts_dir / "review_board_verdict.json").write_text(
+        json.dumps(
+            {
+                "status": "APPROVE_WITH_WARNINGS",
+                "final_incumbent_summary": "final baseline retained",
+                "metric_round_finalization": {"kept": "baseline"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    governance_dir = run_dir_path / "report" / "governance"
+    governance_dir.mkdir(parents=True, exist_ok=True)
+    (governance_dir / "ml_iteration_journal.jsonl").write_text(
+        "{}\n{}\n{}",
+        encoding="utf-8",
+    )
+    (governance_dir / "ml_iteration_trace_summary.json").write_text(
+        json.dumps({"entries_count": 4}),
+        encoding="utf-8",
+    )
+
+    manifest_path = write_run_manifest(run_id, state)
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    trace = manifest.get("iteration_trace", {})
+
+    assert manifest["status_final"] == "APPROVE_WITH_WARNINGS"
+    assert manifest["gates_summary"]["reason"] == "final baseline retained"
+    assert trace["entries_count"] == 3
+    assert trace["summary_entries_count"] == 4
+    assert trace["metric_improvement_kept"] == "baseline"
 
 
 def test_log_agent_snapshot_supports_iteration_and_attempt_paths(tmp_path, monkeypatch):
