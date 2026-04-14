@@ -115,6 +115,7 @@ export interface ModelsConfigResponse {
   custom_option?: string;
   saved_models?: Record<string, string>;
   agents: Array<{ key: string; label: string; section: string }>;
+  recommended_models?: Record<string, string>;
   base_models: Record<string, string>;
   persisted_models: Record<string, string>;
   effective_models: Record<string, string>;

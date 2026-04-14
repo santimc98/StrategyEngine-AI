@@ -18,6 +18,7 @@ from src.utils.sandbox_provider import (
     list_sandbox_providers,
     test_sandbox_provider_connectivity,
 )
+from src.utils.model_routing_defaults import get_recommended_agent_model_defaults
 
 MODEL_SETTING_SPECS: List[Dict[str, str]] = [
     {"key": "steward", "label": "Steward", "section": "primary"},
@@ -25,6 +26,7 @@ MODEL_SETTING_SPECS: List[Dict[str, str]] = [
     {"key": "execution_planner", "label": "Execution Planner", "section": "primary"},
     {"key": "data_engineer", "label": "Data Engineer", "section": "primary"},
     {"key": "ml_engineer", "label": "ML Engineer", "section": "primary"},
+    {"key": "model_analyst", "label": "Model Analyst", "section": "primary"},
     {"key": "cleaning_reviewer", "label": "Cleaning Reviewer", "section": "primary"},
     {"key": "reviewer", "label": "Reviewer", "section": "primary"},
     {"key": "qa_reviewer", "label": "QA Reviewer", "section": "primary"},
@@ -32,12 +34,15 @@ MODEL_SETTING_SPECS: List[Dict[str, str]] = [
     {"key": "translator", "label": "Business Translator", "section": "primary"},
     {"key": "results_advisor", "label": "Results Advisor", "section": "primary"},
     {"key": "failure_explainer", "label": "Failure Explainer", "section": "primary"},
+    {"key": "steward_semantics", "label": "Steward Semantics", "section": "advanced"},
     {"key": "strategist_fallback", "label": "Strategist Fallback", "section": "advanced"},
     {"key": "execution_planner_compiler", "label": "Execution Planner Compiler", "section": "advanced"},
     {"key": "data_engineer_editor", "label": "Data Engineer Editor", "section": "advanced"},
     {"key": "data_engineer_fallback", "label": "Data Engineer Fallback", "section": "advanced"},
+    {"key": "ml_engineer_plan", "label": "ML Engineer Plan", "section": "advanced"},
     {"key": "ml_engineer_editor", "label": "ML Engineer Editor", "section": "advanced"},
     {"key": "ml_engineer_fallback", "label": "ML Engineer Fallback", "section": "advanced"},
+    {"key": "translator_repair", "label": "Business Translator Repair", "section": "advanced"},
     {"key": "results_advisor_critique", "label": "Results Advisor Critique", "section": "advanced"},
     {"key": "results_advisor_llm", "label": "Results Advisor LLM", "section": "advanced"},
 ]
@@ -176,6 +181,7 @@ def get_model_settings_view() -> Dict[str, Any]:
     get_models, _, bootstrap_error = _load_runtime_model_hooks()
     base_models = _sanitize_agent_model_map(get_models()) if callable(get_models) else {}
     persisted = load_agent_model_overrides()
+    recommended = _sanitize_agent_model_map(get_recommended_agent_model_defaults())
     effective = _merge_agent_model_maps(base_models, persisted)
     return {
         "runtime_available": callable(get_models),
@@ -183,6 +189,7 @@ def get_model_settings_view() -> Dict[str, Any]:
         "presets": [{"id": model_id, "label": label} for model_id, label in MODEL_PRESET_OPTIONS],
         "custom_option": CUSTOM_MODEL_OPTION,
         "agents": MODEL_SETTING_SPECS,
+        "recommended_models": recommended,
         "base_models": base_models,
         "persisted_models": persisted,
         "effective_models": effective,

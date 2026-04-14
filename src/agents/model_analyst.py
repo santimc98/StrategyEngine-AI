@@ -122,11 +122,11 @@ class ModelAnalystAgent:
         self.client: Any = None
         self.model_name = (
             os.getenv("OPENROUTER_MODEL_ANALYST_PRIMARY_MODEL")
-            or "z-ai/glm-5"
+            or "anthropic/claude-opus-4.6"
         ).strip()
         self.fallback_model_name = (
             os.getenv("OPENROUTER_MODEL_ANALYST_FALLBACK_MODEL")
-            or "z-ai/glm-4.7"
+            or "anthropic/claude-sonnet-4.6"
         ).strip()
         self.temperature = float(
             os.getenv("MODEL_ANALYST_TEMPERATURE", "0.1")

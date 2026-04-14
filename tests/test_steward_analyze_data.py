@@ -78,3 +78,31 @@ def test_steward_decide_semantics_pass1_uses_gemini_provider(monkeypatch):
     assert result["primary_target"] == "target"
     assert result["split_candidates"] == ["fold_id"]
     assert result["id_candidates"] == ["customer_id"]
+
+
+def test_steward_semantics_passes_use_dedicated_model_slot():
+    agent = StewardAgent.__new__(StewardAgent)
+    agent.semantics_model_name = "google/gemini-3.1-pro-preview"
+    captured = {}
+
+    def fake_generate_json_payload(**kwargs):
+        captured["model_name"] = kwargs.get("model_name")
+        return {
+            "primary_target": "target",
+            "split_candidates": [],
+            "id_candidates": [],
+            "evidence_requests": [],
+        }
+
+    agent._generate_json_payload = fake_generate_json_payload
+
+    result = agent.decide_semantics_pass1(
+        {
+            "business_objective": "Predict churn",
+            "column_inventory_preview": {"head": ["target"]},
+            "sample_rows": {"head": [{"target": 1}]},
+        }
+    )
+
+    assert result["primary_target"] == "target"
+    assert captured["model_name"] == "google/gemini-3.1-pro-preview"

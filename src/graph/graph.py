@@ -256,6 +256,7 @@ from src.utils.metric_eval import (
     normalize_metrics_report_payload as metric_eval_normalize_metrics_report_payload,
     canonicalize_metrics_report_file as metric_eval_canonicalize_metrics_report_file,
 )
+from src.utils.model_routing_defaults import build_initial_agent_model_defaults
 
 
 def _norm_name(name: str) -> str:
@@ -16955,10 +16956,15 @@ review_board = ReviewBoardAgent()
 execution_planner = ExecutionPlannerAgent()
 failure_explainer = FailureExplainerAgent()
 results_advisor = ResultsAdvisorAgent()
+_model_analyst_model_name = (
+    os.getenv("OPENROUTER_MODEL_ANALYST_PRIMARY_MODEL")
+    or "anthropic/claude-opus-4.6"
+).strip()
 
 
 _RUNTIME_MODEL_AGENT_KEYS = (
     "steward",
+    "steward_semantics",
     "strategist",
     "strategist_fallback",
     "execution_planner",
@@ -16966,14 +16972,17 @@ _RUNTIME_MODEL_AGENT_KEYS = (
     "data_engineer",
     "data_engineer_editor",
     "data_engineer_fallback",
+    "ml_engineer_plan",
     "ml_engineer",
     "ml_engineer_editor",
     "ml_engineer_fallback",
+    "model_analyst",
     "cleaning_reviewer",
     "reviewer",
     "qa_reviewer",
     "review_board",
     "translator",
+    "translator_repair",
     "results_advisor",
     "results_advisor_critique",
     "results_advisor_llm",
@@ -16988,6 +16997,10 @@ def _normalize_runtime_model_name(raw_value: Any) -> str:
 def get_runtime_agent_models() -> Dict[str, str]:
     models = {
         "steward": _normalize_runtime_model_name(getattr(steward, "model_name", "")),
+        "steward_semantics": _normalize_runtime_model_name(
+            getattr(steward, "semantics_model_name", "")
+            or getattr(steward, "model_name", "")
+        ),
         "strategist": _normalize_runtime_model_name(getattr(strategist, "model_name", "")),
         "strategist_fallback": _normalize_runtime_model_name(getattr(strategist, "fallback_model_name", "")),
         "execution_planner": _normalize_runtime_model_name(getattr(execution_planner, "model_name", "")),
@@ -17001,13 +17014,22 @@ def get_runtime_agent_models() -> Dict[str, str]:
             or getattr(data_engineer, "model_name", "")
         ),
         "data_engineer_fallback": _normalize_runtime_model_name(getattr(data_engineer, "fallback_model_name", "")),
+        "ml_engineer_plan": _normalize_runtime_model_name(
+            getattr(ml_engineer, "plan_model_name", "")
+            or getattr(ml_engineer, "model_name", "")
+        ),
         "ml_engineer": _normalize_runtime_model_name(getattr(ml_engineer, "model_name", "")),
         "ml_engineer_fallback": _normalize_runtime_model_name(getattr(ml_engineer, "fallback_model_name", "")),
+        "model_analyst": _normalize_runtime_model_name(_model_analyst_model_name),
         "cleaning_reviewer": _normalize_runtime_model_name(getattr(cleaning_reviewer, "model_name", "")),
         "reviewer": _normalize_runtime_model_name(getattr(reviewer, "model_name", "")),
         "qa_reviewer": _normalize_runtime_model_name(getattr(qa_reviewer, "model_name", "")),
         "review_board": _normalize_runtime_model_name(getattr(review_board, "model_name", "")),
         "translator": _normalize_runtime_model_name(getattr(translator, "model_name", "")),
+        "translator_repair": _normalize_runtime_model_name(
+            getattr(translator, "repair_model_name", "")
+            or getattr(translator, "model_name", "")
+        ),
         "results_advisor": _normalize_runtime_model_name(getattr(results_advisor, "model_name", "")),
         "results_advisor_critique": _normalize_runtime_model_name(
             getattr(results_advisor, "critique_model_name", "")
@@ -17029,6 +17051,8 @@ def get_runtime_agent_models() -> Dict[str, str]:
 
 
 def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    global _model_analyst_model_name
+
     if not isinstance(overrides, dict):
         return get_runtime_agent_models()
 
@@ -17039,6 +17063,7 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
             normalized[agent_key] = candidate
 
     steward_model = normalized.get("steward")
+    steward_semantics_model = normalized.get("steward_semantics")
     if steward_model:
         steward.model_name = steward_model
         if getattr(steward, "provider", "") == "gemini":
@@ -17049,6 +17074,8 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
                     steward.client = _genai.GenerativeModel(steward.model_name)
             except Exception:
                 pass
+    if steward_semantics_model:
+        steward.semantics_model_name = steward_semantics_model
 
     strategist_model = normalized.get("strategist")
     strategist_fallback_model = normalized.get("strategist_fallback")
@@ -17105,8 +17132,11 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
         data_engineer.last_model_used = None
 
     ml_engineer_model = normalized.get("ml_engineer")
+    ml_engineer_plan_model = normalized.get("ml_engineer_plan")
     ml_engineer_editor_model = _normalize_runtime_model_name(overrides.get("ml_engineer_editor"))
     ml_engineer_fallback_model = normalized.get("ml_engineer_fallback")
+    if ml_engineer_plan_model:
+        ml_engineer.plan_model_name = ml_engineer_plan_model
     if ml_engineer_model:
         ml_engineer.model_name = ml_engineer_model
         ml_engineer.last_model_used = None
@@ -17137,6 +17167,14 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
         if model_name:
             setattr(agent_obj, "model_name", model_name)
 
+    translator_repair_model = normalized.get("translator_repair")
+    if translator_repair_model:
+        translator.repair_model_name = translator_repair_model
+
+    model_analyst_model = normalized.get("model_analyst")
+    if model_analyst_model:
+        _model_analyst_model_name = model_analyst_model
+
     results_advisor_model = normalized.get("results_advisor")
     results_advisor_critique_model = normalized.get("results_advisor_critique")
     results_advisor_llm_model = normalized.get("results_advisor_llm")
@@ -17152,6 +17190,19 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
         failure_explainer._model_name = failure_explainer_model
 
     return get_runtime_agent_models()
+
+
+def _apply_initial_agent_model_defaults() -> None:
+    preset = str(os.getenv("AGENT_MODEL_ROUTING_PRESET", "recommended") or "").strip().lower()
+    if preset in {"", "0", "false", "no", "off", "none", "env"}:
+        return
+    try:
+        set_runtime_agent_models(build_initial_agent_model_defaults())
+    except Exception as exc:
+        print(f"MODEL_ROUTING_DEFAULTS_WARNING: {exc}")
+
+
+_apply_initial_agent_model_defaults()
 
 
 # 2. Define Nodes
@@ -17203,15 +17254,19 @@ def run_steward(state: AgentState) -> AgentState:
 
     agent_models = {
         "steward": getattr(getattr(steward, "model", None), "model_name", None),
+        "steward_semantics": getattr(steward, "semantics_model_name", None),
         "strategist": getattr(getattr(strategist, "model", None), "model_name", None) or getattr(strategist, "model_name", None),
         "execution_planner": getattr(execution_planner, "model_name", None),
         "data_engineer": getattr(data_engineer, "model_name", None),
         "cleaning_reviewer": getattr(cleaning_reviewer, "model_name", None),
         "ml_engineer": getattr(ml_engineer, "model_name", None),
+        "ml_engineer_plan": getattr(ml_engineer, "plan_model_name", None),
+        "model_analyst": _model_analyst_model_name,
         "reviewer": getattr(reviewer, "model_name", None),
         "qa_reviewer": getattr(qa_reviewer, "model_name", None),
         "results_advisor": getattr(results_advisor, "model_name", None),
         "translator": getattr(translator, "model_name", None),
+        "translator_repair": getattr(translator, "repair_model_name", None),
     }
     init_run_log(
         run_id,
@@ -32566,11 +32621,9 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         try:
             baseline_script = str(state.get("generated_code") or state.get("last_generated_code") or "")
             analyst = ModelAnalystAgent()
-            # Inherit strategist model override so the analyst uses the same
-            # premium model the user selected (instead of the default GLM-5).
-            _strategist_model = getattr(strategist, "model_name", "")
-            if _strategist_model and _strategist_model != analyst.model_name:
-                analyst.model_name = _strategist_model
+            configured_analyst_model = _normalize_runtime_model_name(_model_analyst_model_name)
+            if configured_analyst_model and configured_analyst_model != analyst.model_name:
+                analyst.model_name = configured_analyst_model
             analyst_context = {
                 "script_code": baseline_script,
                 "metrics": baseline_metrics if isinstance(baseline_metrics, dict) else {},

@@ -182,13 +182,20 @@ class MLEngineerAgent:
             self.model_name = "moonshotai/kimi-k2.5"
         if not self.fallback_model_name:
             self.fallback_model_name = "minimax/minimax-m2.5"
+        self.plan_model_name = (
+            os.getenv("OPENROUTER_ML_PLAN_MODEL")
+            or self.model_name
+        ).strip()
+        if not self.plan_model_name:
+            self.plan_model_name = self.model_name
         _editor_raw = (os.getenv("OPENROUTER_ML_EDITOR_MODEL") or "").strip()
         self.editor_model_name = self.resolve_editor_model_name(
             primary_model=self.model_name,
             editor_model_override=_editor_raw,
         )
         self.logger.info(
-            "ML_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s editor=%s",
+            "ML_ENGINEER_OPENROUTER_MODELS: plan=%s primary=%s fallback=%s editor=%s",
+            self.plan_model_name,
             self.model_name,
             self.fallback_model_name,
             self.editor_model_name,
@@ -3763,7 +3770,12 @@ class MLEngineerAgent:
 
     def _execute_llm_call(self, sys_prompt: str, usr_prompt: str, temperature: float = 0.1) -> str:
         """Helper to execute plan-stage LLM call through OpenRouter."""
-        model_name = self.model_name
+        model_name = str(getattr(self, "plan_model_name", "") or self.model_name or "").strip()
+        model_chain = []
+        for candidate in (model_name, self.model_name, self.fallback_model_name):
+            candidate = str(candidate or "").strip()
+            if candidate and candidate not in model_chain:
+                model_chain.append(candidate)
 
         self.last_prompt = sys_prompt + "\n\nUSER:\n" + usr_prompt
         print(f"DEBUG: ML Engineer (Plan) calling OpenRouter Model ({model_name})...")
@@ -3776,7 +3788,7 @@ class MLEngineerAgent:
             response, model_used = call_chat_with_fallback(
                 self.client,
                 messages,
-                [self.model_name, self.fallback_model_name],
+                model_chain,
                 call_kwargs={"temperature": temperature},
                 logger=self.logger,
                 context_tag="ml_engineer_plan",

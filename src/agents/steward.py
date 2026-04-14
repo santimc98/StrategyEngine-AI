@@ -221,7 +221,12 @@ class StewardAgent:
         self.provider = "openrouter"
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         google_api_key = api_key or os.getenv("GOOGLE_API_KEY")
-        self.model_name = os.getenv("STEWARD_MODEL", "google/gemini-3-flash-preview")
+        self.model_name = os.getenv("STEWARD_MODEL", "google/gemini-3-flash-preview").strip()
+        if not self.model_name:
+            self.model_name = "google/gemini-3-flash-preview"
+        self.semantics_model_name = os.getenv("STEWARD_SEMANTICS_MODEL", self.model_name).strip()
+        if not self.semantics_model_name:
+            self.semantics_model_name = self.model_name
         self.client = None
         if self.api_key:
             self.client = OpenAI(
@@ -242,15 +247,19 @@ class StewardAgent:
         self.last_prompt = None
         self.last_response = None
 
-    def _run_text_prompt(self, prompt: str) -> Tuple[str, Any, Any]:
+    def _run_text_prompt(self, prompt: str, *, model_name: Optional[str] = None) -> Tuple[str, Any, Any]:
+        selected_model = str(model_name or self.model_name or "").strip() or self.model_name
         self.last_prompt = prompt
         if self.provider == "gemini" and hasattr(self.client, "generate_content"):
-            response = self.client.generate_content(prompt)
+            model_client = self.client
+            if selected_model != self.model_name and getattr(genai, "GenerativeModel", None):
+                model_client = genai.GenerativeModel(selected_model)
+            response = model_client.generate_content(prompt)
             text = str(getattr(response, "text", "") or "").strip()
             finish_reason = getattr(response, "finish_reason", None)
         else:
             response = self.client.chat.completions.create(
-                model=self.model_name,
+                model=selected_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
             )
@@ -550,12 +559,13 @@ $raw_output
         task_label: str,
         required_keys: Optional[List[str]] = None,
         max_attempts: int = 3,
+        model_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         required_keys = [str(k) for k in (required_keys or []) if k]
         current_prompt = prompt
         last_text = ""
         for attempt in range(max(1, int(max_attempts))):
-            text, _response, _finish_reason = self._run_text_prompt(current_prompt)
+            text, _response, _finish_reason = self._run_text_prompt(current_prompt, model_name=model_name)
             last_text = text
             parsed = self._parse_json_response(text)
             has_required = bool(parsed) and all(key in parsed for key in required_keys)
@@ -646,6 +656,7 @@ $retry_note
             task_label="steward_semantics_pass1",
             required_keys=["primary_target", "split_candidates", "id_candidates", "evidence_requests"],
             max_attempts=3,
+            model_name=getattr(self, "semantics_model_name", None),
         )
 
     def decide_semantics_pass2(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -807,6 +818,7 @@ CONSTRAINTS:
             task_label="steward_semantics_pass2",
             required_keys=["dataset_semantics", "dataset_training_mask", "column_sets"],
             max_attempts=3,
+            model_name=getattr(self, "semantics_model_name", None),
         )
 
     def _detect_csv_dialect(self, data_path: str, encoding: str) -> Dict[str, str]:

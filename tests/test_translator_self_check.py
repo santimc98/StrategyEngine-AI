@@ -39,6 +39,45 @@ class _SequencedModel:
         return _Resp(text)
 
 
+class _CaptureCompletions:
+    def __init__(self, captured):
+        self.captured = captured
+
+    def create(self, **kwargs):
+        self.captured.update(kwargs)
+
+        class _Message:
+            content = "ok"
+
+        class _Choice:
+            message = _Message()
+            finish_reason = "stop"
+
+        class _Response:
+            choices = [_Choice()]
+
+        return _Response()
+
+
+class _TranslatorRepairCaptureClient:
+    def __init__(self, captured):
+        self.chat = type("Chat", (), {"completions": _CaptureCompletions(captured)})()
+
+
+def test_translator_repair_call_can_use_dedicated_model_slot():
+    captured = {}
+    agent = BusinessTranslatorAgent.__new__(BusinessTranslatorAgent)
+    agent.client = _TranslatorRepairCaptureClient(captured)
+    agent.model_name = "anthropic/claude-opus-4.6"
+    agent.repair_model_name = "openai/gpt-5.4-mini"
+    agent._max_tokens = 1024
+
+    content = agent._call_llm("repair this", model_name=agent.repair_model_name)
+
+    assert content == "ok"
+    assert captured["model"] == "openai/gpt-5.4-mini"
+
+
 class _CaptureChatCompletions:
     def __init__(self):
         self.calls = []

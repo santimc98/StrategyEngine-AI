@@ -4103,7 +4103,12 @@ class BusinessTranslatorAgent:
             api_key=self.api_key,
             base_url="https://openrouter.ai/api/v1",
         )
-        self.model_name = os.getenv("TRANSLATOR_MODEL", "google/gemini-3-flash-preview")
+        self.model_name = os.getenv("TRANSLATOR_MODEL", "google/gemini-3-flash-preview").strip()
+        if not self.model_name:
+            self.model_name = "google/gemini-3-flash-preview"
+        self.repair_model_name = os.getenv("TRANSLATOR_REPAIR_MODEL", self.model_name).strip()
+        if not self.repair_model_name:
+            self.repair_model_name = self.model_name
         self.last_prompt = None
         self.last_response = None
         self.last_report_blocks = None
@@ -4113,7 +4118,7 @@ class BusinessTranslatorAgent:
         except Exception:
             self._max_tokens = 16384
 
-    def _call_llm(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str, *, model_name: Optional[str] = None) -> str:
         model = getattr(self, "model", None)
         if model is not None:
             if hasattr(model, "generate_content"):
@@ -4122,8 +4127,9 @@ class BusinessTranslatorAgent:
                 return str(text or "").strip()
             if callable(model):
                 return str(model(prompt) or "").strip()
+        selected_model = str(model_name or self.model_name or "").strip() or self.model_name
         response = self.client.chat.completions.create(
-            model=self.model_name,
+            model=selected_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=int(self._max_tokens),
@@ -5406,7 +5412,10 @@ $execution_results
                                 evidence_paths=evidence_paths,
                                 target_language_code=target_language_code,
                             )
-                        repaired = self._call_llm(repair_prompt)
+                        repaired = self._call_llm(
+                            repair_prompt,
+                            model_name=getattr(self, "repair_model_name", None),
+                        )
                         if structured_layout_enabled:
                             repaired_content, repaired_blocks, repaired_payload, repaired_structured_issues = _materialize_structured_report(
                                 content=repaired,

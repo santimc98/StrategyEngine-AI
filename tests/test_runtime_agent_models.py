@@ -21,6 +21,7 @@ from src.graph.graph import (
     strategist,
     translator,
 )
+import src.graph.graph as graph_module
 
 
 def test_set_runtime_agent_models_derives_ml_editor_from_primary(monkeypatch):
@@ -62,6 +63,7 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
     monkeypatch.delenv("OPENROUTER_ML_EDITOR_MODEL", raising=False)
     originals = {
         "steward_model": getattr(steward, "model_name", ""),
+        "steward_semantics": getattr(steward, "semantics_model_name", ""),
         "strategist_model": getattr(strategist, "model_name", ""),
         "strategist_fallback": getattr(strategist, "fallback_model_name", ""),
         "strategist_chain": list(getattr(strategist, "model_chain", []) or []),
@@ -73,13 +75,16 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
         "data_engineer_model": getattr(data_engineer, "model_name", ""),
         "data_engineer_fallback": getattr(data_engineer, "fallback_model_name", ""),
         "ml_engineer_model": getattr(ml_engineer, "model_name", ""),
+        "ml_engineer_plan": getattr(ml_engineer, "plan_model_name", ""),
         "ml_engineer_editor": getattr(ml_engineer, "editor_model_name", ""),
         "ml_engineer_fallback": getattr(ml_engineer, "fallback_model_name", ""),
+        "model_analyst": getattr(graph_module, "_model_analyst_model_name", ""),
         "cleaning_reviewer_model": getattr(cleaning_reviewer, "model_name", ""),
         "reviewer_model": getattr(reviewer, "model_name", ""),
         "qa_reviewer_model": getattr(qa_reviewer, "model_name", ""),
         "review_board_model": getattr(review_board, "model_name", ""),
         "translator_model": getattr(translator, "model_name", ""),
+        "translator_repair": getattr(translator, "repair_model_name", ""),
         "results_advisor_model": getattr(results_advisor, "model_name", ""),
         "results_advisor_critique": getattr(results_advisor, "critique_model_name", ""),
         "results_advisor_llm": getattr(results_advisor, "fe_model_name", ""),
@@ -88,20 +93,24 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
     try:
         overrides = {
             "steward": "google/gemini-3-flash-preview",
+            "steward_semantics": "google/gemini-3.1-pro-preview",
             "strategist": "openai/gpt-5.4",
             "strategist_fallback": "moonshotai/kimi-k2.5",
             "execution_planner": "google/gemini-3.1-pro-preview",
             "execution_planner_compiler": "google/gemini-3-flash-preview",
             "data_engineer": "openai/gpt-5.4-mini",
             "data_engineer_fallback": "minimax/minimax-m2.5",
+            "ml_engineer_plan": "google/gemini-3.1-pro-preview",
             "ml_engineer": "openai/gpt-5.4",
             "ml_engineer_editor": "openai/gpt-5.4-mini",
             "ml_engineer_fallback": "moonshotai/kimi-k2.5",
+            "model_analyst": "anthropic/claude-opus-4.6",
             "cleaning_reviewer": "google/gemini-3-flash-preview",
             "reviewer": "openai/gpt-5.4-mini",
             "qa_reviewer": "openai/gpt-5.4-mini",
             "review_board": "openai/gpt-5.4-mini",
             "translator": "google/gemini-3-flash-preview",
+            "translator_repair": "openai/gpt-5.4-mini",
             "results_advisor": "google/gemini-3-flash-preview",
             "results_advisor_critique": "openai/gpt-5.4",
             "results_advisor_llm": "google/gemini-3-flash-preview",
@@ -110,6 +119,7 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
         models = set_runtime_agent_models(overrides)
 
         assert steward.model_name == overrides["steward"]
+        assert steward.semantics_model_name == overrides["steward_semantics"]
         assert strategist.model_name == overrides["strategist"]
         assert strategist.fallback_model_name == overrides["strategist_fallback"]
         assert strategist.model_chain == [overrides["strategist"], overrides["strategist_fallback"]]
@@ -120,14 +130,17 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
         assert getattr(execution_planner.client, "model_name", "") == overrides["execution_planner"]
         assert data_engineer.model_name == overrides["data_engineer"]
         assert data_engineer.fallback_model_name == overrides["data_engineer_fallback"]
+        assert ml_engineer.plan_model_name == overrides["ml_engineer_plan"]
         assert ml_engineer.model_name == overrides["ml_engineer"]
         assert ml_engineer.editor_model_name == overrides["ml_engineer_editor"]
         assert ml_engineer.fallback_model_name == overrides["ml_engineer_fallback"]
+        assert graph_module._model_analyst_model_name == overrides["model_analyst"]
         assert cleaning_reviewer.model_name == overrides["cleaning_reviewer"]
         assert reviewer.model_name == overrides["reviewer"]
         assert qa_reviewer.model_name == overrides["qa_reviewer"]
         assert review_board.model_name == overrides["review_board"]
         assert translator.model_name == overrides["translator"]
+        assert translator.repair_model_name == overrides["translator_repair"]
         assert results_advisor.model_name == overrides["results_advisor"]
         assert results_advisor.critique_model_name == overrides["results_advisor_critique"]
         assert results_advisor.fe_model_name == overrides["results_advisor_llm"]
@@ -139,6 +152,7 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
             assert runtime_snapshot[key] == value
     finally:
         steward.model_name = originals["steward_model"]
+        steward.semantics_model_name = originals["steward_semantics"]
         strategist.model_name = originals["strategist_model"]
         strategist.fallback_model_name = originals["strategist_fallback"]
         strategist.model_chain = originals["strategist_chain"]
@@ -151,13 +165,16 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
         data_engineer.model_name = originals["data_engineer_model"]
         data_engineer.fallback_model_name = originals["data_engineer_fallback"]
         ml_engineer.model_name = originals["ml_engineer_model"]
+        ml_engineer.plan_model_name = originals["ml_engineer_plan"]
         ml_engineer.editor_model_name = originals["ml_engineer_editor"]
         ml_engineer.fallback_model_name = originals["ml_engineer_fallback"]
+        graph_module._model_analyst_model_name = originals["model_analyst"]
         cleaning_reviewer.model_name = originals["cleaning_reviewer_model"]
         reviewer.model_name = originals["reviewer_model"]
         qa_reviewer.model_name = originals["qa_reviewer_model"]
         review_board.model_name = originals["review_board_model"]
         translator.model_name = originals["translator_model"]
+        translator.repair_model_name = originals["translator_repair"]
         results_advisor.model_name = originals["results_advisor_model"]
         results_advisor.critique_model_name = originals["results_advisor_critique"]
         results_advisor.fe_model_name = originals["results_advisor_llm"]
