@@ -152,6 +152,20 @@ def _event_to_log_line(
         extra = f" — target final: {final_t}" if final_t else ""
         return {"agent": "Data Steward", "msg": f"Reconsideracion {tag}{extra}", "level": "ok" if accepted else "warn"}
 
+    # -- strategist --
+    if ev == "strategist_start":
+        return {"agent": "Strategist", "msg": "Formulando estrategia de analisis...", "level": "info"}
+
+    if ev == "strategist_complete":
+        title = _fmt(payload.get("selected_title"))
+        atype = _fmt(payload.get("analysis_type"))
+        extra = f" — {atype}" if atype else ""
+        return {
+            "agent": "Strategist",
+            "msg": f"Estrategia seleccionada: {title}{extra}" if title else "Estrategia seleccionada",
+            "level": "ok",
+        }
+
     # -- planner --
     if ev == "execution_planner_start":
         strat = _fmt(payload.get("strategy"))

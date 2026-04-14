@@ -17865,6 +17865,14 @@ def run_strategist(state: AgentState) -> AgentState:
     if abort_state:
         return abort_state
 
+    _strategist_run_id = state.get("run_id") if isinstance(state, dict) else None
+    if _strategist_run_id:
+        log_run_event(
+            _strategist_run_id,
+            "strategist_start",
+            {"business_objective": str(state.get("business_objective") or "")[:500]},
+        )
+
     # Strategist now returns a dict with "strategies": [list of 3]
     user_context = state.get("strategist_context_override") or state.get("business_objective", "")
     if _minimal_agent_context_enabled():
@@ -18012,6 +18020,17 @@ def run_strategist(state: AgentState) -> AgentState:
     # No domain_expert scoring needed — the LLM already reasoned the best strategy.
     best_strategy = strategies_list[0] if strategies_list else {}
     print(f"\n🏆 Strategy: {best_strategy.get('title', 'N/A')}")
+
+    if _strategist_run_id:
+        log_run_event(
+            _strategist_run_id,
+            "strategist_complete",
+            {
+                "selected_title": str(best_strategy.get("title") or "")[:300],
+                "analysis_type": str(best_strategy.get("analysis_type") or ""),
+                "strategies_count": len(strategies_list),
+            },
+        )
 
     return {
         "strategies": {"strategies": strategies_list},
@@ -23656,6 +23675,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 "pipeline_aborted_reason": "cleaning_reviewer_rejected",
                                 "data_engineer_failed": True,
                                 "budget_counters": counters,
+                                # Expose authoritative run outcome so UI and translator
+                                # don't see `None` for a run that actually aborted.
+                                "run_outcome": "NO_GO",
+                                "overall_status_global": "error",
                             }
                         if status == "APPROVE_WITH_WARNINGS":
                             warnings = review_result.get("warnings") or []
@@ -23674,6 +23697,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         "pipeline_aborted_reason": "cleaning_reviewer_failed",
                         "data_engineer_failed": True,
                         "budget_counters": counters,
+                        # Expose authoritative run outcome so UI and translator
+                        # don't see `None` for a run that actually aborted.
+                        "run_outcome": "NO_GO",
+                        "overall_status_global": "error",
                     }
             # Guard: derived columns should not be constant if present (context-only; do not block runs)
             derived_issues = []
