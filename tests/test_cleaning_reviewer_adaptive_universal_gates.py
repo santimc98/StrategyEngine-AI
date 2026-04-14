@@ -232,6 +232,79 @@ def test_outlier_policy_applied_accepts_dict_shaped_report_columns():
     assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
 
 
+def test_outlier_policy_applied_accepts_actions_report():
+    """Regression: run 8ef7d68e aborted because the extractor rejected the
+    `actions: [{column, method, lower, upper, ...}]` schema the DE produced.
+    This is a reasonable shape and must be recognized."""
+    df = pd.DataFrame(
+        {
+            "employees": [10, 20, 30],
+            "annual_revenue": [1000, 2000, 3000],
+        }
+    )
+    gates = [
+        {
+            "name": "outlier_policy_applied",
+            "severity": "HARD",
+            "params": {"strict": True},
+        }
+    ]
+    manifest = {"outlier_treatment": {"policy_applied": True}}
+    outlier_policy = {
+        "enabled": True,
+        "apply_stage": "data_engineer",
+        "target_columns": ["employees", "annual_revenue"],
+        "strict": True,
+    }
+    outlier_report = {
+        "enabled": True,
+        "actions": [
+            {
+                "column": "employees",
+                "method": "cap",
+                "lower": 0.0,
+                "upper": 10000.0,
+                "before_min": 7.0,
+                "before_max": 2839.0,
+            },
+            {
+                "column": "annual_revenue",
+                "method": "cap",
+                "lower": 0.0,
+                "upper": 1000000.0,
+                "before_min": 10000.0,
+                "before_max": 1876092.0,
+            },
+        ],
+    }
+
+    result = _evaluate_gates_deterministic(
+        gates=gates,
+        required_columns=[],
+        cleaned_header=list(df.columns),
+        cleaned_csv_path="data/cleaned_data.csv",
+        sample_str=df.astype(str),
+        sample_infer=df,
+        manifest=manifest,
+        raw_sample=None,
+        column_roles={},
+        allowed_feature_sets={},
+        outlier_policy=outlier_policy,
+        outlier_report=outlier_report,
+        outlier_report_path="data/outlier_treatment_report.json",
+    )
+
+    assert result["status"] == "APPROVED"
+    gate_entry = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "outlier_policy_applied"
+    )
+    evidence = gate_entry.get("evidence") or {}
+    assert gate_entry.get("passed") is True
+    assert set(evidence.get("report_columns_touched") or []) == {"employees", "annual_revenue"}
+
+
 def test_outlier_policy_applied_accepts_flat_top_level_column_report():
     df = pd.DataFrame(
         {

@@ -2827,6 +2827,7 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
       - {"targets": ["col1", ...] | {"col1": {...}}}    (alternative contract variant)
       - {"columns": ["col1", ...] | {"col1": {...}}}    (legacy)
       - {"applied": [{"column": "col1", ...}, ...]}     (per-column detail variant)
+      - {"actions": [{"column": "col1", ...}, ...]}     (action log variant)
       - {"treatments": [{"column": "col1", ...}, ...]}  (treatment log variant)
 
     This function must handle all of them to avoid false-positive gate failures.
@@ -2853,8 +2854,11 @@ def _extract_outlier_report_columns(report: Dict[str, Any]) -> List[str]:
     if not report_columns and isinstance(raw_columns, dict):
         report_columns = [str(key).strip() for key in raw_columns.keys() if str(key).strip()]
     # per-column detail variant: {"applied": [{"column": "employees", ...}, ...]}
+    # "actions" is a common DE-produced variant we must also recognize to avoid
+    # false-positive rejections when the report lists treated columns as action
+    # entries (e.g. [{"column": "arr_current", "method": "cap", ...}, ...]).
     if not report_columns:
-        for list_key in ("applied", "treatments", "treatment_records", "operations"):
+        for list_key in ("applied", "actions", "treatments", "treatment_records", "operations"):
             entries = report.get(list_key)
             if not isinstance(entries, list):
                 continue
