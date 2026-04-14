@@ -23433,6 +23433,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
             # --- CLEANING REVIEWER (contract-driven) ---
             if cleaning_reviewer:
+                if run_id:
+                    log_run_event(run_id, "cleaning_reviewer_start", {"attempt": attempt_id})
                 try:
                     manifest_for_review = _load_json_safe(local_manifest_path)
                     output_dialect = None
@@ -23519,6 +23521,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             response=getattr(cleaning_reviewer, "last_response", None) or review_result,
                             context=review_context_payload,
                             verdicts=review_result,
+                        )
+                        _cr_status = review_result.get("status") if isinstance(review_result, dict) else None
+                        log_run_event(
+                            run_id,
+                            "cleaning_reviewer_complete",
+                            {"status": _cr_status, "attempt": attempt_id},
                         )
 
                     if isinstance(review_result, dict):

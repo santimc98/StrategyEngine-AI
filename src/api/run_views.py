@@ -83,6 +83,7 @@ _PHASE_AGENT: Dict[str, str] = {
     "translator": "Translator",
     "review_board": "Review Board",
     "results_advisor": "Results Advisor",
+    "cleaning_reviewer": "Cleaning Reviewer",
     "reviewer": "Reviewer",
     "qa": "QA Reviewer",
     "runtime": "Runner",
@@ -201,6 +202,27 @@ def _event_to_log_line(
         rows = _fmt(payload.get("row_count"))
         cols = _fmt(payload.get("column_count"))
         return {"agent": "Data Engineer", "msg": f"Limpieza consolidada — {rows} filas, {cols} columnas", "level": "ok"}
+
+    # -- cleaning reviewer --
+    if ev == "cleaning_reviewer_start":
+        attempt = _fmt(payload.get("attempt"))
+        tag = f" (intento {attempt})" if attempt else ""
+        return {"agent": "Cleaning Reviewer", "msg": f"Revisando calidad de limpieza{tag}...", "level": "info"}
+
+    if ev == "cleaning_reviewer_complete":
+        st = _fmt(payload.get("status"))
+        lvl = "ok" if st in ("APPROVED", "APPROVE_WITH_WARNINGS") else "warn"
+        return {"agent": "Cleaning Reviewer", "msg": f"Revision completada — {st}" if st else "Revision completada", "level": lvl}
+
+    if ev == "cleaning_reviewer_runtime_start":
+        return {"agent": "Cleaning Reviewer", "msg": "Revisando fallo de ejecucion...", "level": "info"}
+
+    if ev == "cleaning_reviewer_runtime_complete":
+        st = _fmt(payload.get("status"))
+        return {"agent": "Cleaning Reviewer", "msg": f"Revision de fallo completada — {st}" if st else "Revision de fallo completada", "level": "warn"}
+
+    if ev == "cleaning_reviewer_runtime_failed":
+        return {"agent": "Cleaning Reviewer", "msg": "Revision de fallo no pudo completarse", "level": "error"}
 
     # -- runner --
     if ev == "heavy_runner_request":
