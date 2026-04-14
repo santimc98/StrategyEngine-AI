@@ -24296,6 +24296,36 @@ def run_engineer(state: AgentState) -> AgentState:
 
     # Patch Mode Inputs
     previous_code = _resolve_metric_round_previous_code(state) or state.get('generated_code') or state.get('last_generated_code')
+
+    # ── Coherence guard: best-attempt / previous_code alignment ──
+    # If a best-attempt restoration occurred upstream, execution_output_stale is
+    # True and the graph state should already carry the restored generated_code
+    # (via the propagation added to run_result_evaluator / run_review_board).
+    # As a defense-in-depth fallback, if the graph state was NOT updated (e.g.
+    # restoration happened but propagation was skipped due to an early return),
+    # re-resolve previous_code directly from the best-attempt metadata to avoid
+    # the ML Engineer editing stale (worse/failed) code with feedback produced
+    # for the best attempt.  We read the metadata only (no file copies).
+    if (
+        state.get("execution_output_stale")
+        and not bool(state.get("ml_improvement_round_active"))
+        and previous_code
+    ):
+        _ba_dir = state.get("best_attempt_dir")
+        if isinstance(_ba_dir, str) and _ba_dir.strip() and os.path.isdir(_ba_dir):
+            try:
+                _ba_meta = _load_json_any(os.path.join(_ba_dir, "best_attempt.json"))
+                if isinstance(_ba_meta, dict):
+                    _best_code = str(_ba_meta.get("generated_code") or "").strip()
+                    if _best_code and _best_code != previous_code:
+                        print(
+                            "COHERENCE_GUARD: previous_code mismatched best-attempt after restoration. "
+                            "Re-aligning to best-attempt code."
+                        )
+                        previous_code = _best_code
+            except Exception:
+                pass
+
     gate_context = state.get('last_gate_context')
     metric_round_active = bool(state.get("ml_improvement_round_active"))
     editor_mode_active = _should_use_ml_editor_mode(
@@ -28990,6 +29020,22 @@ def run_result_evaluator(state: AgentState) -> AgentState:
 
     if status == "NEEDS_IMPROVEMENT":
         result_state["iteration_count"] = state.get("iteration_count", 0) + 1
+
+    # ── Best-attempt restoration propagation ──
+    # _restore_best_attempt_as_authoritative_state (called at entry) modifies
+    # our local `state` copy but the graph only sees fields in result_state.
+    # Without propagation the ML Engineer would receive the FAILED code from the
+    # graph while iteration_handoff references the RESTORED (best) output —
+    # a context mismatch that produces incoherent edits.
+    if str(state.get("best_attempt_promoted_for") or "").strip() == "result_evaluator":
+        for _ba_key in (
+            "execution_output", "generated_code", "last_generated_code",
+            "execution_output_stale", "best_attempt_promoted_for",
+        ):
+            _ba_val = state.get(_ba_key)
+            if _ba_val is not None:
+                result_state.setdefault(_ba_key, _ba_val)
+
     if run_id:
         log_run_event(run_id, "result_evaluator_complete", {"status": status})
     return result_state
@@ -29675,6 +29721,20 @@ def run_review_board(state: AgentState) -> AgentState:
         print(f"IMPROVEMENT_SUGGESTIONS: {len(_all_techniques)} techniques consolidated from reviewer/evaluator")
     if _no_improvement_room:
         print("IMPROVEMENT_SUGGESTIONS: Both reviewer and evaluator agree no further improvement possible")
+
+    # ── Best-attempt restoration propagation (defense-in-depth) ──
+    # Same rationale as in run_result_evaluator: if the review board triggered
+    # its own restoration (e.g. evaluator status changed output_contract_report),
+    # propagate the authoritative code/output to the graph state so downstream
+    # nodes (ML Engineer) see a coherent snapshot.
+    if str(state.get("best_attempt_promoted_for") or "").strip() == "review_board":
+        for _ba_key in (
+            "execution_output", "generated_code", "last_generated_code",
+            "execution_output_stale", "best_attempt_promoted_for",
+        ):
+            _ba_val = state.get(_ba_key)
+            if _ba_val is not None:
+                result.setdefault(_ba_key, _ba_val)
 
     return result
 
