@@ -161,6 +161,11 @@ def write_final_state(run_id: str, state: Dict[str, Any]) -> None:
         # Pipeline status
         "data_engineer_failed", "pipeline_aborted_reason",
         "ml_improvement_kept", "stop_reason",
+        # Metric improvement loop state
+        "primary_metric_state", "best_metric_value", "baseline_metric_value",
+        "primary_metric_name", "primary_metric_snapshot",
+        "no_improve_streak", "ml_improvement_round_count",
+        "ml_improvement_round_history", "ml_improvement_attempted",
     ]
     serializable = {}
     for k in keys_to_keep:

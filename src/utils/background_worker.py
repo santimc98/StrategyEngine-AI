@@ -290,11 +290,18 @@ def main(run_id: str) -> None:
                 for pattern in [
                     r"(?:RMSLE|rmsle)[:\s=]+([0-9]+\.?[0-9]*)",
                     r"(?:RMSE|rmse)[:\s=]+([0-9]+\.?[0-9]*)",
+                    r"(?:MSE|mse)[:\s=]+([0-9]+\.?[0-9]*)",
                     r"(?:MAE|mae)[:\s=]+([0-9]+\.?[0-9]*)",
+                    r"(?:MAPE|mape)[:\s=]+([0-9]+\.?[0-9]*)",
                     r"(?:AUC|auc)[:\s=]+([0-9]+\.?[0-9]*)",
                     r"(?:F1|f1)[:\s=]+([0-9]+\.?[0-9]*)",
                     r"(?:Accuracy|accuracy)[:\s=]+([0-9]+\.?[0-9]*)",
                     r"(?:R2|r2|R-squared)[:\s=]+([0-9]+\.?[0-9]*)",
+                    r"(?:average_precision|AP)[:\s=]+([0-9]+\.?[0-9]*)",
+                    r"(?:log_loss|LogLoss)[:\s=]+([0-9]+\.?[0-9]*)",
+                    r"(?:brier_score|Brier)[:\s=]+([0-9]+\.?[0-9]*)",
+                    r"(?:Precision|precision)[:\s=]+([0-9]+\.?[0-9]*)",
+                    r"(?:Recall|recall)[:\s=]+([0-9]+\.?[0-9]*)",
                 ]:
                     match = re.search(pattern, exec_output, re.IGNORECASE)
                     if match:
