@@ -7803,42 +7803,49 @@ def _evaluate_column_presence_gates(
         "messages": messages,
     }
 
+def _strategy_lock_sort_key(value: Any) -> str:
+    """Stable sort key for strategy-lock structures that may contain dicts."""
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _normalize_strategy_lock_value(value: Any) -> Any:
+    """Recursively canonicalize strategy-lock values without assuming scalar lists."""
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_strategy_lock_value(val)
+            for key, val in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        normalized_items = [_normalize_strategy_lock_value(item) for item in value]
+        return sorted(normalized_items, key=_strategy_lock_sort_key)
+    return value
+
+
 def _normalize_allowed_feature_sets(feature_sets: Any) -> Any:
     """Normalize allowed_feature_sets for consistent comparison.
 
-    If dict: sort each list value and return normalized dict.
-    If list: sort and return.
-    Otherwise: return as-is.
+    The contract can contain rich feature metadata such as feature_families:
+    list[dict]. Treat allowed_feature_sets as set-like data and canonicalize
+    recursively instead of sorting raw list items directly.
     """
-    if isinstance(feature_sets, dict):
-        normalized = {}
-        for key, val in feature_sets.items():
-            if isinstance(val, list):
-                normalized[key] = sorted(val)
-            else:
-                normalized[key] = val
-        return normalized
-    elif isinstance(feature_sets, list):
-        if all(isinstance(item, str) for item in feature_sets):
-            return sorted(feature_sets)
-        try:
-            return sorted(feature_sets)
-        except TypeError:
-            return feature_sets
-    return feature_sets
+    return _normalize_strategy_lock_value(feature_sets)
 
 def _derive_forbidden_from_allowed(allowed_feature_sets: Any, explicit_forbidden: List[str]) -> List[str]:
     """Derive forbidden features from allowed_feature_sets if explicit list is empty.
 
-    If allowed_feature_sets is a dict with 'forbidden' key, use that.
+    If allowed_feature_sets is a dict with forbidden feature keys, use that.
     Otherwise return explicit_forbidden.
     """
     if explicit_forbidden:
-        return sorted(explicit_forbidden)
+        return _normalize_strategy_lock_value(explicit_forbidden)
     if isinstance(allowed_feature_sets, dict):
-        forbidden = allowed_feature_sets.get("forbidden", [])
-        if isinstance(forbidden, list):
-            return sorted(forbidden)
+        for key in ("forbidden_features", "forbidden", "disallowed_features"):
+            forbidden = allowed_feature_sets.get(key, [])
+            if isinstance(forbidden, list):
+                return _normalize_strategy_lock_value(forbidden)
     return []
 
 def _capture_strategy_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -13686,6 +13693,134 @@ def _build_column_repair_context(
     return facts, directives
 
 
+def _de_gate_name_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _extract_cleaning_gate_failure_payload(text: Any) -> Dict[str, Any]:
+    payload = str(text or "")
+    match = re.search(r"CLEANING_GATE_FAILED:\s*([A-Za-z0-9_.\- ]+)", payload)
+    if not match:
+        return {}
+    tail = payload[match.start() : match.start() + 500]
+    failure: Dict[str, Any] = {"gate_name": match.group(1).strip().split()[0]}
+    dtype_match = re.search(r"dtype=([^,\n]+)", tail)
+    unique_match = re.search(r"unique=([0-9]+)", tail)
+    span_match = re.search(r"span=([0-9]+)", tail)
+    if dtype_match:
+        failure["actual_dtype"] = dtype_match.group(1).strip()
+    if unique_match:
+        failure["actual_unique"] = int(unique_match.group(1))
+    if span_match:
+        failure["actual_span_days"] = int(span_match.group(1))
+    return failure
+
+
+def _find_de_cleaning_gate(contract: Dict[str, Any], gate_name: str) -> Dict[str, Any]:
+    target = _de_gate_name_token(gate_name)
+    candidates: List[Any] = []
+    if isinstance(contract.get("data_engineer"), dict):
+        candidates.extend(contract.get("data_engineer", {}).get("cleaning_gates") or [])
+    candidates.extend(contract.get("cleaning_gates") or [])
+    for gate in candidates:
+        if not isinstance(gate, dict):
+            continue
+        name = gate.get("name") or gate.get("id") or gate.get("gate")
+        if _de_gate_name_token(name) == target:
+            return gate
+    return {}
+
+
+def _range_contains(value: Any, range_value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    if not isinstance(range_value, list) or len(range_value) != 2:
+        return False
+    try:
+        low = float(range_value[0])
+        high = float(range_value[1])
+    except Exception:
+        return False
+    return low <= float(value) <= high
+
+
+def _profile_column_raw_unique_for_repair(profile: Dict[str, Any], column: str) -> int | None:
+    if not isinstance(profile, dict) or not column:
+        return None
+    column_profiles = profile.get("column_profiles")
+    if isinstance(column_profiles, dict) and isinstance(column_profiles.get(column), dict):
+        entry = column_profiles.get(column) or {}
+        for key in ("unique_count", "n_unique", "distinct_count"):
+            value = entry.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(value)
+    cardinality = profile.get("cardinality")
+    if isinstance(cardinality, dict) and isinstance(cardinality.get(column), dict):
+        value = cardinality.get(column, {}).get("unique")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+
+def _detect_de_contract_gate_contradiction(state: Dict[str, Any], runtime_output: Any) -> Dict[str, Any]:
+    failure = _extract_cleaning_gate_failure_payload(runtime_output)
+    if not failure:
+        return {}
+    contract, _ = _resolve_contract_pair_from_state(state if isinstance(state, dict) else {})
+    gate = _find_de_cleaning_gate(contract, str(failure.get("gate_name") or ""))
+    if not gate:
+        return {}
+    params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+    expected_unique = params.get("expected_unique_range") or params.get("unique_count_range")
+    expected_span = params.get("expected_time_span_days_range") or params.get("time_span_days_range")
+    expected_dtype = str(params.get("expected_dtype") or params.get("dtype") or "").lower()
+    actual_unique = failure.get("actual_unique")
+    actual_span = failure.get("actual_span_days")
+    actual_dtype = str(failure.get("actual_dtype") or "").lower()
+    is_datetime_gate = "datetime" in expected_dtype or "date" in expected_dtype or "datetime" in actual_dtype
+    if not (is_datetime_gate and isinstance(actual_unique, int) and expected_unique):
+        return {}
+    unique_expected = _range_contains(actual_unique, expected_unique)
+    span_expected = _range_contains(actual_span, expected_span) if expected_span else False
+    if unique_expected:
+        return {}
+    column = str(params.get("column") or params.get("date_column") or params.get("time_column") or "").strip()
+    profile = _load_dataset_profile_for_repair(state)
+    raw_unique = _profile_column_raw_unique_for_repair(profile, column)
+    raw_unique_reused = raw_unique is not None and _range_contains(raw_unique, expected_unique)
+    monthly_or_snapshot = any(
+        token in " ".join([column, str(gate.get("name") or ""), str(gate.get("evidence_source") or "")]).lower()
+        for token in ("month", "monthly", "snapshot", "period")
+    )
+    cadence_conflict = (
+        monthly_or_snapshot
+        and span_expected
+        and isinstance(actual_unique, int)
+        and actual_unique <= 40
+        and isinstance(expected_unique, list)
+        and len(expected_unique) == 2
+        and isinstance(expected_unique[0], (int, float))
+        and float(expected_unique[0]) >= 90
+    )
+    if not (raw_unique_reused or cadence_conflict):
+        return {}
+    return {
+        "kind": "contract_gate_semantic_contradiction",
+        "gate_name": str(gate.get("name") or failure.get("gate_name") or ""),
+        "column": column,
+        "expected_unique_range": expected_unique,
+        "expected_time_span_days_range": expected_span,
+        "actual_unique": actual_unique,
+        "actual_span_days": actual_span,
+        "actual_dtype": failure.get("actual_dtype"),
+        "raw_unique": raw_unique,
+        "reason": (
+            "The failing gate appears to compare parsed canonical datetime cardinality against raw string/profile "
+            "cardinality. A correct mixed-format date parse can collapse many raw strings into fewer canonical periods."
+        ),
+    }
+
+
 def _detect_repeated_de_failure_pattern(
     state: Dict[str, Any] | None,
     *,
@@ -13900,6 +14035,31 @@ def _build_repair_ground_truth(
         text = str(item or "").strip()
         if text and text not in compatibility_notes:
             compatibility_notes.append(text)
+    contract_gate_conflict = _detect_de_contract_gate_contradiction(state, runtime_text)
+    if contract_gate_conflict:
+        error_type = "contract_contradiction"
+        repair_focus = "contract_or_gate_semantics"
+        verified_facts.append(
+            {
+                "fact": "contract_gate_semantic_contradiction",
+                "value": contract_gate_conflict,
+                "source": "runtime_traceback+execution_contract+dataset_profile",
+            }
+        )
+        causal_deltas.append(contract_gate_conflict)
+        directive = (
+            "Do not keep enforcing a gate threshold that contradicts canonical cleaned-artifact evidence. "
+            "Patch only the implicated gate check, preserve the successful parsing/transformation, and document the contract conflict."
+        )
+        if directive not in repair_directives:
+            repair_directives.insert(0, directive)
+        goal = (
+            "Resolve the failing CLEANING_GATE_FAILED path by distinguishing an actually bad cleaning transform "
+            "from an impossible contract gate parameter."
+        )
+        if goal not in repair_goals:
+            repair_goals.insert(0, goal)
+        do_not_change.append("Do not regenerate unrelated cleaning logic that already reached the failing gate successfully.")
     for path in (present_outputs or [])[:6]:
         do_not_change.append(f"Keep artifact generation for {path} unchanged unless the failing block directly requires it.")
         stable_regions.append(f"artifact_generation:{path}")
@@ -20328,6 +20488,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 planner_semantic_context = {
                     "strategy_techniques_role": "advisory_hypotheses",
                     "conflict_resolution_priority": [
+                        "DATA_PROFILE_COMPACT_JSON.temporal_normalization_facts",
                         "DATA_PROFILE_COMPACT_JSON.numeric_ranges_digest",
                         "dataset_semantics",
                         "strategy_text",
@@ -20335,6 +20496,10 @@ def run_execution_planner(state: AgentState) -> AgentState:
                     "dtype_conflict_policy": (
                         "If strategy wording conflicts with observed profile ranges/dtypes, prioritize "
                         "observed profile evidence and encode safer dtype constraints."
+                    ),
+                    "temporal_gate_policy": (
+                        "For datetime/date gates, distinguish raw CSV representation from canonical parsed "
+                        "artifact properties; raw_unique_count is not a cleaned-artifact expected_unique_range."
                     ),
                 }
                 compact_payload = json.dumps(compact_profile, indent=2, ensure_ascii=False)

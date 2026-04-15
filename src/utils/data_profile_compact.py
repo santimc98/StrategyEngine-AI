@@ -201,6 +201,14 @@ def convert_dataset_profile_to_data_profile(
         "duplicate_stats": dataset_profile.get("duplicate_stats", {}),
         "sampling": dataset_profile.get("sampling", {}),
         "compute_hints": compute_hints,
+        "temporal_analysis": dataset_profile.get("temporal_analysis", {}),
+        "temporal_normalization_facts": dataset_profile.get("temporal_normalization_facts", [])
+        if isinstance(dataset_profile.get("temporal_normalization_facts"), list)
+        else (
+            dataset_profile.get("temporal_analysis", {}).get("normalization_facts", [])
+            if isinstance(dataset_profile.get("temporal_analysis"), dict)
+            else []
+        ),
         "sampling_uncertainty": {
             "is_uncertain_for_column_level_deterministic_inference": sampled_profile_uncertain,
             "sample_rows": sample_rows,
@@ -281,6 +289,40 @@ def _is_dataset_profile_schema(profile: Dict[str, Any]) -> bool:
     return has_ds_keys and not has_dp_keys
 
 
+def _compact_temporal_normalization_facts(
+    facts: Any,
+    max_items: int = 12,
+) -> List[Dict[str, Any]]:
+    if not isinstance(facts, list):
+        return []
+    compacted: List[Dict[str, Any]] = []
+    for item in facts:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or "").strip()
+        if not column:
+            continue
+        payload: Dict[str, Any] = {
+            "column": column,
+            "parse_ratio": item.get("parse_ratio"),
+            "raw_unique_count": item.get("raw_unique_count"),
+            "raw_format_families": item.get("raw_format_families") or [],
+            "has_mixed_raw_formats": bool(item.get("has_mixed_raw_formats")),
+            "has_time_or_timezone_component": bool(item.get("has_time_or_timezone_component")),
+            "canonical_unique_counts": item.get("canonical_unique_counts") or {},
+            "raw_to_canonical_unique_ratios": item.get("raw_to_canonical_unique_ratios") or {},
+            "semantic_granularity_hints": item.get("semantic_granularity_hints") or [],
+            "normalization_collapse_risk": item.get("normalization_collapse_risk") or "unknown",
+            "gate_policy": "never copy raw_unique_count into cleaned-artifact expected_unique_range",
+        }
+        if item.get("time_span_days") is not None:
+            payload["time_span_days"] = item.get("time_span_days")
+        compacted.append(payload)
+        if len(compacted) >= max_items:
+            break
+    return compacted
+
+
 def compact_data_profile_for_llm(
     profile: Dict[str, Any],
     max_cols: int = 60,
@@ -317,6 +359,13 @@ def compact_data_profile_for_llm(
                 "split_candidates": [],
                 "leakage_flags": [],
                 "missingness_top30": dict(list(profile.get("missing_frac", {}).items())[:30]),
+                "temporal_normalization_facts": profile.get("temporal_normalization_facts", [])
+                if isinstance(profile.get("temporal_normalization_facts"), list)
+                else (
+                    profile.get("temporal_analysis", {}).get("normalization_facts", [])
+                    if isinstance(profile.get("temporal_analysis"), dict)
+                    else []
+                ),
                 "_warning": "dataset_profile detected but no contract provided for conversion",
             }
         profile = convert_dataset_profile_to_data_profile(profile, contract, analysis_type)
@@ -362,6 +411,13 @@ def compact_data_profile_for_llm(
     target_candidates = _build_target_candidates(profile)
     if target_candidates:
         compact["target_candidates"] = target_candidates
+
+    # 7.9 Temporal normalization facts (contract-gate safety context)
+    temporal_facts = _compact_temporal_normalization_facts(
+        profile.get("temporal_normalization_facts")
+    )
+    if temporal_facts:
+        compact["temporal_normalization_facts"] = temporal_facts
 
     # 8. Column DTypes - Simplify
     dtypes = profile.get("dtypes", {})

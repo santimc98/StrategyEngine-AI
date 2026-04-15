@@ -213,6 +213,36 @@ class TestCompactDataProfile:
         assert "split_candidates" in result
         assert result["outcome_analysis"]["target"]["null_frac"] == 0.3
 
+    def test_includes_temporal_normalization_facts(self, synthetic_dataset_profile, contract_with_outcome):
+        """Temporal gate safety facts must survive conversion and compaction."""
+        synthetic_dataset_profile["temporal_normalization_facts"] = [
+            {
+                "column": "snapshot_month_end",
+                "parse_ratio": 1.0,
+                "raw_unique_count": 120,
+                "raw_format_families": ["ymd_dash", "ymd_slash", "ambiguous_mdy_dmy_dash"],
+                "has_mixed_raw_formats": True,
+                "canonical_unique_counts": {"timestamp": 48, "date": 24, "month_period": 24},
+                "raw_to_canonical_unique_ratios": {"month_period": 5.0},
+                "semantic_granularity_hints": ["month_period"],
+                "normalization_collapse_risk": "high",
+            }
+        ]
+
+        result = compact_data_profile_for_llm(
+            synthetic_dataset_profile,
+            contract=contract_with_outcome,
+            analysis_type="classification",
+        )
+
+        facts = result.get("temporal_normalization_facts") or []
+        assert facts[0]["column"] == "snapshot_month_end"
+        assert facts[0]["raw_unique_count"] == 120
+        assert facts[0]["canonical_unique_counts"]["month_period"] == 24
+        assert facts[0]["gate_policy"] == (
+            "never copy raw_unique_count into cleaned-artifact expected_unique_range"
+        )
+
     def test_without_contract_returns_warning(self, synthetic_dataset_profile):
         """Test that dataset_profile without contract returns warning."""
         result = compact_data_profile_for_llm(synthetic_dataset_profile, contract=None)

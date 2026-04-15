@@ -548,6 +548,7 @@ SOURCE OF TRUTH
 1. business_objective + strategy define what this run must achieve.
 2. column_inventory + dataset profile define what exists and what is defensible.
 3. When strategy hints conflict with structural evidence from the data, prefer the safer structural interpretation.
+4. For temporal columns, temporal_normalization_facts separate raw CSV representation from canonical parsed artifact properties. Do not treat raw_unique_count as canonical parsed cardinality.
 
 REASONING WORKFLOW
 Before emitting JSON, reason through:
@@ -628,6 +629,7 @@ SEVEN CORE PRINCIPLES
 5. Minimal: The shortest valid contract that satisfies principles 1-4. No filler sections, no padding with defaults when context provides specifics.
 6. Preserve semantic exclusions: if SEMANTIC_CORE_AUTHORITY_JSON or strategy reasoning marks a column as audit-only, reporting-only, stratification-only, or excluded from the initial model, keep it out of model_features. Represent it under audit_only_features or another non-model dependency surface when still operationally required.
 7. Phase coherence: every gate you emit must be verifiable by the agent you assign to it against the artifact you bind it to. If a gate talks about a feature matrix but no feature_matrix artifact exists, either create the artifact, relocate the gate to the phase where the feature matrix exists, or rephrase it as a manifest-declaration invariant.
+8. Semantic parameter coherence: gate params must describe the post-cleaning artifact, not raw profiler artifacts. For datetime parsing gates, never copy raw string cardinality into expected_unique_range after normalization; mixed date formats can collapse many raw strings into fewer canonical dates. If TEMPORAL_NORMALIZATION_FACTS are present, treat raw_unique_count as pre-normalization evidence and use canonical_unique_counts only when the gate is explicitly bound to that representation. Prefer parse success, null preservation, cadence/span, and period alignment unless canonical parsed cardinality is explicitly evidenced.
 
 WHAT GOES IN "shared" (preserved verbatim from SEMANTIC_CORE where available)
 scope, active_workstreams, future_ml_handoff, task_semantics, column_roles, allowed_feature_sets, model_features, strategy_title, business_objective, output_dialect, canonical_columns, column_dtype_targets, iteration_policy.
@@ -692,6 +694,7 @@ Each gate is a PROPOSITION with four mandatory binding fields in addition to nam
 HARD = failure means corrupt, unsafe, or silently wrong output.
 SOFT = quality degraded but output remains usable.
 Each gate addresses a distinct, plausible risk grounded in the data. 5 well-bound gates beat 15 floating gates.
+For temporal/date gates, expected_unique_range is only valid if it is the expected number of canonical parsed periods in the cleaned artifact. If the only evidence is raw profile cardinality for a string/object date column with mixed formats, omit expected_unique_range or make it a soft diagnostic. When temporal_normalization_facts.normalization_collapse_risk is medium/high, explicitly avoid raw_unique_count as a HARD threshold.
 
 PLACEMENT IS SEMANTIC, NOT TOPICAL
 The semantic_core may park invariants under cleaning_gates or qa_gates for convenience. You MUST relocate gates whose intent is not verifiable in the phase where they are parked:
@@ -3533,6 +3536,244 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok" if not violations else "violations", "violations": violations}
 
 
+def _coerce_numeric_range_pair(value: Any) -> Tuple[float, float] | None:
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    try:
+        low = float(value[0])
+        high = float(value[1])
+    except Exception:
+        return None
+    if not math.isfinite(low) or not math.isfinite(high) or low > high:
+        return None
+    return low, high
+
+
+def _profile_column_facts(data_profile: Dict[str, Any] | None, column: str) -> Dict[str, Any]:
+    profile = data_profile if isinstance(data_profile, dict) else {}
+    column = str(column or "").strip()
+    if not column:
+        return {}
+    facts: Dict[str, Any] = {}
+    column_profiles = profile.get("column_profiles")
+    if isinstance(column_profiles, dict) and isinstance(column_profiles.get(column), dict):
+        facts.update(column_profiles.get(column) or {})
+    for source_key, target_key in (
+        ("cardinality", "cardinality"),
+        ("text_summary", "text_summary"),
+        ("dtypes", "dtype"),
+        ("type_hints", "type_hint"),
+    ):
+        source = profile.get(source_key)
+        if isinstance(source, dict) and column in source:
+            facts[target_key] = source.get(column)
+    temporal_facts = profile.get("temporal_normalization_facts")
+    if isinstance(temporal_facts, list):
+        for item in temporal_facts:
+            if isinstance(item, dict) and str(item.get("column") or "").strip() == column:
+                facts["temporal_normalization_fact"] = item
+                break
+    if "temporal_normalization_fact" not in facts:
+        temporal_analysis = profile.get("temporal_analysis")
+        if isinstance(temporal_analysis, dict):
+            nested_facts = temporal_analysis.get("normalization_facts")
+            if isinstance(nested_facts, list):
+                for item in nested_facts:
+                    if isinstance(item, dict) and str(item.get("column") or "").strip() == column:
+                        facts["temporal_normalization_fact"] = item
+                        break
+    return facts
+
+
+def _profile_raw_unique_count(column_facts: Dict[str, Any]) -> int | None:
+    temporal_fact = column_facts.get("temporal_normalization_fact")
+    if isinstance(temporal_fact, dict):
+        value = temporal_fact.get("raw_unique_count")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    for key in ("unique_count", "n_unique", "distinct_count"):
+        value = column_facts.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    cardinality = column_facts.get("cardinality")
+    if isinstance(cardinality, dict):
+        value = cardinality.get("unique")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+
+def _date_format_family(value: Any) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    has_time = "T" in token or bool(re.search(r"\d{1,2}:\d{2}", token))
+    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", token):
+        return "ymd_datetime" if has_time else "ymd_date"
+    if re.match(r"^\d{1,2}[-/]\d{1,2}[-/]\d{4}", token):
+        sep = "/" if "/" in token else "-"
+        return f"ambiguous_{sep}_datetime" if has_time else f"ambiguous_{sep}_date"
+    return ""
+
+
+def _profile_has_mixed_datetime_formats(column_facts: Dict[str, Any]) -> bool:
+    temporal_fact = column_facts.get("temporal_normalization_fact")
+    if isinstance(temporal_fact, dict):
+        risk = str(temporal_fact.get("normalization_collapse_risk") or "").strip().lower()
+        if risk in {"medium", "high"}:
+            return True
+        if bool(temporal_fact.get("has_mixed_raw_formats")):
+            return True
+        raw_families = temporal_fact.get("raw_format_families")
+        if isinstance(raw_families, list) and len([item for item in raw_families if str(item or "").strip()]) > 1:
+            return True
+    for key in ("format_family_hints", "observed_format_patterns"):
+        value = column_facts.get(key)
+        if isinstance(value, list) and len([item for item in value if str(item or "").strip()]) > 1:
+            return True
+    cardinality = column_facts.get("cardinality")
+    values: List[Any] = []
+    if isinstance(cardinality, dict):
+        top_values = cardinality.get("top_values")
+        if isinstance(top_values, list):
+            for item in top_values:
+                if isinstance(item, dict):
+                    values.append(item.get("value"))
+                else:
+                    values.append(item)
+        elif isinstance(top_values, dict):
+            values.extend(top_values.keys())
+    sample_values = column_facts.get("example_values_sample")
+    if isinstance(sample_values, list):
+        values.extend(sample_values)
+    families = {_date_format_family(item) for item in values}
+    families.discard("")
+    if len(families) > 1:
+        return True
+    text_summary = column_facts.get("text_summary")
+    if isinstance(text_summary, dict):
+        ratio = text_summary.get("datetime_like_ratio")
+        if isinstance(ratio, (int, float)) and 0 < float(ratio) < 0.9:
+            return True
+    # Keep this validator conservative: object/string dtype alone is not enough
+    # evidence that a datetime cardinality gate copied raw profiler cardinality.
+    return False
+
+
+def _validate_gate_parameter_semantics(
+    contract: Dict[str, Any],
+    data_profile: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Validate that gate parameter thresholds are semantically executable."""
+    violations: List[Dict[str, Any]] = []
+    if not isinstance(contract, dict):
+        return {"status": "ok", "violations": []}
+
+    gate_sources = (
+        ("data_engineer", "cleaning_gates"),
+        ("ml_engineer", "qa_gates"),
+        ("ml_engineer", "reviewer_gates"),
+    )
+    for agent, gate_field in gate_sources:
+        section = contract.get(agent)
+        if not isinstance(section, dict):
+            continue
+        raw_gates = section.get(gate_field)
+        if not isinstance(raw_gates, list):
+            continue
+        for gate in raw_gates:
+            if not isinstance(gate, dict):
+                continue
+            params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+            gate_name = str(gate.get("name") or gate.get("id") or gate.get("gate") or "<unnamed>").strip()
+            column = str(params.get("column") or params.get("date_column") or params.get("time_column") or "").strip()
+            expected_dtype = str(params.get("expected_dtype") or params.get("dtype") or "").strip().lower()
+            evidence_text = " ".join(
+                str(gate.get(key) or "")
+                for key in ("name", "evidence_source", "phase_reasoning")
+            ).lower()
+            is_datetime_gate = (
+                "datetime" in expected_dtype
+                or expected_dtype in {"date", "timestamp", "time"}
+                or ("date" in evidence_text and "parsed" in evidence_text)
+            )
+            unique_range = (
+                _coerce_numeric_range_pair(params.get("expected_unique_range"))
+                or _coerce_numeric_range_pair(params.get("unique_count_range"))
+                or _coerce_numeric_range_pair(params.get("expected_unique_count_range"))
+            )
+            if not (is_datetime_gate and column and unique_range):
+                continue
+            column_facts = _profile_column_facts(data_profile, column)
+            raw_unique = _profile_raw_unique_count(column_facts)
+            if raw_unique is None:
+                continue
+            low, high = unique_range
+            raw_unique_in_range = low <= float(raw_unique) <= high
+            if raw_unique_in_range and _profile_has_mixed_datetime_formats(column_facts):
+                severity = "hard" if str(gate.get("severity") or "HARD").upper() == "HARD" else "soft"
+                violations.append(
+                    {
+                        "gate_name": gate_name,
+                        "agent": agent,
+                        "gate_field": gate_field,
+                        "kind": "raw_datetime_cardinality_as_parsed_unique",
+                        "severity": severity,
+                        "detail": (
+                            f"Gate {gate_name} expects parsed datetime unique_range={list(unique_range)}, "
+                            f"which matches raw profile cardinality for {column} ({raw_unique}) while the column "
+                            "has mixed/string datetime formats. Parsed canonical dates can collapse raw formats, "
+                            "so this gate can become impossible despite correct cleaning."
+                        ),
+                        "suggested_action": (
+                            "Remove expected_unique_range or replace it with canonical parsed-period evidence "
+                            "from temporal profile; validate dtype, null preservation, cadence/span, and period alignment."
+                        ),
+                        "column": column,
+                        "raw_unique": raw_unique,
+                    }
+                )
+    return {"status": "ok" if not violations else "violations", "violations": violations}
+
+
+def _gate_parameter_semantics_validation_result(semantics: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(semantics, dict) or semantics.get("status") != "violations":
+        return {"status": "ok", "accepted": True, "issues": [], "summary": {"error_count": 0, "warning_count": 0}}
+    issues: List[Dict[str, Any]] = []
+    raw_violations = semantics.get("violations")
+    if not isinstance(raw_violations, list):
+        raw_violations = []
+    for violation in raw_violations:
+        if not isinstance(violation, dict):
+            continue
+        kind = str(violation.get("kind") or "unknown").strip() or "unknown"
+        violation_severity = str(violation.get("severity") or "hard").strip().lower()
+        issue_severity = "warning" if violation_severity in {"soft", "warning", "warn"} else "error"
+        issues.append(
+            {
+                "severity": issue_severity,
+                "rule": f"contract.gate_parameter_semantics.{kind}",
+                "message": str(violation.get("detail") or ""),
+                "phase": "gate_parameter_semantics",
+                "gate_name": violation.get("gate_name"),
+                "gate_field": violation.get("gate_field"),
+                "agent": violation.get("agent"),
+                "column": violation.get("column"),
+                "suggested_action": violation.get("suggested_action"),
+            }
+        )
+    error_count = len(
+        [issue for issue in issues if str(issue.get("severity") or "").lower() in {"error", "fail"}]
+    )
+    warning_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() == "warning"])
+    return {
+        "status": "error" if error_count else ("warning" if warning_count else "ok"),
+        "accepted": error_count == 0,
+        "issues": issues,
+        "summary": {"error_count": error_count, "warning_count": warning_count, "phase": "gate_parameter_semantics"},
+    }
+
+
 def _phase_coherence_validation_result(coherence: Dict[str, Any] | None) -> Dict[str, Any]:
     if not isinstance(coherence, dict) or coherence.get("status") != "violations":
         return {"status": "ok", "accepted": True, "issues": [], "summary": {"error_count": 0, "warning_count": 0}}
@@ -3583,6 +3824,26 @@ def _validation_has_phase_coherence_errors(validation_result: Dict[str, Any] | N
         rule = str(issue.get("rule") or "")
         severity = str(issue.get("severity") or "").lower()
         if rule.startswith("contract.phase_coherence.") and severity in {"error", "fail"}:
+            return True
+    return False
+
+
+def _validation_has_repairable_contract_errors(validation_result: Dict[str, Any] | None) -> bool:
+    if not isinstance(validation_result, dict):
+        return False
+    issues = validation_result.get("issues")
+    if not isinstance(issues, list):
+        return False
+    repairable_prefixes = (
+        "contract.phase_coherence.",
+        "contract.gate_parameter_semantics.",
+    )
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        rule = str(issue.get("rule") or "")
+        severity = str(issue.get("severity") or "").lower()
+        if severity in {"error", "fail"} and rule.startswith(repairable_prefixes):
             return True
     return False
 
@@ -11029,9 +11290,14 @@ class ExecutionPlannerAgent:
                     trace_stage="contract_diagnostics_adjudication",
                 )
                 phase_coherence = _validate_gate_phase_coherence(contract)
+                gate_parameter_semantics = _validate_gate_parameter_semantics(contract, data_profile)
                 validation_result = _merge_validation_results(
                     validation_result,
                     _phase_coherence_validation_result(phase_coherence),
+                )
+                validation_result = _merge_validation_results(
+                    validation_result,
+                    _gate_parameter_semantics_validation_result(gate_parameter_semantics),
                 )
             except Exception as err:
                 phase_coherence = {
@@ -11048,6 +11314,7 @@ class ExecutionPlannerAgent:
                         }
                     ],
                 }
+                gate_parameter_semantics = {"status": "ok", "violations": []}
                 validation_result = {
                     "status": "error",
                     "accepted": False,
@@ -11062,6 +11329,7 @@ class ExecutionPlannerAgent:
                 }
 
             diagnostics["phase_coherence"] = phase_coherence
+            diagnostics["gate_parameter_semantics"] = gate_parameter_semantics
             status = str(validation_result.get("status") or "unknown").lower()
             issues = validation_result.get("issues") if isinstance(validation_result, dict) else []
             accepted = _contract_is_accepted(validation_result if isinstance(validation_result, dict) else None)
@@ -11153,6 +11421,8 @@ class ExecutionPlannerAgent:
                         "For phase_coherence issues, repair gate topology: add missing gate binding fields, "
                         "bind applies_to_artifact to an existing required_output, relocate ML-evidence gates to ml_engineer.qa_gates, "
                         "or rephrase cleaning-phase gates as cleaning_manifest invariants.\n"
+                        "For gate_parameter_semantics issues, repair the gate params: do not use raw profiler cardinality "
+                        "as parsed artifact cardinality; remove impossible thresholds or replace them with canonical artifact evidence.\n"
                         + "Attempt "
                         + str(attempt)
                         + "/2.\n\n"
@@ -11203,15 +11473,22 @@ class ExecutionPlannerAgent:
                         model_name=self.model_name,
                         trace_stage="finalize_post_validation_adjudication",
                     )
-                    return _merge_validation_results(
+                    result = _merge_validation_results(
                         result,
                         _phase_coherence_validation_result(_validate_gate_phase_coherence(payload)),
                     )
+                    result = _merge_validation_results(
+                        result,
+                        _gate_parameter_semantics_validation_result(
+                            _validate_gate_parameter_semantics(payload, data_profile)
+                        ),
+                    )
+                    return result
 
                 post_validation = _post_generation_validator(contract)
                 if (
                     not _contract_is_accepted(post_validation)
-                    and _validation_has_phase_coherence_errors(post_validation)
+                    and _validation_has_repairable_contract_errors(post_validation)
                 ):
                     repaired_contract, repaired_validation, repair_trace = _validate_repair_revalidate_loop(
                         contract,
@@ -11429,6 +11706,18 @@ class ExecutionPlannerAgent:
             temporal_analysis = data_profile.get("temporal_analysis")
             if isinstance(temporal_analysis, dict) and temporal_analysis.get("details"):
                 compiler_support_context_payload["temporal_profile"] = temporal_analysis
+            temporal_normalization_facts = data_profile.get("temporal_normalization_facts")
+            if isinstance(temporal_normalization_facts, list) and temporal_normalization_facts:
+                compiler_support_context_payload["temporal_normalization_facts"] = temporal_normalization_facts[:12]
+                compiler_support_context_payload["temporal_gate_policy"] = {
+                    "raw_unique_count_scope": "raw CSV representation before cleaning/normalization",
+                    "expected_unique_range_requires": (
+                        "canonical parsed artifact evidence for the exact bucket the gate verifies"
+                    ),
+                    "unsafe_hard_threshold": (
+                        "raw_unique_count copied into expected_unique_range for a parsed datetime artifact"
+                    ),
+                }
         compiler_support_context = json.dumps(
             compiler_support_context_payload,
             indent=2,
@@ -11440,8 +11729,16 @@ class ExecutionPlannerAgent:
         temporal_context = ""
         if isinstance(data_profile, dict):
             temporal_analysis = data_profile.get("temporal_analysis")
+            temporal_normalization_facts = data_profile.get("temporal_normalization_facts")
             if isinstance(temporal_analysis, dict) and temporal_analysis.get("details"):
                 temporal_context = f"\ntemporal_profile:\n{json.dumps(temporal_analysis, indent=2)}"
+            if isinstance(temporal_normalization_facts, list) and temporal_normalization_facts:
+                temporal_facts_context = json.dumps(temporal_normalization_facts[:12], indent=2)
+                temporal_context = (
+                    f"{temporal_context}\nTEMPORAL_NORMALIZATION_FACTS:\n{temporal_facts_context}\n"
+                    "TEMPORAL_GATE_POLICY: raw_unique_count is pre-normalization evidence; "
+                    "do not use it as cleaned parsed expected_unique_range unless canonical evidence supports it.\n"
+                )
 
         user_input = f"""
 strategy:
@@ -11881,6 +12178,12 @@ domain_expert_critique:
                                 validation_result,
                                 _phase_coherence_validation_result(
                                     _validate_gate_phase_coherence(candidate_for_validation)
+                                ),
+                            )
+                            validation_result = _merge_validation_results(
+                                validation_result,
+                                _gate_parameter_semantics_validation_result(
+                                    _validate_gate_parameter_semantics(candidate_for_validation, data_profile)
                                 ),
                             )
                         except Exception as val_err:

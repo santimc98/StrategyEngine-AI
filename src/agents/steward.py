@@ -1260,6 +1260,9 @@ def build_dataset_profile(
         },
         "compute_hints": compute_hints,
         "temporal_analysis": temporal_analysis,
+        "temporal_normalization_facts": temporal_analysis.get("normalization_facts", [])
+        if isinstance(temporal_analysis, dict)
+        else [],
     }
     return profile
 
@@ -1302,6 +1305,164 @@ def _infer_temporal_granularity(seconds: float) -> str:
     return "yearly"
 
 
+def _datetime_raw_format_family(value: Any) -> str:
+    token = str(value or "").strip()
+    if not token or token.lower() in {"nan", "none", "null", "<na>", "nat"}:
+        return ""
+    has_time = bool(re.search(r"[T ]\d{1,2}:\d{2}", token))
+    has_tz = bool(re.search(r"(Z|[+-]\d{2}:?\d{2})$", token))
+    suffix = ""
+    if has_time:
+        suffix += "_time"
+    if has_tz:
+        suffix += "_tz"
+    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", token):
+        sep = "slash" if "/" in token[:10] else "dash"
+        return f"ymd_{sep}{suffix}"
+    if re.match(r"^\d{1,2}[-/]\d{1,2}[-/]\d{4}", token):
+        sep = "slash" if "/" in token[:10] else "dash"
+        return f"ambiguous_mdy_dmy_{sep}{suffix}"
+    if re.match(r"^\d{8}$", token):
+        return f"compact_yyyymmdd{suffix}"
+    if re.match(r"^\d{4}[-/]\d{1,2}$", token):
+        sep = "slash" if "/" in token else "dash"
+        return f"year_month_{sep}{suffix}"
+    if re.match(r"^\d{4}$", token):
+        return "year"
+    return f"other_datetime_like{suffix}"
+
+
+def _safe_dt_unique_count(series: pd.Series, bucket: str) -> int | None:
+    try:
+        if bucket == "timestamp":
+            return int(series.nunique())
+        if bucket == "date":
+            return int(series.dt.normalize().nunique())
+        if bucket == "month_period":
+            return int(series.dt.to_period("M").nunique())
+        if bucket == "year":
+            return int(series.dt.year.nunique())
+    except Exception:
+        return None
+    return None
+
+
+def _temporal_semantic_granularity_hints(column: str) -> List[str]:
+    tokenized = str(column or "").lower().replace("-", "_")
+    hints: List[str] = []
+    if any(tok in tokenized for tok in ("month", "monthly", "snapshot", "period", "cycle")):
+        hints.append("month_period")
+    if any(tok in tokenized for tok in ("date", "day", "daily")):
+        hints.append("date")
+    if any(tok in tokenized for tok in ("time", "timestamp", "datetime", "created", "updated", "modified")):
+        hints.append("timestamp")
+    return list(dict.fromkeys(hints))
+
+
+def _build_temporal_normalization_fact(
+    *,
+    column: str,
+    raw_text: pd.Series,
+    parsed_non_null: pd.Series,
+    parse_ratio: float,
+    time_span_days: float | None,
+    sample_rows: int,
+) -> Dict[str, Any]:
+    try:
+        raw_unique_count = int(raw_text.nunique(dropna=True))
+        raw_examples = [str(v) for v in raw_text.dropna().drop_duplicates().head(6).tolist()]
+    except Exception:
+        raw_unique_count = 0
+        raw_examples = []
+
+    raw_families = sorted(
+        {
+            family
+            for family in (_datetime_raw_format_family(value) for value in raw_examples)
+            if family
+        }
+    )
+    if len(raw_families) < 2:
+        try:
+            sampled_values = raw_text.dropna().astype(str).drop_duplicates().head(200).tolist()
+            raw_families = sorted(
+                {
+                    family
+                    for family in (_datetime_raw_format_family(value) for value in sampled_values)
+                    if family
+                }
+            )
+        except Exception:
+            pass
+
+    canonical_counts: Dict[str, int] = {}
+    for bucket in ("timestamp", "date", "month_period", "year"):
+        count = _safe_dt_unique_count(parsed_non_null, bucket)
+        if count is not None:
+            canonical_counts[bucket] = count
+
+    def _ratio(bucket: str) -> float | None:
+        count = canonical_counts.get(bucket)
+        if not count:
+            return None
+        return round(float(raw_unique_count / max(count, 1)), 4)
+
+    collapse_ratios = {
+        bucket: value
+        for bucket in ("timestamp", "date", "month_period", "year")
+        for value in [_ratio(bucket)]
+        if value is not None
+    }
+    semantic_hints = _temporal_semantic_granularity_hints(column)
+    max_relevant_ratio = max(collapse_ratios.values()) if collapse_ratios else 1.0
+    month_ratio = collapse_ratios.get("month_period", 1.0)
+    has_mixed_formats = len(raw_families) > 1
+    has_time_component = any("_time" in family or "_tz" in family for family in raw_families)
+    likely_period_column = "month_period" in semantic_hints
+    collapse_risk = "low"
+    if has_mixed_formats and max_relevant_ratio >= 1.25:
+        collapse_risk = "medium"
+    if likely_period_column and month_ratio >= 1.25:
+        collapse_risk = "high"
+    if has_time_component and max_relevant_ratio >= 1.25:
+        collapse_risk = "high"
+
+    fact: Dict[str, Any] = {
+        "column": column,
+        "sample_rows_evaluated": int(sample_rows),
+        "parse_ratio": round(float(parse_ratio), 4),
+        "raw_unique_count": int(raw_unique_count),
+        "raw_examples": raw_examples,
+        "raw_format_families": raw_families,
+        "has_mixed_raw_formats": bool(has_mixed_formats),
+        "has_time_or_timezone_component": bool(has_time_component),
+        "canonical_unique_counts": canonical_counts,
+        "raw_to_canonical_unique_ratios": collapse_ratios,
+        "semantic_granularity_hints": semantic_hints,
+        "normalization_collapse_risk": collapse_risk,
+        "contract_gate_guidance": {
+            "raw_unique_count_is_pre_normalization": True,
+            "expected_unique_range_policy": (
+                "Do not copy raw_unique_count into expected_unique_range for the cleaned artifact. "
+                "Use a canonical bucket count only when the gate is explicitly bound to that representation."
+            ),
+            "safe_hard_gate_examples": [
+                "parsed dtype is datetime-like",
+                "parse failures/nulls do not increase unexpectedly",
+                "min/max temporal span remains consistent with source evidence",
+                "period alignment is preserved when the business concept is periodic",
+            ],
+            "unsafe_hard_gate_examples": [
+                "expected_unique_range copied from raw_unique_count",
+                "raw string cardinality used as parsed timestamp cardinality",
+            ],
+        },
+    }
+    if time_span_days is not None:
+        fact["time_span_days"] = time_span_days
+    return fact
+
+
 def _compute_temporal_analysis(
     df: pd.DataFrame,
     columns: List[str],
@@ -1310,12 +1471,16 @@ def _compute_temporal_analysis(
 ) -> Dict[str, Any]:
     candidates: List[str] = []
     # Use dtype-based detection + minimal structural hints for temporal candidates
-    _temporal_hints = {"date", "time", "timestamp", "datetime", "month", "year", "day", "week", "hour", "created", "updated", "modified"}
+    _temporal_hints = {"date", "time", "timestamp", "datetime", "month", "year", "week", "hour", "created", "updated", "modified"}
     for col in columns:
         tokenized = str(col).lower().replace("-", "_")
-        if any(tok in tokenized for tok in _temporal_hints):
+        dtype = getattr(df[col], "dtype", None)
+        is_datetime_dtype = bool(dtype is not None and pd.api.types.is_datetime64_any_dtype(dtype))
+        is_numeric_dtype = bool(dtype is not None and pd.api.types.is_numeric_dtype(dtype))
+        has_temporal_name_hint = any(tok in tokenized for tok in _temporal_hints)
+        if is_datetime_dtype:
             candidates.append(col)
-        elif hasattr(df[col], "dtype") and pd.api.types.is_datetime64_any_dtype(df[col]):
+        elif has_temporal_name_hint and not is_numeric_dtype:
             candidates.append(col)
     if not candidates:
         return {"is_time_series": False, "detected_datetime_columns": [], "details": []}
@@ -1328,6 +1493,7 @@ def _compute_temporal_analysis(
             sample_df = df.head(max_rows)
 
     details: List[Dict[str, Any]] = []
+    normalization_facts: List[Dict[str, Any]] = []
     for col in candidates[:max_candidates]:
         try:
             series = sample_df[col]
@@ -1418,6 +1584,26 @@ def _compute_temporal_analysis(
             }
             if time_span_days is not None:
                 detail_entry["time_span_days"] = time_span_days
+            try:
+                raw_text = working[non_missing_mask].astype(str).str.strip()
+                normalization_fact = _build_temporal_normalization_fact(
+                    column=col,
+                    raw_text=raw_text,
+                    parsed_non_null=non_null,
+                    parse_ratio=parse_ratio,
+                    time_span_days=time_span_days,
+                    sample_rows=len(series),
+                )
+                detail_entry["normalization_collapse_risk"] = normalization_fact.get(
+                    "normalization_collapse_risk"
+                )
+                detail_entry["canonical_unique_counts"] = normalization_fact.get(
+                    "canonical_unique_counts"
+                )
+                detail_entry["raw_unique_count"] = normalization_fact.get("raw_unique_count")
+                normalization_facts.append(normalization_fact)
+            except Exception:
+                pass
             details.append(detail_entry)
         except Exception:
             continue
@@ -1427,6 +1613,7 @@ def _compute_temporal_analysis(
         "is_time_series": bool(is_time_series),
         "detected_datetime_columns": [str(item.get("column")) for item in details if item.get("column")],
         "details": details[:20],
+        "normalization_facts": normalization_facts[:20],
     }
 
 
@@ -1878,6 +2065,9 @@ def build_data_profile(
         "high_cardinality_columns": high_cardinality_columns,
         "leakage_flags": leakage_flags,
         "temporal_analysis": temporal_analysis,
+        "temporal_normalization_facts": temporal_analysis.get("normalization_facts", [])
+        if isinstance(temporal_analysis, dict)
+        else [],
         "feature_target_associations": feature_target_associations,
         "multicollinearity_pairs_high": multicollinearity_pairs,
         "compute_hints": compute_hints,

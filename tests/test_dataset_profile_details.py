@@ -56,6 +56,68 @@ def test_build_dataset_profile_includes_temporal_analysis_for_datetime_like_colu
     assert any(item.get("column") == "snapshot_month_end" for item in details if isinstance(item, dict))
 
 
+def test_build_dataset_profile_adds_temporal_normalization_facts_for_mixed_period_dates() -> None:
+    df = pd.DataFrame(
+        {
+            "account_id": ["A", "B", "C", "D", "E", "F"],
+            "snapshot_month_end": [
+                "2025-01-31",
+                "01/31/2025",
+                "2025/01/31",
+                "2025-02-28",
+                "02-28-2025",
+                "2025-02-28T18:00:00",
+            ],
+            "target": [0, 1, 0, 1, 0, 1],
+        }
+    )
+
+    profile = build_dataset_profile(
+        df=df,
+        objective="test",
+        dialect_info={"sep": ",", "decimal": ".", "diagnostics": {}},
+        encoding="utf-8",
+        file_size_bytes=123,
+        was_sampled=False,
+        sample_size=len(df),
+        pii_findings=None,
+    )
+
+    facts = profile.get("temporal_normalization_facts") or []
+    snapshot_fact = next(item for item in facts if item.get("column") == "snapshot_month_end")
+    assert snapshot_fact["raw_unique_count"] == 6
+    assert snapshot_fact["canonical_unique_counts"]["month_period"] == 2
+    assert snapshot_fact["normalization_collapse_risk"] == "high"
+    assert snapshot_fact["contract_gate_guidance"]["raw_unique_count_is_pre_normalization"] is True
+
+
+def test_temporal_analysis_does_not_treat_numeric_day_durations_as_dates() -> None:
+    df = pd.DataFrame(
+        {
+            "account_id": ["A", "B", "C"],
+            "login_days_14d": [1, 4, 9],
+            "invoice_overdue_days": [0, 15, 30],
+            "snapshot_month_end": ["2025-01-31", "2025-02-28", "2025-03-31"],
+        }
+    )
+
+    profile = build_dataset_profile(
+        df=df,
+        objective="test",
+        dialect_info={"sep": ",", "decimal": ".", "diagnostics": {}},
+        encoding="utf-8",
+        file_size_bytes=123,
+        was_sampled=False,
+        sample_size=len(df),
+        pii_findings=None,
+    )
+
+    detected = set(profile.get("temporal_analysis", {}).get("detected_datetime_columns") or [])
+    assert "snapshot_month_end" in detected
+    assert "login_days_14d" not in detected
+    assert "invoice_overdue_days" not in detected
+
+
 def test_convert_dataset_profile_preserves_extended_fields() -> None:
     dataset_profile = {
         "rows": 5,
@@ -70,6 +132,14 @@ def test_convert_dataset_profile_preserves_extended_fields() -> None:
         "sampling": {"was_sampled": False, "sample_size": 5, "file_size_bytes": 123},
         "dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
         "pii_findings": {"detected": False, "findings": []},
+        "temporal_normalization_facts": [
+            {
+                "column": "cat",
+                "raw_unique_count": 3,
+                "canonical_unique_counts": {"date": 2},
+                "normalization_collapse_risk": "medium",
+            }
+        ],
         "cardinality_note": "test",
     }
 
@@ -81,3 +151,4 @@ def test_convert_dataset_profile_preserves_extended_fields() -> None:
     assert data_profile.get("duplicate_stats") == dataset_profile["duplicate_stats"]
     assert data_profile.get("sampling") == dataset_profile["sampling"]
     assert data_profile.get("dialect") == dataset_profile["dialect"]
+    assert data_profile.get("temporal_normalization_facts") == dataset_profile["temporal_normalization_facts"]

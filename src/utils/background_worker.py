@@ -67,16 +67,42 @@ _STAGE_NAMES = {
 }
 
 
-def _has_execution_failure(final_state: dict) -> bool:
+def _read_run_json(run_id: str, rel_path: str) -> dict:
+    if not run_id:
+        return {}
+    path = os.path.join(PROJECT_ROOT, "runs", run_id, rel_path)
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _has_execution_failure(final_state: dict, run_id: str | None = None) -> bool:
     if not isinstance(final_state, dict):
         return False
     if bool(final_state.get("execution_error")) or bool(final_state.get("sandbox_failed")):
         return True
+    preview = str(final_state.get("cleaned_data_preview") or "")
+    error_message = str(final_state.get("error_message") or "")
+    if preview.lower().startswith("error:") or error_message.strip():
+        return True
     output_contract = final_state.get("output_contract_report")
+    if not isinstance(output_contract, dict) and run_id:
+        output_contract = _read_run_json(run_id, os.path.join("work", "data", "output_contract_report.json"))
     if isinstance(output_contract, dict):
         if str(output_contract.get("overall_status") or "").strip().lower() == "error":
             return True
         if any(str(item).strip() for item in (output_contract.get("missing") or [])):
+            return True
+    if run_id:
+        run_summary = _read_run_json(run_id, os.path.join("work", "data", "run_summary.json"))
+        if str(run_summary.get("run_outcome") or "").strip().upper() == "NO_GO":
+            return True
+        if str(run_summary.get("overall_status_global") or "").strip().lower() == "error":
             return True
     execution_output = str(final_state.get("execution_output", "") or "")
     failure_markers = [
@@ -93,12 +119,13 @@ def _has_execution_failure(final_state: dict) -> bool:
 def _update_status(run_id, *, stage, progress, completed_steps,
                    iteration=0, max_iterations=6,
                    metric_name="", metric_value="",
-                   status="running", error=None, started_at=None):
+                   status="running", error=None, started_at=None,
+                   stage_name=None):
     write_status(
         run_id,
         status=status,
         stage=stage,
-        stage_name=_STAGE_NAMES.get(stage, stage or "Procesando"),
+        stage_name=stage_name or _STAGE_NAMES.get(stage, stage or "Procesando"),
         progress=progress,
         iteration=iteration,
         max_iterations=max_iterations,
@@ -255,10 +282,21 @@ def main(run_id: str) -> None:
                     append_log(run_id, "Cleaning Reviewer", f"Revision de limpieza: {cr_verdict}", level)
 
             elif "data_engineer" in event:
-                completed_steps.add("data_engineer")
-                active_step = "engineer"
-                current_progress = _STEP_PROGRESS["data_engineer"]
-                append_log(run_id, "Data Engineer", "Dataset limpiado y estandarizado.", "ok")
+                data_engineer_failed = _has_execution_failure(final_state, run_id=run_id)
+                if data_engineer_failed:
+                    active_step = "data_engineer"
+                    current_progress = _STEP_PROGRESS["execution_planner"]
+                    append_log(
+                        run_id,
+                        "Data Engineer",
+                        "Limpieza fallida; no se marca el dataset como completado.",
+                        "warn",
+                    )
+                else:
+                    completed_steps.add("data_engineer")
+                    active_step = "engineer"
+                    current_progress = _STEP_PROGRESS["data_engineer"]
+                    append_log(run_id, "Data Engineer", "Dataset limpiado y estandarizado.", "ok")
                 # Detect iteration policy from contract
                 contract = final_state.get("execution_contract", {})
                 if isinstance(contract, dict):
@@ -272,8 +310,9 @@ def main(run_id: str) -> None:
                         best_metric_name = str(metric).upper()
                 if not best_metric_name:
                     best_metric_name = "Metric"
-                ml_iteration = 1
-                append_log(run_id, "ML Engineer", f"Generando codigo -- Iteracion 1/{ml_max_iterations}...", "info")
+                if not data_engineer_failed:
+                    ml_iteration = 1
+                    append_log(run_id, "ML Engineer", f"Generando codigo -- Iteracion 1/{ml_max_iterations}...", "info")
 
             elif "engineer" in event:
                 iteration = final_state.get("current_iteration", ml_iteration)
@@ -411,14 +450,37 @@ def main(run_id: str) -> None:
                 started_at=started_at,
             )
 
-        # Pipeline completed successfully
         elapsed = time.time() - started_at
         m, s = divmod(int(elapsed), 60)
         h, m = divmod(m, 60)
         elapsed_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-        append_log(run_id, "Sistema", f"Pipeline completado en {elapsed_str}.", "ok")
 
         write_final_state(run_id, final_state)
+        if _has_execution_failure(final_state, run_id=run_id):
+            append_log(
+                run_id,
+                "Sistema",
+                f"Pipeline finalizado como NO_GO en {elapsed_str}; hay fallos de contrato o artefactos obligatorios.",
+                "warn",
+            )
+            _update_status(
+                run_id,
+                stage=active_step,
+                progress=current_progress,
+                completed_steps=list({s[0] if isinstance(s, tuple) else s for s in completed_steps}),
+                iteration=ml_iteration,
+                max_iterations=ml_max_iterations,
+                metric_name=best_metric_name,
+                metric_value=current_metric_value,
+                status="error",
+                error="Pipeline finalizado como NO_GO por fallos de contrato o artefactos obligatorios.",
+                started_at=started_at,
+                stage_name="No aprobado",
+            )
+            print(f"WORKER: Pipeline finished with NO_GO for run {run_id}")
+            return
+
+        append_log(run_id, "Sistema", f"Pipeline completado en {elapsed_str}.", "ok")
         _update_status(
             run_id,
             stage=None,
