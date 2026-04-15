@@ -2,6 +2,7 @@ import json
 import os
 import ast
 import copy
+import fnmatch
 import hashlib
 import math
 from typing import Dict, Any, List, Optional, Tuple, Callable
@@ -81,6 +82,7 @@ GATE_BINDING_FIELDS: Tuple[str, ...] = (
     "evidence_source",
     "phase_reasoning",
 )
+GATE_BINDING_PLACEHOLDER_TOKENS = {"", "tbd", "todo", "n/a", "na", "none", "null", "placeholder", "?"}
 _DEFAULT_EXECUTION_PLANNER_COMPILER_MODEL = "google/gemini-3-flash-preview"
 
 # ── Token sets removed (seniority refactoring) ──────────────────────────
@@ -3237,6 +3239,7 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
                 "agent": "<unknown>",
                 "gate_field": "",
                 "kind": "unresolved_artifact",
+                "severity": "hard",
                 "detail": "Contract is not a dictionary; gate phase coherence cannot be evaluated.",
                 "suggested_action": "repair_contract_shape",
             }
@@ -3252,15 +3255,23 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
     def _path_token(value: Any) -> str:
         return normalize_artifact_path(value or "").strip().lower()
 
-    def _as_list(value: Any) -> List[Any]:
-        return value if isinstance(value, list) else []
-
     def _as_str_set(value: Any) -> set[str]:
         if isinstance(value, str) and value.strip():
             return {value.strip()}
         if not isinstance(value, list):
             return set()
         return {str(item).strip() for item in value if str(item or "").strip()}
+
+    def _is_placeholder_binding(value: Any) -> bool:
+        token = _clean_token(value)
+        return token in GATE_BINDING_PLACEHOLDER_TOKENS or len(token) < 3
+
+    def _glob_path_matches(pattern: str, candidate: str) -> bool:
+        pattern_norm = _path_token(pattern)
+        candidate_norm = _path_token(candidate)
+        if not pattern_norm or not candidate_norm or "*" not in pattern_norm:
+            return False
+        return fnmatch.fnmatchcase(candidate_norm, pattern_norm)
 
     def _required_outputs(agent: str) -> List[Dict[str, Any]]:
         outputs = _section(agent).get("required_outputs")
@@ -3304,6 +3315,10 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
         if key in {intent, kind, name}:
             return True
         if key_path and path and key_path == path:
+            return True
+        if key_path and path and _glob_path_matches(path, key_path):
+            return True
+        if key_path and path and _glob_path_matches(key_path, path):
             return True
         if key in {"validation_metrics", "cv_metrics", "metrics"} and (intent in {"validation_metrics", "cv_metrics"} or kind == "metrics"):
             return True
@@ -3349,6 +3364,8 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
                 return str(req_key), requirement
             if key and req_path and _path_token(artifact_key) == req_path:
                 return str(req_key), requirement
+            if key and req_path and _glob_path_matches(req_path, artifact_key):
+                return str(req_key), requirement
         return "", None
 
     def _resolve_artifact(agent: str, artifact_key: Any) -> Dict[str, Any] | None:
@@ -3368,43 +3385,31 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(requirement, dict):
             req_path = _requirement_path(requirement)
             for output in _required_outputs(agent):
-                if req_path and _path_token(output.get("path")) == req_path:
+                output_path = _path_token(output.get("path"))
+                if req_path and output_path == req_path:
+                    return {"output": output, "requirement_key": req_key, "requirement": requirement}
+                if req_path and output_path and _glob_path_matches(output_path, req_path):
                     return {"output": output, "requirement_key": req_key, "requirement": requirement}
         return None
 
-    def _declared_columns(resolved: Dict[str, Any] | None) -> set[str]:
-        columns: set[str] = set()
+    def _declared_column_sets(resolved: Dict[str, Any] | None) -> Tuple[set[str], set[str]]:
+        required: set[str] = set()
+        optional: set[str] = set()
         if not isinstance(resolved, dict):
-            return columns
+            return required, optional
         output = resolved.get("output")
         requirement = resolved.get("requirement")
         for payload in (requirement, output):
             if not isinstance(payload, dict):
                 continue
-            for key in (
-                "required_columns",
-                "optional_passthrough_columns",
-                "columns",
-                "schema_columns",
-                "expected_columns",
-            ):
-                columns.update(_as_str_set(payload.get(key)))
+            required.update(_as_str_set(payload.get("required_columns")))
+            optional.update(_as_str_set(payload.get("optional_passthrough_columns")))
+            for key in ("columns", "schema_columns", "expected_columns"):
+                required.update(_as_str_set(payload.get(key)))
             schema = payload.get("schema")
             if isinstance(schema, dict):
-                columns.update(_as_str_set(schema.get("columns")))
-        return columns
-
-    def _gate_text(gate: Dict[str, Any]) -> str:
-        parts = [
-            str(gate.get("name") or ""),
-            str(gate.get("description") or ""),
-            str(gate.get("evidence_source") or ""),
-            str(gate.get("phase_reasoning") or ""),
-        ]
-        params = gate.get("params")
-        if isinstance(params, dict):
-            parts.extend(str(value) for value in params.values() if value is not None)
-        return " ".join(parts).lower()
+                required.update(_as_str_set(schema.get("columns")))
+        return required, optional
 
     def _default_artifact_for_gate(agent: str, gate_field: str) -> str:
         if agent == "data_engineer" and gate_field == "cleaning_gates":
@@ -3422,39 +3427,22 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
         detail: str,
         suggested_action: str,
         artifact_key: str = "",
+        severity: str = "hard",
     ) -> None:
+        severity_token = "soft" if str(severity or "").lower() in {"soft", "warning", "warn"} else "hard"
         violations.append(
             {
                 "gate_name": gate_name,
                 "agent": agent,
                 "gate_field": gate_field,
                 "kind": kind,
+                "severity": severity_token,
                 "detail": detail,
                 "suggested_action": suggested_action,
                 "applies_to_artifact": artifact_key,
             }
         )
 
-    ml_evidence_tokens = (
-        "feature_names_in_",
-        "trained model",
-        "feature_importance",
-        "roc_auc",
-        "pr_auc",
-        "validation_metrics",
-        "model.pkl",
-        "feature matrix",
-        "model input",
-        "training features",
-    )
-    cleaning_evidence_tokens = (
-        "cleaned csv header",
-        "cleaned_dataset",
-        "cleaning_manifest",
-        "dtype coercion",
-        "duplicate row",
-        "row count",
-    )
     gate_sources = (
         ("data_engineer", "cleaning_gates"),
         ("ml_engineer", "qa_gates"),
@@ -3471,7 +3459,7 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
             missing_fields = [
                 field
                 for field in GATE_BINDING_FIELDS
-                if not str(gate.get(field) or "").strip()
+                if _is_placeholder_binding(gate.get(field))
             ]
             artifact_key = str(gate.get("applies_to_artifact") or "").strip()
             effective_artifact_key = artifact_key or _default_artifact_for_gate(agent, gate_field)
@@ -3487,6 +3475,7 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
                     ),
                     suggested_action="add_binding",
                     artifact_key=effective_artifact_key,
+                    severity="hard",
                 )
             resolved = _resolve_artifact(agent, effective_artifact_key)
             if resolved is None:
@@ -3498,6 +3487,7 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
                     detail=f"applies_to_artifact={effective_artifact_key!r} does not resolve to {agent}.required_outputs.",
                     suggested_action="add_binding",
                     artifact_key=effective_artifact_key,
+                    severity="hard",
                 )
                 continue
 
@@ -3505,9 +3495,10 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
             params = params if isinstance(params, dict) else {}
             forbidden = _as_str_set(params.get("forbidden_columns"))
             if forbidden:
-                declared = _declared_columns(resolved)
-                clash = sorted(forbidden & declared)
-                if clash:
+                declared_required, declared_optional = _declared_column_sets(resolved)
+                required_clash = sorted(forbidden & declared_required)
+                optional_clash = sorted((forbidden & declared_optional) - set(required_clash))
+                if required_clash:
                     suggested = "relocate_to_ml_engineer" if agent == "data_engineer" else "rephrase_as_manifest_invariant"
                     _add_violation(
                         gate_name=gate_name,
@@ -3515,34 +3506,29 @@ def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
                         gate_field=gate_field,
                         kind="structural_contradiction",
                         detail=(
-                            f"Gate forbids columns {clash}, but artifact {effective_artifact_key!r} "
-                            "declares them in required_columns/optional_passthrough_columns."
+                            f"Gate forbids columns {required_clash}, but artifact {effective_artifact_key!r} "
+                            "declares them in required_columns."
                         ),
                         suggested_action=suggested,
                         artifact_key=effective_artifact_key,
+                        severity="hard",
                     )
-
-            text = _gate_text(gate)
-            if agent == "data_engineer" and any(token in text for token in ml_evidence_tokens):
-                _add_violation(
-                    gate_name=gate_name,
-                    agent=agent,
-                    gate_field=gate_field,
-                    kind="phase_mismatch",
-                    detail="Gate text/evidence refers to ML-phase objects but the gate lives in the cleaning phase.",
-                    suggested_action="relocate_to_ml_engineer",
-                    artifact_key=effective_artifact_key,
-                )
-            if agent == "ml_engineer" and any(token in text for token in cleaning_evidence_tokens):
-                _add_violation(
-                    gate_name=gate_name,
-                    agent=agent,
-                    gate_field=gate_field,
-                    kind="phase_mismatch",
-                    detail="Gate text/evidence refers to cleaning-phase objects but the gate lives in the ML phase.",
-                    suggested_action="relocate_to_data_engineer",
-                    artifact_key=effective_artifact_key,
-                )
+                if optional_clash:
+                    suggested = "verify_feature_binding_or_rephrase_manifest_invariant"
+                    _add_violation(
+                        gate_name=gate_name,
+                        agent=agent,
+                        gate_field=gate_field,
+                        kind="optional_passthrough_overlap",
+                        detail=(
+                            f"Gate forbids columns {optional_clash}, but artifact {effective_artifact_key!r} "
+                            "retains them as optional_passthrough_columns. This may be valid for an audit-complete artifact, "
+                            "but the gate should bind to the feature matrix/model features or be rephrased as a manifest invariant."
+                        ),
+                        suggested_action=suggested,
+                        artifact_key=effective_artifact_key,
+                        severity="soft",
+                    )
 
     return {"status": "ok" if not violations else "violations", "violations": violations}
 
@@ -3558,9 +3544,11 @@ def _phase_coherence_validation_result(coherence: Dict[str, Any] | None) -> Dict
         if not isinstance(violation, dict):
             continue
         kind = str(violation.get("kind") or "unknown").strip() or "unknown"
+        violation_severity = str(violation.get("severity") or "hard").strip().lower()
+        issue_severity = "warning" if violation_severity in {"soft", "warning", "warn"} else "error"
         issues.append(
             {
-                "severity": "error",
+                "severity": issue_severity,
                 "rule": f"contract.phase_coherence.{kind}",
                 "message": str(violation.get("detail") or ""),
                 "phase": "phase_coherence",
@@ -3571,11 +3559,15 @@ def _phase_coherence_validation_result(coherence: Dict[str, Any] | None) -> Dict
                 "suggested_action": violation.get("suggested_action"),
             }
         )
+    error_count = len(
+        [issue for issue in issues if str(issue.get("severity") or "").lower() in {"error", "fail"}]
+    )
+    warning_count = len([issue for issue in issues if str(issue.get("severity") or "").lower() == "warning"])
     return {
-        "status": "error" if issues else "ok",
-        "accepted": not issues,
+        "status": "error" if error_count else ("warning" if warning_count else "ok"),
+        "accepted": error_count == 0,
         "issues": issues,
-        "summary": {"error_count": len(issues), "warning_count": 0, "phase": "phase_coherence"},
+        "summary": {"error_count": error_count, "warning_count": warning_count, "phase": "phase_coherence"},
     }
 
 
@@ -10649,9 +10641,9 @@ class ExecutionPlannerAgent:
                     "If a gate forbids columns that the same artifact requires or passes through, relocate it to ML QA, "
                     "rephrase it as a cleaning_manifest invariant, or materialize a separate feature_matrix artifact."
                 ),
-                "contract.phase_coherence.phase_mismatch": (
-                    "Move gates to the phase where their evidence is observable: model feature gates to ml_engineer.qa_gates; "
-                    "cleaned CSV/manifest gates to data_engineer.cleaning_gates."
+                "contract.phase_coherence.optional_passthrough_overlap": (
+                    "If a gate forbids optional passthrough columns, verify whether the bound artifact is audit-complete. "
+                    "Prefer binding the gate to model features/feature matrix, or rephrase it as a cleaning_manifest invariant."
                 ),
             }
             for issue in issues:
@@ -11050,6 +11042,7 @@ class ExecutionPlannerAgent:
                             "agent": "<unknown>",
                             "gate_field": "",
                             "kind": "phase_validation_exception",
+                            "severity": "hard",
                             "detail": str(err),
                             "suggested_action": "inspect_contract_validation",
                         }
