@@ -18,6 +18,7 @@ from src.utils.senior_protocol import (
     SENIOR_REASONING_PROTOCOL_GENERAL,
 )
 from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
+from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
 from src.utils.sandbox_deps import (
     BASE_ALLOWLIST,
     EXTENDED_ALLOWLIST,
@@ -4596,6 +4597,11 @@ class MLEngineerAgent:
         - Choose preprocessing, validation, and scoring logic that matches the data structure rather than generic boilerplate.
         - Handle outliers with data-driven, non-destructive methods unless contract says otherwise.
 
+        METHOD NAMES ARE CONTRACTS, NOT LABELS
+        When you declare a validation method, splitter type, CV scheme, or resampling rule — in code (cv_method field, fold metadata, log lines), in artifacts, or in the script header — you are making a claim that downstream reviewers, QA agents, and human operators will trust at face value. The declaration becomes the specification the verifier grades against.
+        Every named method has a defining invariant that makes it that method rather than a degenerate or random alternative. Your code must enforce the invariant, not merely observe that it is violated. A `grouped_*` method is grouped iff no group crosses partitions within a fold; a `stratified_*` method preserves class balance across folds; a `time_series_*` or `walk_forward_*` method has no future-into-past bleed; a `nested_*` method keeps the outer test fold isolated from inner tuning. These are illustrations of the reasoning — apply the same principle to whatever method the contract names, including methods outside this list.
+        Recording a violation as observability metadata (for example, exporting an overlap count while letting the overlap persist, or logging a cv_method label that the fold construction does not actually produce) is a correctness bug, not a caveat. It misrepresents the method to every downstream consumer: QA reads the label and grades against it; the reviewer trusts the declaration; operators believe the run executed what it claims. If your fold-building code cannot enforce the invariant, change the method declaration to match what the code actually does, or change the code until it matches the declaration. Never let the two drift apart.
+
         FEATURE GOVERNANCE
         - Use only contract-allowed features:
           allowed_feature_sets, canonical_columns, derived_columns, leakage_execution_plan.
@@ -5800,13 +5806,18 @@ class MLEngineerAgent:
             stage: str = "repair_subcall",
         ) -> str:
             print(f"DEBUG: ML Engineer calling {provider_label} Model ({model_name})...")
-            response = self.client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": usr_prompt}
-                ],
-                temperature=temperature,
+            response = create_chat_completion_with_reasoning(
+                self.client,
+                agent_name="ml_engineer",
+                model_name=model_name,
+                call_kwargs={
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": usr_prompt},
+                    ],
+                    "temperature": temperature,
+                },
             )
             content = response.choices[0].message.content
             self._record_prompt_trace_entry(

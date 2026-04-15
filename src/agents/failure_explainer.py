@@ -3,6 +3,7 @@ from typing import Any, Dict
 
 from dotenv import load_dotenv
 
+from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
 from src.utils.retries import call_with_retries
 
 load_dotenv()
@@ -36,11 +37,16 @@ class FailureExplainerAgent:
 
     def _call_llm(self, prompt: str) -> str:
         """Call OpenRouter and return the text response."""
-        response = self._client.chat.completions.create(
-            model=self._model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=2048,
+        response = create_chat_completion_with_reasoning(
+            self._client,
+            agent_name="failure_explainer",
+            model_name=self._model_name,
+            call_kwargs={
+                "model": self._model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 2048,
+            },
         )
         return (response.choices[0].message.content or "").strip()
 

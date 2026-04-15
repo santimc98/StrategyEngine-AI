@@ -67,6 +67,11 @@ from src.utils.problem_capabilities import (
     is_problem_family,
     resolve_problem_capabilities_from_contract,
 )
+from src.utils.openrouter_reasoning import (
+    apply_reasoning_to_call_kwargs,
+    is_reasoning_parameter_error,
+    strip_reasoning_from_call_kwargs,
+)
 
 load_dotenv()
 
@@ -484,6 +489,12 @@ class _OpenRouterAdapter:
                 allowed = fcc.get("allowedFunctionNames", [])
                 if allowed:
                     call_kwargs["tool_choice"] = {"type": "function", "function": {"name": allowed[0]}}
+        call_kwargs = apply_reasoning_to_call_kwargs(
+            call_kwargs,
+            agent_name="execution_planner",
+            model_name=self.model_name,
+        )
+        reasoning_applied = bool(call_kwargs.pop("_codex_reasoning_applied", False))
         use_raw_capture = str(os.getenv("EXECUTION_PLANNER_CAPTURE_RAW_RESPONSE", "")).strip().lower() in {
             "1",
             "true",
@@ -494,7 +505,14 @@ class _OpenRouterAdapter:
             raw_api = getattr(self._client.chat.completions, "with_raw_response", None)
             if raw_api is None or not hasattr(raw_api, "create"):
                 raise RuntimeError("with_raw_response transport unavailable while raw capture is enabled")
-            raw_response = raw_api.create(**call_kwargs)
+            try:
+                raw_response = raw_api.create(**call_kwargs)
+            except Exception as exc:
+                if reasoning_applied and is_reasoning_parameter_error(exc):
+                    call_kwargs = strip_reasoning_from_call_kwargs(call_kwargs)
+                    raw_response = raw_api.create(**call_kwargs)
+                else:
+                    raise
             response = raw_response.parse() if hasattr(raw_response, "parse") else raw_response
             raw_body = _read_openai_raw_response_body(raw_response)
             raw_http_response = getattr(raw_response, "http_response", None)
@@ -520,7 +538,13 @@ class _OpenRouterAdapter:
                 pass
             return response
 
-        response = self._client.chat.completions.create(**call_kwargs)
+        try:
+            response = self._client.chat.completions.create(**call_kwargs)
+        except Exception as exc:
+            if reasoning_applied and is_reasoning_parameter_error(exc):
+                response = self._client.chat.completions.create(**strip_reasoning_from_call_kwargs(call_kwargs))
+            else:
+                raise
         try:
             setattr(response, "_codex_transport_mode", "standard")
             setattr(response, "_codex_transport_max_retries", self.transport_max_retries)
@@ -574,6 +598,7 @@ Gates must be grounded in actual data risk, not template completeness.
 - Gates you emit at the semantic layer may provisionally be placed under cleaning_gates or qa_gates, but you should NOT assume that placement is final. The compiler step (Senior Contract Architect) is authorized to relocate gates whose intent is not verifiable in the phase where you parked them.
 - When profiling reveals coarse granularity, tied values, grouped events, snapshots, or other legitimate boundary ambiguities, do not collapse a semantic invariant into a brittle literal rule. Preserve the intent of the invariant and express gates that remain valid under those observed data conditions.
 - Semantic closure for row-filtering rules: if you define a training_rows_rule, scoring_rows_rule, or any condition that partitions which rows belong in the output, ask yourself whether that condition will actually be enforced. Downstream agents treat cleaning_gates as the authoritative enforcement mechanism — a rule declared only in task_semantics or runbook may be treated as advisory and skipped. If a row-filtering condition is important enough to define, it is important enough to have a corresponding HARD cleaning gate that ensures enforcement.
+- Semantic closure for declared methods: the same principle applies to any method named in the runbook or task_semantics that commits to how validation, resampling, splitting, or tuning is done. A method name (for example a grouped, stratified, time-series, nested, blocked, or purged scheme) is a claim about the defining invariant of that method. If the invariant is not bound as a gate whose evidence lives in an artifact the reviewer can inspect, the method name is cosmetic and the downstream code can silently implement something else while keeping the label. Reason about each declared method, name its defining invariant, and ensure the gate set covers it — or strip the method declaration down to what you are willing to enforce.
 
 RUNBOOK AND TECHNIQUE HANDLING — CRITICAL
 The downstream agents (data_engineer, ml_engineer) are senior engineers who reason about method selection given data context. Your runbooks must give them freedom to reason.
@@ -695,6 +720,25 @@ HARD = failure means corrupt, unsafe, or silently wrong output.
 SOFT = quality degraded but output remains usable.
 Each gate addresses a distinct, plausible risk grounded in the data. 5 well-bound gates beat 15 floating gates.
 For temporal/date gates, expected_unique_range is only valid if it is the expected number of canonical parsed periods in the cleaned artifact. If the only evidence is raw profile cardinality for a string/object date column with mixed formats, omit expected_unique_range or make it a soft diagnostic. When temporal_normalization_facts.normalization_collapse_risk is medium/high, explicitly avoid raw_unique_count as a HARD threshold.
+
+METHOD DECLARATIONS IMPLY INVARIANTS - MANDATORY DERIVATION
+Every method named in validation_requirements, runbook, training policy, or anywhere the contract commits to a CV topology, resampling scheme, or partitioning rule is a CLAIM about what the ML code will actually do. A declared method without a gate that proves its defining invariants is cosmetic - the contract allows the ML Engineer to name the method while implementing something else, and the reviewer has nothing to falsify the claim against.
+
+Before moving to placement, reason explicitly about every method you (or the strategist) declared:
+
+Step A - Name the invariants that make this method what it says it is. The invariants are whatever distinguishes the declared method from a generic random split or a degenerate version of itself. Think about what can silently drift:
+- A "grouped_*" method is grouped iff no group appears in both partitions of a fold; otherwise it is a random split with a misleading label.
+- A "stratified_*" method is stratified iff the class distribution is preserved across folds within a tolerance.
+- A "time_series_*" or "walk_forward_*" method is temporal iff every validation row's timestamp is strictly after every training row's timestamp in that fold.
+- A "nested_*" method is nested iff the outer test fold was never touched by inner hyperparameter search.
+- A "blocked_*" or "purged_*" method is block-correct iff the block boundaries in code match the declared block definition.
+These are illustrations of the REASONING pattern, not an exhaustive list. Apply the same pattern to whatever methods actually appear in the plan, including methods outside this list.
+
+Step B - For each invariant, bind a gate. The evidence_source must point to an artifact field that a verifier can check (for example, a fold_metadata array with overlap counts or per-fold boundaries, a stratification summary, a nested-split manifest). If no artifact exposes the needed field, either (i) extend required_outputs so the ML Engineer emits one, or (ii) rebind the gate to an equivalent observable (for example, model inputs for monotonicity claims).
+
+Step C - Severity reasoning. An invariant whose violation turns the declared method into a different method is HARD, because downstream reviewers, QA, and operators will read the method name and trust a claim that the run no longer supports. SOFT is reserved for quality degradations within a correctly-identified method.
+
+Self-check before placement: read the runbook and validation_requirements one more time. For every method name you find, point to the gate that proves its defining invariant. If you cannot, either bind the gate now or drop the method declaration. A runbook that names a method without binding its invariants is a wish, not a compiled contract.
 
 PLACEMENT IS SEMANTIC, NOT TOPICAL
 The semantic_core may park invariants under cleaning_gates or qa_gates for convenience. You MUST relocate gates whose intent is not verifiable in the phase where they are parked:

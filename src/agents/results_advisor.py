@@ -18,6 +18,7 @@ from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_wi
 from src.utils.results_advisor_response_schema import (
     build_results_advisor_critique_response_schema,
 )
+from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
 from src.utils.problem_capabilities import infer_problem_capabilities, is_problem_family, normalize_problem_family
 
 load_dotenv()
@@ -229,13 +230,18 @@ class ResultsAdvisorAgent:
         self.last_prompt = system_prompt + "\n\n" + user_prompt
 
         def _call_model():
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
+            response = create_chat_completion_with_reasoning(
+                self.client,
+                agent_name="results_advisor",
+                model_name=self.model_name,
+                call_kwargs={
+                    "model": self.model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.1,
+                },
             )
             return response.choices[0].message.content
 
@@ -467,16 +473,31 @@ class ResultsAdvisorAgent:
             if self._use_response_schema:
                 call_kwargs["response_format"] = self._openai_response_format_for_critique()
             try:
-                response = self.critique_client.chat.completions.create(**call_kwargs)
+                response = create_chat_completion_with_reasoning(
+                    self.critique_client,
+                    agent_name="results_advisor_critique",
+                    model_name=self.critique_model_name,
+                    call_kwargs=call_kwargs,
+                )
             except TypeError:
                 retry_kwargs = dict(call_kwargs)
                 retry_kwargs.pop("temperature", None)
-                response = self.critique_client.chat.completions.create(**retry_kwargs)
+                response = create_chat_completion_with_reasoning(
+                    self.critique_client,
+                    agent_name="results_advisor_critique",
+                    model_name=self.critique_model_name,
+                    call_kwargs=retry_kwargs,
+                )
             except Exception as err:
                 if self._use_response_schema and self._is_response_schema_unsupported_error(err):
                     fallback_kwargs = dict(call_kwargs)
                     fallback_kwargs.pop("response_format", None)
-                    response = self.critique_client.chat.completions.create(**fallback_kwargs)
+                    response = create_chat_completion_with_reasoning(
+                        self.critique_client,
+                        agent_name="results_advisor_critique",
+                        model_name=self.critique_model_name,
+                        call_kwargs=fallback_kwargs,
+                    )
                 else:
                     raise
             repaired_text = response.choices[0].message.content
@@ -850,16 +871,31 @@ class ResultsAdvisorAgent:
             if self._use_response_schema:
                 call_kwargs["response_format"] = self._openai_response_format_for_critique()
             try:
-                response = self.critique_client.chat.completions.create(**call_kwargs)
+                response = create_chat_completion_with_reasoning(
+                    self.critique_client,
+                    agent_name="results_advisor_critique",
+                    model_name=self.critique_model_name,
+                    call_kwargs=call_kwargs,
+                )
             except TypeError:
                 retry_kwargs = dict(call_kwargs)
                 retry_kwargs.pop("temperature", None)
-                response = self.critique_client.chat.completions.create(**retry_kwargs)
+                response = create_chat_completion_with_reasoning(
+                    self.critique_client,
+                    agent_name="results_advisor_critique",
+                    model_name=self.critique_model_name,
+                    call_kwargs=retry_kwargs,
+                )
             except Exception as err:
                 if self._use_response_schema and self._is_response_schema_unsupported_error(err):
                     fallback_kwargs = dict(call_kwargs)
                     fallback_kwargs.pop("response_format", None)
-                    response = self.critique_client.chat.completions.create(**fallback_kwargs)
+                    response = create_chat_completion_with_reasoning(
+                        self.critique_client,
+                        agent_name="results_advisor_critique",
+                        model_name=self.critique_model_name,
+                        call_kwargs=fallback_kwargs,
+                    )
                 else:
                     raise
             raw_text = response.choices[0].message.content
@@ -1259,13 +1295,18 @@ class ResultsAdvisorAgent:
                 response = self.fe_client.generate_content(system_prompt + "\n\n" + user_prompt)
                 content = _coerce_llm_response_text(response)
             else:
-                response = self.fe_client.chat.completions.create(
-                    model=self.fe_model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.1,
+                response = create_chat_completion_with_reasoning(
+                    self.fe_client,
+                    agent_name="results_advisor_llm",
+                    model_name=self.fe_model_name,
+                    call_kwargs={
+                        "model": self.fe_model_name,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": 0.1,
+                    },
                 )
                 content = response.choices[0].message.content
         except Exception:

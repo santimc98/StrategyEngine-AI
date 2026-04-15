@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
+from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
 
 
 class ReviewBoardAgent:
@@ -66,14 +67,19 @@ class ReviewBoardAgent:
         self.last_prompt = system_prompt + "\n\n" + user_prompt
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
+            response = create_chat_completion_with_reasoning(
+                self.client,
+                agent_name="review_board",
+                model_name=self.model_name,
+                call_kwargs={
+                    "model": self.model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.0,
+                },
             )
             content = response.choices[0].message.content
             self.last_response = content

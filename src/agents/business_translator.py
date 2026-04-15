@@ -23,6 +23,7 @@ from src.utils.csv_dialect import (
     coerce_number,
 )
 from src.utils.dataset_semantics import build_target_lineage_summary
+from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
 
 
 def _detect_primary_language(text: str, preferred_language: Optional[str] = None) -> str:
@@ -4128,11 +4129,16 @@ class BusinessTranslatorAgent:
             if callable(model):
                 return str(model(prompt) or "").strip()
         selected_model = str(model_name or self.model_name or "").strip() or self.model_name
-        response = self.client.chat.completions.create(
-            model=selected_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=int(self._max_tokens),
+        response = create_chat_completion_with_reasoning(
+            self.client,
+            agent_name="translator",
+            model_name=selected_model,
+            call_kwargs={
+                "model": selected_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": int(self._max_tokens),
+            },
         )
         finish_reason = getattr(response.choices[0], "finish_reason", None)
         if finish_reason in ("length", "max_tokens"):
@@ -4246,6 +4252,13 @@ class BusinessTranslatorAgent:
             os.path.join(work_dir, "data", "review_board_verdict.json"),
             os.path.join("work", "data", "review_board_verdict.json"),
         ) or {}
+        # QA reviewer output. The QA agent frequently approves with warnings —
+        # warnings in this agent are *materially significant* (they represent
+        # the senior QA verdict on unresolved risks) and must be available to
+        # the translator so the executive report can represent them honestly.
+        qa_last_result = state.get("qa_last_result")
+        if not isinstance(qa_last_result, dict):
+            qa_last_result = {}
         alignment_check_report = _safe_load_json("data/alignment_check.json") or {}
         plot_insights = (
             _safe_load_json_candidates(
@@ -4856,6 +4869,61 @@ class BusinessTranslatorAgent:
             decision_discrepancy=decision_discrepancy,
         )
 
+        # Build a compact, normalized QA signal block. QA warnings/soft
+        # failures represent material caveats the executive report must not
+        # silently drop. We keep this as a separate fact entry so the model
+        # can reason about QA verdicts without having to parse the whole
+        # qa_last_result dict.
+        qa_status_raw = str(qa_last_result.get("status") or "").strip() or None
+        qa_feedback_raw = str(qa_last_result.get("feedback") or "").strip()
+        qa_review_signals: Dict[str, Any] = {
+            "status": qa_status_raw,
+            "status_is_warning": bool(
+                qa_status_raw
+                and (
+                    "WARNING" in qa_status_raw.upper()
+                    or "WITH_WARN" in qa_status_raw.upper()
+                )
+            ),
+            "feedback_excerpt": (qa_feedback_raw[:1600] if qa_feedback_raw else ""),
+            "failed_gates": [
+                str(x) for x in (qa_last_result.get("failed_gates") or []) if str(x or "").strip()
+            ][:12],
+            "hard_failures": [
+                str(x) for x in (qa_last_result.get("hard_failures") or []) if str(x or "").strip()
+            ][:12],
+            "soft_failures": [
+                str(x) for x in (qa_last_result.get("soft_failures") or []) if str(x or "").strip()
+            ][:12],
+            "explicit_warnings": [
+                str(x) for x in (qa_last_result.get("warnings") or []) if str(x or "").strip()
+            ][:12],
+            "required_fixes": [
+                str(x) for x in (qa_last_result.get("required_fixes") or []) if str(x or "").strip()
+            ][:8],
+            "qa_gates_evaluated": [
+                str(x) for x in (qa_last_result.get("qa_gates_evaluated") or []) if str(x or "").strip()
+            ][:20],
+        }
+        # Keep a small evidence preview only when the QA verdict carries
+        # non-empty soft/warning signals — it helps the translator cite the
+        # caveat accurately without overloading the prompt.
+        qa_evidence = qa_last_result.get("evidence")
+        if isinstance(qa_evidence, list) and (
+            qa_review_signals["status_is_warning"]
+            or qa_review_signals["failed_gates"]
+            or qa_review_signals["soft_failures"]
+            or qa_review_signals["explicit_warnings"]
+        ):
+            qa_review_signals["evidence_preview"] = [
+                {
+                    "claim": str((item or {}).get("claim") or "")[:240],
+                    "source": str((item or {}).get("source") or "")[:200],
+                }
+                for item in qa_evidence
+                if isinstance(item, dict)
+            ][:6]
+
         facts_block = {
             "executive_decision_label": executive_decision_label,
             "authoritative_run_outcome": run_outcome_token,
@@ -4864,6 +4932,7 @@ class BusinessTranslatorAgent:
             "final_incumbent_state": final_incumbent_state,
             "governance_contradiction_packet": governance_contradiction_packet,
             "stale_or_rejected_history": stale_or_rejected_history,
+            "qa_review_signals": qa_review_signals,
             "business_objective": business_objective,
             "strategy_title": strategy_title,
             "review_verdict": review_verdict or compliance,
@@ -5030,6 +5099,30 @@ OUTCOME ASSESSMENT
   on disk, trust the canonical value — it reflects the selected incumbent.
 - If improvement history exists, make the ML engineer's progress visible,
   but keep final KPI/stability language tied to the selected incumbent only.
+
+QA REVIEWER SIGNALS ARE MATERIAL CAVEATS
+- facts_block.qa_review_signals carries the senior QA reviewer's final
+  assessment of the pipeline's unresolved risks. Its status, feedback,
+  explicit warnings, soft failures, and failed gates are not optional
+  context — they are the reviewer's judgement on what the downstream
+  consumer needs to know before acting on the result.
+- If qa_review_signals.status is APPROVE_WITH_WARNINGS (or any variant
+  flagged by status_is_warning), the report's limitations section must
+  faithfully represent those warnings. Do not silently drop them just
+  because the authoritative outcome is positive — the two coexist: the
+  pipeline succeeded *and* the reviewer surfaced unresolved caveats.
+- Read qa_review_signals.feedback_excerpt for the reviewer's own
+  reasoning. When warnings inside that feedback describe a risk that
+  affects metric interpretation (for example the validation method did
+  not fully enforce its claimed invariants, a calibration caveat, or a
+  specification deviation), that risk belongs in the limitations or
+  "how confident can we be" section of the report, not omitted.
+- soft_failures and explicit_warnings are named slots for caveats; list
+  them plainly. failed_gates and hard_failures are harder blockers and
+  must be surfaced with the corresponding evidence from the reviewer.
+- You choose the phrasing and depth, but materially significant QA
+  caveats may not be omitted. A silent omission of a senior reviewer's
+  stated reservation is a reporting error, not a stylistic choice.
 
 WHAT MATTERS
 - From all the metrics and artifacts below, decide which findings are

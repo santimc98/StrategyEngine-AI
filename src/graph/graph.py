@@ -17068,6 +17068,8 @@ class AgentState(TypedDict):
     ml_improvement_rounds_allowed: int
     ml_improvement_current_round_id: int
     ml_improvement_no_improve_streak: int
+    ml_improvement_runtime_failure_streak: int
+    ml_improvement_runtime_failure_cap: int
     ml_improvement_patience: int
     ml_improvement_min_delta: float
     ml_improvement_higher_is_better: bool
@@ -18002,6 +18004,8 @@ def run_steward(state: AgentState) -> AgentState:
         "ml_improvement_rounds_allowed": 1,
         "ml_improvement_current_round_id": 0,
         "ml_improvement_no_improve_streak": 0,
+        "ml_improvement_runtime_failure_streak": 0,
+        "ml_improvement_runtime_failure_cap": 2,
         "ml_improvement_patience": 2,
         "ml_improvement_min_delta": 0.0005,
         "ml_improvement_higher_is_better": None,
@@ -33708,16 +33712,45 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             state["reviewer_last_result"] = dict(baseline_reviewer_packet)
         if baseline_qa_packet:
             state["qa_last_result"] = dict(baseline_qa_packet)
-        # Both runtime failures and metric stagnation count toward the
-        # no-improve streak.  A runtime failure means all execution retries
-        # were exhausted without producing viable results — the technique
-        # is effectively unviable and should consume patience just like a
-        # technique that ran but failed to improve the metric.
-        no_improve_streak = int(no_improve_streak) + 1
+        # Distinguish *runtime failure* (script could not execute — syntax
+        # error, sandbox block, timeout, crash) from *technique inefficacy*
+        # (script ran but the candidate metric did not improve).
+        #
+        # A runtime failure carries no information about whether the chosen
+        # technique is viable: the code never produced evidence. Counting it
+        # toward no_improve_streak conflates "we exhausted our ideas" with
+        # "our editor/sandbox is broken", and silently consumes the patience
+        # budget meant for evaluating techniques.
+        #
+        # Track runtime failures on their own streak so the loop can abort
+        # when infrastructure is clearly unstable (consecutive failures) while
+        # leaving the technique-exhaustion budget intact across isolated
+        # runtime noise.
+        runtime_failure_streak = int(
+            state.get("ml_improvement_runtime_failure_streak", 0) or 0
+        )
+        if runtime_failed:
+            runtime_failure_streak = int(runtime_failure_streak) + 1
+        else:
+            runtime_failure_streak = 0
+            no_improve_streak = int(no_improve_streak) + 1
+        state["ml_improvement_runtime_failure_streak"] = int(runtime_failure_streak)
+        # Hard safety net: if we cannot get a viable candidate to execute
+        # after several consecutive attempts, stop the loop and keep the
+        # baseline, rather than looping forever on infra issues.
+        runtime_failure_cap = int(
+            state.get("ml_improvement_runtime_failure_cap", 2) or 2
+        )
+        if runtime_failure_streak >= max(1, runtime_failure_cap) and not force_finalize:
+            force_finalize = True
+            force_finalize_reason = "runtime_failure_streak_exhausted"
+            incumbent_selection["force_finalize"] = True
+            incumbent_selection["force_finalize_reason"] = force_finalize_reason
     else:
         state["ml_improvement_kept"] = "improved"
         state["stop_reason"] = "IMPROVEMENT_ROUND_KEPT_IMPROVED"
         no_improve_streak = 0
+        state["ml_improvement_runtime_failure_streak"] = 0
 
     metrics_path = _resolve_declared_artifact_path_from_state(
         state if isinstance(state, dict) else {},
@@ -33969,6 +34002,9 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         },
         "incumbent_selection": incumbent_selection,
         "no_improve_streak": int(no_improve_streak),
+        "runtime_failure_streak": int(
+            state.get("ml_improvement_runtime_failure_streak", 0) or 0
+        ),
         "rounds_allowed": int(rounds_allowed),
         "patience": int(patience),
     }

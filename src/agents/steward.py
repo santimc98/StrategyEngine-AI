@@ -20,6 +20,7 @@ except Exception:
 
 load_dotenv()
 from src.utils.pii_scrubber import PIIScrubber
+from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
 
 
 # =============================================================================
@@ -258,10 +259,15 @@ class StewardAgent:
             text = str(getattr(response, "text", "") or "").strip()
             finish_reason = getattr(response, "finish_reason", None)
         else:
-            response = self.client.chat.completions.create(
-                model=selected_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
+            response = create_chat_completion_with_reasoning(
+                self.client,
+                agent_name="steward",
+                model_name=selected_model,
+                call_kwargs={
+                    "model": selected_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                },
             )
             choices = getattr(response, "choices", None) or []
             choice = choices[0] if choices else None

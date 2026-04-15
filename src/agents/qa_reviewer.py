@@ -11,6 +11,7 @@ from src.utils.ml_plan_validation import validate_ml_plan_constraints
 from src.utils.review_context_packets import build_review_context_packet
 from src.utils.reviewer_response_schema import build_qa_response_schema
 from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
+from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
 from src.utils.metric_eval import (
     canonicalize_metric_name,
     canonicalize_metrics_report_file,
@@ -803,14 +804,19 @@ class QAReviewerAgent:
                     isinstance(used_config, dict) and "response_schema" in used_config
                 )
             else:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": "Return only valid JSON."},
-                        {"role": "user", "content": repair_prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
+                response = create_chat_completion_with_reasoning(
+                    self.client,
+                    agent_name="qa_reviewer",
+                    model_name=self.model_name,
+                    call_kwargs={
+                        "model": self.model_name,
+                        "messages": [
+                            {"role": "system", "content": "Return only valid JSON."},
+                            {"role": "user", "content": repair_prompt},
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.0,
+                    },
                 )
                 repaired_text = response.choices[0].message.content
                 trace["used_response_schema"] = False
@@ -856,14 +862,19 @@ class QAReviewerAgent:
         )
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "Return only valid JSON."},
-                    {"role": "user", "content": simplified_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
+            response = create_chat_completion_with_reasoning(
+                self.client,
+                agent_name="qa_reviewer",
+                model_name=self.model_name,
+                call_kwargs={
+                    "model": self.model_name,
+                    "messages": [
+                        {"role": "system", "content": "Return only valid JSON."},
+                        {"role": "user", "content": simplified_prompt},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.0,
+                },
             )
             content = response.choices[0].message.content
 
@@ -1244,13 +1255,18 @@ class QAReviewerAgent:
 
         try:
             print(f"DEBUG: QA Reviewer calling OpenRouter ({self.model_name})...")
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                response_format={"type": "json_object"}
+            response = create_chat_completion_with_reasoning(
+                self.client,
+                agent_name="qa_reviewer",
+                model_name=self.model_name,
+                call_kwargs={
+                    "model": self.model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    "response_format": {"type": "json_object"},
+                },
             )
             content = response.choices[0].message.content
             self.last_response = content

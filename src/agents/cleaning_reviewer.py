@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from src.utils.code_extract import extract_code_block
 from src.utils.cleaning_contract_semantics import resolve_required_columns_for_cleaning
+from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
 from src.utils.reviewer_llm import init_reviewer_llm
 
 load_dotenv()
@@ -451,20 +452,25 @@ def _review_cleaning_impl(
     )
     print(f"DEBUG: Cleaning Reviewer calling OpenRouter ({model_name})...")
     try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": (
-                    "Analyze this evidence payload as a senior auditor. Read cleaning_code, gates_contract, full "
-                    "manifest facts, raw artifact JSON, and secondary_outputs before deciding. Reject only with "
-                    "specific positive evidence citations; otherwise use INSUFFICIENT_EVIDENCE as a warning verdict. "
-                    "Return the JSON schema requested in the system prompt.\n\n"
-                    + json.dumps(payload, ensure_ascii=True)
-                )},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
+        response = create_chat_completion_with_reasoning(
+            client,
+            agent_name="cleaning_reviewer",
+            model_name=model_name,
+            call_kwargs={
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": (
+                        "Analyze this evidence payload as a senior auditor. Read cleaning_code, gates_contract, full "
+                        "manifest facts, raw artifact JSON, and secondary_outputs before deciding. Reject only with "
+                        "specific positive evidence citations; otherwise use INSUFFICIENT_EVIDENCE as a warning verdict. "
+                        "Return the JSON schema requested in the system prompt.\n\n"
+                        + json.dumps(payload, ensure_ascii=True)
+                    )},
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0,
+            },
         )
         content = response.choices[0].message.content
     except Exception as exc:

@@ -1,6 +1,12 @@
 import logging
 from typing import Iterable, Tuple, Any, Dict, List
 
+from src.utils.openrouter_reasoning import (
+    apply_reasoning_to_call_kwargs,
+    is_reasoning_parameter_error,
+    strip_reasoning_from_call_kwargs,
+)
+
 
 def _coerce_text(value: Any) -> str:
     if value is None:
@@ -96,17 +102,39 @@ def call_chat_with_fallback(
     for model in model_chain:
         if not model:
             continue
+        reasoning_applied = False
+        effective_kwargs = dict(call_kwargs or {})
         try:
+            effective_kwargs = apply_reasoning_to_call_kwargs(
+                call_kwargs or {},
+                agent_name=context_tag,
+                model_name=model,
+            )
+            reasoning_applied = bool(effective_kwargs.pop("_codex_reasoning_applied", False))
             response = llm_client.chat.completions.create(
                 model=model,
                 messages=messages,
-                **(call_kwargs or {}),
+                **effective_kwargs,
             )
             if not _response_has_content(response):
                 detail = _empty_completion_detail(response)
                 raise ValueError(f"EMPTY_COMPLETION {detail}")
             return response, model
         except Exception as exc:  # pragma: no cover - safety net
+            if reasoning_applied and is_reasoning_parameter_error(exc):
+                try:
+                    fallback_kwargs = strip_reasoning_from_call_kwargs(effective_kwargs)
+                    response = llm_client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        **fallback_kwargs,
+                    )
+                    if not _response_has_content(response):
+                        detail = _empty_completion_detail(response)
+                        raise ValueError(f"EMPTY_COMPLETION {detail}")
+                    return response, model
+                except Exception as retry_exc:
+                    exc = retry_exc
             last_exc = exc
             if logger:
                 logger.warning(

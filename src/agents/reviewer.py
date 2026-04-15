@@ -14,6 +14,7 @@ from src.utils.reviewer_response_schema import (
 from src.utils.review_context_packets import build_review_context_packet
 from src.utils.llm_json_repair import JsonObjectParseError, parse_json_object_with_repair
 from src.utils.contract_first_gates import apply_contract_first_gate_policy
+from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
 
 load_dotenv()
 
@@ -572,14 +573,19 @@ class ReviewerAgent:
                     isinstance(used_config, dict) and "response_schema" in used_config
                 )
             else:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": "Return only valid JSON."},
-                        {"role": "user", "content": repair_prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
+                response = create_chat_completion_with_reasoning(
+                    self.client,
+                    agent_name="reviewer",
+                    model_name=self.model_name,
+                    call_kwargs={
+                        "model": self.model_name,
+                        "messages": [
+                            {"role": "system", "content": "Return only valid JSON."},
+                            {"role": "user", "content": repair_prompt},
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.0,
+                    },
                 )
                 repaired_text = response.choices[0].message.content
                 trace["used_response_schema"] = False
@@ -855,11 +861,16 @@ class ReviewerAgent:
 
         try:
             print(f"DEBUG: Reviewer calling OpenRouter ({self.model_name})...")
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                response_format={'type': 'json_object'},
-                temperature=0.0
+            response = create_chat_completion_with_reasoning(
+                self.client,
+                agent_name="reviewer",
+                model_name=self.model_name,
+                call_kwargs={
+                    "model": self.model_name,
+                    "messages": messages,
+                    "response_format": {'type': 'json_object'},
+                    "temperature": 0.0,
+                },
             )
             content = response.choices[0].message.content
             self.last_response = content
@@ -1080,14 +1091,19 @@ class ReviewerAgent:
 
         try:
             print(f"DEBUG: Reviewer evaluation calling OpenRouter ({self.model_name})...")
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Evaluate results."}
-                ],
-                response_format={'type': 'json_object'},
-                temperature=0.1
+            response = create_chat_completion_with_reasoning(
+                self.client,
+                agent_name="reviewer",
+                model_name=self.model_name,
+                call_kwargs={
+                    "model": self.model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": "Evaluate results."}
+                    ],
+                    "response_format": {'type': 'json_object'},
+                    "temperature": 0.1,
+                },
             )
             content = response.choices[0].message.content
             self.last_response = content
