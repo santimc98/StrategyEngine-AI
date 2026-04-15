@@ -75,6 +75,12 @@ _API_KEY_SENTINEL = object()
 
 _QA_SEVERITIES = {"HARD", "SOFT"}
 _CLEANING_SEVERITIES = {"HARD", "SOFT"}
+GATE_BINDING_FIELDS: Tuple[str, ...] = (
+    "applies_to_artifact",
+    "evaluated_by",
+    "evidence_source",
+    "phase_reasoning",
+)
 _DEFAULT_EXECUTION_PLANNER_COMPILER_MODEL = "google/gemini-3-flash-preview"
 
 # ── Token sets removed (seniority refactoring) ──────────────────────────
@@ -154,8 +160,24 @@ FULL EXAMPLE (full_pipeline with model_training=true):
       {"intent": "eda_plots", "path": "static/plots/*.png", "required": false, "kind": "visualization"}
     ],
     "cleaning_gates": [
-      {"name": "verify_no_leakage", "severity": "HARD", "params": {"forbidden_columns": ["created_at"]}},
-      {"name": "preferred_null_rate", "severity": "SOFT", "params": {"max_null_pct": 0.05}}
+      {
+        "name": "cleaning_manifest_excludes_audit_only_from_model_features",
+        "severity": "HARD",
+        "applies_to_artifact": "artifacts/clean/cleaning_manifest.json",
+        "evaluated_by": "cleaning_reviewer",
+        "evidence_source": "cleaning_manifest.model_features list",
+        "phase_reasoning": "The cleaned CSV may retain audit-only columns; the cleaning-phase invariant is that the manifest excludes them from model features.",
+        "params": {"forbidden_columns": ["created_at"]}
+      },
+      {
+        "name": "preferred_null_rate",
+        "severity": "SOFT",
+        "applies_to_artifact": "primary_cleaned_dataset",
+        "evaluated_by": "cleaning_reviewer",
+        "evidence_source": "cleaned CSV profile null rates",
+        "phase_reasoning": "Null-rate quality is observable directly on the primary cleaned dataset.",
+        "params": {"max_null_pct": 0.05}
+      }
     ],
     "runbook": {
       "objectives": ["Clean and prepare dataset for ML training"],
@@ -176,12 +198,44 @@ FULL EXAMPLE (full_pipeline with model_training=true):
       {"intent": "model_plots", "path": "static/plots/*.png", "required": false, "kind": "visualization"}
     ],
     "qa_gates": [
-      {"name": "metric_above_baseline", "severity": "HARD", "params": {"metric": "roc_auc", "min_value": 0.5}},
-      {"name": "no_target_leakage", "severity": "HARD", "params": {}}
+      {
+        "name": "metric_above_baseline",
+        "severity": "HARD",
+        "applies_to_artifact": "artifacts/ml/cv_metrics.json",
+        "evaluated_by": "qa_reviewer",
+        "evidence_source": "validation_metrics.json.roc_auc",
+        "phase_reasoning": "Model quality is only measurable after ML validation has produced metrics.",
+        "params": {"metric": "roc_auc", "min_value": 0.5}
+      },
+      {
+        "name": "no_target_leakage",
+        "severity": "HARD",
+        "applies_to_artifact": "artifacts/ml/model.pkl",
+        "evaluated_by": "qa_reviewer",
+        "evidence_source": "model.feature_names_in_",
+        "phase_reasoning": "Target leakage in the feature matrix is a property of the trained model inputs, not the cleaned CSV.",
+        "params": {"forbidden_columns": ["target"]}
+      }
     ],
     "reviewer_gates": [
-      {"name": "no_test_leakage", "severity": "HARD", "params": {}},
-      {"name": "reproducible_seed", "severity": "SOFT", "params": {}}
+      {
+        "name": "no_test_leakage",
+        "severity": "HARD",
+        "applies_to_artifact": "artifacts/ml/cv_metrics.json",
+        "evaluated_by": "qa_reviewer",
+        "evidence_source": "training code and validation metrics split metadata",
+        "phase_reasoning": "Split leakage is verifiable from ML execution evidence after validation.",
+        "params": {}
+      },
+      {
+        "name": "reproducible_seed",
+        "severity": "SOFT",
+        "applies_to_artifact": "artifacts/ml/cv_metrics.json",
+        "evaluated_by": "qa_reviewer",
+        "evidence_source": "metrics metadata and training code seed usage",
+        "phase_reasoning": "Reproducibility is verified against ML execution metadata.",
+        "params": {}
+      }
     ],
     "runbook": {
       "objectives": ["Train competitive gradient boosting model optimizing for the primary metric"],
@@ -285,8 +339,9 @@ BUSINESS_TRANSLATOR section:
 
 --- GATE CONVENTIONS ---
 
-Gate preferred shape: {"name": str, "severity": "HARD"|"SOFT", "params": object}
+Gate preferred shape: {"name": str, "severity": "HARD"|"SOFT", "applies_to_artifact": str, "evaluated_by": str, "evidence_source": str, "phase_reasoning": str, "params": object}
 Optional extensions: action_type, column_phase, final_state, condition, evidence_required, action_if_fail.
+The four binding fields are mandatory for newly compiled gates. They make every gate a verifiable proposition against a named artifact by a named reviewer.
 HARD: failure means corrupt, unsafe, or silently wrong output.
 SOFT: quality degraded but output remains usable.
 
@@ -513,6 +568,7 @@ Gates must be grounded in actual data risk, not template completeness.
 - HARD: failure makes the output corrupt, unsafe, or silently wrong (leakage surviving, target missing, schema violation).
 - SOFT: quality degraded but output remains usable (null rate above threshold, optional format).
 - Do not create gates for impossible conditions. Each gate must address a plausible risk visible in the data.
+- Gates you emit at the semantic layer may provisionally be placed under cleaning_gates or qa_gates, but you should NOT assume that placement is final. The compiler step (Senior Contract Architect) is authorized to relocate gates whose intent is not verifiable in the phase where you parked them.
 - When profiling reveals coarse granularity, tied values, grouped events, snapshots, or other legitimate boundary ambiguities, do not collapse a semantic invariant into a brittle literal rule. Preserve the intent of the invariant and express gates that remain valid under those observed data conditions.
 - Semantic closure for row-filtering rules: if you define a training_rows_rule, scoring_rows_rule, or any condition that partitions which rows belong in the output, ask yourself whether that condition will actually be enforced. Downstream agents treat cleaning_gates as the authoritative enforcement mechanism — a rule declared only in task_semantics or runbook may be treated as advisory and skipped. If a row-filtering condition is important enough to define, it is important enough to have a corresponding HARD cleaning gate that ensures enforcement.
 
@@ -536,16 +592,24 @@ OUTPUT
 """
 
 MINIMAL_CONTRACT_COMPILER_PROMPT = """
-You are a Senior Execution Contract Compiler for a multi-agent business intelligence system.
+You are the Senior Contract Architect for a multi-agent business intelligence system.
 
 MISSION
-Compile SEMANTIC_CORE_AUTHORITY_JSON into ONE executable JSON contract using the V5.0 HIERARCHICAL FORMAT. Your job is compilation, not reinterpretation. Build the smallest executable contract that preserves the semantic core and gives each downstream agent exactly what it needs — organized by agent hierarchy.
+Compose SEMANTIC_CORE_AUTHORITY_JSON into ONE executable JSON contract using the V5.0 HIERARCHICAL FORMAT.
+You are responsible for the execution topology of the run: which artifacts exist, which agent
+produces each one, and WHICH GATE EVALUATES AGAINST WHICH ARTIFACT.
 
-SOURCE OF TRUTH
-1. SEMANTIC_CORE_AUTHORITY_JSON is authoritative. Do not override it with SUPPORT_CONTEXT.
-2. SUPPORT_CONTEXT improves compilation quality but never overrides semantic decisions.
-3. Do not widen scope, renegotiate intent, or re-decide whether model_training is active.
-4. Do not narrow, strengthen, or reinterpret semantic row-partition rules from SEMANTIC_CORE_AUTHORITY_JSON. Compile them faithfully.
+The semantic_core declares intent, invariants, and hard constraints. It does not dictate topology.
+Gate placement (cleaning phase vs ML phase) and artifact binding are YOUR design decisions.
+Pass-through of gates without binding them to a specific artifact is forbidden when the binding is
+structurally ambiguous.
+
+SOURCE OF TRUTH - WHAT IS FROZEN VS WHAT YOU DESIGN
+FROZEN (never renegotiate): scope, primary target, primary metric, training_rows_rule,
+scoring_rows_rule, forbidden columns/leakage semantics, active_workstreams flags.
+YOUR DESIGN: artifact graph, gate-to-artifact binding, gate placement, number of DE outputs,
+and whether the contract needs a feature_matrix artifact separate from an audit-complete dataset.
+SUPPORT_CONTEXT improves compilation quality but never overrides semantic decisions.
 
 V5.0 HIERARCHICAL STRUCTURE
 The contract has a "shared" section plus one section per agent: data_engineer, ml_engineer, cleaning_reviewer, qa_reviewer, business_translator.
@@ -554,13 +618,14 @@ HIERARCHY PRINCIPLE: If a field is needed by 2+ agents, place it in "shared". If
 
 The cleaning_reviewer inherits the data_engineer context (cleaning_gates, artifact_requirements, etc.) automatically. The qa_reviewer inherits the ml_engineer context (qa_gates, evaluation_spec, etc.) automatically. You do NOT need to duplicate those fields — only add review-specific directives in the reviewer sections.
 
-FIVE CORE PRINCIPLES
+SEVEN CORE PRINCIPLES
 1. Evidence-grounded: Every field must be supported by evidence from semantic_core or support_context. Do not invent columns, paths, or artifacts.
 2. Semantic closure: If you declare a concept anywhere, close its dependencies everywhere. model_features must appear in cleaned_dataset.required_columns. Evaluation metric must match in evaluation_spec and validation_requirements. HARD gate columns and task_semantics dependencies must be covered by required_columns or optional_passthrough_columns even when they are excluded from model_features.
 3. Downstream-executable: Each downstream agent must be able to execute its task from its contract section alone (plus shared). The contract is the single source of truth for execution.
 4. No invention: Do not reference columns not in column_inventory, do not create training sections when model_training=false, do not invent artifacts beyond what the semantic core implies.
 5. Minimal: The shortest valid contract that satisfies principles 1-4. No filler sections, no padding with defaults when context provides specifics.
 6. Preserve semantic exclusions: if SEMANTIC_CORE_AUTHORITY_JSON or strategy reasoning marks a column as audit-only, reporting-only, stratification-only, or excluded from the initial model, keep it out of model_features. Represent it under audit_only_features or another non-model dependency surface when still operationally required.
+7. Phase coherence: every gate you emit must be verifiable by the agent you assign to it against the artifact you bind it to. If a gate talks about a feature matrix but no feature_matrix artifact exists, either create the artifact, relocate the gate to the phase where the feature matrix exists, or rephrase it as a manifest-declaration invariant.
 
 WHAT GOES IN "shared" (preserved verbatim from SEMANTIC_CORE where available)
 scope, active_workstreams, future_ml_handoff, task_semantics, column_roles, allowed_feature_sets, model_features, strategy_title, business_objective, output_dialect, canonical_columns, column_dtype_targets, iteration_policy.
@@ -584,7 +649,7 @@ Omitting the manifest path causes downstream validation failures because the sys
 DE OUTPUT DESIGN — REASON, DO NOT TEMPLATE
 The number and naming of DE output datasets is YOUR decision, not a template:
 - Reason about what the business objective actually needs. Some objectives need a single ML-ready CSV. Others may benefit from multiple outputs (e.g., a full-fidelity archive + a leakage-free modeling set).
-- One of the required_outputs MUST be marked "primary": true. This is the deliverable that downstream agents (reviewer, QA, ML Engineer) will use as their primary input. Cleaning gates are verified against THIS file.
+- One of the required_outputs MUST be marked "primary": true. This is the default deliverable downstream agents use. Gates may bind to the primary dataset, the cleaning manifest, a model artifact, metrics JSON, predictions CSV, or an explicitly materialized feature_matrix artifact, depending on where the evidence is observable.
 - The output path and filename should be descriptive of what the file contains (e.g., "dataset_enriched.csv" for a feature-engineered set, "dataset_audit.csv" for a full-fidelity archive). Do not blindly use "dataset_cleaned.csv" — name it based on its actual purpose.
 - If you produce multiple datasets, document in the runbook which one is the primary deliverable and why.
 
@@ -616,15 +681,54 @@ Runbooks state OBJECTIVES and CONSTRAINTS, not implementation recipes.
 CRITICAL: Strategy techniques in semantic_core are advisory hypotheses. Do NOT transcribe them as prescriptive steps. Abstract into objectives and let the downstream agent reason about implementation.
 
 GATE PRINCIPLES
-- HARD: failure means corrupt, unsafe, or silently wrong output.
-- SOFT: quality degraded but output remains usable.
-- Each gate must address a distinct, plausible risk grounded in the data. 5 well-reasoned gates beat 15 templated ones.
-- Place cleaning_gates in data_engineer section, qa_gates and reviewer_gates in ml_engineer section.
-- Cross-check row-filtering rules against gates: if the semantic core defines a training_rows_rule or scoring_rows_rule that excludes certain rows, verify that a corresponding cleaning gate enforces that exclusion. Downstream agents treat cleaning_gates as the authoritative enforcement mechanism — a rule present only in task_semantics or runbook may be treated as advisory and not enforced. If the semantic core did not include a matching gate but the row-filtering rule implies one, add it during compilation.
+Each gate is a PROPOSITION with four mandatory binding fields in addition to name/severity/params:
+- applies_to_artifact: path or intent-key of the artifact the reviewer checks.
+- evaluated_by: exact agent name that verdicts this gate ("cleaning_reviewer" or "qa_reviewer").
+- evidence_source: short phrase describing where the verifier looks (for example "cleaning_manifest.model_features", "model.feature_names_in_", "predictions.csv header", "validation_metrics.json.roc_auc").
+- phase_reasoning: one sentence justifying why this gate lives in this phase and not another.
+
+HARD = failure means corrupt, unsafe, or silently wrong output.
+SOFT = quality degraded but output remains usable.
+Each gate addresses a distinct, plausible risk grounded in the data. 5 well-bound gates beat 15 floating gates.
+
+PLACEMENT IS SEMANTIC, NOT TOPICAL
+The semantic_core may park invariants under cleaning_gates or qa_gates for convenience. You MUST relocate gates whose intent is not verifiable in the phase where they are parked:
+- A gate whose evidence_source is the trained model (feature_names_in_, coefficients, feature_importance) belongs in ml_engineer.qa_gates, never in data_engineer.cleaning_gates.
+- A gate whose evidence_source is a cleaned CSV header, cleaned dataset profile, or cleaning manifest declaration belongs in data_engineer.cleaning_gates.
+- A gate whose intent cannot be verified until the ML Engineer runs, but the semantic_core placed it under cleaning_gates, MUST be relocated.
+- Cross-check row-filtering rules against gates: if the semantic core defines a training_rows_rule or scoring_rows_rule that excludes certain rows, compile a gate bound to the artifact that can actually prove the row partition.
 
 SCOPE-CONDITIONAL LOGIC
 - When model_training=false: do not invent evaluation_spec, validation_requirements, or training sections in ml_engineer. Compile a handoff-ready cleaning/feature-prep contract.
 - When model_training=true: ml_engineer MUST include evaluation_spec, validation_requirements, runbook, and optimization_policy. A metrics JSON artifact must appear in ml_engineer.required_outputs.
+
+PHASE-COHERENCE SIMULATION - MANDATORY BEFORE EMITTING JSON
+For each gate in your compiled contract, perform this check. If any step fails, repair before emitting.
+
+Step 1 - Name the artifact. Resolve applies_to_artifact to a concrete entry in the owning agent's required_outputs. If no such entry exists, add an output or relocate the gate to an agent whose outputs contain the needed evidence.
+
+Step 2 - Simulate the verifier's point of view. Ask: "Given only this artifact and the evidence_source I named, can evaluated_by produce a definitive pass/fail?" If the evidence is not observable in that artifact, the binding is wrong.
+
+Step 3 - Trivial-failure check. For every gate whose params contain forbidden_columns, required_columns, or allowed_columns, compare that column set with the required_columns and optional_passthrough_columns declared on applies_to_artifact. If a forbidden column is required or passthrough on the same artifact, the gate fails by construction. Relocate the gate, rephrase it as a manifest invariant, or materialize a separate artifact.
+
+Step 4 - Feature-matrix materialization. If any gate mentions feature matrix, model input, or training features, choose exactly one valid topology:
+- Option alpha: no physical feature_matrix artifact exists; the ML Engineer builds X in memory. Put feature-matrix gates in ml_engineer.qa_gates with evidence_source pointing to model.feature_names_in_ or training-code inspection.
+- Option beta: materialize a feature_matrix.csv. Add it to data_engineer.required_outputs with explicit required_columns excluding target/leakage, and bind gates to that artifact.
+- Option gamma: keep the cleaned CSV audit-complete and enforce early via a cleaning manifest invariant such as cleaning_manifest.model_features excludes target/leakage columns.
+Never bind feature-matrix exclusion gates to an audit-complete CSV that intentionally retains target/leakage columns.
+
+Step 5 - Record your reasoning. Populate phase_reasoning on every gate in one grounded sentence.
+
+Example bound gate:
+{
+  "name": "no_leakage_in_trained_model",
+  "severity": "HARD",
+  "applies_to_artifact": "artifacts/ml/model.pkl",
+  "evaluated_by": "qa_reviewer",
+  "evidence_source": "model.feature_names_in_ intersected with semantic leakage columns",
+  "phase_reasoning": "Leakage absence is a property of the trained model feature set, not of an audit-complete cleaned CSV.",
+  "params": {"forbidden_columns": ["created_at"]}
+}
 
 OUTPUT
 - Return ONLY valid JSON. No markdown, no code fences, no reasoning traces.
@@ -655,6 +759,9 @@ Decision policy:
 Examples of acceptable semantic compilation:
 - semantic required outputs like "cleaned_dataset" become concrete artifact outputs with matching intent.
 - a cleaning gate whose action is to drop leakage/admin columns aligns with drop_columns rather than contradicting it.
+- phase_coherence_violation: a gate is placed where its evidence_source is unobservable, or its
+  forbidden/required columns contradict the artifact's declared columns. Resolution: relocate the
+  gate, rephrase it as a manifest invariant, or materialize a new artifact.
 
 Hard rules:
 - Do not invent missing contract fields.
@@ -672,6 +779,7 @@ Return format:
     }
   ]
 }
+"""
 
 
 def _coerce_provider_text(value: Any, depth: int = 0) -> str:
@@ -771,7 +879,6 @@ def _build_explicit_transport_failure(
         ],
         "summary": {"error_count": 1, "warning_count": 0, "phase": phase},
     }
-"""
 
 CONTRACT_SOURCE_OF_TRUTH_POLICY_V1 = {
     "contract_is_single_source_of_truth": True,
@@ -2971,7 +3078,7 @@ def _normalize_qa_gate_spec(item: Any) -> Dict[str, Any] | None:
             if param_key in item and param_key not in params:
                 params[param_key] = item.get(param_key)
         gate_spec: Dict[str, Any] = {"name": str(name), "severity": severity, "params": params}
-        for extra_key in ("condition", "evidence_required", "action_if_fail"):
+        for extra_key in ("condition", "evidence_required", "action_if_fail") + GATE_BINDING_FIELDS:
             if extra_key in item:
                 gate_spec[extra_key] = item.get(extra_key)
         return gate_spec
@@ -3028,7 +3135,7 @@ def _normalize_cleaning_gate_spec(item: Any) -> Dict[str, Any] | None:
             if param_key in item and param_key not in params:
                 params[param_key] = item.get(param_key)
         gate_spec: Dict[str, Any] = {"name": str(name), "severity": severity, "params": params}
-        for extra_key in ("condition", "evidence_required", "action_if_fail"):
+        for extra_key in ("condition", "evidence_required", "action_if_fail") + GATE_BINDING_FIELDS:
             if extra_key in item:
                 gate_spec[extra_key] = item.get(extra_key)
         return gate_spec
@@ -3058,12 +3165,22 @@ def _normalize_cleaning_gates(raw_gates: Any) -> List[Dict[str, Any]]:
 
 
 def _build_default_cleaning_gates() -> List[Dict[str, Any]]:
+    default_binding = {
+        "applies_to_artifact": "primary_cleaned_dataset",
+        "evaluated_by": "cleaning_reviewer",
+        "evidence_source": "primary cleaned CSV plus cleaning manifest",
+        "phase_reasoning": "This gate verifies a property observable at cleaning time on the primary cleaned output.",
+    }
+
+    def _gate(name: str, severity: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"name": name, "severity": severity, "params": params, **default_binding}
+
     return [
-        {"name": "required_columns_present", "severity": "HARD", "params": {}},
-        {
-            "name": "id_integrity",
-            "severity": "HARD",
-            "params": {
+        _gate("required_columns_present", "HARD", {}),
+        _gate(
+            "id_integrity",
+            "HARD",
+            {
                 "identifier_name_regex": (
                     r"(?i)(^id$|"
                     r"(?:^|[_\W])(?:id|entity|cod|code|key|partida|invoice|account)(?:[_\W]|$)|"
@@ -3071,29 +3188,25 @@ def _build_default_cleaning_gates() -> List[Dict[str, Any]]:
                 ),
                 "detect_scientific_notation": True,
             },
-        },
-        {
-            "name": "no_semantic_rescale",
-            "severity": "HARD",
-            "params": {
+        ),
+        _gate(
+            "no_semantic_rescale",
+            "HARD",
+            {
                 "allow_percent_like_only": True,
                 "percent_like_name_regex": r"(?i)%|pct|percent|plazo",
             },
-        },
-        {"name": "no_synthetic_data", "severity": "HARD", "params": {}},
-        {
-            "name": "row_count_sanity",
-            "severity": "SOFT",
-            "params": {"max_drop_pct": 5.0, "max_dup_increase_pct": 1.0},
-        },
-        {
-            "name": "feature_coverage_sanity",
-            "severity": "SOFT",
-            "params": {
+        ),
+        _gate("no_synthetic_data", "HARD", {}),
+        _gate("row_count_sanity", "SOFT", {"max_drop_pct": 5.0, "max_dup_increase_pct": 1.0}),
+        _gate(
+            "feature_coverage_sanity",
+            "SOFT",
+            {
                 "min_feature_count": 3,
                 "check_against": "data_atlas",
             },
-        },
+        ),
     ]
 
 
@@ -3112,6 +3225,374 @@ def _apply_cleaning_gate_policy(raw_gates: Any) -> List[Dict[str, Any]]:
             merged.append(gate)
             existing.add(name)
     return merged
+
+
+def _validate_gate_phase_coherence(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Structural coherence check for gate binding and phase placement."""
+    violations: List[Dict[str, Any]] = []
+    if not isinstance(contract, dict):
+        return {"status": "violations", "violations": [
+            {
+                "gate_name": "<contract>",
+                "agent": "<unknown>",
+                "gate_field": "",
+                "kind": "unresolved_artifact",
+                "detail": "Contract is not a dictionary; gate phase coherence cannot be evaluated.",
+                "suggested_action": "repair_contract_shape",
+            }
+        ]}
+
+    def _section(agent: str) -> Dict[str, Any]:
+        section = contract.get(agent)
+        return section if isinstance(section, dict) else {}
+
+    def _clean_token(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    def _path_token(value: Any) -> str:
+        return normalize_artifact_path(value or "").strip().lower()
+
+    def _as_list(value: Any) -> List[Any]:
+        return value if isinstance(value, list) else []
+
+    def _as_str_set(value: Any) -> set[str]:
+        if isinstance(value, str) and value.strip():
+            return {value.strip()}
+        if not isinstance(value, list):
+            return set()
+        return {str(item).strip() for item in value if str(item or "").strip()}
+
+    def _required_outputs(agent: str) -> List[Dict[str, Any]]:
+        outputs = _section(agent).get("required_outputs")
+        if not isinstance(outputs, list):
+            return []
+        normalized: List[Dict[str, Any]] = []
+        for item in outputs:
+            if isinstance(item, dict):
+                normalized.append(item)
+            elif isinstance(item, str) and item.strip():
+                normalized.append({"path": item.strip(), "intent": "", "kind": ""})
+        return normalized
+
+    def _artifact_requirements(agent: str) -> Dict[str, Any]:
+        requirements = _section(agent).get("artifact_requirements")
+        return requirements if isinstance(requirements, dict) else {}
+
+    def _primary_output(agent: str) -> Dict[str, Any] | None:
+        outputs = _required_outputs(agent)
+        for output in outputs:
+            if bool(output.get("primary")):
+                return output
+        for output in outputs:
+            intent = _clean_token(output.get("intent"))
+            kind = _clean_token(output.get("kind"))
+            if intent in {"primary_deliverable", "cleaned_dataset", "primary_cleaned_dataset"}:
+                return output
+            if agent == "data_engineer" and kind == "dataset":
+                return output
+        return outputs[0] if outputs else None
+
+    def _matches_output(output: Dict[str, Any], artifact_key: str) -> bool:
+        key = _clean_token(artifact_key)
+        key_path = _path_token(artifact_key)
+        if not key:
+            return False
+        path = _path_token(output.get("path") or output.get("output_path") or output.get("file"))
+        intent = _clean_token(output.get("intent"))
+        kind = _clean_token(output.get("kind"))
+        name = _clean_token(output.get("name") or output.get("id"))
+        if key in {intent, kind, name}:
+            return True
+        if key_path and path and key_path == path:
+            return True
+        if key in {"validation_metrics", "cv_metrics", "metrics"} and (intent in {"validation_metrics", "cv_metrics"} or kind == "metrics"):
+            return True
+        if key in {"model_artifact", "model", "trained_model"} and (intent in {"model_artifact", "model"} or kind == "model"):
+            return True
+        if key in {"predictions", "scored_csv", "scored_rows"} and (intent in {"predictions", "scored_csv", "scored_rows"} or kind == "predictions"):
+            return True
+        if key in {"cleaning_manifest", "manifest"} and (intent == "cleaning_manifest" or kind == "manifest"):
+            return True
+        return False
+
+    def _requirement_path(requirement: Dict[str, Any]) -> str:
+        for key in ("output_path", "path", "file", "artifact", "scored_csv_path", "metrics_path", "model_path"):
+            path = _path_token(requirement.get(key))
+            if path:
+                return path
+        return ""
+
+    def _matching_requirement(agent: str, artifact_key: str, output: Dict[str, Any] | None) -> Tuple[str, Dict[str, Any] | None]:
+        reqs = _artifact_requirements(agent)
+        key = _clean_token(artifact_key)
+        output_path = _path_token(output.get("path")) if isinstance(output, dict) else ""
+        output_intent = _clean_token(output.get("intent")) if isinstance(output, dict) else ""
+        aliases = {
+            "primary_cleaned_dataset": {"cleaned_dataset", "primary_cleaned_dataset", "primary_deliverable"},
+            "cleaned_dataset": {"cleaned_dataset", "primary_cleaned_dataset", "primary_deliverable"},
+            "cleaning_manifest": {"cleaning_manifest", "manifest"},
+            "validation_metrics": {"validation_metrics", "cv_metrics", "metrics"},
+            "model_artifact": {"model_artifact", "model", "model_path"},
+            "predictions": {"predictions", "scored_csv", "scored_rows"},
+        }
+        alias_set = aliases.get(key, {key})
+        if output_intent:
+            alias_set = set(alias_set) | {output_intent}
+        for req_key, requirement in reqs.items():
+            if not isinstance(requirement, dict):
+                continue
+            req_key_norm = _clean_token(req_key)
+            req_path = _requirement_path(requirement)
+            if req_key_norm in alias_set or req_key_norm == key:
+                return str(req_key), requirement
+            if output_path and req_path and output_path == req_path:
+                return str(req_key), requirement
+            if key and req_path and _path_token(artifact_key) == req_path:
+                return str(req_key), requirement
+        return "", None
+
+    def _resolve_artifact(agent: str, artifact_key: Any) -> Dict[str, Any] | None:
+        key = str(artifact_key or "").strip()
+        if not key:
+            return None
+        if _clean_token(key) == "primary_cleaned_dataset" and agent == "data_engineer":
+            output = _primary_output(agent)
+            if output:
+                req_key, requirement = _matching_requirement(agent, key, output)
+                return {"output": output, "requirement_key": req_key, "requirement": requirement}
+        for output in _required_outputs(agent):
+            if _matches_output(output, key):
+                req_key, requirement = _matching_requirement(agent, key, output)
+                return {"output": output, "requirement_key": req_key, "requirement": requirement}
+        req_key, requirement = _matching_requirement(agent, key, None)
+        if isinstance(requirement, dict):
+            req_path = _requirement_path(requirement)
+            for output in _required_outputs(agent):
+                if req_path and _path_token(output.get("path")) == req_path:
+                    return {"output": output, "requirement_key": req_key, "requirement": requirement}
+        return None
+
+    def _declared_columns(resolved: Dict[str, Any] | None) -> set[str]:
+        columns: set[str] = set()
+        if not isinstance(resolved, dict):
+            return columns
+        output = resolved.get("output")
+        requirement = resolved.get("requirement")
+        for payload in (requirement, output):
+            if not isinstance(payload, dict):
+                continue
+            for key in (
+                "required_columns",
+                "optional_passthrough_columns",
+                "columns",
+                "schema_columns",
+                "expected_columns",
+            ):
+                columns.update(_as_str_set(payload.get(key)))
+            schema = payload.get("schema")
+            if isinstance(schema, dict):
+                columns.update(_as_str_set(schema.get("columns")))
+        return columns
+
+    def _gate_text(gate: Dict[str, Any]) -> str:
+        parts = [
+            str(gate.get("name") or ""),
+            str(gate.get("description") or ""),
+            str(gate.get("evidence_source") or ""),
+            str(gate.get("phase_reasoning") or ""),
+        ]
+        params = gate.get("params")
+        if isinstance(params, dict):
+            parts.extend(str(value) for value in params.values() if value is not None)
+        return " ".join(parts).lower()
+
+    def _default_artifact_for_gate(agent: str, gate_field: str) -> str:
+        if agent == "data_engineer" and gate_field == "cleaning_gates":
+            return "primary_cleaned_dataset"
+        if gate_field == "reviewer_gates":
+            return "validation_metrics"
+        return "validation_metrics"
+
+    def _add_violation(
+        *,
+        gate_name: str,
+        agent: str,
+        gate_field: str,
+        kind: str,
+        detail: str,
+        suggested_action: str,
+        artifact_key: str = "",
+    ) -> None:
+        violations.append(
+            {
+                "gate_name": gate_name,
+                "agent": agent,
+                "gate_field": gate_field,
+                "kind": kind,
+                "detail": detail,
+                "suggested_action": suggested_action,
+                "applies_to_artifact": artifact_key,
+            }
+        )
+
+    ml_evidence_tokens = (
+        "feature_names_in_",
+        "trained model",
+        "feature_importance",
+        "roc_auc",
+        "pr_auc",
+        "validation_metrics",
+        "model.pkl",
+        "feature matrix",
+        "model input",
+        "training features",
+    )
+    cleaning_evidence_tokens = (
+        "cleaned csv header",
+        "cleaned_dataset",
+        "cleaning_manifest",
+        "dtype coercion",
+        "duplicate row",
+        "row count",
+    )
+    gate_sources = (
+        ("data_engineer", "cleaning_gates"),
+        ("ml_engineer", "qa_gates"),
+        ("ml_engineer", "reviewer_gates"),
+    )
+    for agent, gate_field in gate_sources:
+        raw_gates = _section(agent).get(gate_field)
+        if not isinstance(raw_gates, list):
+            continue
+        for gate in raw_gates:
+            if not isinstance(gate, dict):
+                continue
+            gate_name = str(gate.get("name") or gate.get("id") or gate.get("gate") or "<unnamed>")
+            missing_fields = [
+                field
+                for field in GATE_BINDING_FIELDS
+                if not str(gate.get(field) or "").strip()
+            ]
+            artifact_key = str(gate.get("applies_to_artifact") or "").strip()
+            effective_artifact_key = artifact_key or _default_artifact_for_gate(agent, gate_field)
+            if missing_fields:
+                _add_violation(
+                    gate_name=gate_name,
+                    agent=agent,
+                    gate_field=gate_field,
+                    kind="missing_binding",
+                    detail=(
+                        f"Gate {gate_field}.{gate_name} is missing binding fields: "
+                        + ", ".join(missing_fields)
+                    ),
+                    suggested_action="add_binding",
+                    artifact_key=effective_artifact_key,
+                )
+            resolved = _resolve_artifact(agent, effective_artifact_key)
+            if resolved is None:
+                _add_violation(
+                    gate_name=gate_name,
+                    agent=agent,
+                    gate_field=gate_field,
+                    kind="unresolved_artifact",
+                    detail=f"applies_to_artifact={effective_artifact_key!r} does not resolve to {agent}.required_outputs.",
+                    suggested_action="add_binding",
+                    artifact_key=effective_artifact_key,
+                )
+                continue
+
+            params = gate.get("params")
+            params = params if isinstance(params, dict) else {}
+            forbidden = _as_str_set(params.get("forbidden_columns"))
+            if forbidden:
+                declared = _declared_columns(resolved)
+                clash = sorted(forbidden & declared)
+                if clash:
+                    suggested = "relocate_to_ml_engineer" if agent == "data_engineer" else "rephrase_as_manifest_invariant"
+                    _add_violation(
+                        gate_name=gate_name,
+                        agent=agent,
+                        gate_field=gate_field,
+                        kind="structural_contradiction",
+                        detail=(
+                            f"Gate forbids columns {clash}, but artifact {effective_artifact_key!r} "
+                            "declares them in required_columns/optional_passthrough_columns."
+                        ),
+                        suggested_action=suggested,
+                        artifact_key=effective_artifact_key,
+                    )
+
+            text = _gate_text(gate)
+            if agent == "data_engineer" and any(token in text for token in ml_evidence_tokens):
+                _add_violation(
+                    gate_name=gate_name,
+                    agent=agent,
+                    gate_field=gate_field,
+                    kind="phase_mismatch",
+                    detail="Gate text/evidence refers to ML-phase objects but the gate lives in the cleaning phase.",
+                    suggested_action="relocate_to_ml_engineer",
+                    artifact_key=effective_artifact_key,
+                )
+            if agent == "ml_engineer" and any(token in text for token in cleaning_evidence_tokens):
+                _add_violation(
+                    gate_name=gate_name,
+                    agent=agent,
+                    gate_field=gate_field,
+                    kind="phase_mismatch",
+                    detail="Gate text/evidence refers to cleaning-phase objects but the gate lives in the ML phase.",
+                    suggested_action="relocate_to_data_engineer",
+                    artifact_key=effective_artifact_key,
+                )
+
+    return {"status": "ok" if not violations else "violations", "violations": violations}
+
+
+def _phase_coherence_validation_result(coherence: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(coherence, dict) or coherence.get("status") != "violations":
+        return {"status": "ok", "accepted": True, "issues": [], "summary": {"error_count": 0, "warning_count": 0}}
+    issues: List[Dict[str, Any]] = []
+    raw_violations = coherence.get("violations")
+    if not isinstance(raw_violations, list):
+        raw_violations = []
+    for violation in raw_violations:
+        if not isinstance(violation, dict):
+            continue
+        kind = str(violation.get("kind") or "unknown").strip() or "unknown"
+        issues.append(
+            {
+                "severity": "error",
+                "rule": f"contract.phase_coherence.{kind}",
+                "message": str(violation.get("detail") or ""),
+                "phase": "phase_coherence",
+                "gate_name": violation.get("gate_name"),
+                "gate_field": violation.get("gate_field"),
+                "agent": violation.get("agent"),
+                "applies_to_artifact": violation.get("applies_to_artifact"),
+                "suggested_action": violation.get("suggested_action"),
+            }
+        )
+    return {
+        "status": "error" if issues else "ok",
+        "accepted": not issues,
+        "issues": issues,
+        "summary": {"error_count": len(issues), "warning_count": 0, "phase": "phase_coherence"},
+    }
+
+
+def _validation_has_phase_coherence_errors(validation_result: Dict[str, Any] | None) -> bool:
+    if not isinstance(validation_result, dict):
+        return False
+    issues = validation_result.get("issues")
+    if not isinstance(issues, list):
+        return False
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        rule = str(issue.get("rule") or "")
+        severity = str(issue.get("severity") or "").lower()
+        if rule.startswith("contract.phase_coherence.") and severity in {"error", "fail"}:
+            return True
+    return False
 
 
 _DEFAULT_MISSING_CATEGORY_VALUE = "__MISSING__"
@@ -3689,21 +4170,31 @@ def _build_default_qa_gates(
 ) -> List[Dict[str, Any]]:
     requires_target = _infer_requires_target(strategy, contract)
     allow_resampling = _allow_resampling_random(requires_target, contract)
+    default_binding = {
+        "applies_to_artifact": "validation_metrics",
+        "evaluated_by": "qa_reviewer",
+        "evidence_source": "ML execution artifacts and validation metrics",
+        "phase_reasoning": "This gate verifies a property observable after the ML Engineer executes.",
+    }
+
+    def _gate(name: str, severity: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"name": name, "severity": severity, "params": params, **default_binding}
+
     gates: List[Dict[str, Any]] = [
-        {"name": "security_sandbox", "severity": "HARD", "params": {}},
-        {"name": "must_read_input_csv", "severity": "HARD", "params": {}},
-        {"name": "must_reference_contract_columns", "severity": "HARD", "params": {}},
-        {"name": "no_synthetic_data", "severity": "HARD", "params": {"allow_resampling_random": allow_resampling}},
-        {"name": "output_row_count_consistency", "severity": "HARD", "params": {}},
-        {"name": "dialect_mismatch_handling", "severity": "SOFT", "params": {}},
-        {"name": "group_split_required", "severity": "SOFT", "params": {}},
+        _gate("security_sandbox", "HARD", {}),
+        _gate("must_read_input_csv", "HARD", {}),
+        _gate("must_reference_contract_columns", "HARD", {}),
+        _gate("no_synthetic_data", "HARD", {"allow_resampling_random": allow_resampling}),
+        _gate("output_row_count_consistency", "HARD", {}),
+        _gate("dialect_mismatch_handling", "SOFT", {}),
+        _gate("group_split_required", "SOFT", {}),
     ]
     if requires_target:
         gates.extend(
             [
-                {"name": "target_variance_guard", "severity": "HARD", "params": {}},
-                {"name": "leakage_prevention", "severity": "HARD", "params": {}},
-                {"name": "train_eval_split", "severity": "SOFT", "params": {}},
+                _gate("target_variance_guard", "HARD", {}),
+                _gate("leakage_prevention", "HARD", {}),
+                _gate("train_eval_split", "SOFT", {}),
             ]
         )
     return gates
@@ -3732,7 +4223,17 @@ def _apply_qa_gate_policy(
         for gate in gates
         if isinstance(gate, dict)
     ):
-        gates.append({"name": "output_row_count_consistency", "severity": "HARD", "params": {}})
+        gates.append(
+            {
+                "name": "output_row_count_consistency",
+                "severity": "HARD",
+                "params": {},
+                "applies_to_artifact": "validation_metrics",
+                "evaluated_by": "qa_reviewer",
+                "evidence_source": "ML execution artifacts and validation metrics",
+                "phase_reasoning": "Output row consistency is verified after ML artifacts are produced.",
+            }
+        )
     return gates
 
 
@@ -4116,6 +4617,10 @@ def _ensure_benchmark_kpi_gate(
                 "type": "metric_report",
                 "params": {"metric": kpi, "validation": "cross_validation_or_holdout"},
                 "severity": "warning",
+                "applies_to_artifact": "validation_metrics",
+                "evaluated_by": "qa_reviewer",
+                "evidence_source": "validation metrics JSON primary metric entry",
+                "phase_reasoning": "Benchmark KPI reporting is verifiable after ML validation metrics are produced.",
             }
         )
 
@@ -5893,6 +6398,11 @@ def _build_contract_repair_hints(
             continue
         seen_rules.add(rule)
         action = get_contract_schema_repair_action(rule)
+        if not action and rule.startswith("contract.phase_coherence."):
+            action = (
+                "Repair gate phase coherence: bind every gate to an existing artifact, name the evaluator/evidence, "
+                "and relocate/rephrase gates whose evidence is not observable in their current phase."
+            )
         hint_text = action or message or "Apply minimal structural fix for this rule."
         hints.append(f"{rule}: {hint_text}")
         if len(hints) >= max(3, min(max_hints, 5)):
@@ -10129,6 +10639,20 @@ class ExecutionPlannerAgent:
                     "(NOT 'type'). Example: {\"target_dtype\": \"float64\", \"nullable\": false}. "
                     "Replace all {\"type\": X} with {\"target_dtype\": X}."
                 ),
+                "contract.phase_coherence.missing_binding": (
+                    "Add applies_to_artifact, evaluated_by, evidence_source, and phase_reasoning to every gate."
+                ),
+                "contract.phase_coherence.unresolved_artifact": (
+                    "Bind each gate to an artifact that exists in the owning agent's required_outputs, or add/relocate the artifact."
+                ),
+                "contract.phase_coherence.structural_contradiction": (
+                    "If a gate forbids columns that the same artifact requires or passes through, relocate it to ML QA, "
+                    "rephrase it as a cleaning_manifest invariant, or materialize a separate feature_matrix artifact."
+                ),
+                "contract.phase_coherence.phase_mismatch": (
+                    "Move gates to the phase where their evidence is observable: model feature gates to ml_engineer.qa_gates; "
+                    "cleaned CSV/manifest gates to data_engineer.cleaning_gates."
+                ),
             }
             for issue in issues:
                 if not isinstance(issue, dict):
@@ -10138,6 +10662,11 @@ class ExecutionPlannerAgent:
                     continue
                 seen.add(rule)
                 action = rule_to_action.get(rule) or get_contract_schema_repair_action(rule)
+                if not action and rule.startswith("contract.phase_coherence."):
+                    action = (
+                        "Repair gate phase coherence: every gate must name applies_to_artifact, evaluated_by, "
+                        "evidence_source, and phase_reasoning, and the artifact/evidence must be observable in that phase."
+                    )
                 if action:
                     actions.append(f"- {action}")
                 else:
@@ -10226,9 +10755,12 @@ class ExecutionPlannerAgent:
                 "aligned with strategy/evidence so views can request the right visuals.\n"
                 "When active_workstreams.model_training=false but future_ml_handoff is in scope, do not invent training/CV sections; instead make future_ml_handoff and enriched_dataset coverage explicit.\n"
                 "Gate lists must be executable by downstream views: use gate objects with "
-                "{name, severity, params} (severity in HARD|SOFT). If using metric/check/rule language, "
+                "{name, severity, params, applies_to_artifact, evaluated_by, evidence_source, phase_reasoning} "
+                "(severity in HARD|SOFT). If using metric/check/rule language, "
                 "map it to name and keep semantic details in params.\n"
-                "Gate example: {\"name\": \"no_nulls_target\", \"severity\": \"HARD\", \"params\": {\"column\": \"target\"}}.\n"
+                "Feature-matrix gates must not be bound to an audit-complete cleaned CSV that retains target/leakage; "
+                "relocate them to ml_engineer.qa_gates, bind them to model.pkl/model.feature_names_in_, rephrase as a cleaning_manifest.model_features invariant, or materialize a feature_matrix artifact.\n"
+                "Gate example: {\"name\": \"no_nulls_target\", \"severity\": \"HARD\", \"applies_to_artifact\": \"primary_cleaned_dataset\", \"evaluated_by\": \"cleaning_reviewer\", \"evidence_source\": \"cleaned CSV header/profile\", \"phase_reasoning\": \"Null target values are observable in the cleaned dataset.\", \"params\": {\"column\": \"target\"}}.\n"
                 "Canonical top-level minimum keys to preserve: "
                 + json.dumps(required_top_level)
                 + "\n\nTargeted fixes to apply first:\n"
@@ -10504,7 +11036,25 @@ class ExecutionPlannerAgent:
                     model_name=self.model_name,
                     trace_stage="contract_diagnostics_adjudication",
                 )
+                phase_coherence = _validate_gate_phase_coherence(contract)
+                validation_result = _merge_validation_results(
+                    validation_result,
+                    _phase_coherence_validation_result(phase_coherence),
+                )
             except Exception as err:
+                phase_coherence = {
+                    "status": "violations",
+                    "violations": [
+                        {
+                            "gate_name": "<validation>",
+                            "agent": "<unknown>",
+                            "gate_field": "",
+                            "kind": "phase_validation_exception",
+                            "detail": str(err),
+                            "suggested_action": "inspect_contract_validation",
+                        }
+                    ],
+                }
                 validation_result = {
                     "status": "error",
                     "accepted": False,
@@ -10518,6 +11068,7 @@ class ExecutionPlannerAgent:
                     "summary": {"error_count": 1, "warning_count": 0},
                 }
 
+            diagnostics["phase_coherence"] = phase_coherence
             status = str(validation_result.get("status") or "unknown").lower()
             issues = validation_result.get("issues") if isinstance(validation_result, dict) else []
             accepted = _contract_is_accepted(validation_result if isinstance(validation_result, dict) else None)
@@ -10565,7 +11116,9 @@ class ExecutionPlannerAgent:
             return diagnostics
 
         def _finalize_and_persist(contract, where, llm_success: bool):
+            nonlocal planner_contract_canonical
             projection_contract = None
+            post_generation_repair_trace: List[Dict[str, Any]] = []
             if (
                 isinstance(contract, dict)
                 and contract
@@ -10604,6 +11157,9 @@ class ExecutionPlannerAgent:
                         "Do NOT regenerate the full contract.\n"
                         "Keep required_outputs as artifact outputs; if rich object entries already exist, preserve them.\n"
                         "Preserve required_output_artifacts and spec_extraction.deliverables if present.\n"
+                        "For phase_coherence issues, repair gate topology: add missing gate binding fields, "
+                        "bind applies_to_artifact to an existing required_output, relocate ML-evidence gates to ml_engineer.qa_gates, "
+                        "or rephrase cleaning-phase gates as cleaning_manifest invariants.\n"
                         + "Attempt "
                         + str(attempt)
                         + "/2.\n\n"
@@ -10641,21 +11197,45 @@ class ExecutionPlannerAgent:
                         return {"changes": parsed.get("judgment_patch")}
                     return {"changes": parsed}
 
-                post_validation = _merge_validation_results(
-                    _validate_contract_quality(contract),
-                    _build_semantic_guard_validation(planner_semantic_core, contract),
-                )
-                post_validation = _adjudicate_ambiguous_validation_issues(
-                    planner_semantic_core,
-                    contract,
-                    post_validation,
-                    model_client=self._build_model_client(self.model_name) if self.client else None,
-                    model_name=self.model_name,
-                    trace_stage="finalize_post_validation_adjudication",
-                )
+                def _post_generation_validator(payload: Dict[str, Any]) -> Dict[str, Any]:
+                    result = _merge_validation_results(
+                        _validate_contract_quality(payload),
+                        _build_semantic_guard_validation(planner_semantic_core, payload),
+                    )
+                    result = _adjudicate_ambiguous_validation_issues(
+                        planner_semantic_core,
+                        payload,
+                        result,
+                        model_client=self._build_model_client(self.model_name) if self.client else None,
+                        model_name=self.model_name,
+                        trace_stage="finalize_post_validation_adjudication",
+                    )
+                    return _merge_validation_results(
+                        result,
+                        _phase_coherence_validation_result(_validate_gate_phase_coherence(payload)),
+                    )
+
+                post_validation = _post_generation_validator(contract)
+                if (
+                    not _contract_is_accepted(post_validation)
+                    and _validation_has_phase_coherence_errors(post_validation)
+                ):
+                    repaired_contract, repaired_validation, repair_trace = _validate_repair_revalidate_loop(
+                        contract,
+                        _post_generation_validator,
+                        repair_provider=_llm_minimal_repair_provider,
+                        max_iterations=2,
+                    )
+                    post_generation_repair_trace = repair_trace
+                    if _contract_is_accepted(repaired_validation):
+                        contract = repaired_contract
+                        planner_contract_canonical = copy.deepcopy(repaired_contract)
+                        projection_contract = _apply_planner_structural_support(contract)
             diagnostics = _build_contract_diagnostics(contract if isinstance(contract, dict) else {}, where, llm_success)
             if isinstance(diagnostics, dict):
                 diagnostics["llm_call_trace"] = copy.deepcopy(planner_llm_call_trace)
+                if post_generation_repair_trace:
+                    diagnostics["post_generation_repair_trace"] = post_generation_repair_trace
             self.last_contract_diagnostics = diagnostics
             self.last_llm_call_trace = copy.deepcopy(planner_llm_call_trace)
             _persist_contracts(
@@ -10981,7 +11561,7 @@ domain_expert_critique:
         latest_response_text_for_repair: str | None = None
         latest_parse_feedback_for_repair: str | None = None
 
-        max_quality_rounds = 1
+        max_quality_rounds = 3
 
         current_prompt = semantic_prompt
         current_prompt_name = "semantic_prompt_attempt_1.txt"
@@ -11304,6 +11884,12 @@ domain_expert_critique:
                                 model_name=model_name,
                                 trace_stage="compile_validation_adjudication",
                             )
+                            validation_result = _merge_validation_results(
+                                validation_result,
+                                _phase_coherence_validation_result(
+                                    _validate_gate_phase_coherence(candidate_for_validation)
+                                ),
+                            )
                         except Exception as val_err:
                             validation_result = {
                                 "status": "error",
@@ -11473,6 +12059,8 @@ domain_expert_critique:
                     if isinstance(latest_validation_for_repair, dict)
                     else best_validation
                 )
+                if not _validation_has_phase_coherence_errors(repair_validation):
+                    break
                 repair_response_text = (
                     latest_response_text_for_repair
                     if isinstance(latest_response_text_for_repair, str)
@@ -11494,6 +12082,8 @@ domain_expert_critique:
                     "Your previous contract was rejected. Fix the issues below and return the COMPLETE corrected contract.\n"
                     f"Every required top-level key MUST be present: {', '.join(EXECUTION_CONTRACT_V5_CANONICAL_REQUIRED_KEYS + list(V5_AGENT_SECTION_KEYS))}.\n"
                     'contract_version MUST be "5.0". Use V5.0 hierarchical structure (shared + per-agent sections).\n'
+                    "Every gate MUST include applies_to_artifact, evaluated_by, evidence_source, and phase_reasoning.\n"
+                    "If a gate forbids columns that the bound artifact intentionally retains, do not leave it there: relocate it to ML QA, rephrase it as a cleaning_manifest.model_features invariant, or materialize a separate feature_matrix artifact.\n"
                 )
                 if targeted_actions.strip():
                     repair_suffix += f"\nTargeted fixes:\n{targeted_actions}\n"
