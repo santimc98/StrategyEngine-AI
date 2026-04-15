@@ -85,7 +85,7 @@ class ResultsAdvisorAgent:
         )
         self._generation_config = {
             "temperature": float(os.getenv("RESULTS_ADVISOR_TEMPERATURE", "0.2")),
-            "max_tokens": int(os.getenv("RESULTS_ADVISOR_MAX_TOKENS", "8192")),
+            "max_tokens": int(os.getenv("RESULTS_ADVISOR_MAX_TOKENS", "32768")),
         }
         schema_flag = str(
             os.getenv(

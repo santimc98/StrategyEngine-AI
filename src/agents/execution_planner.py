@@ -70,6 +70,9 @@ from src.utils.problem_capabilities import (
 from src.utils.openrouter_reasoning import (
     apply_reasoning_to_call_kwargs,
     is_reasoning_parameter_error,
+    is_token_budget_parameter_error,
+    lower_token_budget_in_call_kwargs,
+    pop_internal_call_markers,
     strip_reasoning_from_call_kwargs,
 )
 
@@ -89,6 +92,17 @@ GATE_BINDING_FIELDS: Tuple[str, ...] = (
 )
 GATE_BINDING_PLACEHOLDER_TOKENS = {"", "tbd", "todo", "n/a", "na", "none", "null", "placeholder", "?"}
 _DEFAULT_EXECUTION_PLANNER_COMPILER_MODEL = "google/gemini-3-flash-preview"
+_OPENROUTER_GENERATION_ID_RE = re.compile(r"^(gen|chatcmpl|resp|msg)-[A-Za-z0-9_-]{8,}$")
+
+
+def _looks_like_transport_marker_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if _OPENROUTER_GENERATION_ID_RE.match(text):
+        return True
+    lowered = text.lower()
+    return lowered in {"stop", "length", "tool_calls", "content_filter"}
 
 # ── Token sets removed (seniority refactoring) ──────────────────────────
 # Capability detection (resampling, decisioning, explanation, visualization)
@@ -495,6 +509,7 @@ class _OpenRouterAdapter:
             model_name=self.model_name,
         )
         reasoning_applied = bool(call_kwargs.pop("_codex_reasoning_applied", False))
+        call_kwargs = pop_internal_call_markers(call_kwargs)
         use_raw_capture = str(os.getenv("EXECUTION_PLANNER_CAPTURE_RAW_RESPONSE", "")).strip().lower() in {
             "1",
             "true",
@@ -505,14 +520,35 @@ class _OpenRouterAdapter:
             raw_api = getattr(self._client.chat.completions, "with_raw_response", None)
             if raw_api is None or not hasattr(raw_api, "create"):
                 raise RuntimeError("with_raw_response transport unavailable while raw capture is enabled")
+            reasoning_stripped = False
+            attempted_token_budgets: set[int] = set()
             try:
-                raw_response = raw_api.create(**call_kwargs)
-            except Exception as exc:
-                if reasoning_applied and is_reasoning_parameter_error(exc):
-                    call_kwargs = strip_reasoning_from_call_kwargs(call_kwargs)
-                    raw_response = raw_api.create(**call_kwargs)
-                else:
-                    raise
+                while True:
+                    try:
+                        raw_response = raw_api.create(**call_kwargs)
+                        break
+                    except Exception as exc:
+                        if reasoning_applied and not reasoning_stripped and is_reasoning_parameter_error(exc):
+                            call_kwargs = strip_reasoning_from_call_kwargs(call_kwargs)
+                            reasoning_stripped = True
+                            continue
+                        if is_token_budget_parameter_error(exc):
+                            current_tokens = call_kwargs.get("max_tokens")
+                            try:
+                                current_token_int = int(current_tokens)
+                            except Exception:
+                                current_token_int = None
+                            if current_token_int is not None:
+                                if current_token_int in attempted_token_budgets:
+                                    raise
+                                attempted_token_budgets.add(current_token_int)
+                            lowered_kwargs = lower_token_budget_in_call_kwargs(call_kwargs)
+                            if lowered_kwargs is not None:
+                                call_kwargs = lowered_kwargs
+                                continue
+                        raise
+            except Exception:
+                raise
             response = raw_response.parse() if hasattr(raw_response, "parse") else raw_response
             raw_body = _read_openai_raw_response_body(raw_response)
             raw_http_response = getattr(raw_response, "http_response", None)
@@ -538,12 +574,31 @@ class _OpenRouterAdapter:
                 pass
             return response
 
-        try:
-            response = self._client.chat.completions.create(**call_kwargs)
-        except Exception as exc:
-            if reasoning_applied and is_reasoning_parameter_error(exc):
-                response = self._client.chat.completions.create(**strip_reasoning_from_call_kwargs(call_kwargs))
-            else:
+        reasoning_stripped = False
+        attempted_token_budgets: set[int] = set()
+        while True:
+            try:
+                response = self._client.chat.completions.create(**call_kwargs)
+                break
+            except Exception as exc:
+                if reasoning_applied and not reasoning_stripped and is_reasoning_parameter_error(exc):
+                    call_kwargs = strip_reasoning_from_call_kwargs(call_kwargs)
+                    reasoning_stripped = True
+                    continue
+                if is_token_budget_parameter_error(exc):
+                    current_tokens = call_kwargs.get("max_tokens")
+                    try:
+                        current_token_int = int(current_tokens)
+                    except Exception:
+                        current_token_int = None
+                    if current_token_int is not None:
+                        if current_token_int in attempted_token_budgets:
+                            raise
+                        attempted_token_budgets.add(current_token_int)
+                    lowered_kwargs = lower_token_budget_in_call_kwargs(call_kwargs)
+                    if lowered_kwargs is not None:
+                        call_kwargs = lowered_kwargs
+                        continue
                 raise
         try:
             setattr(response, "_codex_transport_mode", "standard")
@@ -835,6 +890,8 @@ def _coerce_provider_text(value: Any, depth: int = 0) -> str:
     if depth > 8 or value is None:
         return ""
     if isinstance(value, str):
+        if _looks_like_transport_marker_text(value):
+            return ""
         return value.strip()
     if isinstance(value, (int, float, bool)):
         return str(value)
@@ -9405,11 +9462,11 @@ class ExecutionPlannerAgent:
             resolved_api_key = api_key
         self.api_key = str(resolved_api_key).strip() if resolved_api_key not in (None, "") else None
         self.provider = "openrouter"
-        max_output_tokens = 16384
+        max_output_tokens = 32768
         try:
-            max_output_tokens = int(os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "16384"))
+            max_output_tokens = int(os.getenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", "32768"))
         except Exception:
-            max_output_tokens = 16384
+            max_output_tokens = 32768
         self._default_max_output_tokens = max(4000, max_output_tokens)
         context_limit_tokens = 65536
         try:
@@ -9502,6 +9559,8 @@ class ExecutionPlannerAgent:
         if depth > 8 or value is None:
             return ""
         if isinstance(value, str):
+            if _looks_like_transport_marker_text(value):
+                return ""
             return value.strip()
         if isinstance(value, (int, float, bool)):
             return str(value)
@@ -9707,6 +9766,11 @@ class ExecutionPlannerAgent:
         except Exception:
             return None
         return None
+
+    @staticmethod
+    def _is_truncated_finish_reason(finish_reason: Any) -> bool:
+        token = str(finish_reason or "").strip().lower()
+        return token in {"length", "max_tokens", "max_output_tokens"}
 
     def _generate_content_with_budget(
         self,
@@ -11948,6 +12012,11 @@ domain_expert_critique:
                             parse_error = ValueError(
                                 f"EMPTY_COMPLETION_WITH_TOKENS: finish_reason={finish_reason} completion_tokens={completion_tokens}"
                             )
+                    if self._is_truncated_finish_reason(finish_reason) and parse_error is None:
+                        parse_error = ValueError(
+                            f"TRUNCATED_COMPLETION: finish_reason={finish_reason} "
+                            f"completion_tokens={self._extract_completion_tokens(response, usage_metadata)}"
+                        )
 
                 _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
                 _record_llm_call(
@@ -11969,7 +12038,18 @@ domain_expert_critique:
                 if parse_exc:
                     parse_error = parse_exc
                 parsed_semantic = parsed_payload if isinstance(parsed_payload, dict) else None
-                if (
+                if self._is_truncated_finish_reason(finish_reason):
+                    semantic_validation = ExecutionPlannerAgent._build_explicit_transport_failure(
+                        "semantic_core.transport_truncated",
+                        "Semantic planner response hit the output token limit and cannot be trusted as complete JSON.",
+                        phase="semantic_transport",
+                        item={
+                            "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                            "completion_tokens": self._extract_completion_tokens(response, usage_metadata),
+                        },
+                    )
+                    parsed_semantic = None
+                elif (
                     not str(response_text or "").strip()
                     and isinstance(parse_error, ValueError)
                     and "EMPTY_COMPLETION_WITH_TOKENS" in str(parse_error)
@@ -12113,6 +12193,11 @@ domain_expert_critique:
                                 parse_error = ValueError(
                                     f"EMPTY_COMPLETION_WITH_TOKENS: finish_reason={finish_reason} completion_tokens={completion_tokens}"
                                 )
+                        if self._is_truncated_finish_reason(finish_reason) and parse_error is None:
+                            parse_error = ValueError(
+                                f"TRUNCATED_COMPLETION: finish_reason={finish_reason} "
+                                f"completion_tokens={self._extract_completion_tokens(response, usage_metadata)}"
+                            )
 
                     _persist_attempt(current_prompt_name, response_name, current_prompt, response_text)
                     _record_llm_call(
@@ -12164,7 +12249,21 @@ domain_expert_critique:
                             had_json_parse_error = False
                     else:
                         parsed = _unwrap_execution_contract_transport(parsed_payload)
-                        if (
+                        if self._is_truncated_finish_reason(finish_reason):
+                            transport_validation_result = ExecutionPlannerAgent._build_explicit_transport_failure(
+                                "contract.transport_truncated",
+                                "Contract compiler response hit the output token limit and cannot be trusted as complete JSON.",
+                                phase="transport",
+                                item={
+                                    "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                                    "completion_tokens": self._extract_completion_tokens(response, usage_metadata),
+                                },
+                            )
+                            parsed = None
+                            parse_error = parse_error or ValueError(
+                                f"TRUNCATED_COMPLETION: finish_reason={finish_reason}"
+                            )
+                        elif (
                             not str(response_text or "").strip()
                             and isinstance(parse_error, ValueError)
                             and "EMPTY_COMPLETION_WITH_TOKENS" in str(parse_error)
@@ -12399,6 +12498,25 @@ domain_expert_critique:
                     if isinstance(latest_validation_for_repair, dict)
                     else best_validation
                 )
+                if not round_has_candidate:
+                    repair_parse_feedback = (
+                        latest_parse_feedback_for_repair
+                        if isinstance(latest_parse_feedback_for_repair, str)
+                        else best_parse_feedback
+                    )
+                    transport_retry_suffix = (
+                        "\n\n--- TRANSPORT RETRY FROM PREVIOUS ATTEMPT ---\n"
+                        "The previous compiler attempt did not yield a complete JSON contract object. "
+                        "This is a transport/output-shape failure, not permission to change the semantic intent.\n"
+                        "Return ONLY one complete, syntactically valid V5.0 contract JSON object. "
+                        "Do not emit markdown, prose, generation IDs, patches, or partial objects.\n"
+                        "Be compact: keep runbooks concise, avoid duplicate prose, and preserve only executable fields needed by downstream agents.\n"
+                    )
+                    parse_fb = (repair_parse_feedback or "").strip()
+                    if parse_fb:
+                        transport_retry_suffix += f"\nParse/transport diagnostics:\n{parse_fb}\n"
+                    current_prompt = full_prompt + transport_retry_suffix
+                    continue
                 if not _validation_has_phase_coherence_errors(repair_validation):
                     break
                 repair_response_text = (

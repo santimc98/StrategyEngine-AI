@@ -114,11 +114,11 @@ class StrategistAgent:
         self._pending_temperature = 0.1
         self._pending_context_tag = "strategist_generate"
         self._last_finish_reason = None
-        _max_tokens_raw = os.getenv("STRATEGIST_MAX_TOKENS", "8192")
+        _max_tokens_raw = os.getenv("STRATEGIST_MAX_TOKENS", "32768")
         try:
             self._max_tokens = max(1024, int(_max_tokens_raw))
         except (ValueError, TypeError):
-            self._max_tokens = 8192
+            self._max_tokens = 32768
         self.iteration_mode = self._normalize_iteration_mode(
             os.getenv("STRATEGIST_ITERATION_MODE", "llm")
         )
@@ -2261,7 +2261,7 @@ $payload_json
                         f"Retrying with higher max_tokens."
                     )
                     # Bump max_tokens for retry
-                    self._max_tokens = min(self._max_tokens * 2, 32768)
+                    self._max_tokens = min(self._max_tokens * 2, 65536)
                     continue
                 break
             self._max_tokens = original_max_tokens

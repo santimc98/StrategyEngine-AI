@@ -1090,6 +1090,127 @@ def test_empty_completion_with_tokens_is_classified_as_transport_empty_completio
     assert any(issue.get("rule") == "semantic_core.transport_empty_completion" for issue in issues if isinstance(issue, dict))
 
 
+def test_contract_compiler_retries_after_truncated_transport_response(monkeypatch):
+    planner = ExecutionPlannerAgent(api_key="mock_key")
+    planner.client = object()
+    planner._build_model_client = lambda _model_name: object()
+
+    semantic_payload = {
+        "scope": "full_pipeline",
+        "strategy_title": "Retry truncation",
+        "business_objective": "Predict target.",
+        "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
+        "canonical_columns": ["id", "feature", "target"],
+        "allowed_feature_sets": {
+            "model_features": ["feature"],
+            "segmentation_features": [],
+            "forbidden_features": ["target"],
+            "audit_only_features": ["id"],
+        },
+        "task_semantics": {
+            "problem_family": "classification",
+            "objective_type": "binary_classification",
+            "primary_target": "target",
+            "target_columns": ["target"],
+            "prediction_unit": "row",
+        },
+        "active_workstreams": {"data_engineering": True, "model_training": True, "review": True},
+        "required_outputs": ["artifacts/ml/predictions.csv"],
+        "column_roles": {
+            "pre_decision": ["feature"],
+            "decision": [],
+            "outcome": ["target"],
+            "post_decision_audit_only": [],
+            "identifiers": ["id"],
+            "time_columns": [],
+            "unknown": [],
+        },
+        "model_features": ["feature"],
+        "cleaning_gates": [{"name": "cleaned_dataset_present", "severity": "HARD", "params": {}}],
+        "qa_gates": [{"name": "metrics_present", "severity": "HARD", "params": {}}],
+        "reviewer_gates": [{"name": "strategy_followed", "severity": "HARD", "params": {}}],
+        "data_engineer_runbook": {"steps": ["load", "clean", "persist"]},
+        "optimization_policy": {"primary_objective": "maximize roc_auc"},
+    }
+    compiled_contract = {
+        "contract_version": "5.0",
+        "scope": "full_pipeline",
+        "strategy_title": "Retry truncation",
+        "business_objective": "Predict target.",
+        "output_dialect": {"sep": ",", "decimal": ".", "encoding": "utf-8"},
+        "canonical_columns": ["id", "feature", "target"],
+        "active_workstreams": {"data_engineering": True, "model_training": True, "review": True},
+        "allowed_feature_sets": semantic_payload["allowed_feature_sets"],
+        "task_semantics": semantic_payload["task_semantics"],
+        "column_roles": semantic_payload["column_roles"],
+        "required_outputs": [{"path": "artifacts/ml/predictions.csv", "owner": "ml_engineer", "required": True}],
+        "model_features": ["feature"],
+        "cleaning_gates": [],
+        "qa_gates": [],
+        "reviewer_gates": [],
+        "data_engineer_runbook": {"steps": ["load", "clean", "persist"]},
+        "optimization_policy": {"primary_objective": "maximize roc_auc"},
+        "shared": {
+            "column_dtype_targets": {"id": {"target_dtype": "object"}, "target": {"target_dtype": "int64"}},
+            "optimization_policy": {"primary_objective": "maximize roc_auc"},
+            "iteration_policy": {"max_iterations": 1, "metric_improvement_max": 0, "runtime_fix_max": 0, "compliance_bootstrap_max": 0},
+        },
+        "data_engineer": {
+            "artifact_requirements": {
+                "cleaned_dataset": {
+                    "output_path": "artifacts/clean/dataset_cleaned.csv",
+                    "output_manifest_path": "artifacts/clean/cleaning_manifest.json",
+                    "required_columns": ["id", "feature", "target"],
+                }
+            }
+        },
+        "ml_engineer": {
+            "artifact_requirements": {},
+            "evaluation_spec": {"primary_metric": "roc_auc"},
+            "validation_requirements": {"primary_metric": "roc_auc"},
+        },
+        "reviewer": {"reviewer_gates": []},
+        "qa_reviewer": {"qa_gates": []},
+        "reporting_policy": {},
+    }
+
+    calls = []
+
+    def _response(text, *, finish_reason="stop", completion_tokens=11):
+        return SimpleNamespace(
+            text=text,
+            candidates=[],
+            choices=[SimpleNamespace(message=SimpleNamespace(content=text), finish_reason=finish_reason)],
+            usage=SimpleNamespace(completion_tokens=completion_tokens, prompt_tokens=17),
+        )
+
+    def _fake_generate(_client, prompt, output_token_floor=1024, *, model_name=None, tool_mode="contract"):
+        calls.append({"tool_mode": tool_mode, "prompt": prompt})
+        if tool_mode == "semantic":
+            return _response(json.dumps(semantic_payload)), {"max_output_tokens": output_token_floor}
+        if len([call for call in calls if call["tool_mode"] == "contract"]) == 1:
+            return _response("", finish_reason="length", completion_tokens=32768), {"max_output_tokens": output_token_floor}
+        return _response(json.dumps(compiled_contract)), {"max_output_tokens": output_token_floor}
+
+    planner._generate_content_with_budget = _fake_generate
+
+    contract = planner.generate_contract(
+        strategy={"required_columns": ["id", "feature", "target"], "title": "Retry truncation"},
+        business_objective="Predict target.",
+        column_inventory=["id", "feature", "target"],
+    )
+
+    assert contract.get("strategy_title") == "Retry truncation"
+    assert [call["tool_mode"] for call in calls] == ["semantic", "contract", "contract"]
+    assert "TRANSPORT RETRY FROM PREVIOUS ATTEMPT" in calls[-1]["prompt"]
+    diagnostics = planner.last_planner_diag or []
+    assert any(
+        "contract.transport_truncated" in (entry.get("transport_issue_rules") or [])
+        for entry in diagnostics
+        if isinstance(entry, dict)
+    )
+
+
 def test_execution_planner_records_llm_call_trace_for_main_stages(monkeypatch):
     planner = ExecutionPlannerAgent(api_key="mock_key")
     planner.client = object()

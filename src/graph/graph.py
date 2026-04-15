@@ -17414,22 +17414,7 @@ def run_steward(state: AgentState) -> AgentState:
     except Exception:
         pass
 
-    agent_models = {
-        "steward": getattr(getattr(steward, "model", None), "model_name", None),
-        "steward_semantics": getattr(steward, "semantics_model_name", None),
-        "strategist": getattr(getattr(strategist, "model", None), "model_name", None) or getattr(strategist, "model_name", None),
-        "execution_planner": getattr(execution_planner, "model_name", None),
-        "data_engineer": getattr(data_engineer, "model_name", None),
-        "cleaning_reviewer": getattr(cleaning_reviewer, "model_name", None),
-        "ml_engineer": getattr(ml_engineer, "model_name", None),
-        "ml_engineer_plan": getattr(ml_engineer, "plan_model_name", None),
-        "model_analyst": _model_analyst_model_name,
-        "reviewer": getattr(reviewer, "model_name", None),
-        "qa_reviewer": getattr(qa_reviewer, "model_name", None),
-        "results_advisor": getattr(results_advisor, "model_name", None),
-        "translator": getattr(translator, "model_name", None),
-        "translator_repair": getattr(translator, "repair_model_name", None),
-    }
+    agent_models = get_runtime_agent_models()
     init_run_log(
         run_id,
         {

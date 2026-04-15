@@ -17,6 +17,27 @@ from src.utils.paths import PROJECT_ROOT
 _ALLOWED_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _DEFAULT_REASONING_EFFORT = "xhigh"
 _DEFAULT_EXCLUDE_REASONING = True
+_DEFAULT_MAX_TOKENS = 32768
+_MAX_TOKEN_FALLBACK_STEPS = (49152, 32768, 24576, 16384, 8192, 4096, 2048)
+_AGENT_MAX_TOKEN_DEFAULTS = {
+    "steward": 32768,
+    "steward_semantics": 32768,
+    "strategist": 32768,
+    "strategist_generate": 32768,
+    "execution_planner": 32768,
+    "execution_planner_compiler": 32768,
+    "data_engineer": 32768,
+    "ml_engineer": 32768,
+    "reviewer": 32768,
+    "qa_reviewer": 32768,
+    "cleaning_reviewer": 32768,
+    "review_board": 32768,
+    "results_advisor": 32768,
+    "results_advisor_critique": 32768,
+    "results_advisor_llm": 32768,
+    "translator": 32768,
+    "failure_explainer": 32768,
+}
 _OVERRIDES_CACHE: Dict[str, Any] | None = None
 
 
@@ -35,6 +56,14 @@ def _normalize_agent_name(agent_name: Any) -> str:
 
 def _agent_env_suffix(agent_name: str) -> str:
     return _normalize_agent_name(agent_name).upper()
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _load_reasoning_overrides() -> Dict[str, Any]:
@@ -122,6 +151,37 @@ def _resolve_reasoning_exclude(agent_name: str) -> bool:
     return _truthy(os.getenv("OPENROUTER_REASONING_EXCLUDE"), default=_DEFAULT_EXCLUDE_REASONING)
 
 
+def _resolve_output_budget_enabled(agent_name: str) -> bool:
+    suffix = _agent_env_suffix(agent_name)
+    if os.getenv(f"OPENROUTER_MAX_TOKENS_ENABLED_{suffix}") is not None:
+        return _truthy(os.getenv(f"OPENROUTER_MAX_TOKENS_ENABLED_{suffix}"), default=True)
+    return _truthy(os.getenv("OPENROUTER_MAX_TOKENS_ENABLED"), default=True)
+
+
+def _resolve_output_budget(agent_name: str) -> int:
+    normalized = _normalize_agent_name(agent_name)
+    suffix = _agent_env_suffix(agent_name)
+    candidates = (
+        os.getenv(f"OPENROUTER_MAX_TOKENS_{suffix}"),
+        os.getenv(f"{suffix}_MAX_TOKENS"),
+        os.getenv("OPENROUTER_MAX_TOKENS_DEFAULT"),
+        _AGENT_MAX_TOKEN_DEFAULTS.get(normalized),
+        _DEFAULT_MAX_TOKENS,
+    )
+    for candidate in candidates:
+        parsed = _coerce_positive_int(candidate)
+        if parsed:
+            return parsed
+    return _DEFAULT_MAX_TOKENS
+
+
+def _resolve_output_budget_floor_enabled(agent_name: str) -> bool:
+    suffix = _agent_env_suffix(agent_name)
+    if os.getenv(f"OPENROUTER_MAX_TOKENS_FLOOR_{suffix}") is not None:
+        return _truthy(os.getenv(f"OPENROUTER_MAX_TOKENS_FLOOR_{suffix}"), default=True)
+    return _truthy(os.getenv("OPENROUTER_MAX_TOKENS_FLOOR"), default=False)
+
+
 def build_openrouter_reasoning(
     *,
     agent_name: str,
@@ -147,6 +207,16 @@ def apply_reasoning_to_call_kwargs(
     model_name: Any,
 ) -> Dict[str, Any]:
     kwargs = dict(call_kwargs or {})
+    if _resolve_output_budget_enabled(agent_name):
+        desired_max_tokens = _resolve_output_budget(agent_name)
+        current_max_tokens = _coerce_positive_int(kwargs.get("max_tokens"))
+        if current_max_tokens is None or (
+            _resolve_output_budget_floor_enabled(agent_name)
+            and current_max_tokens < desired_max_tokens
+        ):
+            kwargs["max_tokens"] = desired_max_tokens
+            kwargs["_codex_max_tokens_applied"] = True
+            kwargs["_codex_max_tokens_requested"] = desired_max_tokens
     reasoning = build_openrouter_reasoning(agent_name=agent_name, model_name=model_name)
     if not reasoning:
         return kwargs
@@ -161,6 +231,17 @@ def apply_reasoning_to_call_kwargs(
     return kwargs
 
 
+def pop_internal_call_markers(call_kwargs: Dict[str, Any] | None) -> Dict[str, Any]:
+    kwargs = dict(call_kwargs or {})
+    for key in (
+        "_codex_reasoning_applied",
+        "_codex_max_tokens_applied",
+        "_codex_max_tokens_requested",
+    ):
+        kwargs.pop(key, None)
+    return kwargs
+
+
 def strip_reasoning_from_call_kwargs(call_kwargs: Dict[str, Any] | None) -> Dict[str, Any]:
     kwargs = dict(call_kwargs or {})
     extra_body = kwargs.get("extra_body")
@@ -171,8 +252,7 @@ def strip_reasoning_from_call_kwargs(call_kwargs: Dict[str, Any] | None) -> Dict
             kwargs["extra_body"] = extra_body
         else:
             kwargs.pop("extra_body", None)
-    kwargs.pop("_codex_reasoning_applied", None)
-    return kwargs
+    return pop_internal_call_markers(kwargs)
 
 
 def is_reasoning_parameter_error(exc: BaseException) -> bool:
@@ -192,6 +272,40 @@ def is_reasoning_parameter_error(exc: BaseException) -> bool:
     return any(marker in text for marker in markers)
 
 
+def is_token_budget_parameter_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if not any(token in text for token in ("token", "max_tokens", "max output", "context", "length")):
+        return False
+    markers = (
+        "maximum",
+        "exceed",
+        "exceeds",
+        "too large",
+        "too many",
+        "less than",
+        "invalid",
+        "unsupported",
+        "context length",
+        "max_tokens",
+        "max output",
+        "400",
+    )
+    return any(marker in text for marker in markers)
+
+
+def lower_token_budget_in_call_kwargs(call_kwargs: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    kwargs = dict(call_kwargs or {})
+    current = _coerce_positive_int(kwargs.get("max_tokens"))
+    if current is None:
+        return None
+    for candidate in _MAX_TOKEN_FALLBACK_STEPS:
+        if candidate < current:
+            lowered = dict(kwargs)
+            lowered["max_tokens"] = candidate
+            return lowered
+    return None
+
+
 def create_chat_completion_with_reasoning(
     client: Any,
     *,
@@ -205,9 +319,25 @@ def create_chat_completion_with_reasoning(
         model_name=model_name,
     )
     reasoning_applied = bool(enriched.pop("_codex_reasoning_applied", False))
-    try:
-        return client.chat.completions.create(**enriched)
-    except Exception as exc:
-        if reasoning_applied and is_reasoning_parameter_error(exc):
-            return client.chat.completions.create(**strip_reasoning_from_call_kwargs(enriched))
-        raise
+    enriched = pop_internal_call_markers(enriched)
+    reasoning_stripped = False
+    attempted_token_budgets: set[int] = set()
+    while True:
+        try:
+            return client.chat.completions.create(**enriched)
+        except Exception as exc:
+            if reasoning_applied and not reasoning_stripped and is_reasoning_parameter_error(exc):
+                enriched = strip_reasoning_from_call_kwargs(enriched)
+                reasoning_stripped = True
+                continue
+            if is_token_budget_parameter_error(exc):
+                current_tokens = _coerce_positive_int(enriched.get("max_tokens"))
+                if current_tokens is not None:
+                    if current_tokens in attempted_token_budgets:
+                        raise
+                    attempted_token_budgets.add(current_tokens)
+                lowered = lower_token_budget_in_call_kwargs(enriched)
+                if lowered is not None:
+                    enriched = lowered
+                    continue
+            raise

@@ -22,6 +22,11 @@ def clean_reasoning_env(monkeypatch):
         "OPENROUTER_REASONING_ENABLED_DATA_ENGINEER",
         "OPENROUTER_REASONING_EFFORT_DATA_ENGINEER",
         "OPENROUTER_REASONING_EXCLUDE_DATA_ENGINEER",
+        "OPENROUTER_MAX_TOKENS_ENABLED",
+        "OPENROUTER_MAX_TOKENS_DEFAULT",
+        "OPENROUTER_MAX_TOKENS_DATA_ENGINEER",
+        "OPENROUTER_MAX_TOKENS_FLOOR",
+        "OPENROUTER_MAX_TOKENS_FLOOR_DATA_ENGINEER",
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(openrouter_reasoning, "_OVERRIDES_CACHE", {})
@@ -68,6 +73,8 @@ def test_apply_reasoning_merges_existing_extra_body_without_overwrite():
     )
 
     assert kwargs["_codex_reasoning_applied"] is True
+    assert kwargs["_codex_max_tokens_applied"] is True
+    assert kwargs["max_tokens"] == 32768
     assert kwargs["extra_body"]["provider"] == {"order": ["OpenAI"]}
     assert kwargs["extra_body"]["reasoning"] == {"effort": "xhigh", "exclude": True}
 
@@ -113,6 +120,7 @@ def test_create_chat_completion_retries_without_reasoning_on_provider_rejection(
         "effort": "xhigh",
         "exclude": True,
     }
+    assert completions.calls[0]["max_tokens"] == 32768
     assert "extra_body" not in completions.calls[1]
 
 
@@ -151,3 +159,72 @@ def test_llm_fallback_applies_reasoning_to_model_chain_calls():
         "effort": "xhigh",
         "exclude": True,
     }
+    assert completions.calls[0]["max_tokens"] == 32768
+
+
+def test_agent_env_override_can_raise_output_budget(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_MAX_TOKENS_DATA_ENGINEER", "49152")
+
+    kwargs = apply_reasoning_to_call_kwargs(
+        {"temperature": 0.0},
+        agent_name="data_engineer",
+        model_name="openai/gpt-5.4",
+    )
+
+    assert kwargs["max_tokens"] == 49152
+
+
+def test_explicit_lower_output_budget_is_respected_by_default():
+    kwargs = apply_reasoning_to_call_kwargs(
+        {"temperature": 0.0, "max_tokens": 8192},
+        agent_name="data_engineer",
+        model_name="openai/gpt-5.4",
+    )
+
+    assert kwargs["max_tokens"] == 8192
+
+
+def test_output_budget_floor_can_be_enabled(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_MAX_TOKENS_FLOOR_DATA_ENGINEER", "1")
+
+    kwargs = apply_reasoning_to_call_kwargs(
+        {"temperature": 0.0, "max_tokens": 8192},
+        agent_name="data_engineer",
+        model_name="openai/gpt-5.4",
+    )
+
+    assert kwargs["max_tokens"] == 32768
+
+
+def test_create_lowers_token_budget_on_provider_rejection(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_MAX_TOKENS_DATA_ENGINEER", "49152")
+
+    class FakeCompletions:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise ValueError("400 max_tokens exceeds model maximum")
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok"),
+                    )
+                ]
+            )
+
+    completions = FakeCompletions()
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    response = create_chat_completion_with_reasoning(
+        fake_client,
+        agent_name="data_engineer",
+        model_name="openai/gpt-5.4",
+        call_kwargs={"model": "openai/gpt-5.4", "messages": []},
+    )
+
+    assert response.choices[0].message.content == "ok"
+    assert completions.calls[0]["max_tokens"] == 49152
+    assert completions.calls[1]["max_tokens"] == 32768

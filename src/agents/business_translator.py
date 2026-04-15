@@ -4115,9 +4115,9 @@ class BusinessTranslatorAgent:
         self.last_report_blocks = None
         self.last_report_payload = None
         try:
-            self._max_tokens = int(os.getenv("TRANSLATOR_MAX_TOKENS", "16384"))
+            self._max_tokens = int(os.getenv("TRANSLATOR_MAX_TOKENS", "32768"))
         except Exception:
-            self._max_tokens = 16384
+            self._max_tokens = 32768
 
     def _call_llm(self, prompt: str, *, model_name: Optional[str] = None) -> str:
         model = getattr(self, "model", None)

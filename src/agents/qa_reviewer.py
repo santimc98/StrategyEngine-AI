@@ -697,7 +697,7 @@ class QAReviewerAgent:
             "max_output_tokens": int(
                 os.getenv(
                     "QA_REVIEWER_GEMINI_MAX_TOKENS",
-                    os.getenv("REVIEWER_GEMINI_MAX_TOKENS", "8192"),
+                    os.getenv("REVIEWER_GEMINI_MAX_TOKENS", "32768"),
                 )
             ),
             "response_mime_type": "application/json",

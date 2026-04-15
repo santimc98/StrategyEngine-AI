@@ -463,7 +463,7 @@ class ReviewerAgent:
             "temperature": float(os.getenv("REVIEWER_GEMINI_TEMPERATURE", "0.2")),
             "top_p": 0.9,
             "top_k": 40,
-            "max_output_tokens": int(os.getenv("REVIEWER_GEMINI_MAX_TOKENS", "8192")),
+            "max_output_tokens": int(os.getenv("REVIEWER_GEMINI_MAX_TOKENS", "32768")),
             "response_mime_type": "application/json",
         }
         schema_flag = str(os.getenv("REVIEWER_USE_RESPONSE_SCHEMA", "0")).strip().lower()

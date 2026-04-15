@@ -45,7 +45,7 @@ class FailureExplainerAgent:
                 "model": self._model_name,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
-                "max_tokens": 2048,
+                "max_tokens": int(os.getenv("FAILURE_EXPLAINER_MAX_TOKENS", "32768")),
             },
         )
         return (response.choices[0].message.content or "").strip()

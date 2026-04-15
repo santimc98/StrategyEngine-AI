@@ -515,7 +515,7 @@ class TestStrategistNormalization:
 
         assert output["strategies"][0]["title"] == "Retry Strategy"
         assert observed_max_tokens[0] == original_max_tokens
-        assert observed_max_tokens[1] == min(original_max_tokens * 2, 32768)
+        assert observed_max_tokens[1] == min(original_max_tokens * 2, 65536)
         assert self.agent._max_tokens == original_max_tokens
 
 

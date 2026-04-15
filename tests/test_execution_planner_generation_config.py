@@ -12,7 +12,7 @@ def test_execution_planner_sets_max_output_tokens_floor(monkeypatch):
     monkeypatch.delenv("EXECUTION_PLANNER_MAX_OUTPUT_TOKENS", raising=False)
     agent = ExecutionPlannerAgent(api_key=None)
 
-    assert int(agent._generation_config.get("max_output_tokens", 0)) >= 4000
+    assert int(agent._generation_config.get("max_output_tokens", 0)) == 32768
 
 
 def test_execution_planner_generation_config_keeps_stable_defaults(monkeypatch):
@@ -161,6 +161,22 @@ def test_execution_planner_extracts_tool_call_arguments():
     response = type("_Resp", (), {"function_calls": [function_call]})()
 
     assert agent._extract_openai_response_text(response) == '{"scope": "full_pipeline"}'
+
+
+def test_execution_planner_ignores_openrouter_generation_ids_as_content():
+    agent = ExecutionPlannerAgent(api_key=None)
+
+    class _Response:
+        text = ""
+        choices = [SimpleNamespace(message=SimpleNamespace(content="", reasoning=None), finish_reason="length")]
+
+        def model_dump(self, exclude_none=True):
+            return {
+                "id": "gen-1776253459-IIwO6rar0eQos7f7ZYDZ",
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+            }
+
+    assert agent._extract_openai_response_text(_Response()) == ""
 
 
 def test_execution_planner_unwraps_transport_payload():
