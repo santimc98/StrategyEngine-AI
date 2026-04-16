@@ -25,7 +25,7 @@ _AGENT_MAX_TOKEN_DEFAULTS = {
     "strategist": 32768,
     "strategist_generate": 32768,
     "execution_planner": 32768,
-    "execution_planner_compiler": 32768,
+    "execution_planner_compiler": 65536,
     "data_engineer": 32768,
     "ml_engineer": 32768,
     "reviewer": 32768,

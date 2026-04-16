@@ -451,9 +451,10 @@ def _read_openai_raw_response_body(raw_response: Any) -> str:
 class _OpenRouterAdapter:
     """Adapter that exposes a generate_content-style call surface using OpenRouter (OpenAI API)."""
 
-    def __init__(self, api_key: str, model_name: str):
+    def __init__(self, api_key: str, model_name: str, agent_name: str = "execution_planner"):
         self.api_key = str(api_key or "").strip()
         self.model_name = str(model_name or "").strip()
+        self.agent_name = str(agent_name or "execution_planner").strip()
         retries_raw = str(os.getenv("EXECUTION_PLANNER_TRANSPORT_MAX_RETRIES", "0")).strip()
         try:
             self.transport_max_retries = max(0, int(retries_raw))
@@ -505,7 +506,7 @@ class _OpenRouterAdapter:
                     call_kwargs["tool_choice"] = {"type": "function", "function": {"name": allowed[0]}}
         call_kwargs = apply_reasoning_to_call_kwargs(
             call_kwargs,
-            agent_name="execution_planner",
+            agent_name=self.agent_name,
             model_name=self.model_name,
         )
         reasoning_applied = bool(call_kwargs.pop("_codex_reasoning_applied", False))
@@ -923,7 +924,16 @@ def _coerce_provider_text(value: Any, depth: int = 0) -> str:
             text = _coerce_provider_text(value.get(key), depth + 1)
             if text:
                 return text
-        for nested in value.values():
+        # Fallback: iterate remaining values, but skip transport metadata
+        # keys to avoid returning role-prefix strings ("assistant") as text.
+        _METADATA_KEYS = frozenset({
+            "role", "finish_reason", "finishReason", "stop_reason",
+            "stop_sequence", "type", "model", "id", "index", "object",
+            "created", "logprobs", "system_fingerprint", "refusal", "name",
+        })
+        for k, nested in value.items():
+            if k in _METADATA_KEYS:
+                continue
             text = _coerce_provider_text(nested, depth + 1)
             if text:
                 return text
@@ -9592,7 +9602,19 @@ class ExecutionPlannerAgent:
                 text = ExecutionPlannerAgent._coerce_provider_text(value.get(key), depth + 1)
                 if text:
                     return text
-            for nested in value.values():
+            # Fallback: iterate remaining values, but skip keys that are
+            # transport metadata (role, finish_reason, type, model, id, …).
+            # Without this guard, an empty-content response like
+            # {"role":"assistant","content":""} would return the string
+            # "assistant" as if it were model-generated text.
+            _METADATA_KEYS = frozenset({
+                "role", "finish_reason", "finishReason", "stop_reason",
+                "stop_sequence", "type", "model", "id", "index", "object",
+                "created", "logprobs", "system_fingerprint", "refusal", "name",
+            })
+            for k, nested in value.items():
+                if k in _METADATA_KEYS:
+                    continue
                 text = ExecutionPlannerAgent._coerce_provider_text(nested, depth + 1)
                 if text:
                     return text
@@ -9797,14 +9819,18 @@ class ExecutionPlannerAgent:
 
         raise TypeError("Execution planner model client must expose generate_content.")
 
-    def _build_model_client(self, model_name: str) -> Any:
+    def _build_model_client(self, model_name: str, agent_name: str | None = None) -> Any:
         if not self.api_key:
             return None
         if not isinstance(self.client, _OpenRouterAdapter):
             return self.client
-        if str(model_name or "").strip() == str(self.client.model_name or "").strip():
+        effective_agent_name = agent_name or getattr(self.client, "agent_name", "execution_planner")
+        if (
+            str(model_name or "").strip() == str(self.client.model_name or "").strip()
+            and effective_agent_name == getattr(self.client, "agent_name", "execution_planner")
+        ):
             return self.client
-        return _OpenRouterAdapter(self.api_key, model_name)
+        return _OpenRouterAdapter(self.api_key, model_name, agent_name=effective_agent_name)
 
     def generate_contract(
         self,
@@ -12166,7 +12192,7 @@ domain_expert_critique:
                         response_name = f"response_attempt_{quality_round}.txt"
 
                     try:
-                        model_client = self._build_model_client(model_name)
+                        model_client = self._build_model_client(model_name, agent_name="execution_planner_compiler")
                         if model_client is None:
                             parse_error = ValueError(f"Planner client unavailable for model {model_name}")
                         else:

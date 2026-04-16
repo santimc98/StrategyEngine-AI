@@ -319,7 +319,7 @@ def is_run_abort_requested(run_id: str) -> bool:
 
 
 def kill_worker(run_id: str) -> bool:
-    """Kill the worker process for a run. Returns True if killed."""
+    """Kill the worker process tree for a run. Returns True if killed."""
     status = read_status(run_id)
     if not status:
         return False
@@ -328,26 +328,33 @@ def kill_worker(run_id: str) -> bool:
         return False
     if not is_process_alive(pid):
         return False
+    # First try psutil with full process-tree kill
     try:
         import psutil
         proc = psutil.Process(pid)
-        proc.terminate()
-        proc.wait(timeout=5)
+        children = proc.children(recursive=True)
+        for child in children:
+            try:
+                child.kill()
+            except Exception:
+                pass
+        proc.kill()
+        proc.wait(timeout=10)
         return True
     except ImportError:
         pass
     except Exception:
         pass
-    # Fallback: OS kill
+    # Fallback: OS kill (with /T for tree on Windows)
     try:
         if os.name == "nt":
             import subprocess as _sp
-            _sp.run(["taskkill", "/F", "/PID", str(pid)],
-                    capture_output=True, timeout=5)
+            _sp.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=10)
             return True
         else:
             import signal as _sig
-            os.kill(pid, _sig.SIGTERM)
+            os.kill(pid, _sig.SIGKILL)
             return True
     except Exception:
         return False

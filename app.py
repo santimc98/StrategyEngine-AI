@@ -2374,177 +2374,181 @@ def _start_terminal_log_tail(run_id: str) -> None:
 # Background Worker Polling UI
 # ---------------------------------------------------------------------------
 def _run_polling_ui(run_id: str) -> None:
-    """Poll background worker status files and update Streamlit UI in real time."""
-    progress_header_placeholder = st.empty()
+    """Poll background worker status and update Streamlit UI.
+
+    Uses single-pass rendering + st.rerun() instead of while-True so that
+    widget interactions (the abort button) are processed between reruns.
+    Log history is kept in session_state to survive across reruns.
+    """
+    # ── Persistent log state across reruns ──
+    _log_state_key = f"_poll_log_lines_{run_id}"
+    _log_html_key = f"_poll_log_html_{run_id}"
+    if _log_state_key not in st.session_state:
+        st.session_state[_log_state_key] = 0
+    if _log_html_key not in st.session_state:
+        st.session_state[_log_html_key] = []
+
+    # ── Abort button (evaluated every rerun) ──
     abort_col1, abort_col2, abort_col3 = st.columns([3, 1, 3])
     with abort_col2:
-        if st.button("Cancelar ejecuci\u00f3n", type="secondary", use_container_width=True):
+        if st.button("Cancelar ejecuci\u00f3n", type="secondary", use_container_width=True, key=f"abort_{run_id}"):
             _request_run_abort(run_id)
             _kill_worker(run_id)
             st.session_state.pop("active_run_id", None)
+            st.session_state.pop(_log_state_key, None)
+            st.session_state.pop(_log_html_key, None)
             st.warning("Ejecuci\u00f3n cancelada.")
-            time.sleep(1)
-            st.rerun()
-            return
-    progress_bar = st.progress(0)
-    pipeline_placeholder = st.empty()
-    log_placeholder = st.empty()
-    sidebar_status_placeholder = st.sidebar.empty()
-
-    log_lines_read = 0
-    log_html_entries: list[str] = []
-
-    while True:
-        status = _read_run_status(run_id)
-        if not status:
-            time.sleep(2)
-            continue
-
-        # Read new log entries
-        new_logs = _read_log_entries(run_id, after_line=log_lines_read)
-        for entry in new_logs:
-            ts = entry.get("ts", "")
-            agent = entry.get("agent", "")
-            msg = entry.get("msg", "")
-            level = entry.get("level", "info")
-            cls = {"ok": "log-ok", "warn": "log-warn", "info": ""}.get(level, "")
-            log_html_entries.append(
-                f'<div class="log-entry">'
-                f'<span class="log-time">[{ts}]</span> '
-                f'<span class="log-agent">{agent}</span> '
-                f'<span class="{cls}">{msg}</span>'
-                f'</div>'
-            )
-        log_lines_read += len(new_logs)
-
-        # Current state from worker
-        stage = status.get("stage")
-        stage_name = status.get("stage_name") or _STAGE_NAMES.get(stage, stage or "Procesando")
-        progress = status.get("progress", 0)
-        iteration = status.get("iteration", 0)
-        max_iterations = status.get("max_iterations", 6)
-        metric_name = status.get("metric_name", "")
-        metric_value = status.get("metric_value", "")
-        completed_steps_set = set(status.get("completed_steps", []))
-        started_at = status.get("started_at", time.time())
-
-        elapsed_str = _fmt_elapsed(time.time() - started_at)
-
-        # --- Update UI elements ---
-        progress_header_placeholder.markdown(f"""
-        <div class="progress-header">
-            <div class="progress-timer">
-                <span class="progress-timer-icon">&#9202;</span>
-                <span>{elapsed_str}</span>
-            </div>
-            <div style="text-align:center;">
-                <div class="progress-stage">{stage_name}</div>
-            </div>
-            <div class="progress-pct">{progress}%</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        progress_bar.progress(min(progress, 100))
-
-        # Iteration badge
-        iter_info = ""
-        if iteration >= 1:
-            parts = [
-                f'<span class="iter-badge-label">Iteraci\u00f3n</span>',
-                f'<span class="iter-badge-value">{iteration}/{max_iterations}</span>',
-            ]
-            if metric_value:
-                parts.append(f'<span class="iter-badge-sep">|</span>')
-                parts.append(f'<span class="iter-badge-metric">{metric_name}: {metric_value}</span>')
-            iter_info = '<div class="iter-badge">' + " ".join(parts) + '</div>'
-
-        pipeline_placeholder.markdown(
-            '<div class="card">'
-            + _render_pipeline(completed_steps_set, stage, iter_info)
-            + '</div>',
-            unsafe_allow_html=True
-        )
-
-        log_placeholder.markdown(
-            '<div class="activity-log">' + "\n".join(log_html_entries) + '</div>',
-            unsafe_allow_html=True
-        )
-
-        # Sidebar run status
-        iter_display = f"{iteration}/{max_iterations}" if iteration > 0 else "--"
-        metric_display = f"{metric_name}: {metric_value}" if metric_value else "--"
-        sidebar_status_placeholder.markdown(f"""
-        <div class="sidebar-run-status">
-            <div class="srs-title">Ejecuci&oacute;n en Curso</div>
-            <div class="srs-row">
-                <span class="srs-label">Etapa</span>
-                <span class="srs-step">{stage_name}</span>
-            </div>
-            <div class="srs-row">
-                <span class="srs-label">Progreso</span>
-                <span class="srs-value">{progress}%</span>
-            </div>
-            <div class="srs-row">
-                <span class="srs-label">Tiempo</span>
-                <span class="srs-timer">{elapsed_str}</span>
-            </div>
-            <div class="srs-row">
-                <span class="srs-label">Iteraci&oacute;n ML</span>
-                <span class="srs-value">{iter_display}</span>
-            </div>
-            <div class="srs-row">
-                <span class="srs-label">Metrica</span>
-                <span class="srs-value">{metric_display}</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # --- Check for completion ---
-        run_status = status.get("status", "running")
-        if run_status == "complete":
-            final = _read_final_state(run_id)
-            if final:
-                st.session_state["analysis_result"] = final
-                st.session_state["analysis_complete"] = True
-            st.session_state.pop("active_run_id", None)
-            sidebar_status_placeholder.empty()
             time.sleep(0.5)
             st.rerun()
             return
 
-        if run_status in ("error", "aborted"):
-            if run_status == "aborted":
-                st.warning("Ejecuci\u00f3n cancelada por el usuario.")
-            else:
-                error = status.get("error", "Error desconocido")
-                st.error(f"Error en la ejecuci\u00f3n: {error}")
-            final = _read_final_state(run_id)
-            if final:
-                st.session_state["analysis_result"] = final
-                st.session_state["analysis_complete"] = True
-            st.session_state.pop("active_run_id", None)
-            sidebar_status_placeholder.empty()
-            if st.session_state.get("analysis_complete"):
-                time.sleep(0.5)
-                st.rerun()
-            return
+    # ── Read current status ──
+    status = _read_run_status(run_id)
+    if not status:
+        st.info("Esperando inicio del worker...")
+        time.sleep(1.5)
+        st.rerun()
+        return
 
-        # Check if worker process died unexpectedly
-        pid = status.get("pid")
-        if pid and not _is_process_alive(pid):
-            st.error("El proceso de ejecuci\u00f3n ha terminado inesperadamente.")
-            final = _read_final_state(run_id)
-            if final:
-                st.session_state["analysis_result"] = final
-                st.session_state["analysis_complete"] = True
-            st.session_state.pop("active_run_id", None)
-            sidebar_status_placeholder.empty()
-            if st.session_state.get("analysis_complete"):
-                time.sleep(0.5)
-                st.rerun()
-            return
+    # ── Accumulate log entries ──
+    log_lines_read = st.session_state[_log_state_key]
+    log_html_entries: list[str] = list(st.session_state[_log_html_key])
+    new_logs = _read_log_entries(run_id, after_line=log_lines_read)
+    for entry in new_logs:
+        ts = entry.get("ts", "")
+        agent = entry.get("agent", "")
+        msg = entry.get("msg", "")
+        level = entry.get("level", "info")
+        cls = {"ok": "log-ok", "warn": "log-warn", "info": ""}.get(level, "")
+        log_html_entries.append(
+            f'<div class="log-entry">'
+            f'<span class="log-time">[{ts}]</span> '
+            f'<span class="log-agent">{agent}</span> '
+            f'<span class="{cls}">{msg}</span>'
+            f'</div>'
+        )
+    st.session_state[_log_state_key] = log_lines_read + len(new_logs)
+    st.session_state[_log_html_key] = log_html_entries
 
-        time.sleep(3)
+    # ── Current state from worker ──
+    stage = status.get("stage")
+    stage_name = status.get("stage_name") or _STAGE_NAMES.get(stage, stage or "Procesando")
+    progress = status.get("progress", 0)
+    iteration = status.get("iteration", 0)
+    max_iterations = status.get("max_iterations", 6)
+    metric_name = status.get("metric_name", "")
+    metric_value = status.get("metric_value", "")
+    completed_steps_set = set(status.get("completed_steps", []))
+    started_at = status.get("started_at", time.time())
+
+    elapsed_str = _fmt_elapsed(time.time() - started_at)
+
+    # ── Render UI elements ──
+    st.markdown(f"""
+    <div class="progress-header">
+        <div class="progress-timer">
+            <span class="progress-timer-icon">&#9202;</span>
+            <span>{elapsed_str}</span>
+        </div>
+        <div style="text-align:center;">
+            <div class="progress-stage">{stage_name}</div>
+        </div>
+        <div class="progress-pct">{progress}%</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.progress(min(progress, 100))
+
+    # Iteration badge
+    iter_info = ""
+    if iteration >= 1:
+        parts = [
+            f'<span class="iter-badge-label">Iteraci\u00f3n</span>',
+            f'<span class="iter-badge-value">{iteration}/{max_iterations}</span>',
+        ]
+        if metric_value:
+            parts.append(f'<span class="iter-badge-sep">|</span>')
+            parts.append(f'<span class="iter-badge-metric">{metric_name}: {metric_value}</span>')
+        iter_info = '<div class="iter-badge">' + " ".join(parts) + '</div>'
+
+    st.markdown(
+        '<div class="card">'
+        + _render_pipeline(completed_steps_set, stage, iter_info)
+        + '</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        '<div class="activity-log">' + "\n".join(log_html_entries) + '</div>',
+        unsafe_allow_html=True
+    )
+
+    # Sidebar run status
+    iter_display = f"{iteration}/{max_iterations}" if iteration > 0 else "--"
+    metric_display = f"{metric_name}: {metric_value}" if metric_value else "--"
+    st.sidebar.markdown(f"""
+    <div class="sidebar-run-status">
+        <div class="srs-title">Ejecuci&oacute;n en Curso</div>
+        <div class="srs-row">
+            <span class="srs-label">Etapa</span>
+            <span class="srs-step">{stage_name}</span>
+        </div>
+        <div class="srs-row">
+            <span class="srs-label">Progreso</span>
+            <span class="srs-value">{progress}%</span>
+        </div>
+        <div class="srs-row">
+            <span class="srs-label">Tiempo</span>
+            <span class="srs-timer">{elapsed_str}</span>
+        </div>
+        <div class="srs-row">
+            <span class="srs-label">Iteraci&oacute;n ML</span>
+            <span class="srs-value">{iter_display}</span>
+        </div>
+        <div class="srs-row">
+            <span class="srs-label">Metrica</span>
+            <span class="srs-value">{metric_display}</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Check for terminal states ──
+    run_status = status.get("status", "running")
+
+    def _handle_terminal(msg_fn=None, msg_text=None):
+        final = _read_final_state(run_id)
+        if final:
+            st.session_state["analysis_result"] = final
+            st.session_state["analysis_complete"] = True
+        st.session_state.pop("active_run_id", None)
+        st.session_state.pop(_log_state_key, None)
+        st.session_state.pop(_log_html_key, None)
+        if msg_fn and msg_text:
+            msg_fn(msg_text)
+        time.sleep(0.5)
+        st.rerun()
+
+    if run_status == "complete":
+        _handle_terminal()
+        return
+
+    if run_status in ("error", "aborted"):
+        if run_status == "aborted":
+            _handle_terminal(st.warning, "Ejecuci\u00f3n cancelada por el usuario.")
+        else:
+            error = status.get("error", "Error desconocido")
+            _handle_terminal(st.error, f"Error en la ejecuci\u00f3n: {error}")
+        return
+
+    # Check if worker process died unexpectedly
+    pid = status.get("pid")
+    if pid and not _is_process_alive(pid):
+        _handle_terminal(st.error, "El proceso de ejecuci\u00f3n ha terminado inesperadamente.")
+        return
+
+    # ── Schedule next poll via rerun (allows button clicks between polls) ──
+    time.sleep(3)
+    st.rerun()
 
 # ---------------------------------------------------------------------------
 # Start Analysis / Resume Active Run
