@@ -61,6 +61,7 @@ export function SettingsWorkspace({
   const [apiKeysState, setApiKeysState] = useState(initialApiKeys);
 
   const [modelInputs, setModelInputs] = useState<Record<string, string>>(initialModels.effective_models);
+  const [customModeAgents, setCustomModeAgents] = useState<Set<string>>(new Set());
   const [provider, setProvider] = useState(initialSandbox.provider);
   const [providerSettings, setProviderSettings] = useState<Record<string, string>>(
     sanitizeObject(
@@ -144,6 +145,9 @@ export function SettingsWorkspace({
   }
 
   function resolveModelSelectValue(agentKey: string): string {
+    if (customModeAgents.has(agentKey)) {
+      return customModelOption;
+    }
     const currentValue = String(modelInputs[agentKey] || "").trim();
     if (!currentValue) {
       return "";
@@ -152,16 +156,32 @@ export function SettingsWorkspace({
   }
 
   function updateModelPreset(agentKey: string, nextValue: string): void {
-    setModelInputs((current) => {
-      const currentValue = String(current[agentKey] || "").trim();
-      if (!nextValue) {
-        return { ...current, [agentKey]: "" };
+    if (nextValue === customModelOption) {
+      setCustomModeAgents((current) => {
+        const next = new Set(current);
+        next.add(agentKey);
+        return next;
+      });
+      setModelInputs((current) => {
+        const currentValue = String(current[agentKey] || "").trim();
+        // If the current value is a preset, clear it so the user can type freely.
+        // If it's already a custom string, preserve it.
+        if (presetModels.has(currentValue)) {
+          return { ...current, [agentKey]: "" };
+        }
+        return current;
+      });
+      return;
+    }
+    setCustomModeAgents((current) => {
+      if (!current.has(agentKey)) {
+        return current;
       }
-      if (nextValue === customModelOption) {
-        return { ...current, [agentKey]: presetModels.has(currentValue) ? "" : currentValue };
-      }
-      return { ...current, [agentKey]: nextValue };
+      const next = new Set(current);
+      next.delete(agentKey);
+      return next;
     });
+    setModelInputs((current) => ({ ...current, [agentKey]: nextValue || "" }));
   }
 
   async function saveModels(): Promise<void> {
