@@ -15,28 +15,37 @@ from typing import Any, Dict
 from src.utils.paths import PROJECT_ROOT
 
 _ALLOWED_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
-_DEFAULT_REASONING_EFFORT = "xhigh"
+_DEFAULT_REASONING_EFFORT = "medium"
 _DEFAULT_EXCLUDE_REASONING = True
 _DEFAULT_MAX_TOKENS = 32768
 _MAX_TOKEN_FALLBACK_STEPS = (49152, 32768, 24576, 16384, 8192, 4096, 2048)
 _AGENT_MAX_TOKEN_DEFAULTS = {
-    "steward": 32768,
-    "steward_semantics": 32768,
-    "strategist": 32768,
-    "strategist_generate": 32768,
-    "execution_planner": 32768,
-    "execution_planner_compiler": 65536,
-    "data_engineer": 32768,
-    "ml_engineer": 32768,
-    "reviewer": 32768,
-    "qa_reviewer": 32768,
-    "cleaning_reviewer": 32768,
-    "review_board": 32768,
-    "results_advisor": 32768,
-    "results_advisor_critique": 32768,
-    "results_advisor_llm": 32768,
-    "translator": 32768,
-    "failure_explainer": 32768,
+    # --- HIGH reasoning: need headroom for thinking + full output ---
+    "strategist": 49152,            # high effort; creative strategy design
+    "strategist_generate": 49152,   # high effort; strategy candidate generation
+    "execution_planner": 49152,     # high effort; semantic reasoning
+    "ml_engineer_plan": 49152,      # high effort; ML architecture planning
+    # --- MEDIUM reasoning: moderate thinking + structured output ---
+    "steward": 32768,               # medium effort; data audit
+    "steward_semantics": 32768,     # medium effort; data semantics
+    "data_engineer": 49152,         # medium effort; code gen needs headroom (27K+ prompts)
+    "model_analyst": 32768,         # medium effort; analysis + hypotheses
+    "reviewer": 32768,              # medium effort; code review + gates
+    "qa_reviewer": 32768,           # medium effort; compliance review
+    "cleaning_reviewer": 32768,     # medium effort; cleaning review
+    "failure_explainer": 32768,     # medium effort; causal diagnosis
+    # --- LOW/NONE reasoning: full budget goes to output content ---
+    "ml_engineer": 49152,           # low effort; long code output, heavy prompts
+    "translator": 32768,            # low effort; long executive report
+    "review_board": 32768,          # low effort; synthesis of reviews
+    "results_advisor": 32768,       # low effort; interpretation
+    "results_advisor_critique": 32768,  # low effort; evaluation
+    "ml_engineer_editor": 32768,    # low effort; code editing
+    "data_engineer_editor": 32768,  # low effort; code editing
+    "results_advisor_llm": 32768,   # none; mechanical support
+    "translator_repair": 32768,     # none; format repair
+    # --- DISABLED reasoning: pure translation, no thinking overhead ---
+    "execution_planner_compiler": 65536,  # disabled; full budget for large JSON contract
 }
 _OVERRIDES_CACHE: Dict[str, Any] | None = None
 
