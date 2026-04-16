@@ -584,17 +584,42 @@ export function SettingsWorkspace({
                           {preset.label}
                         </option>
                       ))}
-                      <option value={customModelOption}>Modelo personalizado</option>
-                    </select>
-                    {resolveModelSelectValue(agent.key) === customModelOption ? (
-                      <input
-                        type="text"
-                        value={modelInputs[agent.key] || ""}
-                        placeholder="anthropic/claude-sonnet-4.6"
-                        onChange={(event) =>
-                          setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
+                      {(() => {
+                        const v = String(modelInputs[agent.key] || "").trim();
+                        if (v && !presetModels.has(v) && !customModeAgents.has(agent.key)) {
+                          return <option value={v}>{v} (personalizado)</option>;
                         }
-                      />
+                        return null;
+                      })()}
+                      <option value={customModelOption}>Modelo personalizado…</option>
+                    </select>
+                    {customModeAgents.has(agent.key) ? (
+                      <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                        <input
+                          type="text"
+                          autoFocus
+                          value={modelInputs[agent.key] || ""}
+                          placeholder="z-ai/glm-5.1"
+                          onChange={(event) =>
+                            setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
+                          }
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === "Escape") {
+                              event.preventDefault();
+                              commitCustomModel(agent.key, (event.target as HTMLInputElement).value);
+                            }
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => commitCustomModel(agent.key)}
+                          disabled={!String(modelInputs[agent.key] || "").trim()}
+                          aria-label="Confirmar modelo personalizado"
+                        >
+                          OK
+                        </button>
+                      </div>
                     ) : null}
                   </div>
                 ))}
