@@ -129,11 +129,12 @@ export function RunLiveConsole({ runId, initialStatus }: RunLiveConsoleProps) {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ force_kill: false }),
+        body: JSON.stringify({ force_kill: true }),
       });
       if (!response.ok) {
         throw new Error("No se pudo solicitar el aborto de la run");
       }
+      // Re-read status — kill_worker marks it as "aborted"
       const statusResponse = await fetch(`/api/runs/${runId}/status`, { cache: "no-store" });
       if (statusResponse.ok) {
         const statusPayload = (await statusResponse.json()) as JsonRecord;

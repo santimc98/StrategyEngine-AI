@@ -319,7 +319,7 @@ def is_run_abort_requested(run_id: str) -> bool:
 
 
 def kill_worker(run_id: str) -> bool:
-    """Kill the worker process tree for a run. Returns True if killed."""
+    """Kill the worker process tree for a run and mark status as aborted."""
     status = read_status(run_id)
     if not status:
         return False
@@ -327,7 +327,10 @@ def kill_worker(run_id: str) -> bool:
     if not pid:
         return False
     if not is_process_alive(pid):
+        # Process already dead — still mark as aborted so UI reads clean state
+        _mark_status_aborted(run_id, status)
         return False
+    killed = False
     # First try psutil with full process-tree kill
     try:
         import psutil
@@ -340,24 +343,53 @@ def kill_worker(run_id: str) -> bool:
                 pass
         proc.kill()
         proc.wait(timeout=10)
-        return True
+        killed = True
     except ImportError:
         pass
     except Exception:
         pass
     # Fallback: OS kill (with /T for tree on Windows)
+    if not killed:
+        try:
+            if os.name == "nt":
+                import subprocess as _sp
+                _sp.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, timeout=10)
+                killed = True
+            else:
+                import signal as _sig
+                os.kill(pid, _sig.SIGKILL)
+                killed = True
+        except Exception:
+            pass
+    # Always update status to "aborted" so UI/refresh reads clean state
+    if killed:
+        _mark_status_aborted(run_id, status)
+    return killed
+
+
+def _mark_status_aborted(run_id: str, current_status: Dict[str, Any] | None = None) -> None:
+    """Overwrite worker_status.json to reflect an aborted run."""
+    base = current_status if isinstance(current_status, dict) else {}
+    aborted = {
+        "pid": base.get("pid"),
+        "status": "aborted",
+        "stage": base.get("stage"),
+        "stage_name": "Cancelado",
+        "progress": base.get("progress", 0),
+        "iteration": base.get("iteration", 0),
+        "max_iterations": base.get("max_iterations", 6),
+        "metric_name": base.get("metric_name", ""),
+        "metric_value": base.get("metric_value", ""),
+        "completed_steps": base.get("completed_steps", []),
+        "error": "Ejecuci\u00f3n cancelada por el usuario.",
+        "started_at": base.get("started_at", time.time()),
+        "updated_at": time.time(),
+    }
     try:
-        if os.name == "nt":
-            import subprocess as _sp
-            _sp.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                    capture_output=True, timeout=10)
-            return True
-        else:
-            import signal as _sig
-            os.kill(pid, _sig.SIGKILL)
-            return True
+        _atomic_write_json(_status_path(run_id), aborted)
     except Exception:
-        return False
+        pass
 
 
 def is_process_alive(pid: int) -> bool:

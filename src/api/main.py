@@ -270,9 +270,10 @@ def abort_run(run_id: str, payload: RunAbortRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
 
     run_status.request_run_abort(run_id)
-    worker_killed = False
-    if payload.force_kill:
-        worker_killed = run_status.kill_worker(run_id)
+    # Always kill the worker process — the abort flag alone is insufficient
+    # because the worker may be blocked on a long LLM call and never poll it.
+    # kill_worker also marks worker_status.json as "aborted".
+    worker_killed = run_status.kill_worker(run_id)
 
     return {
         "run_id": run_id,
