@@ -145,14 +145,34 @@ export function SettingsWorkspace({
   }
 
   function resolveModelSelectValue(agentKey: string): string {
+    const currentValue = String(modelInputs[agentKey] || "").trim();
     if (customModeAgents.has(agentKey)) {
+      // Mientras se edita, el select siempre muestra "Modelo personalizado…",
+      // independientemente de lo que haya en el input (pegar, escribir, etc.).
       return customModelOption;
     }
-    const currentValue = String(modelInputs[agentKey] || "").trim();
     if (!currentValue) {
       return "";
     }
-    return presetModels.has(currentValue) ? currentValue : customModelOption;
+    return presetModels.has(currentValue) ? currentValue : currentValue;
+  }
+
+  function commitCustomModel(agentKey: string, explicitValue?: string): void {
+    const fromState = String(modelInputs[agentKey] || "").trim();
+    const value = (explicitValue !== undefined ? explicitValue : fromState).trim();
+    if (!value) {
+      return;
+    }
+    // Asegura que el valor del input quede normalizado (trim) en el estado.
+    setModelInputs((current) => ({ ...current, [agentKey]: value }));
+    setCustomModeAgents((current) => {
+      if (!current.has(agentKey)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.delete(agentKey);
+      return next;
+    });
   }
 
   function updateModelPreset(agentKey: string, nextValue: string): void {
@@ -504,17 +524,45 @@ export function SettingsWorkspace({
                         {preset.label}
                       </option>
                     ))}
-                    <option value={customModelOption}>Modelo personalizado</option>
-                  </select>
-                  {resolveModelSelectValue(agent.key) === customModelOption ? (
-                    <input
-                      type="text"
-                      value={modelInputs[agent.key] || ""}
-                      placeholder="anthropic/claude-sonnet-4.6"
-                      onChange={(event) =>
-                        setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
+                    {(() => {
+                      const v = String(modelInputs[agent.key] || "").trim();
+                      if (v && !presetModels.has(v) && !customModeAgents.has(agent.key)) {
+                        return <option value={v}>{v} (personalizado)</option>;
                       }
-                    />
+                      return null;
+                    })()}
+                    <option value={customModelOption}>Modelo personalizado…</option>
+                  </select>
+                  {customModeAgents.has(agent.key) ? (
+                    <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                      <input
+                        type="text"
+                        autoFocus
+                        value={modelInputs[agent.key] || ""}
+                        placeholder="z-ai/glm-5.1"
+                        onChange={(event) =>
+                          setModelInputs((current) => ({ ...current, [agent.key]: event.target.value }))
+                        }
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            commitCustomModel(agent.key, (event.target as HTMLInputElement).value);
+                          } else if (event.key === "Escape") {
+                            event.preventDefault();
+                            commitCustomModel(agent.key, (event.target as HTMLInputElement).value);
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => commitCustomModel(agent.key)}
+                        disabled={!String(modelInputs[agent.key] || "").trim()}
+                        aria-label="Confirmar modelo personalizado"
+                      >
+                        OK
+                      </button>
+                    </div>
                   ) : null}
                 </div>
               ))}
