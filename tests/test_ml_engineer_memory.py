@@ -123,8 +123,10 @@ def run():
         func = node.func
         if isinstance(func, ast.Attribute) and func.attr == "read_csv":
             read_seen = True
+            expected_helper = "_strip_csv_dialect_kwargs"
         elif isinstance(func, ast.Attribute) and func.attr == "to_csv":
             write_seen = True
+            expected_helper = "_strip_csv_write_dialect_kwargs"
         else:
             continue
         keyword_names = [kw.arg for kw in node.keywords if kw.arg is not None]
@@ -135,6 +137,73 @@ def run():
         assert len(star_kwargs) == 1
         assert isinstance(star_kwargs[0].value, ast.Call)
         assert isinstance(star_kwargs[0].value.func, ast.Name)
-        assert star_kwargs[0].value.func.id == "_strip_csv_dialect_kwargs"
+        assert star_kwargs[0].value.func.id == expected_helper
     assert read_seen is True
     assert write_seen is True
+
+
+def test_universal_guards_filter_read_only_kwargs_for_to_csv_only():
+    agent = MLEngineerAgent.__new__(MLEngineerAgent)
+    raw_code = """
+import pandas as pd
+
+def run():
+    dialect = {"sep": ",", "quotechar": '"', "skipinitialspace": True}
+    df = pd.read_csv("data/cleaned_data.csv", **dialect)
+    df.to_csv("data/out.csv", **dialect)
+""".strip()
+
+    patched = agent._apply_universal_script_guards(
+        raw_code,
+        csv_sep=",",
+        csv_decimal=".",
+        csv_encoding="utf-8",
+    )
+
+    namespace = {}
+    exec(patched, namespace)
+    read_kwargs = namespace["_strip_csv_dialect_kwargs"](
+        {"sep": ",", "quotechar": '"', "skipinitialspace": True}
+    )
+    write_kwargs = namespace["_strip_csv_write_dialect_kwargs"](
+        {"sep": ",", "quotechar": '"', "skipinitialspace": True}
+    )
+
+    assert "skipinitialspace" in read_kwargs
+    assert "skipinitialspace" not in write_kwargs
+    assert write_kwargs == {"quotechar": '"'}
+
+
+def test_universal_guards_upgrade_existing_to_csv_read_helper_wrapper():
+    agent = MLEngineerAgent.__new__(MLEngineerAgent)
+    raw_code = """
+import pandas as pd
+
+def _strip_csv_dialect_kwargs(kwargs):
+    return kwargs
+
+def run(df, write_kwargs):
+    df.to_csv("data/out.csv", **_strip_csv_dialect_kwargs(write_kwargs))
+""".strip()
+
+    patched = agent._apply_universal_script_guards(
+        raw_code,
+        csv_sep=",",
+        csv_decimal=".",
+        csv_encoding="utf-8",
+    )
+
+    tree = ast.parse(patched)
+    to_csv_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "to_csv"
+    ]
+    assert len(to_csv_calls) == 1
+    star_kwargs = [kw for kw in to_csv_calls[0].keywords if kw.arg is None]
+    assert len(star_kwargs) == 1
+    assert isinstance(star_kwargs[0].value, ast.Call)
+    assert isinstance(star_kwargs[0].value.func, ast.Name)
+    assert star_kwargs[0].value.func.id == "_strip_csv_write_dialect_kwargs"

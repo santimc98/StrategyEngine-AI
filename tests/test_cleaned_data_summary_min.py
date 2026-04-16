@@ -153,3 +153,59 @@ def test_cleaned_data_summary_min_includes_cleaned_ml_fact_packet():
 
     normalization = packet.get("data_engineer_normalization") or []
     assert any(item.get("action") == "parsed_numeric" for item in normalization)
+
+
+def test_cleaned_ml_fact_packet_includes_temporal_fold_feasibility():
+    df = pd.DataFrame(
+        {
+            "account_id": [f"a{i}" for i in range(1, 13)],
+            "snapshot_month_end": pd.to_datetime(
+                [
+                    "2025-01-31",
+                    "2025-01-31",
+                    "2025-02-28",
+                    "2025-02-28",
+                    "2025-03-31",
+                    "2025-03-31",
+                    "2025-04-30",
+                    "2025-04-30",
+                    "2025-05-31",
+                    "2025-05-31",
+                    "2025-06-30",
+                    "2025-06-30",
+                ]
+            ),
+            "churn_60d": [0, 0, 0, 0, 1, 0, 1, 0, 0, 0, None, None],
+            "arr_current": [1000, 1200, 1100, 1300, 900, 950, 1800, 1700, 1600, 1650, 2000, 2100],
+        }
+    )
+    contract = {
+        "allowed_feature_sets": {"model_features": ["arr_current"]},
+        "task_semantics": {
+            "target_columns": ["churn_60d"],
+            "temporal_ordering_column": "snapshot_month_end",
+        },
+        "validation_requirements": {
+            "method": "rolling_origin_out_of_time_validation",
+            "params": {"preferred_folds": 3, "min_folds": 2},
+        },
+        "column_roles": {
+            "identifiers": ["account_id"],
+            "time_columns": ["snapshot_month_end"],
+            "target": ["churn_60d"],
+            "numerical_features": ["arr_current"],
+        },
+    }
+
+    summary = _build_cleaned_data_summary_min(
+        df_clean=df,
+        contract=contract,
+        required_columns=["account_id", "snapshot_month_end", "churn_60d", "arr_current"],
+    )
+
+    feasibility = (summary.get("cleaned_ml_fact_packet") or {}).get("temporal_fold_feasibility") or {}
+    assert feasibility.get("temporal_ordering_column") == "snapshot_month_end"
+    assert feasibility.get("total_positive_rows") == 2
+    assert feasibility.get("windows_with_zero_positives") >= 2
+    assert feasibility.get("candidate_folds_with_single_class_training") >= 1
+    assert "both target classes" in feasibility.get("recommended_guardrail", "")

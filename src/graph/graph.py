@@ -4645,6 +4645,288 @@ def _binary_positive_rate(series: pd.Series) -> float | None:
     return round(float(mapped.mean()), 6)
 
 
+def _binary_target_counts(series: pd.Series) -> Dict[str, Any] | None:
+    try:
+        non_null = series.dropna()
+    except Exception:
+        return None
+    if non_null.empty:
+        return None
+
+    values: Optional[pd.Series] = None
+    if pd.api.types.is_bool_dtype(non_null):
+        try:
+            values = non_null.astype(int)
+        except Exception:
+            return None
+    elif pd.api.types.is_numeric_dtype(non_null):
+        try:
+            numeric = pd.to_numeric(non_null, errors="coerce")
+        except Exception:
+            return None
+        if numeric.isna().any():
+            return None
+        values = numeric.astype(float)
+    else:
+        try:
+            normalized = non_null.astype(str).str.strip().str.lower()
+        except Exception:
+            return None
+        mapping = {
+            "1": 1.0,
+            "1.0": 1.0,
+            "true": 1.0,
+            "yes": 1.0,
+            "y": 1.0,
+            "t": 1.0,
+            "0": 0.0,
+            "0.0": 0.0,
+            "false": 0.0,
+            "no": 0.0,
+            "n": 0.0,
+            "f": 0.0,
+        }
+        mapped = normalized.map(mapping)
+        if mapped.isna().any():
+            return None
+        values = mapped.astype(float)
+
+    uniques = {float(v) for v in values.unique().tolist()}
+    if not uniques or not uniques.issubset({0.0, 1.0}):
+        return None
+    labeled_rows = int(values.shape[0])
+    positive_rows = int((values == 1.0).sum())
+    negative_rows = int((values == 0.0).sum())
+    return {
+        "labeled_rows": labeled_rows,
+        "positive_rows": positive_rows,
+        "negative_rows": negative_rows,
+        "positive_rate": round(float(positive_rows / labeled_rows), 6) if labeled_rows else None,
+    }
+
+
+def _resolve_cleaned_summary_temporal_ordering_column(
+    contract: Dict[str, Any],
+    df_clean: pd.DataFrame,
+    split_column: str | None,
+) -> str | None:
+    candidates: List[Any] = []
+    for section_name in ("task_semantics", "validation_requirements", "evaluation_spec"):
+        section = contract.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for key in (
+            "temporal_ordering_column",
+            "validation_split_column",
+            "split_column",
+            "time_column",
+            "date_column",
+        ):
+            candidates.append(section.get(key))
+        params = section.get("params")
+        if isinstance(params, dict):
+            for key in (
+                "temporal_ordering_column",
+                "validation_split_column",
+                "split_column",
+                "time_column",
+                "date_column",
+            ):
+                candidates.append(params.get(key))
+    if split_column:
+        candidates.append(split_column)
+
+    for candidate in _ordered_unique_strings(candidates):
+        if candidate in df_clean.columns:
+            return candidate
+    return None
+
+
+def _validation_fold_count_hint(contract: Dict[str, Any], key_names: Tuple[str, ...], default: int) -> int:
+    validation_requirements = contract.get("validation_requirements")
+    sources: List[Dict[str, Any]] = []
+    if isinstance(validation_requirements, dict):
+        sources.append(validation_requirements)
+        params = validation_requirements.get("params")
+        if isinstance(params, dict):
+            sources.append(params)
+    for source in sources:
+        for key in key_names:
+            try:
+                value = int(source.get(key))
+            except Exception:
+                continue
+            if value > 0:
+                return value
+    return default
+
+
+def _representative_temporal_fold_samples(folds: List[Dict[str, Any]], max_items: int = 8) -> List[Dict[str, Any]]:
+    if len(folds) <= max_items:
+        return folds
+    head_count = max_items // 2
+    tail_count = max_items - head_count
+    return folds[:head_count] + folds[-tail_count:]
+
+
+def _build_temporal_fold_feasibility(
+    df_clean: pd.DataFrame,
+    target_series: pd.Series,
+    target_column: str,
+    temporal_column: str | None,
+    contract: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    if not temporal_column or temporal_column not in df_clean.columns:
+        return None
+
+    total_counts = _binary_target_counts(target_series)
+    if not total_counts:
+        return None
+
+    try:
+        parsed_time = pd.to_datetime(df_clean[temporal_column], errors="coerce")
+    except Exception:
+        return None
+    valid_time_mask = parsed_time.notna()
+    if not bool(valid_time_mask.any()):
+        return None
+
+    normalized_time = parsed_time.dt.normalize()
+    unique_dates = int(normalized_time[valid_time_mask].nunique())
+    if unique_dates > 60:
+        window_labels = parsed_time.dt.to_period("M").astype(str)
+        window_sort_values = parsed_time.dt.to_period("M").dt.to_timestamp()
+        window_granularity = "month"
+    else:
+        window_labels = normalized_time.dt.strftime("%Y-%m-%d")
+        window_sort_values = normalized_time
+        window_granularity = "date"
+
+    frame = pd.DataFrame(
+        {
+            "window": window_labels,
+            "sort_value": window_sort_values,
+            "target": target_series,
+        }
+    )
+    frame = frame[valid_time_mask].copy()
+    if frame.empty:
+        return None
+
+    window_stats: List[Dict[str, Any]] = []
+    for window_value, group in frame.groupby("window", sort=False):
+        counts = _binary_target_counts(group["target"])
+        labeled_rows = int(group["target"].notna().sum())
+        unlabeled_rows = int(group["target"].isna().sum())
+        stat: Dict[str, Any] = {
+            "window": str(window_value),
+            "sort_value": group["sort_value"].min(),
+            "rows": int(len(group)),
+            "labeled_rows": labeled_rows,
+            "unlabeled_rows": unlabeled_rows,
+            "positive_rows": int((counts or {}).get("positive_rows") or 0),
+            "negative_rows": int((counts or {}).get("negative_rows") or 0),
+        }
+        if counts and counts.get("positive_rate") is not None:
+            stat["positive_rate"] = counts.get("positive_rate")
+        window_stats.append(stat)
+
+    window_stats.sort(key=lambda item: item.get("sort_value"))
+    labeled_windows = [item for item in window_stats if int(item.get("labeled_rows") or 0) > 0]
+    if len(labeled_windows) < 2:
+        return None
+
+    positives_by_window = [int(item.get("positive_rows") or 0) for item in labeled_windows]
+    negatives_by_window = [int(item.get("negative_rows") or 0) for item in labeled_windows]
+    windows_with_zero_positives = int(sum(1 for value in positives_by_window if value == 0))
+    windows_with_zero_negatives = int(sum(1 for value in negatives_by_window if value == 0))
+
+    preferred_folds = _validation_fold_count_hint(
+        contract,
+        ("preferred_folds", "validation_folds_preferred", "n_splits", "cv_folds"),
+        5,
+    )
+    minimum_folds = _validation_fold_count_hint(
+        contract,
+        ("min_folds", "validation_folds_min", "minimum_folds"),
+        3,
+    )
+
+    all_candidate_folds: List[Dict[str, Any]] = []
+    for val_idx in range(1, len(labeled_windows)):
+        train_windows = labeled_windows[:val_idx]
+        val_window = labeled_windows[val_idx]
+        train_positive_rows = int(sum(int(item.get("positive_rows") or 0) for item in train_windows))
+        train_negative_rows = int(sum(int(item.get("negative_rows") or 0) for item in train_windows))
+        validation_positive_rows = int(val_window.get("positive_rows") or 0)
+        validation_negative_rows = int(val_window.get("negative_rows") or 0)
+        all_candidate_folds.append(
+            {
+                "validation_window": str(val_window.get("window")),
+                "train_window_start": str(train_windows[0].get("window")),
+                "train_window_end": str(train_windows[-1].get("window")),
+                "train_labeled_rows": int(sum(int(item.get("labeled_rows") or 0) for item in train_windows)),
+                "validation_labeled_rows": int(val_window.get("labeled_rows") or 0),
+                "train_positive_rows": train_positive_rows,
+                "train_negative_rows": train_negative_rows,
+                "validation_positive_rows": validation_positive_rows,
+                "validation_negative_rows": validation_negative_rows,
+                "train_has_both_classes": bool(train_positive_rows > 0 and train_negative_rows > 0),
+                "validation_has_both_classes": bool(validation_positive_rows > 0 and validation_negative_rows > 0),
+            }
+        )
+
+    train_single_class_count = int(
+        sum(1 for fold in all_candidate_folds if not fold.get("train_has_both_classes"))
+    )
+    validation_single_class_count = int(
+        sum(1 for fold in all_candidate_folds if not fold.get("validation_has_both_classes"))
+    )
+    warning_parts: List[str] = []
+    if windows_with_zero_positives:
+        warning_parts.append(f"{windows_with_zero_positives} temporal windows have zero positive labels")
+    if windows_with_zero_negatives:
+        warning_parts.append(f"{windows_with_zero_negatives} temporal windows have zero negative labels")
+    if train_single_class_count:
+        warning_parts.append(f"{train_single_class_count} rolling-origin candidate folds have single-class training")
+    if validation_single_class_count:
+        warning_parts.append(f"{validation_single_class_count} rolling-origin candidate folds have single-class validation")
+
+    sample_folds = _representative_temporal_fold_samples(all_candidate_folds, max_items=8)
+    for item in window_stats:
+        item.pop("sort_value", None)
+
+    return {
+        "target_column": target_column,
+        "temporal_ordering_column": temporal_column,
+        "window_granularity": window_granularity,
+        "total_labeled_rows": int(total_counts.get("labeled_rows") or 0),
+        "total_positive_rows": int(total_counts.get("positive_rows") or 0),
+        "total_negative_rows": int(total_counts.get("negative_rows") or 0),
+        "target_positive_rate_labeled": total_counts.get("positive_rate"),
+        "labeled_window_count": int(len(labeled_windows)),
+        "windows_with_positives": int(sum(1 for value in positives_by_window if value > 0)),
+        "windows_with_zero_positives": windows_with_zero_positives,
+        "windows_with_zero_negatives": windows_with_zero_negatives,
+        "min_positives_per_window": int(min(positives_by_window)),
+        "median_positives_per_window": round(float(pd.Series(positives_by_window).median()), 3),
+        "min_negatives_per_window": int(min(negatives_by_window)),
+        "median_negatives_per_window": round(float(pd.Series(negatives_by_window).median()), 3),
+        "preferred_folds": int(preferred_folds),
+        "minimum_folds": int(minimum_folds),
+        "rolling_origin_candidate_fold_count": int(len(all_candidate_folds)),
+        "candidate_folds_with_single_class_training": train_single_class_count,
+        "candidate_folds_with_single_class_validation": validation_single_class_count,
+        "candidate_rolling_origin_folds": sample_folds,
+        "window_class_counts_sample": window_stats[:12],
+        "recommended_guardrail": (
+            "If the selected supervised classifier requires both target classes, verify each "
+            "train/validation fold before fit and skip, merge, or shift folds that are class-degenerate."
+        ),
+        "warning": "; ".join(warning_parts) if warning_parts else "",
+    }
+
+
 def _build_cleaned_ml_fact_packet(
     df_clean: pd.DataFrame,
     contract: Dict[str, Any],
@@ -4662,6 +4944,12 @@ def _build_cleaned_ml_fact_packet(
     target_column = _resolve_cleaned_summary_primary_target_column(contract, column_roles)
     if target_column:
         packet["target_column"] = target_column
+
+    temporal_column = _resolve_cleaned_summary_temporal_ordering_column(
+        contract,
+        df_clean,
+        split_column,
+    )
 
     split_labels = None
     if split_column and split_column in df_clean.columns:
@@ -4713,6 +5001,19 @@ def _build_cleaned_ml_fact_packet(
                     packet["target_observability_by_split"] = split_facts
             except Exception:
                 pass
+
+        try:
+            feasibility = _build_temporal_fold_feasibility(
+                df_clean=df_clean,
+                target_series=target_series,
+                target_column=target_column,
+                temporal_column=temporal_column,
+                contract=contract,
+            )
+            if feasibility:
+                packet["temporal_fold_feasibility"] = feasibility
+        except Exception:
+            pass
 
     disallowed_roles = {
         "target",

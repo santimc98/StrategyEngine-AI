@@ -131,6 +131,17 @@ def test_ml_engineer_compacts_cleaned_ml_fact_packet_for_prompt():
                 {"split_value": "holdout", "rows": 406},
                 {"split_value": "scoring", "rows": 780},
             ],
+            "temporal_fold_feasibility": {
+                "temporal_ordering_column": "snapshot_month_end",
+                "total_positive_rows": 230,
+                "windows_with_zero_positives": 1,
+                "candidate_folds_with_single_class_training": 1,
+                "candidate_rolling_origin_folds": [
+                    {"validation_window": "2025-01-31"},
+                    {"validation_window": "2025-02-28"},
+                ],
+                "recommended_guardrail": "verify each train/validation fold before fit",
+            },
             "feature_readiness": {
                 "scope": "allowed_feature_sets.model_features",
                 "candidate_feature_count": 3,
@@ -148,6 +159,8 @@ def test_ml_engineer_compacts_cleaned_ml_fact_packet_for_prompt():
     )
 
     assert packet["expected_scoring_row_count"] == 780
+    assert packet["temporal_fold_feasibility"]["total_positive_rows"] == 230
+    assert packet["temporal_fold_feasibility"]["candidate_rolling_origin_folds"][0]["validation_window"] == "2025-01-31"
     assert packet["feature_readiness"]["candidate_feature_count"] == 3
     assert packet["feature_readiness"]["buckets"]["numeric_ready"]["sample_columns"] == ["arr_current"]
     assert packet["validation_relevant_facts"]["validation_method"] == "temporal_holdout_with_cv"

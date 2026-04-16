@@ -490,6 +490,17 @@ class MLEngineerAgent:
         if isinstance(observability, list) and observability:
             compact["target_observability_by_split"] = observability[:max_splits]
 
+        temporal_feasibility = packet.get("temporal_fold_feasibility")
+        if isinstance(temporal_feasibility, dict) and temporal_feasibility:
+            compact_feasibility = dict(temporal_feasibility)
+            folds = compact_feasibility.get("candidate_rolling_origin_folds")
+            if isinstance(folds, list):
+                compact_feasibility["candidate_rolling_origin_folds"] = folds[:max_splits]
+            window_counts = compact_feasibility.get("window_class_counts_sample")
+            if isinstance(window_counts, list):
+                compact_feasibility["window_class_counts_sample"] = window_counts[:max_splits]
+            compact["temporal_fold_feasibility"] = compact_feasibility
+
         readiness = packet.get("feature_readiness")
         if isinstance(readiness, dict) and readiness:
             buckets = readiness.get("buckets")
@@ -3487,6 +3498,21 @@ class MLEngineerAgent:
             + "        for key, value in kwargs.items()\n"
             + "        if str(key) not in {'sep', 'delimiter', 'decimal', 'encoding'}\n"
             + "    }\n\n"
+            + "def _strip_csv_write_dialect_kwargs(kwargs):\n"
+            + "    stripped = _strip_csv_dialect_kwargs(kwargs)\n"
+            + "    if not hasattr(stripped, 'items'):\n"
+            + "        return stripped\n"
+            + "    writer_allowed = {\n"
+            + "        'quotechar', 'quoting', 'doublequote', 'escapechar',\n"
+            + "        'lineterminator', 'na_rep', 'date_format', 'compression',\n"
+            + "        'errors', 'storage_options', 'columns', 'header',\n"
+            + "        'index_label', 'mode', 'chunksize'\n"
+            + "    }\n"
+            + "    return {\n"
+            + "        key: value\n"
+            + "        for key, value in stripped.items()\n"
+            + "        if str(key) in writer_allowed\n"
+            + "    }\n\n"
             + "def json_default(obj):\n"
             + "    if isinstance(obj, np.bool_):\n"
             + "        return bool(obj)\n"
@@ -3710,11 +3736,16 @@ class MLEngineerAgent:
         def _is_to_csv(node: ast.Call) -> bool:
             return isinstance(node.func, ast.Attribute) and node.func.attr == "to_csv"
 
-        def _is_strip_helper_call(node: ast.AST) -> bool:
+        def _is_strip_helper_call(node: ast.AST, helper_name: str | None = None) -> bool:
+            helper_names = (
+                {helper_name}
+                if helper_name
+                else {"_strip_csv_dialect_kwargs", "_strip_csv_write_dialect_kwargs"}
+            )
             return (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id == "_strip_csv_dialect_kwargs"
+                and node.func.id in helper_names
                 and len(node.args) == 1
             )
 
@@ -3731,7 +3762,19 @@ class MLEngineerAgent:
                     named_keywords = [kw for kw in named_keywords if kw.arg != "delimiter"]
 
                 for kw in star_keywords:
-                    if _is_strip_helper_call(kw.value):
+                    if _is_to_csv(node):
+                        source_arg = (
+                            kw.value.args[0]
+                            if _is_strip_helper_call(kw.value)
+                            else kw.value
+                        )
+                        kw.value = ast.Call(
+                            func=ast.Name(id="_strip_csv_write_dialect_kwargs", ctx=ast.Load()),
+                            args=[source_arg],
+                            keywords=[],
+                        )
+                        continue
+                    if _is_strip_helper_call(kw.value, "_strip_csv_dialect_kwargs"):
                         continue
                     kw.value = ast.Call(
                         func=ast.Name(id="_strip_csv_dialect_kwargs", ctx=ast.Load()),
