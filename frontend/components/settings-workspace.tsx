@@ -111,6 +111,24 @@ export function SettingsWorkspace({
     return new Map(modelsState.presets.map((preset) => [preset.id, preset.label]));
   }, [modelsState.presets]);
 
+  // Pool de modelos personalizados: cualquier ID usado por algún agente
+  // que no esté en los presets. Se recalcula automáticamente — tras guardar,
+  // los valores persisten en agent_model_overrides.json y se redescubren al recargar.
+  const customModelsPool = useMemo(() => {
+    const unique = new Set<string>();
+    Object.entries(modelInputs).forEach(([agentKey, raw]) => {
+      if (customModeAgents.has(agentKey)) {
+        // Ignora valores en curso de edición para que no ensucien otros selectores.
+        return;
+      }
+      const value = String(raw || "").trim();
+      if (value && !presetModels.has(value)) {
+        unique.add(value);
+      }
+    });
+    return Array.from(unique).sort();
+  }, [modelInputs, presetModels, customModeAgents]);
+
   const selectedProviderSpec = useMemo(() => {
     return sandboxState.providers.find((item) => item.name === provider) || sandboxState.providers[0];
   }, [provider, sandboxState.providers]);
@@ -524,13 +542,11 @@ export function SettingsWorkspace({
                         {preset.label}
                       </option>
                     ))}
-                    {(() => {
-                      const v = String(modelInputs[agent.key] || "").trim();
-                      if (v && !presetModels.has(v) && !customModeAgents.has(agent.key)) {
-                        return <option value={v}>{v} (personalizado)</option>;
-                      }
-                      return null;
-                    })()}
+                    {customModelsPool.map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
                     <option value={customModelOption}>Modelo personalizado…</option>
                   </select>
                   {customModeAgents.has(agent.key) ? (
@@ -584,13 +600,11 @@ export function SettingsWorkspace({
                           {preset.label}
                         </option>
                       ))}
-                      {(() => {
-                        const v = String(modelInputs[agent.key] || "").trim();
-                        if (v && !presetModels.has(v) && !customModeAgents.has(agent.key)) {
-                          return <option value={v}>{v} (personalizado)</option>;
-                        }
-                        return null;
-                      })()}
+                      {customModelsPool.map((id) => (
+                        <option key={id} value={id}>
+                          {id}
+                        </option>
+                      ))}
                       <option value={customModelOption}>Modelo personalizado…</option>
                     </select>
                     {customModeAgents.has(agent.key) ? (

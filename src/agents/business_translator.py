@@ -5362,7 +5362,10 @@ $execution_results
             return system_prompt + "\n\n" + user_message
 
         full_prompt = _compose_prompt(prompt_values)
-        max_prompt_tokens = int(os.getenv("TRANSLATOR_MAX_PROMPT_TOKENS", "28000"))
+        # Claude Sonnet/Opus 4.6 soporta 200K de contexto; 28000 dejaba el 86% sin usar
+        # y disparaba compactación de appendix/tables → reportes más cortos con "Prompt Budget Note".
+        # 140000 usa ~70% del contexto y reserva ~60K para reasoning + output.
+        max_prompt_tokens = int(os.getenv("TRANSLATOR_MAX_PROMPT_TOKENS", "140000"))
         est_tokens = _estimate_prompt_tokens(full_prompt)
         prompt_budget_notes: List[str] = []
 
