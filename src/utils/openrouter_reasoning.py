@@ -38,7 +38,7 @@ _AGENT_REASONING_EFFORT_DEFAULTS = {
     "failure_explainer": "medium",
     "ml_engineer": "low",
     "ml_engineer_editor": "low",
-    "translator": "low",
+    "translator": "none",
     "review_board": "low",
     "results_advisor": "low",
     "results_advisor_critique": "low",
@@ -232,7 +232,10 @@ def build_openrouter_reasoning(
         return {}
     effort = _resolve_reasoning_effort(agent_name)
     if effort == "none":
-        return {"effort": "none", "exclude": True}
+        # "none" means the agent explicitly does not want reasoning.
+        # Return empty dict so no reasoning params are sent in extra_body,
+        # avoiding wasted API calls when the provider route rejects the param.
+        return {}
     return {
         "effort": effort,
         "exclude": _resolve_reasoning_exclude(agent_name),
