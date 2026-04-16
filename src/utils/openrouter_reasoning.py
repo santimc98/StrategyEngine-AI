@@ -19,12 +19,40 @@ _DEFAULT_REASONING_EFFORT = "medium"
 _DEFAULT_EXCLUDE_REASONING = True
 _DEFAULT_MAX_TOKENS = 32768
 _MAX_TOKEN_FALLBACK_STEPS = (49152, 32768, 24576, 16384, 8192, 4096, 2048)
+_AGENT_REASONING_EFFORT_DEFAULTS = {
+    # Planning/semantic decisions need deeper reasoning than long-form code output.
+    "strategist": "high",
+    "strategist_generate": "high",
+    "execution_planner": "high",
+    "ml_engineer_plan": "high",
+    "data_engineer_plan": "high",
+    # Code generation should keep reasoning budget moderate and leave room for code.
+    "steward": "medium",
+    "steward_semantics": "medium",
+    "data_engineer": "medium",
+    "data_engineer_editor": "medium",
+    "model_analyst": "medium",
+    "reviewer": "medium",
+    "qa_reviewer": "medium",
+    "cleaning_reviewer": "medium",
+    "failure_explainer": "medium",
+    "ml_engineer": "low",
+    "ml_engineer_editor": "low",
+    "translator": "low",
+    "review_board": "low",
+    "results_advisor": "low",
+    "results_advisor_critique": "low",
+    "results_advisor_llm": "none",
+    "translator_repair": "none",
+    "execution_planner_compiler": "none",
+}
 _AGENT_MAX_TOKEN_DEFAULTS = {
     # --- HIGH reasoning: need headroom for thinking + full output ---
     "strategist": 49152,            # high effort; creative strategy design
     "strategist_generate": 49152,   # high effort; strategy candidate generation
     "execution_planner": 49152,     # high effort; semantic reasoning
     "ml_engineer_plan": 49152,      # high effort; ML architecture planning
+    "data_engineer_plan": 49152,    # high effort; cleaning architecture planning
     # --- MEDIUM reasoning: moderate thinking + structured output ---
     "steward": 32768,               # medium effort; data audit
     "steward_semantics": 32768,     # medium effort; data semantics
@@ -128,12 +156,14 @@ def model_supports_openrouter_reasoning(model_name: Any) -> bool:
 
 
 def _resolve_reasoning_effort(agent_name: str) -> str:
+    normalized = _normalize_agent_name(agent_name)
     suffix = _agent_env_suffix(agent_name)
     override = _override_for_agent(agent_name)
     raw = (
         os.getenv(f"OPENROUTER_REASONING_EFFORT_{suffix}")
         or override.get("effort")
         or os.getenv("OPENROUTER_REASONING_EFFORT")
+        or _AGENT_REASONING_EFFORT_DEFAULTS.get(normalized)
         or _DEFAULT_REASONING_EFFORT
     )
     effort = str(raw or _DEFAULT_REASONING_EFFORT).strip().lower()

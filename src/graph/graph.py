@@ -13699,20 +13699,34 @@ def _de_gate_name_token(value: Any) -> str:
 
 def _extract_cleaning_gate_failure_payload(text: Any) -> Dict[str, Any]:
     payload = str(text or "")
-    match = re.search(r"CLEANING_GATE_FAILED:\s*([A-Za-z0-9_.\- ]+)", payload)
+    match = re.search(r"CLEANING_GATE_FAILED:\s*([A-Za-z0-9_.\-]+)", payload)
     if not match:
         return {}
     tail = payload[match.start() : match.start() + 500]
-    failure: Dict[str, Any] = {"gate_name": match.group(1).strip().split()[0]}
+    gate_name = str(match.group(1) or "").strip()
+    if not gate_name:
+        return {}
+    failure: Dict[str, Any] = {"gate_name": gate_name}
     dtype_match = re.search(r"dtype=([^,\n]+)", tail)
     unique_match = re.search(r"unique=([0-9]+)", tail)
-    span_match = re.search(r"span=([0-9]+)", tail)
+    span_match = re.search(r"span=([0-9]+(?:\.[0-9]+)?)", tail)
+    time_span_outside_match = re.search(
+        r"time\s+span\s+([0-9]+(?:\.[0-9]+)?)\s+outside\s+\[\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*\]",
+        tail,
+        re.IGNORECASE,
+    )
     if dtype_match:
         failure["actual_dtype"] = dtype_match.group(1).strip()
     if unique_match:
         failure["actual_unique"] = int(unique_match.group(1))
-    if span_match:
-        failure["actual_span_days"] = int(span_match.group(1))
+    if time_span_outside_match:
+        failure["actual_span_days"] = float(time_span_outside_match.group(1))
+        failure["expected_time_span_days_range"] = [
+            float(time_span_outside_match.group(2)),
+            float(time_span_outside_match.group(3)),
+        ]
+    elif span_match:
+        failure["actual_span_days"] = float(span_match.group(1))
     return failure
 
 
@@ -13744,6 +13758,46 @@ def _range_contains(value: Any, range_value: Any) -> bool:
     return low <= float(value) <= high
 
 
+def _coerce_expected_span_range(params: Dict[str, Any], failure: Dict[str, Any] | None = None) -> List[float] | None:
+    if not isinstance(params, dict):
+        params = {}
+    failure = failure if isinstance(failure, dict) else {}
+    for key in (
+        "expected_time_span_days_range",
+        "time_span_days_range",
+        "expected_span_days_range",
+        "span_days_range",
+    ):
+        value = params.get(key)
+        if isinstance(value, list) and len(value) == 2:
+            try:
+                return [float(value[0]), float(value[1])]
+            except Exception:
+                pass
+    min_value = (
+        params.get("expected_time_span_days_min")
+        if params.get("expected_time_span_days_min") is not None
+        else params.get("min_time_span_days")
+    )
+    max_value = (
+        params.get("expected_time_span_days_max")
+        if params.get("expected_time_span_days_max") is not None
+        else params.get("max_time_span_days")
+    )
+    if min_value is not None and max_value is not None:
+        try:
+            return [float(min_value), float(max_value)]
+        except Exception:
+            pass
+    failure_range = failure.get("expected_time_span_days_range")
+    if isinstance(failure_range, list) and len(failure_range) == 2:
+        try:
+            return [float(failure_range[0]), float(failure_range[1])]
+        except Exception:
+            pass
+    return None
+
+
 def _profile_column_raw_unique_for_repair(profile: Dict[str, Any], column: str) -> int | None:
     if not isinstance(profile, dict) or not column:
         return None
@@ -13762,6 +13816,33 @@ def _profile_column_raw_unique_for_repair(profile: Dict[str, Any], column: str) 
     return None
 
 
+def _profile_temporal_fact_for_repair(profile: Dict[str, Any], column: str) -> Dict[str, Any]:
+    if not isinstance(profile, dict) or not column:
+        return {}
+    fact_sources: List[Any] = []
+    top_level = profile.get("temporal_normalization_facts")
+    if isinstance(top_level, list):
+        fact_sources.extend(top_level)
+    temporal_analysis = profile.get("temporal_analysis")
+    if isinstance(temporal_analysis, dict):
+        nested = temporal_analysis.get("normalization_facts")
+        if isinstance(nested, list):
+            fact_sources.extend(nested)
+    for item in fact_sources:
+        if isinstance(item, dict) and str(item.get("column") or "").strip() == column:
+            return item
+    return {}
+
+
+def _numbers_close_for_repair(left: Any, right: Any, *, rel_tol: float = 0.03, abs_tol: float = 3.0) -> bool:
+    try:
+        left_f = float(left)
+        right_f = float(right)
+    except Exception:
+        return False
+    return abs(left_f - right_f) <= max(abs_tol, abs(right_f) * rel_tol)
+
+
 def _detect_de_contract_gate_contradiction(state: Dict[str, Any], runtime_output: Any) -> Dict[str, Any]:
     failure = _extract_cleaning_gate_failure_payload(runtime_output)
     if not failure:
@@ -13772,22 +13853,54 @@ def _detect_de_contract_gate_contradiction(state: Dict[str, Any], runtime_output
         return {}
     params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
     expected_unique = params.get("expected_unique_range") or params.get("unique_count_range")
-    expected_span = params.get("expected_time_span_days_range") or params.get("time_span_days_range")
+    expected_span = _coerce_expected_span_range(params, failure)
     expected_dtype = str(params.get("expected_dtype") or params.get("dtype") or "").lower()
     actual_unique = failure.get("actual_unique")
     actual_span = failure.get("actual_span_days")
     actual_dtype = str(failure.get("actual_dtype") or "").lower()
-    is_datetime_gate = "datetime" in expected_dtype or "date" in expected_dtype or "datetime" in actual_dtype
-    if not (is_datetime_gate and isinstance(actual_unique, int) and expected_unique):
-        return {}
-    unique_expected = _range_contains(actual_unique, expected_unique)
-    span_expected = _range_contains(actual_span, expected_span) if expected_span else False
-    if unique_expected:
+    gate_text = " ".join(
+        [
+            str(gate.get("name") or ""),
+            str(gate.get("evidence_source") or ""),
+            str(gate.get("phase_reasoning") or ""),
+            str(failure.get("gate_name") or ""),
+        ]
+    ).lower()
+    is_datetime_gate = (
+        "datetime" in expected_dtype
+        or "date" in expected_dtype
+        or "datetime" in actual_dtype
+        or "time span" in str(runtime_output or "").lower()
+        or any(token in gate_text for token in ("datetime", "date", "temporal", "time_span", "time span"))
+    )
+    if not is_datetime_gate:
         return {}
     column = str(params.get("column") or params.get("date_column") or params.get("time_column") or "").strip()
     profile = _load_dataset_profile_for_repair(state)
     raw_unique = _profile_column_raw_unique_for_repair(profile, column)
-    raw_unique_reused = raw_unique is not None and _range_contains(raw_unique, expected_unique)
+    raw_unique_reused = (
+        isinstance(actual_unique, int)
+        and bool(expected_unique)
+        and raw_unique is not None
+        and _range_contains(raw_unique, expected_unique)
+        and not _range_contains(actual_unique, expected_unique)
+    )
+    temporal_fact = _profile_temporal_fact_for_repair(profile, column)
+    profile_span = temporal_fact.get("time_span_days") if isinstance(temporal_fact, dict) else None
+    time_span_confidence = str(temporal_fact.get("time_span_confidence") or "").strip().lower()
+    span_expected = _range_contains(actual_span, expected_span) if expected_span else False
+    span_mismatch = bool(expected_span and isinstance(actual_span, (int, float)) and not span_expected)
+    profile_span_matches_runtime = _numbers_close_for_repair(actual_span, profile_span)
+    span_gate_unsupported = bool(
+        span_mismatch
+        and (
+            profile_span_matches_runtime
+            or time_span_confidence in {"low", "medium"}
+            or not time_span_confidence
+        )
+    )
+    if expected_unique and isinstance(actual_unique, int) and _range_contains(actual_unique, expected_unique):
+        raw_unique_reused = False
     monthly_or_snapshot = any(
         token in " ".join([column, str(gate.get("name") or ""), str(gate.get("evidence_source") or "")]).lower()
         for token in ("month", "monthly", "snapshot", "period")
@@ -13802,8 +13915,25 @@ def _detect_de_contract_gate_contradiction(state: Dict[str, Any], runtime_output
         and isinstance(expected_unique[0], (int, float))
         and float(expected_unique[0]) >= 90
     )
-    if not (raw_unique_reused or cadence_conflict):
+    if not (raw_unique_reused or cadence_conflict or span_gate_unsupported):
         return {}
+    reason_parts = []
+    if raw_unique_reused or cadence_conflict:
+        reason_parts.append(
+            "The failing gate appears to compare parsed canonical datetime cardinality against raw string/profile cardinality."
+        )
+    if span_gate_unsupported:
+        reason_parts.append(
+            "The failing gate enforces a hard parsed time-span threshold that is not supported by the current cleaned-runtime evidence."
+        )
+        if profile_span_matches_runtime:
+            reason_parts.append(
+                "The runtime span matches the steward temporal profile, so changing the parser just to hit the gate would likely corrupt semantics."
+            )
+        elif time_span_confidence in {"low", "medium"}:
+            reason_parts.append(
+                f"The steward marks time_span_days confidence as {time_span_confidence}; this is diagnostic context, not a safe hard gate threshold."
+            )
     return {
         "kind": "contract_gate_semantic_contradiction",
         "gate_name": str(gate.get("name") or failure.get("gate_name") or ""),
@@ -13814,10 +13944,9 @@ def _detect_de_contract_gate_contradiction(state: Dict[str, Any], runtime_output
         "actual_span_days": actual_span,
         "actual_dtype": failure.get("actual_dtype"),
         "raw_unique": raw_unique,
-        "reason": (
-            "The failing gate appears to compare parsed canonical datetime cardinality against raw string/profile "
-            "cardinality. A correct mixed-format date parse can collapse many raw strings into fewer canonical periods."
-        ),
+        "profile_time_span_days": profile_span,
+        "time_span_confidence": time_span_confidence or None,
+        "reason": " ".join(reason_parts),
     }
 
 
@@ -14577,7 +14706,7 @@ def _build_repair_scope(
     hypothesis_packet: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     repair_focus = str(repair_focus or "").strip().lower()
-    if repair_focus not in {"runtime", "persistence", "compliance"}:
+    if repair_focus not in {"runtime", "persistence", "compliance", "contract_or_gate_semantics"}:
         return {}
 
     repair_ground_truth = repair_ground_truth if isinstance(repair_ground_truth, dict) else {}
@@ -14588,7 +14717,10 @@ def _build_repair_scope(
     failed_gates = _normalize_handoff_items(failed_gates, max_items=12, max_len=180)
     optimization_context = optimization_context if isinstance(optimization_context, dict) else {}
     hypothesis_packet = hypothesis_packet if isinstance(hypothesis_packet, dict) else {}
-    phase = "compliance_runtime" if repair_focus in {"runtime", "compliance"} else "contract_persistence"
+    if repair_focus == "contract_or_gate_semantics":
+        phase = "contract_gate_runtime_adjudication"
+    else:
+        phase = "compliance_runtime" if repair_focus in {"runtime", "compliance"} else "contract_persistence"
 
     editable_targets: List[str] = []
     protected_regions: List[str] = []
@@ -14612,6 +14744,29 @@ def _build_repair_scope(
             target = "artifact_writers:" + ",".join([str(path) for path in value[:4]])
             if target not in editable_targets:
                 editable_targets.append(target)
+        elif name == "contract_gate_semantic_contradiction" and isinstance(value, dict):
+            gate = str(value.get("gate_name") or "").strip()
+            column = str(value.get("column") or "").strip()
+            expected_span = value.get("expected_time_span_days_range")
+            actual_span = value.get("actual_span_days")
+            if gate:
+                target = f"gate_validation:{gate}"
+                if target not in editable_targets:
+                    editable_targets.append(target)
+            if column:
+                region = f"parse_logic:{column}"
+                if region not in protected_regions:
+                    protected_regions.append(region)
+            finding = (
+                f"{gate or 'cleaning gate'}: runtime cleaned evidence is incompatible with the contract gate"
+                + (
+                    f" (actual span {actual_span}, expected {expected_span})."
+                    if expected_span is not None and actual_span is not None
+                    else "."
+                )
+            )
+            if finding not in active_findings:
+                active_findings.append(finding)
         elif name == "failed_gate":
             text = str(value or "").strip()
             if text and text not in active_findings:
@@ -14850,6 +15005,21 @@ def _append_data_engineer_structured_repair_context(
         required_fixes=required_fixes,
         evidence_focus=evidence_focus,
     )
+    if isinstance(repair_ground_truth, dict) and repair_ground_truth:
+        root_cause = str(repair_ground_truth.get("root_cause_type") or "").strip()
+        focus = str(repair_ground_truth.get("repair_focus") or "").strip()
+        if root_cause:
+            retry_context["error_type"] = root_cause
+        if focus:
+            retry_context["repair_focus"] = focus
+        recommended = retry_context.get("recommended_actions")
+        if not isinstance(recommended, list):
+            recommended = []
+        for directive in repair_ground_truth.get("repair_directives") or []:
+            text = str(directive or "").strip()
+            if text and text not in recommended:
+                recommended.insert(0, text)
+        retry_context["recommended_actions"] = recommended[:8]
     effective_focus = str(
         (repair_ground_truth.get("repair_focus") if isinstance(repair_ground_truth, dict) else "")
         or retry_context.get("repair_focus")
@@ -17131,6 +17301,7 @@ _RUNTIME_MODEL_AGENT_KEYS = (
     "strategist_fallback",
     "execution_planner",
     "execution_planner_compiler",
+    "data_engineer_plan",
     "data_engineer",
     "data_engineer_editor",
     "data_engineer_fallback",
@@ -17169,6 +17340,10 @@ def get_runtime_agent_models() -> Dict[str, str]:
         "execution_planner_compiler": _normalize_runtime_model_name(
             getattr(execution_planner, "compiler_model_name", "")
             or getattr(execution_planner, "model_name", "")
+        ),
+        "data_engineer_plan": _normalize_runtime_model_name(
+            getattr(data_engineer, "plan_model_name", "")
+            or getattr(data_engineer, "model_name", "")
         ),
         "data_engineer": _normalize_runtime_model_name(getattr(data_engineer, "model_name", "")),
         "data_engineer_editor": _normalize_runtime_model_name(
@@ -17270,9 +17445,12 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
     if execution_planner_compiler_model:
         execution_planner.compiler_model_name = execution_planner_compiler_model
 
+    data_engineer_plan_model = normalized.get("data_engineer_plan")
     data_engineer_model = normalized.get("data_engineer")
     data_engineer_editor_model = _normalize_runtime_model_name(overrides.get("data_engineer_editor"))
     data_engineer_fallback_model = normalized.get("data_engineer_fallback")
+    if data_engineer_plan_model:
+        data_engineer.plan_model_name = data_engineer_plan_model
     if data_engineer_model:
         data_engineer.model_name = data_engineer_model
     if data_engineer_fallback_model:
@@ -17290,7 +17468,12 @@ def set_runtime_agent_models(overrides: Optional[Dict[str, Any]] = None) -> Dict
             data_engineer.editor_model_name = data_engineer_editor_model
         elif data_engineer_model:
             data_engineer.editor_model_name = _normalize_runtime_model_name(getattr(data_engineer, "model_name", ""))
-    if (data_engineer_model or data_engineer_fallback_model) and hasattr(data_engineer, "last_model_used"):
+    if not data_engineer_plan_model and data_engineer_model:
+        data_engineer.plan_model_name = _normalize_runtime_model_name(
+            getattr(data_engineer, "plan_model_name", "")
+            or getattr(data_engineer, "model_name", "")
+        )
+    if (data_engineer_plan_model or data_engineer_model or data_engineer_fallback_model) and hasattr(data_engineer, "last_model_used"):
         data_engineer.last_model_used = None
 
     ml_engineer_model = normalized.get("ml_engineer")
@@ -19641,6 +19824,68 @@ def _resolve_ml_input_path(state: Dict[str, Any], *, require_exists: bool) -> st
     return ""
 
 
+def _looks_like_de_code_runtime_error(text: Any) -> bool:
+    payload = str(text or "").lower()
+    if not payload:
+        return False
+    infra_markers = (
+        "local_runner_input_uri_missing",
+        "heavy_runner_protocol_mismatch",
+        "required cli not found",
+        "failed to load input json",
+        "request.json",
+        "gcloud",
+        "gsutil",
+    )
+    if any(marker in payload for marker in infra_markers):
+        return False
+    code_markers = (
+        "cleaning_gate_failed",
+        "traceback (most recent call last)",
+        "file \"c:\\tmp\\run\\ml_script.py\"",
+        "script_execution_failed",
+        "runtime_error",
+        "valueerror:",
+        "typeerror:",
+        "keyerror:",
+        "attributeerror:",
+        "modulenotfounderror:",
+        "importerror:",
+    )
+    return any(marker in payload for marker in code_markers)
+
+
+def _classify_de_heavy_runtime_error_kind(
+    *,
+    error_kind_hint: str,
+    heavy_script_error: Any,
+    runtime_error_text: str,
+    heavy_error: str = "",
+) -> str:
+    hint = str(error_kind_hint or "").strip().lower()
+    combined = "\n".join(
+        str(item or "")
+        for item in [
+            runtime_error_text,
+            heavy_error,
+            heavy_script_error if not isinstance(heavy_script_error, dict) else "",
+        ]
+        if str(item or "").strip()
+    )
+    if hint.startswith("infra"):
+        return "infra"
+    if hint == "code" or _looks_like_de_code_runtime_error(combined):
+        return "code"
+    if isinstance(heavy_script_error, dict):
+        script_error_name = str(heavy_script_error.get("error") or "").strip().lower()
+        has_trace = bool(
+            str(heavy_script_error.get("stacktrace") or "").strip()
+            or str(heavy_script_error.get("traceback") or "").strip()
+        )
+        return "code" if (has_trace or script_error_name in {"script_execution_failed", "runtime_error"}) else "infra"
+    return "code" if heavy_script_error else "infra"
+
+
 def _execute_data_engineer_via_heavy_runner(
     *,
     state: Dict[str, Any],
@@ -19822,6 +20067,27 @@ def _execute_data_engineer_via_heavy_runner(
         contract=state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else None,
     )
 
+    downloaded_error_text = ""
+    heavy_error_artifact_path = os.path.join("artifacts", "heavy_error.json")
+    if os.path.exists(heavy_error_artifact_path):
+        try:
+            with open(heavy_error_artifact_path, "r", encoding="utf-8") as f_err:
+                downloaded_error_payload = json.load(f_err)
+            if isinstance(downloaded_error_payload, dict):
+                downloaded_error_text = "\n".join(
+                    str(item or "").strip()
+                    for item in [
+                        downloaded_error_payload.get("error"),
+                        downloaded_error_payload.get("stacktrace"),
+                        downloaded_error_payload.get("traceback"),
+                    ]
+                    if str(item or "").strip()
+                )
+            else:
+                downloaded_error_text = str(downloaded_error_payload)
+        except Exception:
+            downloaded_error_text = ""
+
     downloaded = heavy_result.get("downloaded") or {}
     missing = list(heavy_result.get("missing_artifacts") or [])
     status_ok = str(heavy_result.get("status") or "").lower() == "success"
@@ -19907,6 +20173,8 @@ def _execute_data_engineer_via_heavy_runner(
             err_parts.append(str(heavy_result.get("job_error")))
         if heavy_result.get("error"):
             err_parts.append(str(heavy_result.get("error")))
+        if downloaded_error_text and downloaded_error_text not in err_parts:
+            err_parts.append(downloaded_error_text)
         if missing:
             err_parts.append(f"missing_artifacts={missing}")
         if not err_parts:
@@ -19918,7 +20186,11 @@ def _execute_data_engineer_via_heavy_runner(
             error_kind_hint = "infra_protocol_mismatch"
             error_details = "HEAVY_RUNNER_PROTOCOL_MISMATCH: " + " | ".join(err_parts)
         else:
-            error_kind_hint = "code_or_infra_unknown"
+            error_kind_hint = (
+                "code"
+                if _looks_like_de_code_runtime_error("\n".join(err_parts))
+                else "code_or_infra_unknown"
+            )
             error_details = "HEAVY_RUNNER_ERROR: " + " | ".join(err_parts)
         error_payload = {
             "stage": "heavy_runner_error",
@@ -21399,6 +21671,72 @@ def run_data_engineer(state: AgentState) -> AgentState:
         artifact_obligations_context = build_data_engineer_artifact_obligations(
             execution_contract if isinstance(execution_contract, dict) else {}
         )
+    data_cleaning_plan = state.get("data_cleaning_plan")
+    if not isinstance(data_cleaning_plan, dict) or not data_cleaning_plan:
+        data_cleaning_plan = _load_json_safe("data/data_cleaning_plan.json")
+    if not isinstance(data_cleaning_plan, dict):
+        data_cleaning_plan = {}
+    if (
+        not data_cleaning_plan
+        and int(attempt_id or 0) <= 1
+        and hasattr(data_engineer, "generate_cleaning_plan")
+    ):
+        try:
+            print("--- [3.1] Data Engineer: Planning Cleaning Pipeline ---")
+            plan_kwargs = {
+                "data_audit": data_engineer_audit_override,
+                "strategy": selected,
+                "input_path": "data/raw.csv",
+                "prompt_input_path": csv_path,
+                "business_objective": de_objective,
+                "csv_encoding": csv_encoding,
+                "csv_sep": csv_sep,
+                "csv_decimal": csv_decimal,
+                "execution_contract": execution_contract,
+                "de_view": de_view,
+                "artifact_obligations": artifact_obligations_context,
+            }
+            data_cleaning_plan = data_engineer.generate_cleaning_plan(**plan_kwargs)
+            if not isinstance(data_cleaning_plan, dict):
+                data_cleaning_plan = {}
+            state["data_cleaning_plan"] = data_cleaning_plan
+            os.makedirs("data", exist_ok=True)
+            with open(os.path.join("data", "data_cleaning_plan.json"), "w", encoding="utf-8") as f_plan:
+                json.dump(data_cleaning_plan, f_plan, indent=2, ensure_ascii=False)
+            state["data_cleaning_plan_path"] = "data/data_cleaning_plan.json"
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "data_cleaning_plan_generated",
+                    {
+                        "attempt": attempt_id,
+                        "plan_source": data_cleaning_plan.get("plan_source"),
+                        "owned_deliverables": data_cleaning_plan.get("owned_deliverables"),
+                    },
+                )
+                log_agent_snapshot(
+                    run_id,
+                    "data_engineer_plan",
+                    prompt=getattr(data_engineer, "last_plan_prompt", None),
+                    response=getattr(data_engineer, "last_plan_response", None) or data_cleaning_plan,
+                    context={
+                        "de_view": de_view,
+                        "execution_contract": execution_contract,
+                        "artifact_obligations_context": artifact_obligations_context,
+                    },
+                    attempt=attempt_id,
+                )
+            print(
+                "DATA_CLEANING_PLAN: Generated plan "
+                f"source={data_cleaning_plan.get('plan_source', 'unknown')}"
+            )
+        except Exception as plan_err:
+            print(f"Warning: data_cleaning_plan generation failed: {plan_err}")
+            data_cleaning_plan = {}
+            state["data_cleaning_plan"] = data_cleaning_plan
+    elif data_cleaning_plan:
+        state["data_cleaning_plan"] = data_cleaning_plan
+        state.setdefault("data_cleaning_plan_path", "data/data_cleaning_plan.json")
     if minimal_context_mode:
         context_payload = {
             "csv_path": csv_path,
@@ -21408,6 +21746,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "de_view": de_view,
             "artifact_obligations_context": artifact_obligations_context,
             "artifact_obligations_context_path": state.get("artifact_obligations_context_path"),
+            "data_cleaning_plan": data_cleaning_plan,
             "feedback_context": data_engineer_audit_override,
             "last_gate_context": state.get("last_gate_context"),
         }
@@ -21429,6 +21768,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "execution_contract": execution_contract,
             "artifact_obligations_context": artifact_obligations_context,
             "artifact_obligations_context_path": state.get("artifact_obligations_context_path"),
+            "data_cleaning_plan": data_cleaning_plan,
             "context_pack": context_pack,
         }
     try:
@@ -21488,6 +21828,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
         kwargs["de_view"] = de_view
     if "artifact_obligations" in sig.parameters and artifact_obligations_context:
         kwargs["artifact_obligations"] = artifact_obligations_context
+    if "data_cleaning_plan" in sig.parameters and data_cleaning_plan:
+        kwargs["data_cleaning_plan"] = data_cleaning_plan
     if "repair_mode" in sig.parameters:
         kwargs["repair_mode"] = bool(attempt_id > 1)
     if "previous_code" in sig.parameters and previous_de_code:
@@ -22102,6 +22444,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     runtime_error_text = str(heavy_script_error)
                 if not runtime_error_text:
                     runtime_error_text = heavy_error
+                heavy_error_kind = _classify_de_heavy_runtime_error_kind(
+                    error_kind_hint=error_kind_hint,
+                    heavy_script_error=heavy_script_error,
+                    runtime_error_text=runtime_error_text,
+                    heavy_error=heavy_error,
+                )
 
                 if heavy_error_kind == "code":
                     repaired_code, repair_notes = _attempt_de_local_syntax_repair(code, runtime_error_text)
@@ -22192,6 +22540,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 runtime_error_text = str(heavy_script_error)
                             if not runtime_error_text:
                                 runtime_error_text = heavy_error
+                            heavy_error_kind = _classify_de_heavy_runtime_error_kind(
+                                error_kind_hint=error_kind_hint,
+                                heavy_script_error=heavy_script_error,
+                                runtime_error_text=runtime_error_text,
+                                heavy_error=heavy_error,
+                            )
 
                 if (
                     not de_heavy_result.get("ok")
@@ -24202,6 +24556,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "cleaned_data_summary_min": cleaned_data_summary_min,
             "cleaned_data_summary_min_path": cleaned_data_summary_min_path,
             "plots_local": de_plots_local,
+            "data_cleaning_plan": data_cleaning_plan,
+            "data_cleaning_plan_path": state.get("data_cleaning_plan_path"),
             "error_message": None,
         }
         merged_state = dict(state or {})

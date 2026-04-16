@@ -1054,8 +1054,8 @@ def _infer_type_hint(series: pd.Series) -> str:
         if sample.empty:
             return "categorical"
         try:
-            parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
-            if parsed.notna().mean() > 0.7:
+            _parsed, diagnostics = _parse_temporal_series_format_aware(sample)
+            if float(diagnostics.get("parse_ratio_non_missing") or 0.0) > 0.7:
                 return "datetime"
         except Exception:
             pass
@@ -1064,6 +1064,180 @@ def _infer_type_hint(series: pd.Series) -> str:
             return "numeric"
         return "categorical"
     return "unknown"
+
+
+_TEMPORAL_NULL_TOKENS = {"", "nan", "none", "null", "<na>", "nat"}
+
+
+def _to_utc_naive_timestamp(value: Any) -> pd.Timestamp:
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return pd.NaT
+    if pd.isna(ts):
+        return pd.NaT
+    try:
+        if ts.tzinfo is not None:
+            return ts.tz_convert("UTC").tz_localize(None)
+    except Exception:
+        try:
+            return ts.tz_localize(None)
+        except Exception:
+            return pd.NaT
+    return ts
+
+
+def _ambiguous_date_match(token: str) -> re.Match[str] | None:
+    return re.match(r"^(\d{1,2})([-/])(\d{1,2})\2(\d{4})(?:[T\s].*)?$", token)
+
+
+def _separator_key(separator: str) -> str:
+    return "slash" if separator == "/" else "dash"
+
+
+def _infer_ambiguous_date_preferences(values: pd.Series) -> Tuple[Dict[str, Optional[bool]], Dict[str, Any]]:
+    stats: Dict[str, Dict[str, int]] = {
+        "slash": {"dayfirst_evidence": 0, "monthfirst_evidence": 0, "ambiguous": 0, "invalid": 0},
+        "dash": {"dayfirst_evidence": 0, "monthfirst_evidence": 0, "ambiguous": 0, "invalid": 0},
+    }
+    for raw_value in values.dropna().astype(str):
+        token = raw_value.strip()
+        match = _ambiguous_date_match(token)
+        if not match:
+            continue
+        first = int(match.group(1))
+        second = int(match.group(3))
+        key = _separator_key(match.group(2))
+        if first > 12 and second <= 12:
+            stats[key]["dayfirst_evidence"] += 1
+        elif second > 12 and first <= 12:
+            stats[key]["monthfirst_evidence"] += 1
+        elif first <= 12 and second <= 12:
+            stats[key]["ambiguous"] += 1
+        else:
+            stats[key]["invalid"] += 1
+
+    preferences: Dict[str, Optional[bool]] = {}
+    for key, item in stats.items():
+        has_dayfirst = item["dayfirst_evidence"] > 0
+        has_monthfirst = item["monthfirst_evidence"] > 0
+        if has_dayfirst and not has_monthfirst:
+            preferences[key] = True
+        elif has_monthfirst and not has_dayfirst:
+            preferences[key] = False
+        else:
+            preferences[key] = None
+    return preferences, stats
+
+
+def _preference_label(value: Optional[bool]) -> str:
+    if value is True:
+        return "dayfirst"
+    if value is False:
+        return "monthfirst"
+    return "unresolved"
+
+
+def _parse_temporal_value_format_aware(token: str, preferences: Dict[str, Optional[bool]]) -> pd.Timestamp:
+    token = str(token or "").strip()
+    if not token or token.lower() in _TEMPORAL_NULL_TOKENS:
+        return pd.NaT
+    try:
+        if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T\s].*)?$", token):
+            return _to_utc_naive_timestamp(date_parser.parse(token, yearfirst=True, dayfirst=False))
+
+        if re.match(r"^\d{8}$", token):
+            return _to_utc_naive_timestamp(datetime.strptime(token, "%Y%m%d"))
+
+        year_month = re.match(r"^(\d{4})([-/])(\d{1,2})$", token)
+        if year_month:
+            return pd.Timestamp(year=int(year_month.group(1)), month=int(year_month.group(3)), day=1)
+
+        if re.match(r"^\d{4}$", token):
+            return pd.Timestamp(year=int(token), month=1, day=1)
+
+        ambiguous = _ambiguous_date_match(token)
+        if ambiguous:
+            first = int(ambiguous.group(1))
+            second = int(ambiguous.group(3))
+            key = _separator_key(ambiguous.group(2))
+            if first > 12 and second <= 12:
+                dayfirst = True
+            elif second > 12 and first <= 12:
+                dayfirst = False
+            else:
+                preference = preferences.get(key)
+                # Parse unresolved ambiguous tokens deterministically, but the
+                # caller marks the resulting span as low-confidence evidence.
+                dayfirst = bool(preference) if preference is not None else False
+            return _to_utc_naive_timestamp(date_parser.parse(token, yearfirst=False, dayfirst=dayfirst))
+
+        looks_temporal = bool(re.search(r"\d{4}", token) and re.search(r"[-/T:\s]", token))
+        looks_temporal = looks_temporal or bool(
+            re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", token, re.IGNORECASE)
+        )
+        if not looks_temporal:
+            return pd.NaT
+        return _to_utc_naive_timestamp(date_parser.parse(token, yearfirst=False, dayfirst=False))
+    except Exception:
+        return pd.NaT
+
+
+def _parse_temporal_series_format_aware(series: pd.Series) -> Tuple[pd.Series, Dict[str, Any]]:
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    try:
+        raw_text = series.dropna().astype(str).str.strip()
+        raw_text = raw_text[~raw_text.str.lower().isin(_TEMPORAL_NULL_TOKENS)]
+    except Exception:
+        return parsed, {
+            "parse_policy": "format_family_aware_explicit_yearfirst",
+            "parse_ratio_non_missing": 0.0,
+            "ambiguous_date_token_count": 0,
+            "unresolved_ambiguous_date_count": 0,
+        }
+    if raw_text.empty:
+        return parsed, {
+            "parse_policy": "format_family_aware_explicit_yearfirst",
+            "parse_ratio_non_missing": 0.0,
+            "ambiguous_date_token_count": 0,
+            "unresolved_ambiguous_date_count": 0,
+        }
+
+    preferences, stats = _infer_ambiguous_date_preferences(raw_text)
+    parsed_values = raw_text.map(lambda value: _parse_temporal_value_format_aware(value, preferences))
+    parsed.loc[raw_text.index] = pd.to_datetime(parsed_values, errors="coerce")
+
+    unresolved_count = 0
+    ambiguous_count = 0
+    for raw_value in raw_text:
+        match = _ambiguous_date_match(str(raw_value).strip())
+        if not match:
+            continue
+        first = int(match.group(1))
+        second = int(match.group(3))
+        if first <= 12 and second <= 12:
+            ambiguous_count += 1
+            if preferences.get(_separator_key(match.group(2))) is None:
+                unresolved_count += 1
+
+    conflict_count = sum(
+        1
+        for item in stats.values()
+        if item["dayfirst_evidence"] > 0 and item["monthfirst_evidence"] > 0
+    )
+    diagnostics = {
+        "parse_policy": "format_family_aware_explicit_yearfirst",
+        "parse_ratio_non_missing": round(float(parsed_values.notna().mean()), 4),
+        "ambiguous_date_preferences": {
+            key: _preference_label(value)
+            for key, value in preferences.items()
+        },
+        "ambiguous_date_evidence": stats,
+        "ambiguous_date_token_count": int(ambiguous_count),
+        "unresolved_ambiguous_date_count": int(unresolved_count),
+        "ambiguous_date_conflict_count": int(conflict_count),
+    }
+    return parsed, diagnostics
 
 
 def detect_pii_findings(df: pd.DataFrame, threshold: float = 0.3) -> Dict[str, Any]:
@@ -1161,8 +1335,8 @@ def build_dataset_profile(
             )
             summary["percent_like_ratio"] = float(values.str.contains(r"%").mean())
             try:
-                parsed = pd.to_datetime(values, errors="coerce", dayfirst=True)
-                summary["datetime_like_ratio"] = float(parsed.notna().mean())
+                _parsed, diagnostics = _parse_temporal_series_format_aware(values)
+                summary["datetime_like_ratio"] = float(diagnostics.get("parse_ratio_non_missing") or 0.0)
             except Exception:
                 summary["datetime_like_ratio"] = 0.0
         except Exception:
@@ -1373,6 +1547,7 @@ def _build_temporal_normalization_fact(
     parse_ratio: float,
     time_span_days: float | None,
     sample_rows: int,
+    parse_diagnostics: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     try:
         raw_unique_count = int(raw_text.nunique(dropna=True))
@@ -1433,6 +1608,17 @@ def _build_temporal_normalization_fact(
     if has_time_component and max_relevant_ratio >= 1.25:
         collapse_risk = "high"
 
+    parse_diagnostics = parse_diagnostics or {}
+    parse_success_ratio = float(parse_diagnostics.get("parse_ratio_non_missing") or parse_ratio or 0.0)
+    unresolved_ambiguous = int(parse_diagnostics.get("unresolved_ambiguous_date_count") or 0)
+    ambiguous_conflicts = int(parse_diagnostics.get("ambiguous_date_conflict_count") or 0)
+    if parse_success_ratio < 0.95 or unresolved_ambiguous or ambiguous_conflicts:
+        time_span_confidence = "low"
+    elif has_mixed_formats or has_time_component:
+        time_span_confidence = "medium"
+    else:
+        time_span_confidence = "high"
+
     fact: Dict[str, Any] = {
         "column": column,
         "sample_rows_evaluated": int(sample_rows),
@@ -1446,24 +1632,40 @@ def _build_temporal_normalization_fact(
         "raw_to_canonical_unique_ratios": collapse_ratios,
         "semantic_granularity_hints": semantic_hints,
         "normalization_collapse_risk": collapse_risk,
+        "parse_policy": parse_diagnostics.get("parse_policy") or "format_family_aware_explicit_yearfirst",
+        "time_span_confidence": time_span_confidence,
         "contract_gate_guidance": {
             "raw_unique_count_is_pre_normalization": True,
             "expected_unique_range_policy": (
                 "Do not copy raw_unique_count into expected_unique_range for the cleaned artifact. "
                 "Use a canonical bucket count only when the gate is explicitly bound to that representation."
             ),
+            "time_span_days_policy": (
+                "Use time_span_days as a HARD gate only when time_span_confidence is high and the gate cites "
+                "the parsed artifact scope. Otherwise treat it as diagnostic context and prefer dtype, parse "
+                "success, null preservation, cadence, and causal consistency checks."
+            ),
             "safe_hard_gate_examples": [
                 "parsed dtype is datetime-like",
                 "parse failures/nulls do not increase unexpectedly",
-                "min/max temporal span remains consistent with source evidence",
+                "min/max temporal span remains consistent with high-confidence parsed source evidence",
                 "period alignment is preserved when the business concept is periodic",
             ],
             "unsafe_hard_gate_examples": [
                 "expected_unique_range copied from raw_unique_count",
                 "raw string cardinality used as parsed timestamp cardinality",
+                "expected_time_span_days copied from low/medium-confidence temporal profile evidence",
             ],
         },
     }
+    if parse_diagnostics:
+        fact["ambiguous_date_resolution"] = {
+            "preferences": parse_diagnostics.get("ambiguous_date_preferences") or {},
+            "evidence": parse_diagnostics.get("ambiguous_date_evidence") or {},
+            "ambiguous_token_count": int(parse_diagnostics.get("ambiguous_date_token_count") or 0),
+            "unresolved_ambiguous_token_count": unresolved_ambiguous,
+            "conflict_count": ambiguous_conflicts,
+        }
     if time_span_days is not None:
         fact["time_span_days"] = time_span_days
     return fact
@@ -1507,40 +1709,11 @@ def _compute_temporal_analysis(
             if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
                 try:
                     text = series.astype(str).str.strip()
-                    non_missing_mask = non_missing_mask & ~text.str.lower().isin({"", "nan", "none", "null", "<na>", "nat"})
+                    non_missing_mask = non_missing_mask & ~text.str.lower().isin(_TEMPORAL_NULL_TOKENS)
                 except Exception:
                     pass
             working = series.where(non_missing_mask)
-            parsed = pd.to_datetime(working, errors="coerce", utc=True)
-            remaining = non_missing_mask & parsed.isna()
-            if bool(remaining.any()):
-                parsed_dayfirst = pd.to_datetime(working[remaining], errors="coerce", utc=True, dayfirst=True)
-                parsed.loc[remaining] = parsed_dayfirst
-            remaining = non_missing_mask & parsed.isna()
-            if bool(remaining.any()):
-                def _fallback_parse(value: Any) -> pd.Timestamp:
-                    text = str(value or "").strip()
-                    if not text or text.lower() in {"nan", "none", "null", "<na>", "nat"}:
-                        return pd.NaT
-                    for dayfirst in (False, True):
-                        try:
-                            ts = pd.Timestamp(date_parser.parse(text, dayfirst=dayfirst))
-                            if ts.tzinfo is None:
-                                return ts.tz_localize("UTC")
-                            return ts.tz_convert("UTC")
-                        except Exception:
-                            continue
-                    return pd.NaT
-
-                fallback = working[remaining].apply(_fallback_parse)
-                parsed.loc[remaining] = fallback
-            try:
-                parsed = parsed.dt.tz_convert(None)
-            except Exception:
-                try:
-                    parsed = parsed.dt.tz_localize(None)
-                except Exception:
-                    pass
+            parsed, parse_diagnostics = _parse_temporal_series_format_aware(working)
             parse_ratio = float(parsed.notna().mean())
             if parse_ratio < 0.6:
                 continue
@@ -1590,6 +1763,22 @@ def _compute_temporal_analysis(
             }
             if time_span_days is not None:
                 detail_entry["time_span_days"] = time_span_days
+                detail_entry["time_span_confidence"] = (
+                    "low"
+                    if int(parse_diagnostics.get("unresolved_ambiguous_date_count") or 0)
+                    or int(parse_diagnostics.get("ambiguous_date_conflict_count") or 0)
+                    or float(parse_diagnostics.get("parse_ratio_non_missing") or parse_ratio or 0.0) < 0.95
+                    else "medium"
+                    if parse_diagnostics.get("ambiguous_date_token_count")
+                    else "high"
+                )
+            detail_entry["parse_policy"] = parse_diagnostics.get("parse_policy")
+            detail_entry["ambiguous_date_resolution"] = {
+                "preferences": parse_diagnostics.get("ambiguous_date_preferences") or {},
+                "ambiguous_token_count": int(parse_diagnostics.get("ambiguous_date_token_count") or 0),
+                "unresolved_ambiguous_token_count": int(parse_diagnostics.get("unresolved_ambiguous_date_count") or 0),
+                "conflict_count": int(parse_diagnostics.get("ambiguous_date_conflict_count") or 0),
+            }
             try:
                 raw_text = working[non_missing_mask].astype(str).str.strip()
                 normalization_fact = _build_temporal_normalization_fact(
@@ -1599,10 +1788,12 @@ def _compute_temporal_analysis(
                     parse_ratio=parse_ratio,
                     time_span_days=time_span_days,
                     sample_rows=len(series),
+                    parse_diagnostics=parse_diagnostics,
                 )
                 detail_entry["normalization_collapse_risk"] = normalization_fact.get(
                     "normalization_collapse_risk"
                 )
+                detail_entry["time_span_confidence"] = normalization_fact.get("time_span_confidence")
                 detail_entry["canonical_unique_counts"] = normalization_fact.get(
                     "canonical_unique_counts"
                 )

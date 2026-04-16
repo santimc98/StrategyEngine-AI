@@ -48,6 +48,7 @@ def test_cleaning_reviewer_failure_fail_closed(tmp_workdir, monkeypatch):
     with patch("src.graph.graph._get_heavy_runner_config", return_value={"job": "j", "bucket": "b", "region": "r"}), \
          patch("src.graph.graph._execute_data_engineer_via_heavy_runner", side_effect=_mock_de_heavy_success), \
          patch("src.graph.graph.scan_code_safety", return_value=(True, [])), \
+         patch("src.graph.graph.data_engineer.generate_cleaning_plan", return_value={"plan_source": "test"}), \
          patch("src.graph.graph.data_engineer.generate_cleaning_script", return_value="print('clean')"), \
          patch("src.graph.graph.data_engineer_preflight", return_value=[]), \
          patch.dict(os.environ, {"DEEPSEEK_API_KEY": "dummy", "GOOGLE_API_KEY": "dummy"}):

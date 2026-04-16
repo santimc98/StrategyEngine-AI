@@ -72,6 +72,7 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
         "execution_planner_chain": list(getattr(execution_planner, "model_chain", []) or []),
         "execution_planner_default_chain": list(getattr(execution_planner, "_default_model_chain", []) or []),
         "execution_planner_client_model": getattr(getattr(execution_planner, "client", None), "model_name", ""),
+        "data_engineer_plan": getattr(data_engineer, "plan_model_name", ""),
         "data_engineer_model": getattr(data_engineer, "model_name", ""),
         "data_engineer_fallback": getattr(data_engineer, "fallback_model_name", ""),
         "ml_engineer_model": getattr(ml_engineer, "model_name", ""),
@@ -98,6 +99,7 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
             "strategist_fallback": "moonshotai/kimi-k2.5",
             "execution_planner": "google/gemini-3.1-pro-preview",
             "execution_planner_compiler": "google/gemini-3-flash-preview",
+            "data_engineer_plan": "google/gemini-3.1-pro-preview",
             "data_engineer": "openai/gpt-5.4-mini",
             "data_engineer_fallback": "minimax/minimax-m2.5",
             "ml_engineer_plan": "google/gemini-3.1-pro-preview",
@@ -128,6 +130,7 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
         assert execution_planner.model_chain == [overrides["execution_planner"]]
         assert execution_planner._default_model_chain == [overrides["execution_planner"]]
         assert getattr(execution_planner.client, "model_name", "") == overrides["execution_planner"]
+        assert data_engineer.plan_model_name == overrides["data_engineer_plan"]
         assert data_engineer.model_name == overrides["data_engineer"]
         assert data_engineer.fallback_model_name == overrides["data_engineer_fallback"]
         assert ml_engineer.plan_model_name == overrides["ml_engineer_plan"]
@@ -162,6 +165,7 @@ def test_set_runtime_agent_models_updates_extended_runtime_slots(monkeypatch):
         execution_planner._default_model_chain = originals["execution_planner_default_chain"]
         if getattr(execution_planner, "client", None) is not None:
             execution_planner.client.model_name = originals["execution_planner_client_model"]
+        data_engineer.plan_model_name = originals["data_engineer_plan"]
         data_engineer.model_name = originals["data_engineer_model"]
         data_engineer.fallback_model_name = originals["data_engineer_fallback"]
         ml_engineer.model_name = originals["ml_engineer_model"]

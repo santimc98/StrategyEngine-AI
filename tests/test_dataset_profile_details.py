@@ -91,6 +91,68 @@ def test_build_dataset_profile_adds_temporal_normalization_facts_for_mixed_perio
     assert snapshot_fact["contract_gate_guidance"]["raw_unique_count_is_pre_normalization"] is True
 
 
+def test_temporal_profile_parses_year_first_dates_without_day_month_flip() -> None:
+    df = pd.DataFrame(
+        {
+            "account_id": ["A", "B", "C", "D", "E", "F", "G"],
+            "account_created_at": [
+                "04/10/2023",
+                "30/04/2024",
+                "2024-01-02",
+                "2024-04-30",
+                "2023/12/12",
+                "2024-06-13T18:00:00",
+                "2025-02-11",
+            ],
+            "target": [0, 1, 0, 1, 0, 1, 0],
+        }
+    )
+
+    profile = build_dataset_profile(
+        df=df,
+        objective="test",
+        dialect_info={"sep": ",", "decimal": ".", "diagnostics": {}},
+        encoding="utf-8",
+        file_size_bytes=123,
+        was_sampled=False,
+        sample_size=len(df),
+        pii_findings=None,
+    )
+
+    facts = profile.get("temporal_normalization_facts") or []
+    created_fact = next(item for item in facts if item.get("column") == "account_created_at")
+    assert profile["type_hints"]["account_created_at"] == "datetime"
+    assert created_fact["parse_policy"] == "format_family_aware_explicit_yearfirst"
+    assert created_fact["ambiguous_date_resolution"]["preferences"]["slash"] == "dayfirst"
+    assert 495 <= created_fact["time_span_days"] <= 497
+
+
+def test_temporal_profile_marks_unresolved_ambiguous_spans_low_confidence() -> None:
+    df = pd.DataFrame(
+        {
+            "event_date": ["01/02/2024", "02/03/2024", "2024-04-05", "2024-04-06"],
+            "target": [0, 1, 0, 1],
+        }
+    )
+
+    profile = build_dataset_profile(
+        df=df,
+        objective="test",
+        dialect_info={"sep": ",", "decimal": ".", "diagnostics": {}},
+        encoding="utf-8",
+        file_size_bytes=123,
+        was_sampled=False,
+        sample_size=len(df),
+        pii_findings=None,
+    )
+
+    facts = profile.get("temporal_normalization_facts") or []
+    event_fact = next(item for item in facts if item.get("column") == "event_date")
+    assert event_fact["time_span_confidence"] == "low"
+    assert event_fact["ambiguous_date_resolution"]["unresolved_ambiguous_token_count"] == 2
+    assert "time_span_days_policy" in event_fact["contract_gate_guidance"]
+
+
 def test_temporal_analysis_does_not_treat_numeric_day_durations_as_dates() -> None:
     df = pd.DataFrame(
         {

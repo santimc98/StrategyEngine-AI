@@ -37,6 +37,7 @@ MODEL_SETTING_SPECS: List[Dict[str, str]] = [
     {"key": "steward_semantics", "label": "Steward Semantics", "section": "advanced"},
     {"key": "strategist_fallback", "label": "Strategist Fallback", "section": "advanced"},
     {"key": "execution_planner_compiler", "label": "Execution Planner Compiler", "section": "advanced"},
+    {"key": "data_engineer_plan", "label": "Data Engineer Plan", "section": "advanced"},
     {"key": "data_engineer_editor", "label": "Data Engineer Editor", "section": "advanced"},
     {"key": "data_engineer_fallback", "label": "Data Engineer Fallback", "section": "advanced"},
     {"key": "ml_engineer_plan", "label": "ML Engineer Plan", "section": "advanced"},

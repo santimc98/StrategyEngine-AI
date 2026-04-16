@@ -39,6 +39,7 @@ def _run_data_engineer_with_local_runner(
         patch("src.graph.graph._get_execution_runtime_mode", return_value="local"),
         patch("src.graph.graph._get_heavy_runner_config", return_value={"bucket": "local", "job": "local"}),
         patch("src.graph.graph._execute_data_engineer_via_heavy_runner", side_effect=_fake_heavy_runner),
+        patch("src.graph.graph.data_engineer.generate_cleaning_plan", return_value={"plan_source": "test"}),
         patch("src.graph.graph.data_engineer.generate_cleaning_script", return_value="print('clean')"),
         patch("src.graph.graph.cleaning_reviewer.review_cleaning", return_value=mock_cleaning_result),
         patch.dict(os.environ, {"DEEPSEEK_API_KEY": "dummy", "GOOGLE_API_KEY": "dummy"}),
@@ -48,9 +49,9 @@ def _run_data_engineer_with_local_runner(
             patch("src.graph.graph.run_unsupervised_numeric_relation_audit", return_value=mock_audit)
         )
 
-    with patchers[0], patchers[1], patchers[2], patchers[3], patchers[4], patchers[5], patchers[6]:
+    with patchers[0], patchers[1], patchers[2], patchers[3], patchers[4], patchers[5], patchers[6], patchers[7]:
         if mock_audit is not None:
-            with patchers[7]:
+            with patchers[8]:
                 return run_data_engineer(state)
         return run_data_engineer(state)
 

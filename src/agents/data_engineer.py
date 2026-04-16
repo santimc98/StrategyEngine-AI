@@ -94,13 +94,20 @@ class DataEngineerAgent:
             self.model_name = "minimax/minimax-m2.7"
         if not self.fallback_model_name:
             self.fallback_model_name = "moonshotai/kimi-k2.5"
+        self.plan_model_name = (
+            os.getenv("OPENROUTER_DE_PLAN_MODEL")
+            or self.model_name
+        ).strip()
+        if not self.plan_model_name:
+            self.plan_model_name = self.model_name
         _editor_raw = (os.getenv("OPENROUTER_DE_EDITOR_MODEL") or "").strip()
         self.editor_model_name = self._resolve_editor_model_name(
             primary_model=self.model_name,
             editor_model_override=_editor_raw,
         )
         self.logger.info(
-            "DATA_ENGINEER_OPENROUTER_MODELS: primary=%s fallback=%s editor=%s",
+            "DATA_ENGINEER_OPENROUTER_MODELS: plan=%s primary=%s fallback=%s editor=%s",
+            self.plan_model_name,
             self.model_name,
             self.fallback_model_name,
             self.editor_model_name,
@@ -108,6 +115,9 @@ class DataEngineerAgent:
 
         self.last_prompt = None
         self.last_response = None
+        self.last_plan_prompt = None
+        self.last_plan_response = None
+        self.last_plan_model_used = None
 
     def _extract_nonempty(self, response) -> str:
         """
@@ -1190,6 +1200,531 @@ class DataEngineerAgent:
         }
         return json.dumps(summary, ensure_ascii=False, indent=2)
 
+    def _serialize_json_for_prompt(
+        self,
+        payload: Any,
+        *,
+        max_chars: int = 8000,
+        max_str_len: int = 900,
+        max_list_items: int = 60,
+    ) -> str:
+        from src.utils.context_pack import compress_long_lists
+        from src.utils.contract_views import trim_to_budget
+
+        compact = compress_long_lists(payload or {})[0]
+        trimmed = trim_to_budget(
+            compact,
+            max_chars=max_chars,
+            max_str_len=max_str_len,
+            max_list_items=max_list_items,
+        )
+        text = json.dumps(trimmed, ensure_ascii=False, separators=(",", ":"))
+        if len(text) > max_chars:
+            text = self._truncate_prompt_text(
+                text,
+                max_len=max_chars,
+                head_len=int(max_chars * 0.65),
+                tail_len=int(max_chars * 0.25),
+            )
+        return text
+
+    def _parse_json_response(self, text: str) -> Any:
+        try:
+            cleaned = str(text or "").strip()
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
+            elif "```" in cleaned:
+                parts = cleaned.split("```")
+                if len(parts) >= 2:
+                    cleaned = parts[1].strip()
+                    if cleaned.lower().startswith("json"):
+                        cleaned = cleaned[4:].strip()
+            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if match:
+                cleaned = match.group(0)
+            return json.loads(cleaned)
+        except Exception:
+            return None
+
+    def _default_cleaning_plan(
+        self,
+        *,
+        source: str,
+        de_required_outputs: List[Dict[str, Any]],
+        cleaning_gates: List[Any],
+        de_view: Dict[str, Any],
+        artifact_obligations: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        output_paths = [
+            str(item.get("path") or "").strip()
+            for item in de_required_outputs
+            if isinstance(item, dict) and str(item.get("path") or "").strip()
+        ]
+        required_columns = de_view.get("required_columns") if isinstance(de_view, dict) else []
+        if not isinstance(required_columns, list):
+            required_columns = []
+        gate_reviews = []
+        for gate in cleaning_gates or []:
+            if isinstance(gate, dict):
+                name = str(gate.get("name") or gate.get("gate_name") or "").strip()
+                params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+                gate_reviews.append(
+                    {
+                        "gate_name": name or "unnamed_gate",
+                        "status": "requires_implementation",
+                        "evidence_needed": sorted(params.keys())[:8],
+                        "implementation_note": "Implement using contract parameters and raw data evidence.",
+                    }
+                )
+            elif str(gate or "").strip():
+                gate_reviews.append(
+                    {
+                        "gate_name": str(gate).strip(),
+                        "status": "requires_implementation",
+                        "evidence_needed": [],
+                        "implementation_note": "Implement using available contract and profile evidence.",
+                    }
+                )
+        return {
+            "plan_version": "data_cleaning_plan_v1",
+            "plan_source": source,
+            "objective_summary": "Produce contract-valid cleaned data artifacts with traceable, evidence-based transformations.",
+            "owned_deliverables": output_paths,
+            "input_read_policy": {
+                "read_dtype": "str",
+                "preserve_raw_values_before_transform": True,
+                "dialect_source": "run_state",
+            },
+            "operation_order": [
+                "load_raw_csv_preserving_strings",
+                "verify_required_columns_and_output_obligations",
+                "resolve_nulls_before_string_coercion",
+                "resolve_temporal_numeric_and_categorical_formats_from_profile",
+                "apply_contract_cleaning_gates",
+                "materialize_all_required_outputs",
+                "write_manifest_with_actual_operations_and_gate_status",
+            ],
+            "column_policies": {
+                "required_columns": required_columns[:120],
+                "dtype_targets_source": "de_view.column_dtype_targets",
+                "format_resolution_source": "DATA_SAMPLE_CONTEXT and COLUMN_RESOLUTION_CONTEXT",
+            },
+            "gate_feasibility_review": gate_reviews,
+            "artifact_plan": {
+                "required_outputs": output_paths,
+                "artifact_obligations_present": bool(artifact_obligations),
+            },
+            "manifest_requirements": [
+                "output_dialect",
+                "row_counts",
+                "conversions",
+                "contract_conflicts_resolved",
+                "cleaning_gates_status",
+            ],
+            "validation_checks": [
+                "all_owned_required_outputs_exist",
+                "required_columns_present_after_cleaning",
+                "no_unexplained_null_inflation_in_parsed_columns",
+                "cleaning_gates_status_recorded",
+            ],
+            "risk_register": [],
+            "assumptions": [],
+            "open_questions": [],
+            "evidence_used": ["execution_contract", "de_view", "data_sample_context"],
+        }
+
+    def _normalize_cleaning_plan(
+        self,
+        parsed: Any,
+        *,
+        source: str,
+        de_required_outputs: List[Dict[str, Any]],
+        cleaning_gates: List[Any],
+        de_view: Dict[str, Any],
+        artifact_obligations: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        result = self._default_cleaning_plan(
+            source=source,
+            de_required_outputs=de_required_outputs,
+            cleaning_gates=cleaning_gates,
+            de_view=de_view,
+            artifact_obligations=artifact_obligations,
+        )
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            parsed = parsed[0]
+        if not isinstance(parsed, dict):
+            return result
+        for key in (
+            "objective_summary",
+            "input_read_policy",
+            "operation_order",
+            "column_policies",
+            "gate_feasibility_review",
+            "artifact_plan",
+            "manifest_requirements",
+            "validation_checks",
+            "risk_register",
+            "assumptions",
+            "open_questions",
+            "evidence_used",
+        ):
+            value = parsed.get(key)
+            if value not in (None, "", [], {}):
+                result[key] = value
+        owned = parsed.get("owned_deliverables")
+        if isinstance(owned, list) and owned:
+            result["owned_deliverables"] = owned
+        result["plan_version"] = str(parsed.get("plan_version") or "data_cleaning_plan_v1")
+        result["plan_source"] = source
+        return result
+
+    def _execute_cleaning_plan_llm_call(
+        self,
+        sys_prompt: str,
+        usr_prompt: str,
+        temperature: float = 0.1,
+    ) -> str:
+        model_name = str(getattr(self, "plan_model_name", "") or self.model_name or "").strip()
+        model_chain: List[str] = []
+        for candidate in (model_name, self.model_name, self.fallback_model_name):
+            candidate = str(candidate or "").strip()
+            if candidate and candidate not in model_chain:
+                model_chain.append(candidate)
+
+        self.last_plan_prompt = sys_prompt + "\n\nUSER:\n" + usr_prompt
+        print(f"DEBUG: Data Engineer (Plan) calling OpenRouter Model ({model_name})...")
+
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": usr_prompt},
+        ]
+        response, model_used = call_chat_with_fallback(
+            self.client,
+            messages,
+            model_chain,
+            call_kwargs={"temperature": temperature},
+            logger=self.logger,
+            context_tag="data_engineer_plan",
+        )
+        self.last_plan_model_used = model_used
+        self.logger.info("DATA_ENGINEER_PLAN_MODEL_USED: %s", model_used)
+        content = self._extract_nonempty(response)
+        self.last_plan_response = content
+        return content
+
+    def generate_cleaning_plan(
+        self,
+        data_audit: str,
+        strategy: Dict[str, Any],
+        input_path: str,
+        prompt_input_path: Optional[str] = None,
+        business_objective: str = "",
+        csv_encoding: str = "utf-8",
+        csv_sep: str = ",",
+        csv_decimal: str = ".",
+        execution_contract: Optional[Dict[str, Any]] = None,
+        de_view: Optional[Dict[str, Any]] = None,
+        artifact_obligations: Optional[Dict[str, Any]] = None,
+        llm_call: Any = None,
+    ) -> Dict[str, Any]:
+        """
+        Generate a structured cleaning plan before code generation.
+
+        This mirrors the ML plan pattern: first ask the model to make explicit
+        architectural cleaning decisions from evidence, then feed those decisions
+        into the script-writing call.
+        """
+        from src.utils.prompting import render_prompt
+
+        contract = execution_contract if isinstance(execution_contract, dict) else {}
+        de_view = de_view if isinstance(de_view, dict) else {}
+        strategy = strategy if isinstance(strategy, dict) else {}
+        prompt_input_path = str(prompt_input_path or input_path or "").strip()
+        contract_context = self._build_contract_focus_context(contract, de_view)
+        if not isinstance(artifact_obligations, dict) or not artifact_obligations:
+            artifact_obligations = build_data_engineer_artifact_obligations(contract)
+        if not isinstance(artifact_obligations, dict):
+            artifact_obligations = {}
+        de_output_path = str(de_view.get("output_path") or "").strip()
+        de_manifest_path = str(
+            de_view.get("output_manifest_path")
+            or de_view.get("manifest_path")
+            or ""
+        ).strip()
+        outlier_policy = de_view.get("outlier_policy")
+        if not isinstance(outlier_policy, dict):
+            outlier_policy = contract.get("outlier_policy") if isinstance(contract.get("outlier_policy"), dict) else {}
+        outlier_report_path = str(de_view.get("outlier_report_path") or outlier_policy.get("report_path") or "").strip()
+        de_required_outputs = self._build_data_engineer_required_outputs_context(
+            contract,
+            de_view,
+            primary_output_path=de_output_path,
+            manifest_path=de_manifest_path,
+            outlier_report_path=outlier_report_path,
+        )
+        cleaning_gates = (
+            get_cleaning_gates(contract)
+            or get_cleaning_gates({"cleaning_gates": de_view.get("cleaning_gates")})
+            or []
+        )
+        data_sample_context = self._build_data_sample_context(
+            input_path=prompt_input_path,
+            csv_encoding=csv_encoding,
+            csv_sep=csv_sep,
+            csv_decimal=csv_decimal,
+        )
+        selector_expansion_context = self._build_selector_expansion_context(
+            de_view=de_view,
+            input_path=prompt_input_path,
+            csv_encoding=csv_encoding,
+            csv_sep=csv_sep,
+        )
+        runtime_dependency_context = self._build_runtime_dependency_context()
+
+        PLAN_PROMPT = """
+        You are a Senior Data Cleaning Architect. Your task is to produce a structured
+        cleaning plan for the Data Engineer code-generation call. Do not write code.
+
+        MISSION:
+        Convert the evidence below into explicit, executable cleaning decisions for
+        THIS dataset and THIS contract. The next call will write Python from this plan.
+
+        SOURCE OF TRUTH:
+        1) DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT and DE_VIEW_CONTEXT define owned outputs.
+        2) CLEANING_GATES_CONTEXT defines validation obligations.
+        3) DATA_SAMPLE_CONTEXT and COLUMN_RESOLUTION_CONTEXT define observed raw data facts.
+        4) EXECUTION_CONTRACT_CONTEXT resolves ties when DE_VIEW is silent.
+        5) DATA AUDIT and STRATEGY are supporting context, not permission to ignore gates.
+
+        REASONING WORKFLOW:
+        1. Enumerate every owned deliverable and the concrete evidence needed to write it.
+        2. Inspect raw column profiles for nulls, date formats, numeric formats, cardinality, and placeholders.
+        3. Decide the safest operation order, especially dependencies such as null handling before string coercion.
+        4. For each cleaning gate, mark whether it is feasible from available evidence, requires implementation, or looks contract-risky.
+        5. Define manifest and validation checks that make the final script auditable.
+
+        GUARDRAILS:
+        - Do not invent columns, thresholds, outputs, or business semantics absent from the contract/profile.
+        - If a gate appears inconsistent with raw evidence or artifact bindings, mark it as contract_risk with evidence.
+        - Prefer non-destructive parsing when mixed formats are recoverable; flag unresolved values instead of silently erasing signal.
+        - Treat dtype targets as downstream goals to reconcile with evidence, not blind coercion instructions.
+        - Keep the plan universal: reason from context fields and artifact bindings, not from a hardcoded dataset name.
+
+        CONTEXT:
+        Execution Input Path for generated script: "$input_path"
+        Prompt Profiling Source: "$prompt_input_path"
+        Encoding: "$csv_encoding" | Sep: "$csv_sep" | Decimal: "$csv_decimal"
+        DE Cleaning Objective: "$business_objective"
+
+        DATA_ENGINEER_REQUIRED_OUTPUTS_CONTEXT: $de_required_outputs_context
+        DE_VIEW_CONTEXT: $de_view_context
+        ARTIFACT_OBLIGATIONS_CONTEXT: $artifact_obligations_context
+        EXECUTION_CONTRACT_CONTEXT: $execution_contract_context
+        CLEANING_GATES_CONTEXT: $cleaning_gates_context
+        COLUMN_RESOLUTION_CONTEXT: $column_resolution_context
+        COLUMN_DTYPE_TARGETS_CONTEXT: $column_dtype_targets_context
+        COLUMN_TRANSFORMATIONS_CONTEXT: $column_transformations_context
+        SELECTOR_EXPANSION_CONTEXT: $selector_expansion_context
+        RUNTIME_DEPENDENCY_CONTEXT: $runtime_dependency_context
+        DATA_SAMPLE_CONTEXT: $data_sample_context
+        STRATEGY_CONTEXT: $strategy_context
+        DATA AUDIT:
+        $data_audit
+
+        REQUIRED OUTPUT: JSON ONLY, NO MARKDOWN.
+        {
+          "plan_version": "data_cleaning_plan_v1",
+          "objective_summary": "one sentence",
+          "owned_deliverables": ["contract output path or intent"],
+          "input_read_policy": {
+            "read_dtype": "str",
+            "preserve_raw_values_before_transform": true,
+            "dialect_source": "run_state|contract",
+            "notes": "brief"
+          },
+          "operation_order": ["ordered implementation step names"],
+          "column_policies": {
+            "null_handling": [{"column": "name", "policy": "what to do", "evidence": "profile/gate evidence"}],
+            "temporal_parsing": [{"column": "name", "policy": "multi-stage parser/flagging policy", "evidence": "formats/null_pct"}],
+            "numeric_parsing": [{"column": "name", "policy": "normalization/cast policy", "evidence": "formats/ranges"}],
+            "categorical_standardization": [{"column": "name", "policy": "standardization policy", "evidence": "top values"}],
+            "columns_to_preserve": ["columns"],
+            "columns_to_drop_or_exclude": [{"column": "name", "reason": "contract/gate evidence"}]
+          },
+          "gate_feasibility_review": [
+            {
+              "gate_name": "name",
+              "status": "feasible|requires_implementation|contract_risk|needs_evidence",
+              "evidence": "specific evidence",
+              "implementation_note": "how script should satisfy or report it"
+            }
+          ],
+          "artifact_plan": {
+            "required_outputs": ["paths"],
+            "write_order": ["paths/intents"],
+            "empty_artifact_policy": "required artifacts are still materialized schema-valid when empty"
+          },
+          "manifest_requirements": ["required manifest facts"],
+          "validation_checks": ["checks the script must run before exit"],
+          "risk_register": [{"risk": "risk", "mitigation": "mitigation"}],
+          "assumptions": [],
+          "open_questions": [],
+          "evidence_used": ["facts used"]
+        }
+        """
+
+        try:
+            render_kwargs = {
+                "input_path": input_path,
+                "prompt_input_path": prompt_input_path,
+                "csv_encoding": csv_encoding,
+                "csv_sep": csv_sep,
+                "csv_decimal": csv_decimal,
+                "business_objective": business_objective,
+                "de_required_outputs_context": self._serialize_json_for_prompt(
+                    de_required_outputs,
+                    max_chars=9000,
+                    max_str_len=700,
+                    max_list_items=80,
+                ),
+                "de_view_context": self._serialize_json_for_prompt(
+                    de_view,
+                    max_chars=9000,
+                    max_str_len=700,
+                    max_list_items=80,
+                ),
+                "artifact_obligations_context": self._serialize_json_for_prompt(
+                    artifact_obligations,
+                    max_chars=7000,
+                    max_str_len=700,
+                    max_list_items=80,
+                ),
+                "execution_contract_context": self._serialize_json_for_prompt(
+                    contract_context,
+                    max_chars=9000,
+                    max_str_len=700,
+                    max_list_items=80,
+                ),
+                "cleaning_gates_context": self._serialize_json_for_prompt(
+                    cleaning_gates,
+                    max_chars=9000,
+                    max_str_len=800,
+                    max_list_items=100,
+                ),
+                "column_resolution_context": self._serialize_json_for_prompt(
+                    de_view.get("column_resolution_context") or {},
+                    max_chars=7000,
+                    max_str_len=700,
+                    max_list_items=80,
+                ),
+                "column_dtype_targets_context": self._serialize_json_for_prompt(
+                    de_view.get("column_dtype_targets") or contract.get("column_dtype_targets") or {},
+                    max_chars=6000,
+                    max_str_len=600,
+                    max_list_items=80,
+                ),
+                "column_transformations_context": self._serialize_json_for_prompt(
+                    de_view.get("column_transformations") or {},
+                    max_chars=6000,
+                    max_str_len=600,
+                    max_list_items=80,
+                ),
+                "selector_expansion_context": self._truncate_prompt_text(
+                    selector_expansion_context,
+                    max_len=6000,
+                    head_len=4200,
+                    tail_len=1200,
+                ),
+                "runtime_dependency_context": self._serialize_json_for_prompt(
+                    runtime_dependency_context,
+                    max_chars=5000,
+                    max_str_len=600,
+                    max_list_items=60,
+                ),
+                "data_sample_context": self._truncate_prompt_text(
+                    data_sample_context,
+                    max_len=18000,
+                    head_len=12000,
+                    tail_len=4000,
+                ),
+                "strategy_context": self._serialize_json_for_prompt(
+                    strategy,
+                    max_chars=5000,
+                    max_str_len=600,
+                    max_list_items=60,
+                ),
+                "data_audit": self._truncate_prompt_text(
+                    data_audit,
+                    max_len=22000,
+                    head_len=14000,
+                    tail_len=5000,
+                ),
+            }
+            system_prompt = render_prompt(PLAN_PROMPT, **render_kwargs)
+        except Exception as render_err:
+            plan = self._normalize_cleaning_plan(
+                None,
+                source="render_error",
+                de_required_outputs=de_required_outputs,
+                cleaning_gates=cleaning_gates,
+                de_view=de_view,
+                artifact_obligations=artifact_obligations,
+            )
+            plan["notes"] = [f"Failed to render cleaning plan prompt context: {render_err}"]
+            return plan
+
+        user_prompt = "Generate the Data Cleaning Plan JSON now."
+        self.last_plan_prompt = system_prompt + "\n\nUSER:\n" + user_prompt
+        execute_call = llm_call or (
+            lambda sys_prompt, usr_prompt: self._execute_cleaning_plan_llm_call(
+                sys_prompt,
+                usr_prompt,
+                temperature=0.1,
+            )
+        )
+        try:
+            response = execute_call(system_prompt, user_prompt)
+            self.last_plan_response = response
+            parsed = self._parse_json_response(response)
+            plan = self._normalize_cleaning_plan(
+                parsed,
+                source="llm",
+                de_required_outputs=de_required_outputs,
+                cleaning_gates=cleaning_gates,
+                de_view=de_view,
+                artifact_obligations=artifact_obligations,
+            )
+            if parsed is not None:
+                return plan
+
+            print("Warning: Data Cleaning Plan generation returned invalid JSON, retrying...")
+            response = execute_call(
+                system_prompt,
+                user_prompt + "\nCRITICAL: Return VALID JSON ONLY. No markdown.",
+            )
+            self.last_plan_response = response
+            parsed = self._parse_json_response(response)
+            return self._normalize_cleaning_plan(
+                parsed,
+                source="llm_retry",
+                de_required_outputs=de_required_outputs,
+                cleaning_gates=cleaning_gates,
+                de_view=de_view,
+                artifact_obligations=artifact_obligations,
+            )
+        except Exception as exc:
+            print(f"Data Engineer Plan Gen Error: {exc}")
+            plan = self._normalize_cleaning_plan(
+                None,
+                source="llm_error",
+                de_required_outputs=de_required_outputs,
+                cleaning_gates=cleaning_gates,
+                de_view=de_view,
+                artifact_obligations=artifact_obligations,
+            )
+            plan["notes"] = [f"LLM call failed: {exc}"]
+            return plan
+
     def generate_cleaning_script(
         self,
         data_audit: str,
@@ -1208,6 +1743,7 @@ class DataEngineerAgent:
         feedback_record: Optional[Dict[str, Any]] = None,
         attempt_history: Optional[List[Dict[str, Any]]] = None,
         artifact_obligations: Optional[Dict[str, Any]] = None,
+        data_cleaning_plan: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Generates a Python script to clean and standardize the dataset.
@@ -1299,6 +1835,13 @@ class DataEngineerAgent:
             or []
         )
         cleaning_gates_json = json.dumps(compress_long_lists(cleaning_gates)[0], indent=2)
+        if not isinstance(data_cleaning_plan, dict):
+            data_cleaning_plan = {}
+        data_cleaning_plan_json = json.dumps(
+            compress_long_lists(data_cleaning_plan)[0],
+            indent=2,
+            ensure_ascii=False,
+        )
 
         # V4.1: Use data_engineer_runbook only, no legacy role_runbooks fallback
         de_runbook = contract.get("data_engineer_runbook")
@@ -1445,13 +1988,18 @@ class DataEngineerAgent:
            source_contract_paths. It introduces no new semantics.)
         2) CLEANING_GATES_CONTEXT + required_columns + required_feature_selectors
            (authoritative for what must be cleaned, retained, or validated)
-        3) COLUMN_RESOLUTION_CONTEXT + DATA_SAMPLE_CONTEXT
+        3) DATA_CLEANING_PLAN_CONTEXT
+           (authoritative implementation plan produced before code generation. Use it
+           to structure operation order, gate feasibility handling, artifact closure,
+           and validation checks. In repair mode, latest structured repair feedback
+           overrides the plan only for the implicated failing area.)
+        4) COLUMN_RESOLUTION_CONTEXT + DATA_SAMPLE_CONTEXT
            (authoritative support evidence for what raw formats, placeholders,
            locale ambiguities, and recoverable signal exist in THIS dataset)
-        4) COLUMN_DTYPE_TARGETS_CONTEXT + COLUMN_TRANSFORMATIONS_CONTEXT
+        5) COLUMN_DTYPE_TARGETS_CONTEXT + COLUMN_TRANSFORMATIONS_CONTEXT
            (authoritative for target typing and transformation mechanics)
-        5) EXECUTION_CONTRACT_CONTEXT (authoritative tie-breaker when the DE view is silent)
-        6) ROLE RUNBOOK (advisory — informs reasoning, does not override contract/gates)
+        6) EXECUTION_CONTRACT_CONTEXT (authoritative tie-breaker when the DE view is silent)
+        7) ROLE RUNBOOK (advisory — informs reasoning, does not override contract/gates)
 
         ===================================================================
         ENGINEERING REASONING FRAMEWORK
@@ -1706,6 +2254,7 @@ class DataEngineerAgent:
         Optional Passthrough Columns: $optional_passthrough_columns
 
         DE_VIEW_CONTEXT: $de_view_context
+        DATA_CLEANING_PLAN_CONTEXT: $data_cleaning_plan_context
         ARTIFACT_OBLIGATIONS_CONTEXT: $artifact_obligations_context
         EXECUTION_CONTRACT_CONTEXT: $execution_contract_context
         CLEANING_GATES_CONTEXT: $cleaning_gates_context
@@ -1726,7 +2275,8 @@ class DataEngineerAgent:
 
         USER_TEMPLATE = (
             "Analyze the owned deliverables, artifact obligations, cleaning gates, column dtype targets, "
-            "column resolution context, and the DATASET PROFILE (column_profiles in DATA_SAMPLE_CONTEXT). "
+            "DATA_CLEANING_PLAN_CONTEXT, column resolution context, and the DATASET PROFILE "
+            "(column_profiles in DATA_SAMPLE_CONTEXT). "
             "Reason first about the deliverable closure for THIS run — which artifacts you must write, "
             "how each one is materialized, and how the cleaning plan supports them. "
             "Then reason about the correct operation order for THIS specific dataset — "
@@ -1779,6 +2329,8 @@ class DataEngineerAgent:
         Repair task:
         - Treat STRUCTURED_REPAIR_GROUND_TRUTH_JSON as the authoritative causal context for this retry.
           Fix the verified deltas and the verified repair goal, not just the symptom wording.
+        - Use DATA_CLEANING_PLAN_CONTEXT as memory of the initial architecture, but do not let it override
+          LATEST_ITERATION_FEEDBACK_RECORD_JSON or STRUCTURED_REPAIR_GROUND_TRUTH_JSON for the implicated failure.
         - Consult the column_profiles in DATA_SAMPLE_CONTEXT when available to verify your
           parsing approach matches the actual data patterns (null_pct, looks_datetime,
           observed_format_patterns, format_family_hints, example_values_sample,
@@ -1816,6 +2368,7 @@ class DataEngineerAgent:
             data_audit=data_audit,
             execution_contract_context=contract_json,
             de_view_context=de_view_json,
+            data_cleaning_plan_context=data_cleaning_plan_json,
             artifact_obligations_context=artifact_obligations_json,
             outlier_policy_context=outlier_policy_json,
             column_resolution_context=column_resolution_context_json,
