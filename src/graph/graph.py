@@ -5753,6 +5753,103 @@ def _build_translator_run_narrative(
             "source": "primary_metric_state (authoritative)",
         }
 
+    # 9. Abort / execution-failure diagnostics (post-mortem fuel for the translator).
+    # Previously these signals viajaban en el state pero nadie las leía, y el translator
+    # reportaba "NO_GO" sin explicar la causa. Las exponemos aquí para que (a) el
+    # packet las vea sin compactar y (b) el prompt pueda pivotar a modo post-mortem
+    # cuando `abort_info` está presente.
+    def _summarize_attempt_history(history: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(history, list) or not history:
+            return None
+        attempts: List[Dict[str, Any]] = []
+        unique_gates: List[str] = []
+        seen_gates: set[str] = set()
+        last_error_tail = ""
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            attempt_entry = {
+                "attempt": item.get("attempt"),
+                "status": str(item.get("status") or "")[:60],
+                "failed_gates": [str(g) for g in (item.get("failed_gates") or [])[:6] if g],
+                "required_fixes": [str(f)[:200] for f in (item.get("required_fixes") or [])[:4] if f],
+                "error_tail": str(item.get("runtime_error_tail") or "")[:400],
+                "feedback": str(item.get("feedback_summary") or "")[:300],
+            }
+            attempts.append(attempt_entry)
+            for gate in attempt_entry["failed_gates"]:
+                if gate and gate not in seen_gates:
+                    seen_gates.add(gate)
+                    unique_gates.append(gate)
+            if attempt_entry["error_tail"]:
+                last_error_tail = attempt_entry["error_tail"]
+        if not attempts:
+            return None
+        return {
+            "attempt_count": len(attempts),
+            "unique_failed_gates": unique_gates[:10],
+            "last_error_tail": last_error_tail,
+            "attempts": attempts[-3:],  # últimos 3 para caber en el packet
+        }
+
+    abort_info: Dict[str, Any] = {}
+    pipeline_aborted_reason = state.get("pipeline_aborted_reason") or ""
+    if isinstance(pipeline_aborted_reason, str) and pipeline_aborted_reason.strip():
+        abort_info["abort_reason"] = pipeline_aborted_reason.strip()
+
+    # Fallback: lee output_contract_report.json si no hay reason en state.
+    if "abort_reason" not in abort_info:
+        ocr = _load_json_any("data/output_contract_report.json") or {}
+        if isinstance(ocr, dict):
+            reason_from_disk = str(ocr.get("reason") or "").strip()
+            if reason_from_disk:
+                abort_info["abort_reason"] = reason_from_disk
+                abort_info["abort_reason_source"] = "output_contract_report"
+
+    # Error mecánico si el runner capturó uno.
+    err_msg = state.get("error_message")
+    if isinstance(err_msg, str) and err_msg.strip():
+        abort_info["error_message"] = err_msg.strip()[:800]
+
+    # Historiales de intentos: señal crítica para explicar por qué falló la reparación.
+    de_hist = _summarize_attempt_history(state.get("data_engineer_attempt_history"))
+    if de_hist:
+        abort_info["data_engineer_attempts"] = de_hist
+    ml_hist = _summarize_attempt_history(state.get("ml_engineer_attempt_history"))
+    if ml_hist:
+        abort_info["ml_engineer_attempts"] = ml_hist
+
+    # Señales fuertes de abort. Solo las que demuestran que la run REALMENTE cayó.
+    # (Un failure_explainer.txt en disco puede venir de un retry intermedio que
+    # luego se resolvió — no es prueba de abort por sí solo.)
+    outcome_value = str(run_sum.get("run_outcome") or "").upper()
+    run_truly_aborted = bool(
+        abort_info.get("abort_reason")
+        or (abort_info.get("error_message") and outcome_value in {"NO_GO", "ABORTED", "FAILED"})
+        or outcome_value in {"ABORTED", "FAILED"}
+    )
+
+    # Diagnósticos del failure_explainer: SOLO si ya sabemos que la run abortó.
+    # Evita arrastrar diagnósticos de retries que luego tuvieron éxito.
+    if run_truly_aborted:
+        for artifact_name, field_name in (
+            ("artifacts/data_engineer_failure_explainer.txt", "data_engineer_failure_diagnosis"),
+            ("artifacts/ml_engineer_failure_explainer.txt", "ml_engineer_failure_diagnosis"),
+        ):
+            try:
+                if os.path.exists(artifact_name):
+                    with open(artifact_name, "r", encoding="utf-8", errors="replace") as fh:
+                        text = fh.read().strip()
+                    if text:
+                        abort_info[field_name] = text[:2000]
+            except Exception:
+                pass
+
+    # Solo pivotamos narrativa si hay un abort real.
+    if run_truly_aborted:
+        abort_info["run_aborted"] = True
+        narrative["abort_info"] = abort_info
+
     return narrative
 
 

@@ -3948,8 +3948,26 @@ def _build_outline_prompt(
     reporting_policy_context: Dict[str, Any],
     evidence_paths: List[str],
     execution_results: str,
+    abort_info: Optional[Dict[str, Any]] = None,
 ) -> str:
     evidence_paths_text = "\n".join(f"- {p}" for p in evidence_paths[:8]) or "- missing"
+    post_mortem_hint = ""
+    if isinstance(abort_info, dict) and abort_info:
+        post_mortem_hint = (
+            "\n\n⚠ POST-MORTEM MODE:\n"
+            "This run aborted before completing end-to-end. The outline must NOT plan a\n"
+            "success-shaped executive report. Instead, plan sections that serve a senior\n"
+            "data scientist continuing the work manually:\n"
+            "  - What happened and at which stage.\n"
+            "  - Root cause translated from abort_reason / failed_gates / error_tails.\n"
+            "  - Summary of the retry attempts and why each failed.\n"
+            "  - Why automated recovery could not proceed (concrete reasoning limit).\n"
+            "  - Specific next steps for humans (columns to inspect, contract enrichment,\n"
+            "    dataset preprocessing outside the pipeline, or scope adjustments).\n"
+            "ABORT_INFO signal:\n"
+            + json.dumps(abort_info, ensure_ascii=False)[:2500]
+            + "\n"
+        )
     return render_prompt(
         """
 You are a senior executive reporting planner.
@@ -3957,6 +3975,7 @@ Generate ONLY valid JSON (no markdown, no commentary), in language code: $target
 
 Goal: produce an outline plan for the final executive report.
 The final decision label must be: $executive_decision_label
+$post_mortem_hint
 
 Reasoning workflow:
 1. Decide what an executive needs to know first.
@@ -4004,6 +4023,7 @@ Return JSON with this schema:
         reporting_policy_json=json.dumps(reporting_policy_context or {}, ensure_ascii=False),
         evidence_paths=evidence_paths_text,
         execution_results=str(execution_results or "")[:12000],
+        post_mortem_hint=post_mortem_hint,
     )
 
 
@@ -5040,7 +5060,146 @@ class BusinessTranslatorAgent:
         else:
             run_narrative_section = "Not available — use FACTS and DETAILED CONTEXT below."
 
+        # ── Post-mortem directive ────────────────────────────────────
+        # Cuando graph.py detectó que la run abortó (data_engineer/ml_engineer
+        # agotaron reintentos, pipeline_aborted_reason presente, etc.), añade
+        # abort_info al run_narrative. Aquí pivotamos la narrativa del reporte:
+        # en vez de un executive summary, el translator escribe un post-mortem
+        # útil para el equipo de data science.
+        abort_info = {}
+        if isinstance(run_narrative, dict):
+            maybe_abort = run_narrative.get("abort_info")
+            if isinstance(maybe_abort, dict) and maybe_abort:
+                abort_info = maybe_abort
+        post_mortem_directive = ""
+        if abort_info:
+            # Inline content: do NOT force the model to "look elsewhere" for the
+            # diagnosis. When we have concrete signals (failure_explainer output,
+            # attempt history, error message), surface them IN the directive so
+            # the model cannot drift into compliance-report framing.
+            def _fmt_block(label: str, text: str) -> str:
+                text = (text or "").strip()
+                if not text:
+                    return ""
+                # Quote each line to make it visually distinct as "ground truth".
+                quoted = "\n".join(f"    {ln}" for ln in text.splitlines())
+                return f"  {label}:\n{quoted}\n"
+
+            def _fmt_attempts(label: str, attempts: Any) -> str:
+                if not isinstance(attempts, dict) or not attempts:
+                    return ""
+                parts = [f"  {label}:"]
+                ac = attempts.get("attempt_count")
+                if ac is not None:
+                    parts.append(f"    attempt_count: {ac}")
+                gates = attempts.get("unique_failed_gates") or []
+                if gates:
+                    parts.append("    unique_failed_gates: " + ", ".join(str(g) for g in gates[:8]))
+                tail = (attempts.get("last_error_tail") or "").strip()
+                if tail:
+                    parts.append("    last_error_tail:")
+                    for ln in tail.splitlines()[:8]:
+                        parts.append(f"      {ln}")
+                inner = attempts.get("attempts") or []
+                if inner:
+                    parts.append(f"    last_{len(inner)}_attempts:")
+                    for i, att in enumerate(inner, 1):
+                        if not isinstance(att, dict):
+                            continue
+                        status = att.get("status") or att.get("source") or "?"
+                        fg = att.get("failed_gates") or []
+                        fixes = att.get("required_fixes") or []
+                        fb = (att.get("feedback_summary") or "").strip()
+                        parts.append(f"      [{i}] status={status}"
+                                     + (f" | failed_gates={', '.join(fg[:4])}" if fg else "")
+                                     + (f" | tried_fix={fixes[0][:160]}" if fixes else ""))
+                        if fb:
+                            parts.append(f"          feedback: {fb[:200]}")
+                return "\n".join(parts) + "\n"
+
+            inlined_signals = []
+            ar = abort_info.get("abort_reason")
+            if ar:
+                inlined_signals.append(f"  abort_reason: {str(ar).strip()}")
+            em = abort_info.get("error_message")
+            if em:
+                inlined_signals.append(_fmt_block("error_message (mechanical error tail)", str(em)))
+            de_diag = abort_info.get("data_engineer_failure_diagnosis")
+            if de_diag:
+                inlined_signals.append(_fmt_block("data_engineer_failure_diagnosis (WHERE/WHY/FIX — quote verbatim)", str(de_diag)))
+            ml_diag = abort_info.get("ml_engineer_failure_diagnosis")
+            if ml_diag:
+                inlined_signals.append(_fmt_block("ml_engineer_failure_diagnosis (WHERE/WHY/FIX — quote verbatim)", str(ml_diag)))
+            de_att = abort_info.get("data_engineer_attempts")
+            if de_att:
+                inlined_signals.append(_fmt_attempts("data_engineer_attempts (retry history)", de_att))
+            ml_att = abort_info.get("ml_engineer_attempts")
+            if ml_att:
+                inlined_signals.append(_fmt_attempts("ml_engineer_attempts (retry history)", ml_att))
+            inlined_block = "\n".join(s for s in inlined_signals if s).rstrip() or "  (no additional diagnostic signals persisted — derive from RUN NARRATIVE)"
+
+            post_mortem_directive = (
+                "=== RUN ABORTED — POST-MORTEM MODE (OVERRIDES ALL OTHER FRAMING) ===\n"
+                "This run did NOT complete end-to-end. The engineering pipeline aborted\n"
+                "before producing deployable results. The ENTIRE report must be a\n"
+                "post-mortem that serves a senior data scientist who will continue the\n"
+                "work manually. Do not write a success-shaped or compliance-shaped\n"
+                "executive summary. Do not frame the run as a partial success.\n"
+                "\n"
+                "── GROUND-TRUTH SIGNALS (quote from these, do not paraphrase away) ──\n"
+                f"{inlined_block}\n"
+                "\n"
+                "── HOW TO TREAT DOWNSTREAM-SYMPTOM ARTIFACTS ──\n"
+                "The artifact-compliance table (Missing Paths / Required Missing / Failed\n"
+                "Gates = output_contract_missing) and the kpi-snapshot table describe\n"
+                "DOWNSTREAM SYMPTOMS of the abort, not the root cause. The missing\n"
+                "artifacts are missing because the pipeline aborted — they are not the\n"
+                "reason it aborted. Do NOT anchor the report on them, do NOT list them as\n"
+                "primary evidence, and do NOT recommend 'verify file permissions' or\n"
+                "'check output paths' as remediation. Mention them at most as a brief\n"
+                "note that the expected deliverables were not produced; keep the root\n"
+                "cause (the signals above) front and center.\n"
+                "\n"
+                "── REQUIRED POST-MORTEM STRUCTURE ──\n"
+                "  1. WHAT HAPPENED — name the stage that aborted (data cleaning vs ML\n"
+                "     modeling) and the immediate trigger. Reference the specific\n"
+                "     column, gate, or artifact from the signals above BY NAME.\n"
+                "  2. WHY IT HAPPENED — translate the failure_diagnosis WHERE/WHY into\n"
+                "     plain language, QUOTING the diagnosis verbatim where it is\n"
+                "     concrete (column names, error classes, contract invariants). If\n"
+                "     multiple retries hit the same gate, say so and quote the\n"
+                "     recurring signal. Distinguish mechanical errors (tracebacks) from\n"
+                "     contract violations (failed gates).\n"
+                "  3. WHAT WAS TRIED — summarize the retry history factually: attempt\n"
+                "     count, what each attempt tried to fix, why each failed. Do NOT\n"
+                "     invent attempts not present in the signals above. If no retry\n"
+                "     history is present, say 'retry history not persisted' rather\n"
+                "     than inventing one.\n"
+                "  4. WHY AUTOMATION COULD NOT RECOVER — describe the concrete pattern\n"
+                "     the agent could not cross (e.g., 'the cleaning agent repeatedly\n"
+                "     coerced dates in a way that introduced NaT, violating the\n"
+                "     null-count-must-not-increase invariant, because the contract did\n"
+                "     not pin the raw date format'). Avoid blaming 'the LLM' abstractly.\n"
+                "  5. NEXT STEPS FOR HUMANS — concrete, actionable recommendations\n"
+                "     derived from the diagnosis FIX section. Name the file to inspect\n"
+                "     (e.g., work/artifacts/data_engineer_last.py), the column to\n"
+                "     investigate, the contract field to enrich, or the preprocessing\n"
+                "     step to add outside the pipeline. No generic advice like\n"
+                "     're-run integration tests' or 'validate schemas' without\n"
+                "     specifying what and where.\n"
+                "\n"
+                "Tone: honest, technical, diagnostic. Length: as long as the evidence\n"
+                "demands. A shallow post-mortem is worse than none. Do not invent risks\n"
+                "(e.g., leakage) not supported by the signals above.\n"
+                "\n"
+                "The sections further down (OUTCOME ASSESSMENT / QA REVIEWER / ENGINEERING\n"
+                "IMPACT) are written for success-shaped runs — use them only if some\n"
+                "stages actually ran and produced material findings before the abort.\n"
+                "Otherwise ignore them.\n"
+            )
+
         SYSTEM_PROMPT_TEMPLATE = Template("""
+$post_mortem_directive
 $senior_translation_protocol
 
 $senior_evidence_rule
@@ -5267,6 +5426,17 @@ $execution_results
 
 """
 
+        # Change (c): when post-mortem mode is active, the artifact-compliance,
+        # artifact-inventory and kpi-snapshot tables describe DOWNSTREAM SYMPTOMS
+        # of the abort, not the root cause. They pull the LLM toward a
+        # compliance-shaped report. Suppress them so they cannot be embedded.
+        # They still exist on disk (data/report_visual_tables.json) for anyone
+        # who wants raw context.
+        if abort_info:
+            artifact_compliance_table_html = ""
+            artifact_inventory_table_html = ""
+            kpi_snapshot_table_html = ""
+
         artifact_registry = _build_embeddable_artifact_registry(
             plots=plots,
             plot_summaries=plot_summaries,
@@ -5285,6 +5455,7 @@ $execution_results
             "target_language_code": target_language_code,
             "facts_block_json": json.dumps(facts_block, ensure_ascii=False),
             "run_narrative_section": run_narrative_section,
+            "post_mortem_directive": post_mortem_directive,
             "business_objective_summary": business_objective_summary,
             "business_objective": business_objective,
             "strategy_title": strategy_title,
@@ -5335,6 +5506,7 @@ $execution_results
                 reporting_policy_context=reporting_policy_context if isinstance(reporting_policy_context, dict) else {},
                 evidence_paths=evidence_paths,
                 execution_results=execution_results,
+                abort_info=abort_info if abort_info else None,
             )
             try:
                 outline_text = self._call_llm(outline_prompt)
@@ -5602,25 +5774,60 @@ $execution_results
                         ]
                     )
             if decision_discrepancy:
-                content = (
-                    content.rstrip()
-                    + "\n\n## Decision Reconciliation Note\n"
-                    + f"Derived decision: {decision_discrepancy.get('derived_decision')} | "
-                    + f"run_summary outcome: {decision_discrepancy.get('run_outcome')}\n"
-                )
-                if isinstance(self.last_report_blocks, list):
-                    self.last_report_blocks.extend(
-                        [
-                            {"type": "heading", "level": 2, "text": "Decision Reconciliation Note"},
-                            {
-                                "type": "paragraph",
-                                "text": (
-                                    f"Derived decision: {decision_discrepancy.get('derived_decision')} | "
-                                    f"run_summary outcome: {decision_discrepancy.get('run_outcome')}"
-                                ),
-                            },
-                        ]
+                # On an aborted run, the derived/authoritative comparison is
+                # misleading — a "GO_WITH_LIMITATIONS | NO_GO" line reads as if
+                # the run had a softer positive signal, which contradicts the
+                # post-mortem framing. Replace with an explicit abort note.
+                _abort_info_for_note = {}
+                if isinstance(run_narrative, dict):
+                    _ai = run_narrative.get("abort_info")
+                    if isinstance(_ai, dict) and _ai:
+                        _abort_info_for_note = _ai
+                if _abort_info_for_note:
+                    _abort_reason = str(_abort_info_for_note.get("abort_reason") or "unknown").strip()
+                    content = (
+                        content.rstrip()
+                        + "\n\n## Run Aborted Note\n"
+                        + f"This run was aborted (reason: {_abort_reason}). Reviewer/adequacy "
+                        + "signals that may appear in context reflect partial state before the "
+                        + "abort and are NOT an alternate positive decision — the run did not "
+                        + "produce deployable results.\n"
                     )
+                    if isinstance(self.last_report_blocks, list):
+                        self.last_report_blocks.extend(
+                            [
+                                {"type": "heading", "level": 2, "text": "Run Aborted Note"},
+                                {
+                                    "type": "paragraph",
+                                    "text": (
+                                        f"This run was aborted (reason: {_abort_reason}). Reviewer/adequacy "
+                                        "signals that may appear in context reflect partial state before the "
+                                        "abort and are NOT an alternate positive decision — the run did not "
+                                        "produce deployable results."
+                                    ),
+                                },
+                            ]
+                        )
+                else:
+                    content = (
+                        content.rstrip()
+                        + "\n\n## Decision Reconciliation Note\n"
+                        + f"Derived decision: {decision_discrepancy.get('derived_decision')} | "
+                        + f"run_summary outcome: {decision_discrepancy.get('run_outcome')}\n"
+                    )
+                    if isinstance(self.last_report_blocks, list):
+                        self.last_report_blocks.extend(
+                            [
+                                {"type": "heading", "level": 2, "text": "Decision Reconciliation Note"},
+                                {
+                                    "type": "paragraph",
+                                    "text": (
+                                        f"Derived decision: {decision_discrepancy.get('derived_decision')} | "
+                                        f"run_summary outcome: {decision_discrepancy.get('run_outcome')}"
+                                    ),
+                                },
+                            ]
+                        )
             if prompt_budget_notes:
                 content = (
                     content.rstrip()

@@ -214,7 +214,17 @@ class DataEngineerAgent:
                 "Series.str.replace(pat, repl): repl must be a string or callable, NOT pd.NA/np.nan. Use .where() or .mask() instead.",
                 "pd.to_datetime(infer_datetime_format=True) deprecated — omit the kwarg, pandas 2.x infers by default.",
                 "Series.replace({dict}, np.nan) works, but Series.replace(list, np.nan) inside .apply() raises ValueError — use .map() or .where() instead.",
-                "Int64/Float64 nullable dtypes: use pd.array() or .astype('Int64') after imputation, not before.",
+                (
+                    "Int64/Float64 nullable dtypes (capital I/F) are strictly-typed ExtensionArrays — "
+                    "they reject non-numeric values. Calling .where(cond, 'Unknown') or .fillna('NA') on "
+                    "an Int64/Float64 column raises TypeError BEFORE imputation runs. Rules of thumb: "
+                    "(a) if injecting string sentinels, cast to object first: s = s.astype(object).fillna('Unknown'); "
+                    "(b) if imputing with a numeric sentinel or a compatible NA, keep the nullable dtype: "
+                    "s.fillna(0).astype('Int64') or pd.array(..., dtype='Int64'); "
+                    "(c) the same strict-dtype principle applies to datetime64[ns] (rejects non-timestamp strings) "
+                    "and 'category' (rejects values outside declared categories) — cast to object before injecting "
+                    "incompatible sentinels."
+                ),
                 "print() with unicode characters (checkmarks, arrows) fails on Windows cp1252 — use ASCII-safe characters only.",
                 "BooleanDtype columns: fillna() only accepts bool values (True/False/pd.NA), not int or float. "
                 "Use fillna(False) not fillna(0) or fillna(0.0). Note that is_numeric_dtype() returns True for "
