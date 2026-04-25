@@ -201,6 +201,10 @@ def test_run_result_evaluator_restores_best_attempt_before_runtime_failure_revie
         "execution_output": "Recovered execution output",
         "plots_local": [],
         "generated_code": "print('best attempt')\n",
+        "governance_approved": True,
+        "review_verdict": "APPROVED",
+        "final_review_verdict": "APPROVED",
+        "hard_failures": [],
         "metrics_payload": metrics_payload,
         "metrics_path": "data/metrics.json",
         "primary_metric_state": {
@@ -313,6 +317,66 @@ def test_run_review_board_does_not_double_increment_when_already_needs_improveme
     result = graph_mod.run_review_board(state)
     assert result["review_verdict"] == "NEEDS_IMPROVEMENT"
     assert "iteration_count" not in result
+
+
+def test_sync_review_board_verdict_clears_candidate_actions_after_authoritative_incumbent_restore(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    state = {
+        "review_verdict": "NEEDS_IMPROVEMENT",
+        "last_successful_review_verdict": "APPROVED",
+        "last_gate_context": {
+            "failed_gates": ["qa_gates"],
+            "required_fixes": ["Retry challenger with current latency evidence."],
+            "review_board": {
+                "status": "NEEDS_IMPROVEMENT",
+                "summary": "stale",
+                "failed_areas": ["qa_gates"],
+                "required_actions": ["Retry challenger with current latency evidence."],
+            },
+        },
+        "review_board_verdict": {
+            "status": "NEEDS_IMPROVEMENT",
+            "final_review_verdict": "NEEDS_IMPROVEMENT",
+            "summary": "Stale challenger rejection.",
+            "failed_areas": ["qa_gates"],
+            "required_actions": ["Retry challenger with current latency evidence."],
+            "evidence": [
+                {
+                    "claim": "QA cited baseline latency payload.",
+                    "source": "optimization_context.metric_loop_state.round.baseline.metrics_payload#ms_per_1000_debtors",
+                }
+            ],
+        },
+    }
+    metric_loop_state = {
+        "target": {"name": "roc_auc", "min_delta": 0.0005},
+        "round": {"baseline": {"metric_value": 0.81}},
+        "candidate": {"metric_value": 0.84},
+        "final": {"label": "best_attempt", "metric_value": 0.91, "review_verdict": "APPROVED"},
+        "selection": {
+            "selected_label": "best_attempt",
+            "approved": True,
+            "review_signal_approved": True,
+            "governance_approved": True,
+            "metric_improved": True,
+            "improved_by_metric": True,
+            "stability_ok": True,
+            "deterministic_blockers": False,
+            "advisory_review_mode": True,
+        },
+    }
+
+    graph_mod._sync_review_board_verdict_after_metric_round(state, metric_loop_state=metric_loop_state)
+
+    verdict = state["review_board_verdict"]
+    assert verdict["final_review_verdict"] == "APPROVED"
+    assert verdict["failed_areas"] == []
+    assert verdict["required_actions"] == []
+    assert verdict["evidence"] == []
+    assert verdict["candidate_assessment_required_actions"] == ["Retry challenger with current latency evidence."]
+    assert state["last_gate_context"]["failed_gates"] == []
+    assert state["last_gate_context"]["required_fixes"] == []
 
 
 def test_run_review_board_metric_only_needs_improvement_is_downgraded(tmp_path, monkeypatch):

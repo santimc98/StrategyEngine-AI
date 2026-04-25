@@ -12,6 +12,7 @@ from src.graph.graph import (
     _build_metric_round_contract_lock,
     _build_hybrid_bundle_signature,
     _metric_round_has_deterministic_blockers,
+    _metric_improvement_policy,
     _resolve_metric_loop_higher_is_better,
     _promote_best_attempt,
     _resolve_metric_round_hybrid_policy,
@@ -192,10 +193,71 @@ def test_bootstrap_metric_improvement_round_supports_nested_metric_aliases(tmp_p
     assert round_state.get("candidate_attempt_index") == 1
     assert round_state.get("max_attempts") == 3
     assert round_state.get("round_base_incumbent_id") == incumbent_bundle.get("incumbent_id")
+
+
+def test_bootstrap_metric_improvement_round_snapshots_inside_run_workdir(tmp_path, monkeypatch) -> None:
+    work_dir = tmp_path / "runs" / "snaprun1" / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(work_dir)
+    metrics_path = work_dir / "data" / "metrics.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps({"roc_auc": 0.81}), encoding="utf-8")
+
+    monkeypatch.setattr(graph_mod, "append_experiment_entry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod, "log_run_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        graph_mod.results_advisor,
+        "generate_critique_packet",
+        lambda _ctx: {"metric_comparison": {"baseline_value": 0.81, "candidate_value": 0.81}},
+    )
+    monkeypatch.setattr(
+        graph_mod.strategist,
+        "generate_iteration_hypothesis",
+        lambda _ctx: {
+            "action": "APPLY",
+            "hypothesis": {
+                "technique": "feature_interactions",
+                "objective": "Test bounded improvement.",
+                "target_columns": ["ALL_NUMERIC"],
+                "feature_scope": "model_features",
+                "params": {},
+            },
+            "tracker_context": {"signature": "snaprun1", "is_duplicate": False},
+        },
+    )
+    monkeypatch.setattr(graph_mod.results_advisor, "last_critique_meta", {"mode": "deterministic"})
+    monkeypatch.setattr(graph_mod.strategist, "last_iteration_meta", {"mode": "deterministic"})
+
+    state = {
+        "run_id": "snaprun1",
+        "work_dir": str(work_dir),
+        "work_dir_abs": str(work_dir),
+        "review_verdict": "APPROVED",
+        "reviewer_last_result": {"status": "APPROVED"},
+        "qa_last_result": {"status": "APPROVED"},
+        "execution_error": False,
+        "sandbox_failed": False,
+        "ml_improvement_attempted": False,
+        "generated_code": "def train():\n    return None\n",
+        "steward_context_ready": True,
+        "steward_context_quality": {"ready": True},
+    }
+    contract = {
+        "validation_requirements": {"primary_metric": "roc_auc"},
+        "iteration_policy": {"metric_improvement_rounds": 1, "metric_min_delta": 0.0005},
+        "feature_engineering_plan": {"techniques": [{"technique": "feature_interactions"}]},
+        "required_outputs": ["data/metrics.json"],
+    }
+
+    assert graph_mod._bootstrap_metric_improvement_round(state, contract) is True
+    snapshot_dir = Path(state["ml_improvement_snapshot_dir"])
+    assert snapshot_dir == work_dir / "ml_incumbent_snapshot_r1"
+    assert snapshot_dir.exists()
+    assert not (work_dir / "work" / "ml_incumbent_snapshot_r1").exists()
     assert Path("data/incumbent_bundle.json").exists()
     assert Path("data/metric_round_state.json").exists()
     handoff = state.get("iteration_handoff", {})
-    assert handoff.get("optimization_focus", {}).get("primary_metric_name") == "ROC-AUC"
+    assert handoff.get("optimization_focus", {}).get("primary_metric_name") == "roc_auc"
 
 
 def test_metric_round_contract_lock_filters_baseline_only_reviewer_gates() -> None:
@@ -220,6 +282,25 @@ def test_metric_round_contract_lock_filters_baseline_only_reviewer_gates() -> No
         "probability_output_validation",
     ]
     assert lock["reviewer_gates"] == ["submission_schema_compliance"]
+
+
+def test_metric_round_contract_lock_includes_optimization_policy() -> None:
+    contract = {
+        "validation_requirements": {"primary_metric": "roc_auc"},
+        "optimization_policy": {
+            "allow_ensemble": False,
+            "allow_feature_engineering": False,
+            "allow_hpo": True,
+            "allow_model_switch": True,
+            "allow_calibration": True,
+        },
+    }
+
+    lock = _build_metric_round_contract_lock(contract, ["data/metrics.json"], "roc_auc")
+
+    assert lock["optimization_policy"]["allow_ensemble"] is False
+    assert lock["optimization_policy"]["allow_feature_engineering"] is False
+    assert lock["optimization_policy"]["allow_hpo"] is True
 
 
 def test_metric_round_patch_objectives_prefer_compatible_variant_language() -> None:
@@ -507,6 +588,64 @@ def test_is_improvement_respects_min_delta_threshold() -> None:
     assert _is_improvement(0.8000, 0.8010, True, 0.0005) is True
 
 
+def test_metric_improvement_policy_preserves_explicit_contract_min_delta() -> None:
+    _rounds, min_delta, _patience = _metric_improvement_policy(
+        {"optimization_policy": {"enabled": True, "max_rounds": 4, "min_delta": 0.005, "patience": 2}}
+    )
+    assert min_delta == 0.005
+
+
+def test_metric_round_hypothesis_application_requires_declared_model_evidence() -> None:
+    previous_code = "from lightgbm import LGBMClassifier\nmodel = LGBMClassifier()\n"
+    candidate_code = (
+        "from lightgbm import LGBMClassifier\n"
+        "model = LGBMClassifier(n_estimators=500)\n"
+        "score = model.predict_proba(X)[:, 1]\n"
+    )
+    report = _evaluate_metric_round_hypothesis_application(
+        {
+            "ml_improvement_round_active": True,
+            "ml_improvement_hypothesis_packet": {
+                "action": "APPLY",
+                "hypothesis": {"technique": "lightgbm_catboost_weighted_ensemble"},
+            },
+        },
+        previous_code=previous_code,
+        candidate_code=candidate_code,
+    )
+
+    assert report["enforced"] is True
+    assert report["applied"] is False
+    assert report["reason"] == "missing_declared_hypothesis_evidence"
+    assert "catboost" in report["missing_evidence"]
+    assert "ensemble_or_blending_logic" in report["missing_evidence"]
+
+
+def test_metric_round_hypothesis_application_accepts_declared_model_evidence() -> None:
+    previous_code = "from lightgbm import LGBMClassifier\nmodel = LGBMClassifier()\n"
+    candidate_code = (
+        "from lightgbm import LGBMClassifier\n"
+        "from catboost import CatBoostClassifier\n"
+        "lgb_model = LGBMClassifier()\n"
+        "catboost_model = CatBoostClassifier(verbose=False)\n"
+        "weighted_blend = 0.65 * lgb_model.predict_proba(X) + 0.35 * catboost_model.predict_proba(X)\n"
+    )
+    report = _evaluate_metric_round_hypothesis_application(
+        {
+            "ml_improvement_round_active": True,
+            "ml_improvement_hypothesis_packet": {
+                "action": "APPLY",
+                "hypothesis": {"technique": "lightgbm_catboost_weighted_ensemble"},
+            },
+        },
+        previous_code=previous_code,
+        candidate_code=candidate_code,
+    )
+
+    assert report["applied"] is True
+    assert report["missing_evidence"] == []
+
+
 def test_snapshot_and_restore_ml_outputs(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     metrics_path = Path("artifacts/data/metrics.json")
@@ -675,6 +814,43 @@ def test_hybrid_policy_recovers_noop_from_blueprint_actions_when_plan_empty() ->
     assert packet["hypothesis"]["target_columns"] == ["segment"]
     assert packet["hypothesis"]["params"] == {"smoothing": 10}
     assert policy_meta["first_round_apply_forced"] is True
+
+
+def test_hybrid_policy_filters_policy_forbidden_plan_entries() -> None:
+    packet, policy_meta = _resolve_metric_round_hybrid_policy(
+        round_id=1,
+        rounds_allowed=3,
+        no_improve_streak=0,
+        patience=2,
+        min_delta=0.0005,
+        higher_is_better=True,
+        hypothesis_packet={
+            "action": "NO_OP",
+            "hypothesis": {"technique": "NO_OP", "params": {}},
+            "tracker_context": {"signature": "llm_noop_round_1"},
+        },
+        feature_engineering_plan={
+            "techniques": [],
+            "improvement_actions": [
+                {
+                    "technique": "lightgbm_catboost_weighted_ensemble",
+                    "action_family": "ensemble_or_stacking",
+                    "concrete_params": {"blend_weights": {"lightgbm": 0.7, "catboost": 0.3}},
+                },
+                {
+                    "technique": "focused_lightgbm_hpo",
+                    "action_family": "hyperparameter_search",
+                    "concrete_params": {"n_trials": 8},
+                },
+            ],
+        },
+        tracker_entries=[],
+        optimization_policy={"allow_ensemble": False, "allow_hpo": True},
+    )
+
+    assert packet["action"] == "APPLY"
+    assert packet["hypothesis"]["technique"] == "focused_lightgbm_hpo"
+    assert policy_meta["policy_blocked_plan_entries"][0]["technique"] == "lightgbm_catboost_weighted_ensemble"
 
 
 def test_hybrid_policy_preserves_valid_llm_apply_hypothesis() -> None:

@@ -4,6 +4,7 @@ from src.graph.graph import (
     _build_iteration_handoff,
     _build_review_guided_retry_context,
     _extract_verified_gate_feedback,
+    _sanitize_metric_round_review_packet,
     prepare_runtime_fix,
 )
 
@@ -145,6 +146,41 @@ def test_iteration_handoff_defers_metric_optimization_when_runtime_blockers_exis
     assert handoff["optimization_lane"]["resume_after_repair"] is True
     assert handoff["optimization_lane"]["repair_first"] is True
     assert handoff["optimization_lane"]["active_technique"] == "multi_seed_catboost_averaging"
+
+
+def test_metric_round_review_packet_drops_baseline_only_blockers():
+    packet = {
+        "status": "REJECTED",
+        "feedback": (
+            "QA cites eligibility drift 0.1066 from "
+            "optimization_context.metric_loop_state.round.baseline.metrics_payload#eligibility_drift_entity_pct."
+        ),
+        "failed_gates": ["eligibility_drift_within_tolerance", "inference_latency_within_spec"],
+        "required_fixes": [
+            "Resolve eligibility drift using current artifact evidence.",
+            "Provide current latency evidence.",
+        ],
+        "hard_failures": ["eligibility_drift_within_tolerance", "inference_latency_within_spec"],
+        "evidence": [
+            {
+                "claim": "QA cites eligibility drift from baseline payload.",
+                "source": "optimization_context.metric_loop_state.round.baseline.metrics_payload#eligibility_drift_entity_pct",
+            },
+            {
+                "claim": "QA cites latency from baseline payload.",
+                "source": "optimization_context.metric_loop_state.round.baseline.metrics_payload#ms_per_1000_debtors",
+            },
+        ],
+    }
+
+    sanitized = _sanitize_metric_round_review_packet(packet, actor="qa_reviewer")
+
+    assert sanitized["status"] == "APPROVE_WITH_WARNINGS"
+    assert sanitized["failed_gates"] == []
+    assert sanitized["required_fixes"] == []
+    assert sanitized["hard_failures"] == []
+    assert sanitized["comparison_evidence"]
+    assert "comparison-only context" in sanitized["feedback"]
 
 
 def test_iteration_handoff_builds_repair_ground_truth_for_runtime_api_misuse():

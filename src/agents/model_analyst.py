@@ -14,6 +14,11 @@ from openai import OpenAI
 from src.utils.action_families import ACTION_FAMILIES
 from src.utils.llm_json_repair import parse_json_object_with_repair
 from src.utils.llm_fallback import call_chat_with_fallback, extract_response_text
+from src.utils.optimization_policy_guard import (
+    compact_optimization_policy_constraints,
+    filter_optimization_actions,
+    resolve_optimization_policy,
+)
 
 load_dotenv()
 
@@ -41,6 +46,9 @@ situation, and produce a prioritized action plan.
 
 === MODELS USED ===
 {models_used}
+
+=== OPTIMIZATION POLICY CONSTRAINTS ===
+{optimization_policy_json}
 
 === COMPUTE BUDGET ===
 Hard timeout: 7200 seconds (2 hours). ALL proposed optimizations must complete within
@@ -88,6 +96,8 @@ CONSTRAINTS:
 - concrete_params must contain REAL values the ML engineer can use directly
 - expected_delta should be conservative and justified by your reasoning
 - Include a "reasoning" field explaining WHY this technique helps for this specific case
+- The optimization_policy constraints are HARD. Do not propose any action that violates
+  allow_ensemble, allow_hpo, allow_feature_engineering, allow_calibration, or allow_model_switch.
 
 Respond ONLY with valid JSON:
 {{
@@ -205,6 +215,7 @@ class ModelAnalystAgent:
         dataset_profile = context.get("dataset_profile") if isinstance(context.get("dataset_profile"), dict) else {}
         primary_metric = str(context.get("primary_metric") or "unknown")
         models_used = context.get("models_used") if isinstance(context.get("models_used"), list) else []
+        optimization_policy = compact_optimization_policy_constraints(resolve_optimization_policy(context))
 
         # Enrich metrics with diagnostic signals the LLM needs for reasoning
         enriched_metrics = dict(metrics)
@@ -243,6 +254,7 @@ class ModelAnalystAgent:
             dataset_profile_summary=dataset_profile_summary,
             primary_metric=primary_metric,
             models_used=", ".join(str(m) for m in models_used) if models_used else "unknown",
+            optimization_policy_json=json.dumps(optimization_policy, indent=2, default=str),
             action_families=_ACTION_FAMILIES_STR,
         )
 
@@ -757,6 +769,14 @@ class ModelAnalystAgent:
             return blueprint
 
         ctx = context if isinstance(context, dict) else {}
+        policy = resolve_optimization_policy(ctx)
+        actions, blocked_actions = filter_optimization_actions(actions, policy)
+        if blocked_actions:
+            blueprint["policy_blocked_actions"] = blocked_actions
+        if not actions:
+            blueprint["improvement_actions"] = []
+            blueprint["total_expected_delta"] = 0.0
+            return blueprint
         dp = ctx.get("dataset_profile") if isinstance(ctx.get("dataset_profile"), dict) else {}
         mx = ctx.get("metrics") if isinstance(ctx.get("metrics"), dict) else {}
         _n_rows = 0
@@ -772,6 +792,10 @@ class ModelAnalystAgent:
 
         if _n_rows <= 0:
             blueprint["improvement_actions"] = actions[:6]
+            blueprint["total_expected_delta"] = round(
+                sum(float(a.get("expected_delta", 0) or 0) for a in blueprint["improvement_actions"]),
+                4,
+            )
             return blueprint
 
         fw = str(blueprint.get("framework") or "catboost").lower()
@@ -873,6 +897,10 @@ class ModelAnalystAgent:
                 guarded.append(adapted)
 
         blueprint["improvement_actions"] = guarded[:6]
+        blueprint["total_expected_delta"] = round(
+            sum(float(a.get("expected_delta", 0) or 0) for a in blueprint["improvement_actions"]),
+            4,
+        )
         return blueprint
 
     # ------------------------------------------------------------------

@@ -355,6 +355,53 @@ def test_generate_iteration_hypothesis_ranks_evidence_over_blueprint_order(monke
     assert "Evidence-ranked" in str(packet.get("explanation") or "")
 
 
+def test_generate_iteration_hypothesis_respects_optimization_policy(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("STRATEGIST_ITERATION_MODE", "deterministic")
+    strategist = StrategistAgent()
+    packet = strategist.generate_iteration_hypothesis(
+        {
+            "run_id": "run_test",
+            "iteration": 2,
+            "primary_metric_name": "roc_auc",
+            "min_delta": 0.0005,
+            "optimization_policy": {
+                "allow_ensemble": False,
+                "allow_feature_engineering": False,
+                "allow_hpo": True,
+            },
+            "optimization_blueprint": {
+                "improvement_actions": [
+                    {
+                        "technique": "stacking_ensemble",
+                        "action_family": "ensemble_or_stacking",
+                        "priority": 1,
+                        "concrete_params": {"meta_model": "logistic_regression"},
+                    },
+                    {
+                        "technique": "focused_lightgbm_hpo",
+                        "action_family": "hyperparameter_search",
+                        "priority": 2,
+                        "concrete_params": {"n_trials": 8},
+                    },
+                    {
+                        "technique": "kfold_target_encoding",
+                        "action_family": "feature_engineering",
+                        "priority": 3,
+                        "concrete_params": {"smoothing": 10},
+                    },
+                ]
+            },
+            "critique_packet": {"error_modes": [{"id": "metric_stagnation"}]},
+            "dataset_profile": {"basic_stats": {"n_rows": 10000}},
+            "experiment_tracker": [],
+        }
+    )
+
+    assert packet.get("action") == "APPLY"
+    assert packet.get("hypothesis", {}).get("technique") == "focused_lightgbm_hpo"
+
+
 def test_generate_iteration_hypothesis_downranks_recent_regressions(monkeypatch) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("STRATEGIST_ITERATION_MODE", "deterministic")

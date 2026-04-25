@@ -1,4 +1,8 @@
-from src.agents.qa_reviewer import QAReviewerAgent
+from src.agents.qa_reviewer import (
+    QAReviewerAgent,
+    _apply_metric_gate_consistency_guard,
+    _build_deterministic_metric_facts,
+)
 
 
 def test_qa_reviewer_prompt_uses_context_first_structure_for_data_engineer_review():
@@ -95,3 +99,138 @@ def test_qa_reviewer_prompt_includes_hard_blocker_packet_for_restored_candidates
     assert "HARD_BLOCKER_PACKET" in prompt
     assert "best_attempt_restored_recently" in prompt
     assert "baseline_model.predict_proba" in prompt
+
+
+def test_qa_reviewer_enforces_artifact_backed_hard_numeric_gate(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    metrics_dir = tmp_path / "artifacts" / "ml"
+    metrics_dir.mkdir(parents=True)
+    (metrics_dir / "latency_benchmark.json").write_text(
+        '{"ms_per_1000_debtors": 135.54}',
+        encoding="utf-8",
+    )
+    qa_gates = [
+        {
+            "name": "inference_latency_within_spec",
+            "severity": "HARD",
+            "applies_to_artifact": "artifacts/ml/latency_benchmark.json",
+            "params": {
+                "metric": "ms_per_1000_debtors",
+                "min_value": 10,
+                "max_value": 30,
+            },
+        }
+    ]
+
+    facts = _build_deterministic_metric_facts(
+        evaluation_spec={},
+        qa_gates=qa_gates,
+        subject_required_outputs=[
+            {"path": "artifacts/ml/latency_benchmark.json", "intent": "latency_benchmark"}
+        ],
+        qa_required_outputs=[],
+    )
+
+    assert facts["gate_metric_facts"][0]["passed"] is False
+    result, notes = _apply_metric_gate_consistency_guard(
+        {"status": "APPROVED", "failed_gates": [], "hard_failures": []},
+        qa_gates,
+        facts,
+    )
+    assert result["status"] == "REJECTED"
+    assert result["failed_gates"] == ["inference_latency_within_spec"]
+    assert result["hard_failures"] == ["inference_latency_within_spec"]
+    assert notes and "QA_METRIC_FACT_ENFORCED" in notes[0]
+
+
+def test_qa_reviewer_composite_gate_prefers_current_artifact_over_baseline_history(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    metrics_dir = tmp_path / "artifacts" / "ml"
+    metrics_dir.mkdir(parents=True)
+    (metrics_dir / "validation_metrics.json").write_text(
+        '{"eligibility_drift_entity_pct": 0.0008, "eligibility_drift_ventas_pct": 0.01, "eligibility_drift_saldo_pct": 0.02}',
+        encoding="utf-8",
+    )
+    qa_gates = [
+        {
+            "name": "eligibility_drift_within_tolerance",
+            "severity": "HARD",
+            "applies_to_artifact": "artifacts/ml/validation_metrics.json",
+            "evidence_source": (
+                "validation_metrics.json.eligibility_drift_entity_pct, "
+                "eligibility_drift_ventas_pct, eligibility_drift_saldo_pct for confirmation month"
+            ),
+            "params": {
+                "max_entity_drift_pct": 0.10,
+                "max_ventas_drift_pct": 0.10,
+                "max_saldo_drift_pct": 0.10,
+            },
+        }
+    ]
+
+    facts = _build_deterministic_metric_facts(
+        evaluation_spec={
+            "metrics_payload": {
+                "eligibility_drift_entity_pct": 0.1066,
+                "eligibility_drift_ventas_pct": 0.1066,
+                "eligibility_drift_saldo_pct": 0.1066,
+            }
+        },
+        qa_gates=qa_gates,
+        subject_required_outputs=[
+            {"path": "artifacts/ml/validation_metrics.json", "intent": "validation_metrics"}
+        ],
+        qa_required_outputs=[],
+    )
+
+    gate_facts = facts["gate_metric_facts"]
+    assert len(gate_facts) == 3
+    assert all(fact["passed"] is True for fact in gate_facts)
+    assert all(fact["source"] == "artifacts/ml/validation_metrics.json" for fact in gate_facts)
+
+    result, notes = _apply_metric_gate_consistency_guard(
+        {
+            "status": "REJECTED",
+            "failed_gates": ["eligibility_drift_within_tolerance"],
+            "hard_failures": [],
+            "required_fixes": ["stale baseline said eligibility drift failed"],
+        },
+        qa_gates,
+        facts,
+    )
+    assert result["status"] == "APPROVE_WITH_WARNINGS"
+    assert result["failed_gates"] == []
+    assert any("QA_METRIC_FACT_OVERRIDE" in note for note in notes)
+
+
+def test_qa_reviewer_prompt_includes_gate_metric_facts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    metrics_dir = tmp_path / "artifacts" / "ml"
+    metrics_dir.mkdir(parents=True)
+    (metrics_dir / "latency_benchmark.json").write_text(
+        '{"ms_per_1000_debtors": 20.0}',
+        encoding="utf-8",
+    )
+    agent = QAReviewerAgent(api_key=None)
+    agent.review_code(
+        "print('model')",
+        {"title": "ML audit"},
+        "Audit ML outputs",
+        evaluation_spec={
+            "review_subject": "ml_engineer",
+            "subject_required_outputs": [
+                {"path": "artifacts/ml/latency_benchmark.json", "intent": "latency_benchmark"}
+            ],
+            "qa_gates": [
+                {
+                    "name": "inference_latency_within_spec",
+                    "severity": "HARD",
+                    "applies_to_artifact": "artifacts/ml/latency_benchmark.json",
+                    "params": {"metric": "ms_per_1000_debtors", "max_value": 30},
+                }
+            ],
+        },
+    )
+    prompt = agent.last_prompt or ""
+    assert "gate_metric_facts" in prompt
+    assert "current candidate artifact facts outrank baseline" in prompt

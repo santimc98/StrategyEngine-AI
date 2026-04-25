@@ -16,6 +16,13 @@ from src.utils.actor_critic_schemas import (
     validate_iteration_hypothesis_packet,
 )
 from src.utils.experiment_tracker import build_hypothesis_signature
+from src.utils.optimization_policy_guard import (
+    compact_optimization_policy_constraints,
+    filter_optimization_actions,
+    hypothesis_action_from_packet,
+    optimization_policy_violations,
+    resolve_optimization_policy,
+)
 
 load_dotenv()
 
@@ -356,6 +363,29 @@ class StrategistAgent:
                     min_delta=min_delta,
                     explanation=(
                         "Strategist-selected hypothesis duplicates prior tracker evidence; emit NO_OP instead of replaying it."
+                    )[:280],
+                ),
+                [],
+            )
+
+        policy = resolve_optimization_policy(context)
+        policy_violations = optimization_policy_violations(
+            hypothesis_action_from_packet(sanitized),
+            policy,
+        )
+        if policy_violations:
+            return (
+                build_noop_iteration_hypothesis_packet(
+                    run_id=run_id,
+                    iteration=iteration,
+                    signature=signature,
+                    duplicate_of=signature,
+                    primary_metric_name=primary_metric_name,
+                    min_delta=min_delta,
+                    explanation=(
+                        "Selected hypothesis violates contract optimization_policy: "
+                        + ", ".join(policy_violations[:4])
+                        + ". Emit NO_OP rather than asking ML engineer to contradict the contract."
                     )[:280],
                 ),
                 [],
@@ -1022,12 +1052,19 @@ class StrategistAgent:
         blueprint_actions = optimization_blueprint.get("improvement_actions")
         if not isinstance(blueprint_actions, list):
             blueprint_actions = []
+        optimization_policy = resolve_optimization_policy(context)
+        blueprint_actions, blocked_blueprint_actions = filter_optimization_actions(
+            blueprint_actions,
+            optimization_policy,
+        )
 
         llm_context = {
             "run_id": context.get("run_id"),
             "iteration": context.get("iteration"),
             "primary_metric_name": context.get("primary_metric_name"),
             "min_delta": context.get("min_delta"),
+            "optimization_policy": compact_optimization_policy_constraints(optimization_policy),
+            "policy_blocked_blueprint_actions": blocked_blueprint_actions[:6],
             "critique_packet": critique_packet,
             "feature_engineering_plan": feature_engineering_plan,
             "experiment_tracker": tracker_entries[-10:],
@@ -1072,6 +1109,8 @@ class StrategistAgent:
             "Rules:\n"
             "- Exactly one hypothesis; action APPLY or NO_OP.\n"
             "- If duplicate signature then action must be NO_OP.\n"
+            "- optimization_policy is a hard contract. Do not choose hypotheses listed in policy_blocked_blueprint_actions, "
+            "and do not emit any hypothesis that violates an allow_* flag.\n"
             "- Allowed target macros: ALL_NUMERIC, ALL_CATEGORICAL, ALL_TEXT, ALL_DATETIME, ALL_BOOLEAN.\n"
             "- You own the selection. feature_engineering_plan and optimization_blueprint_actions are advisory inputs, not a mandatory queue.\n"
             "- Use critique_packet, round_history, experiment_tracker, dataset_profile_signals, and feature_engineering_plan as primary evidence.\n"
@@ -1126,6 +1165,11 @@ class StrategistAgent:
         blueprint_actions = optimization_blueprint.get("improvement_actions")
         if not isinstance(blueprint_actions, list):
             blueprint_actions = []
+        optimization_policy = resolve_optimization_policy(context)
+        blueprint_actions, _blocked_blueprint_actions = filter_optimization_actions(
+            blueprint_actions,
+            optimization_policy,
+        )
         blueprint_candidates = []
         for bp_action in blueprint_actions:
             if not isinstance(bp_action, dict):
@@ -1149,6 +1193,7 @@ class StrategistAgent:
             candidates = self._dedupe_candidates(blueprint_candidates + candidates)
         if not candidates:
             candidates = self._fallback_candidates_from_critique(critique_packet, context=context)
+        candidates, _blocked_candidates = filter_optimization_actions(candidates, optimization_policy)
         ranked_candidates = self._rank_iteration_candidates(
             candidates,
             critique_packet=critique_packet,

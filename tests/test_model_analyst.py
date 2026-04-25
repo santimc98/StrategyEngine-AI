@@ -57,6 +57,64 @@ def test_model_analyst_validate_blueprint_normalizes_action_fields(monkeypatch) 
     assert action.get("priority") == 5
 
 
+def test_model_analyst_filters_blueprint_actions_for_optimization_policy(monkeypatch) -> None:
+    monkeypatch.setenv("MODEL_ANALYST_MODE", "deterministic")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    agent = ModelAnalystAgent(api_key=None)
+    blueprint = {
+        "model_type": "gradient_boosting",
+        "framework": "lightgbm",
+        "improvement_actions": [
+            {
+                "technique": "lightgbm_catboost_weighted_ensemble",
+                "action_family": "ensemble_or_stacking",
+                "expected_delta": 0.002,
+            },
+            {
+                "technique": "focused_lightgbm_hpo",
+                "action_family": "hyperparameter_search",
+                "expected_delta": 0.001,
+            },
+            {
+                "technique": "ordinal_regression_lightgbm",
+                "action_family": "loss_objective_adjustment",
+                "code_change_hint": "Train an ordinal model; optionally compare it against the baseline.",
+                "expected_delta": 0.001,
+            },
+            {
+                "technique": "kfold_target_encoding_plus_interactions",
+                "action_family": "feature_engineering",
+                "expected_delta": 0.001,
+            },
+        ],
+    }
+
+    finalized = agent._finalize_blueprint(
+        blueprint,
+        {
+            "metrics": {"n_train_rows": 1000},
+            "dataset_profile": {"n_train_rows": 1000},
+            "optimization_policy": {
+                "allow_ensemble": False,
+                "allow_feature_engineering": False,
+                "allow_hpo": True,
+            },
+        },
+    )
+
+    actions = finalized.get("improvement_actions")
+    assert [action.get("technique") for action in actions] == [
+        "focused_lightgbm_hpo",
+        "ordinal_regression_lightgbm",
+    ]
+    blocked = finalized.get("policy_blocked_actions")
+    assert isinstance(blocked, list)
+    assert {item.get("technique") for item in blocked} == {
+        "lightgbm_catboost_weighted_ensemble",
+        "kfold_target_encoding_plus_interactions",
+    }
+
+
 def test_model_analyst_hybrid_without_client_falls_back_to_deterministic(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_ANALYST_MODE", "hybrid")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)

@@ -139,6 +139,13 @@ from src.utils.contract_validator import (
     normalize_optimization_direction,
     collect_contract_operational_dependency_columns,
 )
+from src.utils.optimization_policy_guard import (
+    compact_optimization_policy_constraints,
+    filter_optimization_actions,
+    hypothesis_action_from_packet,
+    optimization_policy_violations,
+    resolve_optimization_policy,
+)
 from src.utils.contract_views import (
     build_contract_views_projection,
     persist_views,
@@ -2208,6 +2215,99 @@ def _build_metric_loop_prompt_snapshot(
     }
 
 
+def _build_metric_round_candidate_evaluation_context(
+    state: Dict[str, Any] | None,
+    *,
+    metric_loop_state: Dict[str, Any] | None,
+    metric_name: str,
+    metric_value: Any,
+    baseline_value: Any,
+    oc_report: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    loop_state = metric_loop_state if isinstance(metric_loop_state, dict) else {}
+    oc = oc_report if isinstance(oc_report, dict) else {}
+    metrics_report = _resolve_metrics_report_for_facts(state)
+    if not isinstance(metrics_report, dict):
+        metrics_report = {}
+    model_performance = (
+        metrics_report.get("model_performance")
+        if isinstance(metrics_report.get("model_performance"), dict)
+        else {}
+    )
+    candidate = loop_state.get("candidate") if isinstance(loop_state.get("candidate"), dict) else {}
+    final_entry = loop_state.get("final") if isinstance(loop_state.get("final"), dict) else {}
+    context: Dict[str, Any] = {
+        "metric_name": str(metric_name or "").strip() or None,
+        "current_metric_value": _coerce_float(metric_value),
+        "baseline_metric_value": _coerce_float(baseline_value),
+        "candidate_metric_from_loop": _coerce_float(candidate.get("metric_value")),
+        "selected_final_metric": _coerce_float(final_entry.get("metric_value")),
+        "output_contract_status": str(oc.get("overall_status") or "").strip().lower() or None,
+        "missing_outputs": _normalize_handoff_items(oc.get("missing"), max_items=10, max_len=180),
+        "present_outputs": _normalize_handoff_items(oc.get("present"), max_items=10, max_len=180),
+    }
+    compact_perf: Dict[str, Any] = {}
+    for key in (
+        str(metric_name or "").strip(),
+        "primary_metric_value",
+        "stability_drift_pct",
+        "eligibility_drift_entity_pct",
+        "eligibility_drift_ventas_pct",
+        "eligibility_drift_saldo_pct",
+        "ms_per_1000_debtors",
+    ):
+        if not key:
+            continue
+        value = model_performance.get(key)
+        if isinstance(value, (int, float, str, bool)):
+            compact_perf[key] = value
+    if compact_perf:
+        context["current_model_performance"] = compact_perf
+    return context
+
+
+def _build_metric_round_baseline_comparison_context(
+    metric_loop_state: Dict[str, Any] | None,
+    *,
+    metric_name: str,
+) -> Dict[str, Any]:
+    loop_state = metric_loop_state if isinstance(metric_loop_state, dict) else {}
+    round_payload = loop_state.get("round") if isinstance(loop_state.get("round"), dict) else {}
+    round_baseline = round_payload.get("baseline") if isinstance(round_payload.get("baseline"), dict) else {}
+    baseline_payload = (
+        round_baseline.get("metrics_payload")
+        if isinstance(round_baseline.get("metrics_payload"), dict)
+        else {}
+    )
+    if not round_baseline and not baseline_payload:
+        return {}
+    context: Dict[str, Any] = {
+        "role": "comparison_only",
+        "metric_name": str(metric_name or round_baseline.get("metric_name") or "").strip() or None,
+        "baseline_metric_value": _coerce_float(round_baseline.get("metric_value")),
+        "source": str(round_baseline.get("source") or "").strip() or None,
+    }
+    compact_payload: Dict[str, Any] = {}
+    for key in (
+        str(metric_name or "").strip(),
+        "primary_metric_value",
+        "stability_drift_pct",
+        "eligibility_drift_entity_pct",
+        "eligibility_drift_ventas_pct",
+        "eligibility_drift_saldo_pct",
+        "ms_per_1000_debtors",
+    ):
+        if not key:
+            continue
+        value = baseline_payload.get(key)
+        if isinstance(value, (int, float, str, bool)):
+            compact_payload[key] = value
+    if compact_payload:
+        context["baseline_metrics_payload"] = compact_payload
+    return context
+
+
 def _sync_metric_loop_legacy_fields(
     state: Dict[str, Any],
     metric_loop_state: Dict[str, Any] | None,
@@ -2763,6 +2863,16 @@ def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
             "overall_status": str(oc_report.get("overall_status") or "").lower() if isinstance(oc_report, dict) else "",
             "missing_required_artifacts": artifact_issues.get("missing_paths", []),
             "schema_issues": artifact_issues.get("schema_issues", []),
+            "qa_gate_failures": (
+                (oc_report.get("qa_gate_results") or {}).get("failures")
+                if isinstance(oc_report.get("qa_gate_results"), dict)
+                else []
+            ),
+            "qa_gate_warnings": (
+                (oc_report.get("qa_gate_results") or {}).get("warnings")
+                if isinstance(oc_report.get("qa_gate_results"), dict)
+                else []
+            ),
         },
         "visual_requirements": {
             "enabled": bool(visual_reqs.get("enabled")),
@@ -9680,6 +9790,11 @@ def _resolve_work_dir_abs(state: Dict[str, Any] | None) -> str:
     return work_dir_abs
 
 
+def _metric_snapshot_dir_for_round(state: Dict[str, Any] | None, round_id: int) -> Path:
+    work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
+    return Path(_abs_in_work(work_dir_abs, f"ml_incumbent_snapshot_r{int(round_id)}"))
+
+
 def _verify_run_bundle_contracts(
     run_id: str,
     expected_contract: Dict[str, Any] | None,
@@ -10084,6 +10199,11 @@ def _snapshot_best_attempt(
     diagnostics: Dict[str, Any] | None = None,
     dest_root: str = os.path.join("artifacts", "best_attempt"),
     contract: Dict[str, Any] | None = None,
+    governance_approved: bool = False,
+    review_verdict: str | None = None,
+    final_review_verdict: str | None = None,
+    hard_failures: List[str] | None = None,
+    snapshot_role: str = "best_attempt",
 ) -> str | None:
     if attempt_id < 1:
         return None
@@ -10100,6 +10220,11 @@ def _snapshot_best_attempt(
             shutil.copy2(path, dest)
         meta = {
             "attempt_id": attempt_id,
+            "snapshot_role": snapshot_role,
+            "governance_approved": bool(governance_approved),
+            "review_verdict": review_verdict,
+            "final_review_verdict": final_review_verdict or review_verdict,
+            "hard_failures": [str(x) for x in (hard_failures or []) if str(x).strip()],
             "artifact_index": artifact_index,
             "output_contract_report": output_contract_report,
             "execution_output": execution_output,
@@ -10256,6 +10381,11 @@ def _sync_best_attempt_authoritative_metric_state(
             ),
             round_id=round_id or None,
         )
+        authoritative_review_verdict = str(
+            restored_state.get("last_successful_review_verdict")
+            or restored_state.get("review_verdict")
+            or ""
+        ).strip()
         incumbent_bundle = _build_incumbent_bundle(
             state=state_for_snapshot,
             round_id=round_id,
@@ -10266,7 +10396,7 @@ def _sync_best_attempt_authoritative_metric_state(
             metric_name=metric_name,
             metric_value=metric_value,
             metrics_path=metrics_path,
-            review_verdict=str(restored_state.get("review_verdict") or restored_state.get("last_successful_review_verdict") or ""),
+            review_verdict=authoritative_review_verdict,
             artifact_snapshot=artifact_snapshot,
         )
         if attempt_id > 0:
@@ -10311,7 +10441,7 @@ def _sync_best_attempt_authoritative_metric_state(
             source="best_attempt_restored",
             round_id=round_id,
             status="selected",
-            review_verdict=str(restored_state.get("review_verdict") or restored_state.get("last_successful_review_verdict") or ""),
+            review_verdict=authoritative_review_verdict,
             artifact_snapshot=artifact_snapshot,
         )
         if attempt_id > 0:
@@ -10368,6 +10498,24 @@ def _sync_best_attempt_authoritative_metric_state(
         updated["metric_loop_state"] = loop_state
         sync_state = {**restored_state, **updated}
         _sync_metric_loop_legacy_fields(sync_state, loop_state)
+        _sync_review_board_verdict_after_metric_round(sync_state, metric_loop_state=loop_state)
+        synced_board = (
+            sync_state.get("review_board_verdict")
+            if isinstance(sync_state.get("review_board_verdict"), dict)
+            else {}
+        )
+        if synced_board:
+            updated["review_board_verdict"] = copy.deepcopy(synced_board)
+        authoritative_review_verdict = str(
+            (synced_board.get("final_review_verdict") if isinstance(synced_board, dict) else "")
+            or authoritative_review_verdict
+            or sync_state.get("last_successful_review_verdict")
+            or ""
+        ).strip()
+        if authoritative_review_verdict:
+            updated["review_verdict"] = authoritative_review_verdict
+            if _is_approved_review_status(authoritative_review_verdict):
+                updated["last_successful_review_verdict"] = authoritative_review_verdict
         for key, value in sync_state.items():
             if key.startswith("ml_improvement_") or key in {"metric_loop_state", "opt_incumbent_selection"}:
                 updated[key] = value
@@ -10480,6 +10628,93 @@ def _promote_best_attempt(state: Dict[str, Any]) -> Dict[str, Any]:
     return updated
 
 
+def _best_attempt_metadata_is_governance_approved(meta: Dict[str, Any] | None) -> bool:
+    if not isinstance(meta, dict) or not meta:
+        return False
+    if meta.get("governance_approved") is True:
+        return True
+    if "governance_approved" in meta:
+        return False
+    hard_failures = [str(x) for x in (meta.get("hard_failures") or []) if str(x).strip()]
+    if hard_failures:
+        return False
+    status = meta.get("final_review_verdict") or meta.get("review_verdict")
+    status_raw = str(status or "").strip().upper()
+    return status_raw in {"APPROVED", "APPROVE_WITH_WARNINGS"}
+
+
+def _promote_candidate_attempt_as_best_attempt(
+    state: Dict[str, Any],
+    *,
+    final_status: str,
+    board_payload: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Promote the latest execution candidate only after reviewer/board approval."""
+    state = state if isinstance(state, dict) else {}
+    if not _is_approved_review_status(final_status):
+        return {}
+    board_payload = board_payload if isinstance(board_payload, dict) else {}
+    deterministic_blockers = [str(x) for x in (board_payload.get("deterministic_blockers") or []) if str(x).strip()]
+    if deterministic_blockers:
+        return {}
+    oc_report = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
+    if str(oc_report.get("overall_status") or "").strip().lower() == "error":
+        return {}
+    if state.get("last_attempt_valid") is False:
+        return {}
+
+    candidate_score = _coerce_float(state.get("candidate_attempt_score"))
+    if candidate_score is None:
+        candidate_score = _coerce_float(state.get("last_attempt_score"))
+    if candidate_score is None:
+        return {}
+    best_score = _coerce_float(state.get("best_attempt_score"))
+    if best_score is not None and float(candidate_score) <= float(best_score):
+        return {}
+
+    candidate_dir = state.get("candidate_attempt_dir")
+    if not isinstance(candidate_dir, str) or not candidate_dir.strip() or not os.path.isdir(candidate_dir):
+        return {}
+    dest = os.path.join("artifacts", "best_attempt")
+    try:
+        if os.path.abspath(candidate_dir) != os.path.abspath(dest):
+            if os.path.isdir(dest):
+                shutil.rmtree(dest)
+            shutil.copytree(candidate_dir, dest)
+        meta_path = os.path.join(dest, "best_attempt.json")
+        meta = _load_json_any(meta_path)
+        if not isinstance(meta, dict):
+            meta = {}
+        hard_failures = [str(x) for x in (board_payload.get("hard_failures") or []) if str(x).strip()]
+        meta.update(
+            {
+                "snapshot_role": "approved_incumbent",
+                "governance_approved": True,
+                "review_verdict": final_status,
+                "final_review_verdict": final_status,
+                "hard_failures": hard_failures,
+                "approved_at_stage": "review_board",
+                "review_board_verdict": board_payload,
+            }
+        )
+        os.makedirs(dest, exist_ok=True)
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, indent=2, ensure_ascii=False)
+    except Exception:
+        return {}
+
+    return {
+        "best_attempt_score": float(candidate_score),
+        "best_attempt_id": int(state.get("candidate_attempt_id") or state.get("execution_attempt") or 0),
+        "best_attempt_dir": dest,
+        "best_attempt_artifact_index": state.get("candidate_attempt_artifact_index") or state.get("artifact_index") or [],
+        "best_attempt_output_contract_report": state.get("candidate_attempt_output_contract_report") or oc_report,
+        "best_attempt_execution_output": state.get("candidate_attempt_execution_output") or state.get("execution_output") or "",
+        "best_attempt_plots": state.get("candidate_attempt_plots") or state.get("plots_local") or [],
+        "best_attempt_governance_approved": True,
+    }
+
+
 def _should_restore_best_attempt(
     state: Dict[str, Any] | None,
     *,
@@ -10493,6 +10728,9 @@ def _should_restore_best_attempt(
         return False
     best_score = _coerce_float(state.get("best_attempt_score"))
     if best_score is None:
+        return False
+    meta = _load_json_any(os.path.join(best_dir, "best_attempt.json"))
+    if not _best_attempt_metadata_is_governance_approved(meta if isinstance(meta, dict) else {}):
         return False
 
     if bool(state.get("execution_error")) or bool(state.get("sandbox_failed")) or bool(state.get("runtime_fix_terminal")):
@@ -12980,6 +13218,114 @@ def _normalize_handoff_evidence(values: Any, max_items: int = 10) -> List[Dict[s
         if len(out) >= max_items:
             break
     return out
+
+
+_METRIC_ROUND_BASELINE_REFERENCE_TOKENS = (
+    "optimization_context.metric_loop_state.round.baseline",
+    "metric_loop_state.round.baseline",
+    "round.baseline.metrics_payload",
+    "baseline.metrics_payload",
+    "baseline metrics payload",
+    "restored_round_baseline",
+    "ml_improvement_round_baseline",
+    "baseline/incumbent evidence",
+)
+
+_METRIC_ROUND_CURRENT_REFERENCE_TOKENS = (
+    "deterministic_facts.",
+    "artifacts/",
+    "artifacts\\",
+    "data/",
+    "data\\",
+    "gate_results",
+    "output_contract",
+    "execution_output",
+    "current candidate",
+    "current artifact",
+    "validation_metrics.json",
+    "latency_benchmark.json",
+    "oot_predictions.csv",
+)
+
+
+def _looks_like_metric_round_baseline_reference(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return any(token in text for token in _METRIC_ROUND_BASELINE_REFERENCE_TOKENS)
+
+
+def _looks_like_metric_round_current_reference(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return any(token in text for token in _METRIC_ROUND_CURRENT_REFERENCE_TOKENS)
+
+
+def _sanitize_metric_round_review_packet(
+    packet: Dict[str, Any] | None,
+    *,
+    actor: str,
+) -> Dict[str, Any]:
+    normalized = dict(packet) if isinstance(packet, dict) else {}
+    if not normalized:
+        return normalized
+
+    evidence = _normalize_handoff_evidence(normalized.get("evidence"), max_items=12)
+    baseline_evidence = [
+        item
+        for item in evidence
+        if _looks_like_metric_round_baseline_reference(item.get("source"))
+        or _looks_like_metric_round_baseline_reference(item.get("claim"))
+    ]
+    if not baseline_evidence and not _looks_like_metric_round_baseline_reference(normalized.get("feedback")):
+        return normalized
+
+    current_evidence = [
+        item
+        for item in evidence
+        if item not in baseline_evidence
+        and (
+            _looks_like_metric_round_current_reference(item.get("source"))
+            or _looks_like_metric_round_current_reference(item.get("claim"))
+        )
+    ]
+    remaining_evidence = [item for item in evidence if item not in baseline_evidence]
+    if baseline_evidence:
+        normalized["comparison_evidence"] = baseline_evidence[:8]
+    normalized["evidence"] = remaining_evidence[:10]
+
+    note = (
+        "METRIC_ROUND_CANDIDATE_TRUTH: baseline/incumbent comparison evidence was moved to "
+        "comparison-only context; blocking findings for the active candidate require current "
+        "artifact or deterministic evidence."
+    )
+    feedback = str(normalized.get("feedback") or "").strip()
+    baseline_only = bool(
+        (_looks_like_metric_round_baseline_reference(feedback) or baseline_evidence)
+        and not current_evidence
+        and not remaining_evidence
+    )
+    if baseline_only:
+        if feedback:
+            normalized["comparison_feedback"] = _truncate_handoff_text(feedback, max_len=1200)
+        normalized["feedback"] = note
+        normalized["failed_gates"] = []
+        normalized["required_fixes"] = []
+        normalized["hard_failures"] = []
+        normalized["status"] = "APPROVE_WITH_WARNINGS"
+    else:
+        normalized["feedback"] = f"{feedback}\n{note}".strip() if feedback else note
+
+    normalized = _attach_review_consistency_signal(
+        normalized,
+        signal_key="metric_round_candidate_truth",
+        note=note,
+        source=f"{str(actor or 'reviewer').lower()}_metric_round_candidate_truth",
+        failed_gates=normalized.get("failed_gates"),
+        required_fixes=normalized.get("required_fixes"),
+    )
+    return normalized
 
 
 def _extract_verified_gate_feedback(
@@ -16128,6 +16474,18 @@ def _build_iteration_handoff(
             if higher_is_better
             else float(metric_value) - float(target_value)
         )
+    candidate_evaluation_context = _build_metric_round_candidate_evaluation_context(
+        state,
+        metric_loop_state=metric_loop_state,
+        metric_name=metric_name,
+        metric_value=metric_value,
+        baseline_value=baseline_value,
+        oc_report=oc_report,
+    )
+    baseline_comparison_context = _build_metric_round_baseline_comparison_context(
+        metric_loop_state,
+        metric_name=metric_name,
+    )
 
     must_preserve: List[str] = []
     for path in present_outputs:
@@ -16382,6 +16740,8 @@ def _build_iteration_handoff(
             "gap_to_target": metric_gap,
             "higher_is_better": higher_is_better,
         },
+        "candidate_evaluation_context": candidate_evaluation_context,
+        "baseline_comparison_context": baseline_comparison_context,
         "feedback": {
             "reviewer": reviewer_feedback,
             "qa": qa_feedback,
@@ -20850,8 +21210,7 @@ def _finalize_heavy_execution(
         result["last_successful_plots"] = plots_local
         result["last_successful_output_contract_report"] = oc_report
         result["last_gate_context"] = _clear_gate_context_after_success(state.get("last_gate_context"))
-    best_score = state.get("best_attempt_score")
-    if attempt_valid and (best_score is None or attempt_score > float(best_score)):
+    if attempt_valid:
         dest = _snapshot_best_attempt(
             attempt_id=attempt_id,
             artifact_paths=artifact_paths,
@@ -20866,14 +21225,19 @@ def _finalize_heavy_execution(
             ),
             diagnostics=content_diagnostics,
             contract=contract,
+            dest_root=os.path.join("artifacts", "candidate_attempt"),
+            governance_approved=False,
+            review_verdict="PENDING_REVIEW",
+            final_review_verdict="PENDING_REVIEW",
+            snapshot_role="candidate_attempt",
         )
-        result["best_attempt_score"] = attempt_score
-        result["best_attempt_id"] = attempt_id
-        result["best_attempt_dir"] = dest
-        result["best_attempt_artifact_index"] = artifact_index
-        result["best_attempt_output_contract_report"] = oc_report
-        result["best_attempt_execution_output"] = output
-        result["best_attempt_plots"] = plots_local
+        result["candidate_attempt_score"] = attempt_score
+        result["candidate_attempt_id"] = attempt_id
+        result["candidate_attempt_dir"] = dest
+        result["candidate_attempt_artifact_index"] = artifact_index
+        result["candidate_attempt_output_contract_report"] = oc_report
+        result["candidate_attempt_execution_output"] = output
+        result["candidate_attempt_plots"] = plots_local
     return result
 
 
@@ -25777,16 +26141,25 @@ def run_engineer(state: AgentState) -> AgentState:
                     iteration_handoff=iteration_handoff if isinstance(iteration_handoff, dict) else {},
                 )
                 technique = str(_extract_hypothesis_technique(hypothesis_packet) or "active_hypothesis")
+                missing_evidence = [
+                    str(item)
+                    for item in (apply_guard_report.get("missing_evidence") or [])
+                    if str(item).strip()
+                ]
                 enforcement_fix = (
                     "Metric improvement round is active: apply hypothesis '"
                     + technique
                     + "' with material edits. NO_OP is not allowed."
                 )
+                if missing_evidence:
+                    enforcement_fix += " Missing declared evidence: " + ", ".join(missing_evidence[:5]) + "."
                 enforcement_note = (
                     "METRIC_IMPROVEMENT_ENFORCEMENT: first editor output did not materially apply hypothesis '"
                     + technique
                     + "'. Regenerate as a targeted edit over previous code with real feature-engineering changes."
                 )
+                if missing_evidence:
+                    enforcement_note += " Missing evidence: " + ", ".join(missing_evidence[:5]) + "."
                 print(enforcement_note)
                 if run_id:
                     try:
@@ -25799,6 +26172,7 @@ def run_engineer(state: AgentState) -> AgentState:
                                 "technique": technique,
                                 "changed_lines": apply_guard_report.get("changed_lines"),
                                 "similarity": apply_guard_report.get("similarity"),
+                                "missing_evidence": missing_evidence,
                             },
                         )
                     except Exception:
@@ -25888,6 +26262,7 @@ def run_engineer(state: AgentState) -> AgentState:
                                 "technique": apply_guard_report.get("technique"),
                                 "changed_lines": apply_guard_report.get("changed_lines"),
                                 "similarity": apply_guard_report.get("similarity"),
+                                "missing_evidence": apply_guard_report.get("missing_evidence") or [],
                             },
                         )
                     except Exception:
@@ -28039,8 +28414,7 @@ def execute_code(state: AgentState) -> AgentState:
         result["last_successful_plots"] = plots_local
         result["last_successful_output_contract_report"] = oc_report
         result["last_gate_context"] = _clear_gate_context_after_success(state.get("last_gate_context"))
-    best_score = state.get("best_attempt_score")
-    if attempt_valid and (best_score is None or attempt_score > float(best_score)):
+    if attempt_valid:
         dest = _snapshot_best_attempt(
             attempt_id=attempt_id,
             artifact_paths=artifact_paths,
@@ -28055,14 +28429,19 @@ def execute_code(state: AgentState) -> AgentState:
             ),
             diagnostics=content_diagnostics,
             contract=contract,
+            dest_root=os.path.join("artifacts", "candidate_attempt"),
+            governance_approved=False,
+            review_verdict="PENDING_REVIEW",
+            final_review_verdict="PENDING_REVIEW",
+            snapshot_role="candidate_attempt",
         )
-        result["best_attempt_score"] = attempt_score
-        result["best_attempt_id"] = attempt_id
-        result["best_attempt_dir"] = dest
-        result["best_attempt_artifact_index"] = artifact_index
-        result["best_attempt_output_contract_report"] = oc_report
-        result["best_attempt_execution_output"] = output
-        result["best_attempt_plots"] = plots_local
+        result["candidate_attempt_score"] = attempt_score
+        result["candidate_attempt_id"] = attempt_id
+        result["candidate_attempt_dir"] = dest
+        result["candidate_attempt_artifact_index"] = artifact_index
+        result["candidate_attempt_output_contract_report"] = oc_report
+        result["candidate_attempt_execution_output"] = output
+        result["candidate_attempt_plots"] = plots_local
     return result
 
 def retry_handler(state: AgentState) -> AgentState:
@@ -29145,6 +29524,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                             review_result, "reviewer",
                             hard_gate_names=_collect_hard_gate_names(review_contract),
                         )
+                        review_result = _sanitize_metric_round_review_packet(
+                            review_result,
+                            actor="reviewer",
+                        )
                     if run_id:
                         log_agent_snapshot(
                             run_id,
@@ -29235,6 +29618,10 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                         qa_result = _coerce_review_packet_to_nonblocking(
                             qa_result, "qa_reviewer",
                             hard_gate_names=_collect_hard_gate_names(review_contract),
+                        )
+                        qa_result = _sanitize_metric_round_review_packet(
+                            qa_result,
+                            actor="qa_reviewer",
                         )
                     if run_id:
                         log_agent_snapshot(
@@ -30126,6 +30513,13 @@ def _collect_board_deterministic_blockers(board_context: Dict[str, Any]) -> List
         _add(f"missing_required_artifact:{path}")
     for issue in output_contract.get("schema_issues") or []:
         _add(f"output_schema_issue:{issue}")
+    for failure in output_contract.get("qa_gate_failures") or []:
+        if isinstance(failure, dict):
+            gate_name = failure.get("name") or failure.get("gate_name") or failure.get("metric")
+            detail = failure.get("detail") or failure.get("status") or ""
+            _add(f"output_contract_gate_failed:{gate_name}:{detail}")
+        else:
+            _add(f"output_contract_gate_failed:{failure}")
 
     # During metric improvement rounds in advisory review mode, reviewer and
     # qa_reviewer packets are stale — they were generated for a prior script
@@ -30637,6 +31031,16 @@ def run_review_board(state: AgentState) -> AgentState:
         "last_gate_context": gate_context,
         "iteration_handoff": iteration_handoff,
     }
+    approved_candidate_update = _promote_candidate_attempt_as_best_attempt(
+        state if isinstance(state, dict) else {},
+        final_status=final_status,
+        board_payload=board_payload,
+    )
+    if approved_candidate_update:
+        result.update(approved_candidate_update)
+        history.append(
+            "BEST_ATTEMPT_PROMOTED: candidate attempt approved by review_board and stored as governance-approved incumbent."
+        )
     if not bool(state.get("ml_improvement_round_active")):
         ledger_state = dict(state or {})
         ledger_state.update(result)
@@ -31438,6 +31842,7 @@ def _metric_improvement_policy(contract: Dict[str, Any] | None) -> Tuple[int, fl
     if not isinstance(policy, dict):
         policy = {}
     optimization_policy = _resolve_optimization_policy(contract if isinstance(contract, dict) else {})
+    explicit_contract_min_delta = _optimization_policy_has_explicit_min_delta(contract if isinstance(contract, dict) else {})
     rounds_raw = optimization_policy.get(
         "max_rounds",
         policy.get("metric_improvement_rounds", os.getenv("METRIC_IMPROVEMENT_MAX_ROUNDS", 4)),
@@ -31465,12 +31870,10 @@ def _metric_improvement_policy(contract: Dict[str, Any] | None) -> Tuple[int, fl
         rounds = 12
     if min_delta < 0:
         min_delta = 0.0
-    # Clamp min_delta to a sensible ceiling.  LLM-generated contracts sometimes
-    # set overly strict thresholds (e.g. 0.001) that reject genuinely useful
-    # but small improvements.  0.0005 is the system default; allowing higher
-    # values wastes optimization rounds by discarding marginal gains that
-    # compound across rounds and often translate to LB improvement.
-    if min_delta > 0.0005:
+    # Clamp only legacy/default policy values. If the planner explicitly emits
+    # optimization_policy.min_delta, that contract threshold is the source of
+    # truth and must not be silently relaxed by runtime policy.
+    if not explicit_contract_min_delta and min_delta > 0.0005:
         min_delta = 0.0005
     if patience < 1:
         patience = 1
@@ -31494,6 +31897,13 @@ def _resolve_metric_round_review_mode(contract: Dict[str, Any] | None) -> str:
     if contract_mode is not None and str(contract_mode).strip():
         return _normalize_metric_round_review_mode(contract_mode)
     return _normalize_metric_round_review_mode(os.getenv("METRIC_ROUND_REVIEW_MODE", "hybrid_guarded"))
+
+
+def _optimization_policy_has_explicit_min_delta(contract: Dict[str, Any] | None) -> bool:
+    if not isinstance(contract, dict):
+        return False
+    optimization_policy = contract.get("optimization_policy")
+    return isinstance(optimization_policy, dict) and "min_delta" in optimization_policy
 
 
 def _is_approved_review_status(value: Any) -> bool:
@@ -32513,6 +32923,7 @@ def _resolve_metric_round_hybrid_policy(
     hypothesis_packet: Dict[str, Any],
     feature_engineering_plan: Dict[str, Any],
     tracker_entries: List[Dict[str, Any]],
+    optimization_policy: Dict[str, Any] | None = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     safe_rounds_allowed = max(1, int(rounds_allowed or 1))
     safe_round_id = max(1, int(round_id or 1))
@@ -32523,11 +32934,39 @@ def _resolve_metric_round_hybrid_policy(
     phase = "exploit" if forced_exploit or safe_round_id > explore_rounds else "explore"
 
     packet = dict(hypothesis_packet) if isinstance(hypothesis_packet, dict) else {}
+    policy = resolve_optimization_policy(optimization_policy or {})
+    blocked_current_violations = optimization_policy_violations(
+        hypothesis_action_from_packet(packet),
+        policy,
+    )
+    if blocked_current_violations:
+        blocked_technique = _extract_hypothesis_technique(packet)
+        packet["action"] = "NO_OP"
+        packet["hypothesis"] = {
+            "technique": "NO_OP",
+            "objective": (
+                "Previous hypothesis violates contract optimization_policy: "
+                + ", ".join(blocked_current_violations[:4])
+            )[:220],
+            "target_columns": ["ALL_NUMERIC"],
+            "feature_scope": "model_features",
+            "params": {},
+            "expected_effect": {"target_error_modes": ["policy_blocked"], "direction": "neutral"},
+        }
+        tracker_context = dict(packet.get("tracker_context")) if isinstance(packet.get("tracker_context"), dict) else {}
+        tracker_context["is_duplicate"] = True
+        tracker_context["duplicate_of"] = tracker_context.get("signature") or blocked_technique or "policy_blocked"
+        packet["tracker_context"] = tracker_context
+        packet["explanation"] = (
+            "Hypothesis converted to NO_OP because it contradicts optimization_policy: "
+            + ", ".join(blocked_current_violations[:4])
+        )[:280]
     hypothesis = packet.get("hypothesis") if isinstance(packet.get("hypothesis"), dict) else {}
     action = str(packet.get("action") or "NO_OP").strip().upper()
     current_technique = str(hypothesis.get("technique") or "").strip()
 
     plan_entries = _normalize_fe_technique_entries(feature_engineering_plan)
+    plan_entries, blocked_plan_entries = filter_optimization_actions(plan_entries, policy)
     plan_map = {str(item.get("technique")).lower(): item for item in plan_entries if str(item.get("technique") or "").strip()}
     known_signatures = _collect_metric_round_tracker_signatures(tracker_entries)
     negative_delta_streak, recent_negative_techniques = _collect_metric_round_negative_streak(
@@ -32855,6 +33294,9 @@ def _resolve_metric_round_hybrid_policy(
         "strategist_action": action,
         "strategist_technique": current_technique or None,
         "strategist_packet_preserved": not bool(first_round_apply_forced or diversity_recovery_applied),
+        "optimization_policy": compact_optimization_policy_constraints(policy),
+        "policy_blocked_current_violations": blocked_current_violations[:6],
+        "policy_blocked_plan_entries": blocked_plan_entries[:6],
     }
     return packet, policy_meta
 
@@ -32871,11 +33313,13 @@ def _build_metric_round_contract_lock(
     reviewer_gates = get_reviewer_gates_for_phase(contract, "metric_round")
     qa_gate_names = [str(item.get("name")) for item in qa_gates if isinstance(item, dict) and str(item.get("name") or "").strip()]
     reviewer_gate_names = [str(item.get("name")) for item in reviewer_gates if isinstance(item, dict) and str(item.get("name") or "").strip()]
+    optimization_policy = resolve_optimization_policy(contract)
     return {
         "required_outputs": _normalize_output_path_list(output_paths)[:12],
         "primary_metric": str(metric_name or validation.get("primary_metric") or "unknown"),
         "split_column": str(validation.get("split_column") or ""),
         "train_filter": str(validation.get("train_filter") or ""),
+        "optimization_policy": compact_optimization_policy_constraints(optimization_policy),
         "forbidden_features": [str(item) for item in (allowed_sets.get("forbidden_features") or [])][:24],
         "model_features": [str(item) for item in (allowed_sets.get("model_features") or [])][:60],
         "qa_gates": qa_gate_names[:20],
@@ -33096,6 +33540,49 @@ def _count_code_line_changes(previous_code: str, candidate_code: str) -> int:
     return int(changes)
 
 
+def _hypothesis_required_evidence_groups(technique: Any) -> List[Dict[str, Any]]:
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", str(technique or "").lower())
+        if token
+    }
+    groups: List[Dict[str, Any]] = []
+
+    def _add(label: str, terms: List[str]) -> None:
+        if not any(group.get("label") == label for group in groups):
+            groups.append({"label": label, "terms": terms})
+
+    model_terms = {
+        "catboost": ["catboost", "catboostclassifier", "catboostregressor"],
+        "xgboost": ["xgboost", "xgbclassifier", "xgbregressor", "xgb."],
+        "lightgbm": ["lightgbm", "lgbmclassifier", "lgbmregressor", "lgb."],
+        "optuna": ["optuna", "trial.suggest", "study.optimize"],
+    }
+    for token, terms in model_terms.items():
+        if token in tokens:
+            _add(token, terms)
+
+    if tokens & {"ensemble", "ensembling", "blend", "blending", "weighted", "stacking"}:
+        _add(
+            "ensemble_or_blending_logic",
+            [
+                "ensemble",
+                "blend",
+                "blended",
+                "weighted",
+                "votingclassifier",
+                "stackingclassifier",
+                "stackingregressor",
+            ],
+        )
+    if tokens & {"calibration", "calibrated", "isotonic", "temperature"}:
+        _add(
+            "calibration_logic",
+            ["calibratedclassifiercv", "isotonic", "calibration", "calibrator", "temperature"],
+        )
+    return groups
+
+
 def _evaluate_metric_round_hypothesis_application(
     state: Dict[str, Any],
     previous_code: Any,
@@ -33111,6 +33598,8 @@ def _evaluate_metric_round_hypothesis_application(
         "similarity": None,
         "changed_lines": 0,
         "char_delta": 0,
+        "evidence_requirements": [],
+        "missing_evidence": [],
     }
     if not isinstance(state, dict) or not bool(state.get("ml_improvement_round_active")):
         return report
@@ -33162,6 +33651,18 @@ def _evaluate_metric_round_hypothesis_application(
     prev_lower = prev_norm.lower()
     cand_lower = cand_norm.lower()
     token_added = any(token in cand_lower and token not in prev_lower for token in technique_tokens[:4])
+    evidence_requirements = _hypothesis_required_evidence_groups(technique)
+    report["evidence_requirements"] = evidence_requirements
+    missing_evidence = []
+    for group in evidence_requirements:
+        terms = [str(term or "").lower() for term in (group.get("terms") or []) if str(term or "").strip()]
+        if terms and not any(term in cand_lower for term in terms):
+            missing_evidence.append(str(group.get("label") or "declared_hypothesis_evidence"))
+    if missing_evidence:
+        report["applied"] = False
+        report["missing_evidence"] = missing_evidence
+        report["reason"] = "missing_declared_hypothesis_evidence"
+        return report
 
     if token_added:
         report["reason"] = "technique_token_added"
@@ -33299,12 +33800,18 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             except (TypeError, ValueError):
                 pass
     adaptive_min_delta = _compute_adaptive_min_delta(baseline_metrics, metric_name, _n_train_for_delta)
-    if adaptive_min_delta is not None:
+    explicit_contract_min_delta = _optimization_policy_has_explicit_min_delta(contract if isinstance(contract, dict) else {})
+    if adaptive_min_delta is not None and not explicit_contract_min_delta:
         print(
-            f"ADAPTIVE_MIN_DELTA: static={min_delta:.6f} → adaptive={adaptive_min_delta:.6f}"
+            f"ADAPTIVE_MIN_DELTA: static={min_delta:.6f} -> adaptive={adaptive_min_delta:.6f}"
             f" (n_train={_n_train_for_delta}, metric={metric_name})"
         )
         min_delta = adaptive_min_delta
+    elif adaptive_min_delta is not None and explicit_contract_min_delta:
+        print(
+            f"ADAPTIVE_MIN_DELTA_SKIPPED: explicit_contract_min_delta={min_delta:.6f} "
+            f"adaptive_candidate={adaptive_min_delta:.6f} (metric={metric_name})"
+        )
 
     # Preserve dynamic patience/rounds from prior blueprint adjustment (persisted
     # in state by Mejora B) — the contract policy gives the base defaults, but
@@ -33343,7 +33850,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "metrics.json",
         kind="metrics",
     )
-    snapshot_dir = Path("work") / f"ml_incumbent_snapshot_r{round_id}"
+    snapshot_dir = _metric_snapshot_dir_for_round(state if isinstance(state, dict) else None, round_id)
     _snapshot_ml_outputs(output_paths, snapshot_dir)
 
     # ── Clear stale candidate metrics from previous round ──────────────
@@ -33559,6 +34066,27 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             print(f"MODEL_ANALYST_ERROR: {exc}")
             optimization_blueprint = {}
     if isinstance(optimization_blueprint, dict) and optimization_blueprint:
+        bp_actions = optimization_blueprint.get("improvement_actions")
+        allowed_bp_actions, blocked_bp_actions = filter_optimization_actions(
+            bp_actions if isinstance(bp_actions, list) else [],
+            resolve_optimization_policy(contract),
+        )
+        if blocked_bp_actions:
+            optimization_blueprint = dict(optimization_blueprint)
+            optimization_blueprint["improvement_actions"] = allowed_bp_actions
+            optimization_blueprint["policy_blocked_actions"] = blocked_bp_actions
+            if run_id:
+                try:
+                    log_run_event(
+                        run_id,
+                        "optimization_blueprint_policy_filter",
+                        {
+                            "blocked_count": len(blocked_bp_actions),
+                            "blocked": blocked_bp_actions[:6],
+                        },
+                    )
+                except Exception:
+                    pass
         state["optimization_blueprint"] = optimization_blueprint
 
     # Adjust patience dynamically: if the blueprint provides N improvement
@@ -33615,6 +34143,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "dataset_profile": state.get("data_profile") if isinstance(state.get("data_profile"), dict) else {},
         "column_roles": contract.get("column_roles") if isinstance(contract.get("column_roles"), dict) else {},
         "optimization_blueprint": optimization_blueprint if isinstance(optimization_blueprint, dict) else {},
+        "optimization_policy": resolve_optimization_policy(contract),
     }
     hypothesis_packet = strategist.generate_iteration_hypothesis(strategist_context)
     hypothesis_packet, hybrid_policy_meta = _resolve_metric_round_hybrid_policy(
@@ -33627,6 +34156,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         hypothesis_packet=hypothesis_packet,
         feature_engineering_plan=hybrid_feature_engineering_plan,
         tracker_entries=tracker_entries,
+        optimization_policy=resolve_optimization_policy(contract),
     )
     metric_round_state = _build_metric_round_state(
         round_id=int(round_id),
@@ -34277,6 +34807,17 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         state,
         include_review_signals=not advisory_review_mode,
     )
+    apply_guard_report_for_blocking = (
+        state.get("ml_improvement_apply_guard_report")
+        if isinstance(state.get("ml_improvement_apply_guard_report"), dict)
+        else {}
+    )
+    apply_guard_blocked = bool(
+        apply_guard_report_for_blocking.get("enforced")
+        and not bool(apply_guard_report_for_blocking.get("applied"))
+    )
+    if apply_guard_blocked:
+        deterministic_blockers = True
     # Distinguish runtime failure (timeout/crash) from technique inefficacy
     runtime_text = f"{state.get('execution_output', '')}\n{state.get('error_message', '')}"
     runtime_failed = bool(
@@ -34759,6 +35300,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             "reason": str(apply_guard_report.get("reason") or ""),
             "changed_lines": int(apply_guard_report.get("changed_lines", 0) or 0),
             "repair_attempted": bool(apply_guard_report.get("repair_attempted")),
+            "missing_evidence": list(apply_guard_report.get("missing_evidence") or []),
         }
     round_record.update(_extract_metric_round_tradeoff(improved_value, critique_packet))
     frontier = state.get("ml_improvement_pareto_frontier")
@@ -35330,6 +35872,11 @@ def _sync_review_board_verdict_after_metric_round(
     force_finalize_reason = str(controller.get("force_finalize_reason") or selection.get("force_finalize_reason") or "")
 
     payload = copy.deepcopy(board_payload)
+    final_entry_review = normalize_review_status(
+        final_entry.get("review_verdict")
+        or state.get("last_successful_review_verdict")
+        or state.get("review_verdict")
+    )
     candidate_board_payload = (
         state.get("ml_improvement_round_candidate_board_payload")
         if isinstance(state.get("ml_improvement_round_candidate_board_payload"), dict)
@@ -35351,6 +35898,37 @@ def _sync_review_board_verdict_after_metric_round(
         if baseline_board_payload:
             payload = copy.deepcopy(baseline_board_payload)
     final_verdict = normalize_review_status(payload.get("final_review_verdict") or state.get("review_verdict"))
+    board_kept = str(
+        (
+            payload.get("metric_round_finalization")
+            if isinstance(payload.get("metric_round_finalization"), dict)
+            else {}
+        ).get("kept")
+        or ""
+    ).strip().lower()
+    board_final_metric = _coerce_float(
+        (
+            payload.get("metric_round_finalization")
+            if isinstance(payload.get("metric_round_finalization"), dict)
+            else {}
+        ).get("final_metric")
+    )
+    loop_selection_label = str(selection.get("selected_label") or final_entry.get("label") or "").strip().lower()
+    loop_final_metric = _coerce_float(final_metric)
+    if (
+        final_entry_review
+        and _is_approved_review_status(final_entry_review)
+        and (
+            (loop_selection_label in {"best_attempt", "incumbent"} and not _is_approved_review_status(final_verdict))
+            or (board_kept and loop_selection_label and board_kept != loop_selection_label)
+            or (
+                board_final_metric is not None
+                and loop_final_metric is not None
+                and abs(float(board_final_metric) - float(loop_final_metric)) > 1e-9
+            )
+        )
+    ):
+        final_verdict = final_entry_review
     candidate_assessment_status = (
         original_candidate_assessment_status
         if kept == "baseline"
@@ -35411,6 +35989,19 @@ def _sync_review_board_verdict_after_metric_round(
         "force_finalize": bool(force_finalize),
         "force_finalize_reason": force_finalize_reason,
     }
+    if _is_approved_review_status(final_verdict) and not deterministic_blockers:
+        candidate_failed_areas = [str(item) for item in (payload.get("failed_areas") or []) if str(item).strip()]
+        candidate_required_actions = [str(item) for item in (payload.get("required_actions") or []) if str(item).strip()]
+        candidate_evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
+        if candidate_failed_areas:
+            payload["candidate_assessment_failed_areas"] = candidate_failed_areas[:12]
+        if candidate_required_actions:
+            payload["candidate_assessment_required_actions"] = candidate_required_actions[:12]
+        if candidate_evidence:
+            payload["candidate_assessment_evidence"] = copy.deepcopy(candidate_evidence[:12])
+        payload["failed_areas"] = []
+        payload["required_actions"] = []
+        payload["evidence"] = []
     _sync_review_board_metric_facts(
         payload,
         metric_name=metric_name,
@@ -35419,6 +36010,34 @@ def _sync_review_board_verdict_after_metric_round(
         final_metric=final_metric,
         kept=kept,
     )
+    gate_context = state.get("last_gate_context") if isinstance(state.get("last_gate_context"), dict) else {}
+    if gate_context:
+        updated_gate_context = copy.deepcopy(gate_context)
+        if _is_approved_review_status(final_verdict) and not deterministic_blockers:
+            candidate_failed_areas = [str(item) for item in (payload.get("candidate_assessment_failed_areas") or []) if str(item).strip()]
+            candidate_required_actions = [str(item) for item in (payload.get("candidate_assessment_required_actions") or []) if str(item).strip()]
+            updated_gate_context["failed_gates"] = [
+                str(item) for item in (updated_gate_context.get("failed_gates") or [])
+                if str(item).strip() and str(item) not in candidate_failed_areas
+            ]
+            updated_gate_context["required_fixes"] = [
+                str(item) for item in (updated_gate_context.get("required_fixes") or [])
+                if str(item).strip() and str(item) not in candidate_required_actions
+            ]
+        review_board_block = (
+            dict(updated_gate_context.get("review_board"))
+            if isinstance(updated_gate_context.get("review_board"), dict)
+            else {}
+        )
+        review_board_block["status"] = final_verdict
+        review_board_block["summary"] = payload.get("summary")
+        review_board_block["failed_areas"] = [str(item) for item in (payload.get("failed_areas") or []) if str(item).strip()]
+        review_board_block["required_actions"] = [str(item) for item in (payload.get("required_actions") or []) if str(item).strip()]
+        review_board_block["confidence"] = payload.get("confidence")
+        updated_gate_context["review_board"] = review_board_block
+        state["last_gate_context"] = updated_gate_context
+        if _is_approved_review_status(final_verdict):
+            state["last_successful_gate_context"] = copy.deepcopy(updated_gate_context)
     state["review_board_verdict"] = payload
     try:
         os.makedirs("data", exist_ok=True)
@@ -35821,6 +36440,77 @@ def check_evaluation(state: AgentState):
     print(f"ITER_DECISION type=other action=stop reason=SUCCESS metric={metric_name}:{metric_value} best={best_value} budget_left={budget_left}")
     return "approved"
 
+
+_TRANSLATOR_FINAL_STATE_KEYS = [
+    "run_id",
+    "business_objective",
+    "csv_path",
+    "review_verdict",
+    "last_successful_review_verdict",
+    "review_board_verdict",
+    "gate_status",
+    "run_outcome",
+    "overall_status_global",
+    "hard_failures",
+    "failed_gates",
+    "budget_counters",
+    "iteration_count",
+    "current_iteration",
+    "execution_contract",
+    "execution_output",
+    "last_successful_execution_output",
+    "final_report",
+    "final_report_blocks",
+    "pdf_path",
+    "output_contract_report",
+    "work_dir",
+    "work_dir_abs",
+    "data_engineer_failed",
+    "pipeline_aborted_reason",
+    "ml_improvement_kept",
+    "stop_reason",
+    "primary_metric_state",
+    "best_metric_value",
+    "baseline_metric_value",
+    "primary_metric_name",
+    "primary_metric_snapshot",
+    "no_improve_streak",
+    "ml_improvement_round_count",
+    "ml_improvement_round_history",
+    "ml_improvement_attempted",
+]
+
+
+def _build_translator_state_delta(
+    state: Dict[str, Any] | None,
+    report_state: Dict[str, Any] | None,
+    summary: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(state if isinstance(state, dict) else {})
+    if isinstance(report_state, dict):
+        merged.update(report_state)
+    if isinstance(summary, dict) and summary:
+        status_token = str(summary.get("status") or "").strip()
+        if status_token:
+            merged["review_verdict"] = status_token
+        run_outcome_token = str(summary.get("run_outcome") or "").strip()
+        if run_outcome_token:
+            merged["run_outcome"] = run_outcome_token
+        for key in ("overall_status_global", "hard_failures", "failed_gates", "budget_counters"):
+            if key in summary:
+                merged[key] = copy.deepcopy(summary.get(key))
+        metric_improvement = summary.get("metric_improvement")
+        if isinstance(metric_improvement, dict):
+            kept = str(metric_improvement.get("kept") or "").strip()
+            if kept:
+                merged["ml_improvement_kept"] = kept
+    return {
+        key: copy.deepcopy(merged[key])
+        for key in _TRANSLATOR_FINAL_STATE_KEYS
+        if key in merged and merged.get(key) is not None
+    }
+
+
 def run_translator(state: AgentState) -> AgentState:
     print("--- [6] Translator: Generating Report ---")
     abort_state = _abort_if_requested(state, "translator")
@@ -36152,7 +36842,7 @@ def run_translator(state: AgentState) -> AgentState:
         print(f"Warning: failed to persist executive_summary.md: {exec_err}")
 
     try:
-        encoding_audit = _persist_encoding_audit(state, report_text=report)
+        encoding_audit = _persist_encoding_audit(report_state, report_text=report)
         existing_index = _load_json_any("data/produced_artifact_index.json")
         normalized_existing = existing_index if isinstance(existing_index, list) else []
         additions = _build_artifact_index(["data/encoding_audit.json"], None)
@@ -36160,6 +36850,7 @@ def run_translator(state: AgentState) -> AgentState:
         dump_json("data/produced_artifact_index.json", merged_index)
         report_state["artifact_index"] = merged_index
         report_state["produced_artifact_index"] = merged_index
+        report_state["encoding_audit"] = encoding_audit
         state["encoding_audit"] = encoding_audit
         if run_id:
             log_run_event(
@@ -36183,29 +36874,49 @@ def run_translator(state: AgentState) -> AgentState:
     except Exception as pdf_err:
         print(f"Warning: PDF generation failed in translator: {pdf_err}")
 
+    summary_final = summary if isinstance(summary, dict) else {}
+    final_state_for_persistence = dict(state if isinstance(state, dict) else {})
+    final_state_for_persistence.update(report_state if isinstance(report_state, dict) else {})
     try:
-        write_data_adequacy_report(state)
-        write_governance_report(state)
-        summary = summary or build_run_summary(state)
+        write_data_adequacy_report(final_state_for_persistence)
+        write_governance_report(final_state_for_persistence)
+        summary_final = build_run_summary(final_state_for_persistence)
+        if isinstance(summary_final, dict) and summary_final:
+            status_token = str(summary_final.get("status") or "").strip()
+            if status_token:
+                final_state_for_persistence["review_verdict"] = status_token
+            run_outcome_token = str(summary_final.get("run_outcome") or "").strip()
+            if run_outcome_token:
+                final_state_for_persistence["run_outcome"] = run_outcome_token
+            for key in ("overall_status_global", "hard_failures", "failed_gates", "budget_counters"):
+                if key in summary_final:
+                    final_state_for_persistence[key] = copy.deepcopy(summary_final.get(key))
+            metric_improvement = summary_final.get("metric_improvement")
+            if isinstance(metric_improvement, dict):
+                kept = str(metric_improvement.get("kept") or "").strip()
+                if kept:
+                    final_state_for_persistence["ml_improvement_kept"] = kept
+        report_state.update(final_state_for_persistence)
         try:
             os.makedirs("data", exist_ok=True)
-            dump_json("data/run_summary.json", summary)
+            dump_json("data/run_summary.json", summary_final)
         except Exception:
             pass
-        fingerprint = state.get("dataset_fingerprint")
+        fingerprint = final_state_for_persistence.get("dataset_fingerprint")
         if fingerprint:
             record_dataset_memory(
                 {
                     "fingerprint": fingerprint,
-                    "run_id": state.get("run_id"),
-                    "status": summary.get("status"),
-                    "failed_gates": summary.get("failed_gates", []),
+                    "run_id": final_state_for_persistence.get("run_id"),
+                    "status": summary_final.get("status"),
+                    "failed_gates": summary_final.get("failed_gates", []),
                 }
             )
+        status_final = normalize_status(summary_final.get("status") if isinstance(summary_final, dict) else None)
         if run_id:
-            finalize_run_log(run_id, summary)
+            finalize_run_log(run_id, summary_final)
             log_run_event(run_id, "translator_complete", {"report_len": len(report or "")})
-            work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
+            work_dir_abs = _resolve_work_dir_abs(final_state_for_persistence if isinstance(final_state_for_persistence, dict) else None)
             copy_run_contracts(
                 run_id,
                 [
@@ -36217,8 +36928,8 @@ def run_translator(state: AgentState) -> AgentState:
                     _abs_in_work(work_dir_abs, "data/produced_artifact_index.json"),
                 ],
             )
-            _verify_run_bundle_contracts(run_id, state.get("execution_contract") or {}, work_dir_abs)
-            since_epoch = state.get("run_start_epoch")
+            _verify_run_bundle_contracts(run_id, final_state_for_persistence.get("execution_contract") or {}, work_dir_abs)
+            since_epoch = final_state_for_persistence.get("run_start_epoch")
             copy_run_artifacts(
                 run_id,
                 [
@@ -36234,31 +36945,27 @@ def run_translator(state: AgentState) -> AgentState:
                 _abs_in_work(work_dir_abs, "report"),
                 _abs_in_work(work_dir_abs, "reports"),
             ]
-            pdf_path = report_state.get("pdf_path") or state.get("pdf_path")
+            pdf_path = final_state_for_persistence.get("pdf_path") or report_state.get("pdf_path") or state.get("pdf_path")
             if pdf_path:
                 report_sources.append(
                     pdf_path if os.path.isabs(pdf_path) else _abs_in_work(work_dir_abs, pdf_path)
                 )
             copy_run_reports(run_id, report_sources, since_epoch=since_epoch)
-            if pdf_path and state.get("run_bundle_dir"):
+            if pdf_path and final_state_for_persistence.get("run_bundle_dir"):
                 try:
-                    dest_path = os.path.join(state.get("run_bundle_dir"), "report", "final_report.pdf")
+                    dest_path = os.path.join(final_state_for_persistence.get("run_bundle_dir"), "report", "final_report.pdf")
                     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     shutil.copy2(pdf_path, dest_path)
                 except Exception:
                     pass
-            status_final = normalize_status(summary.get("status") if isinstance(summary, dict) else None)
-        finalize_run(run_id, status_final=status_final, state=state)
+        state = final_state_for_persistence
+        finalize_run(run_id, status_final=status_final, state=final_state_for_persistence)
     except Exception:
         pass
     finally:
         # P0 FIX: Always restore cwd on exit
         exit_run_workspace(state)
-    return {
-        "final_report": report,
-        "final_report_blocks": report_state.get("final_report_blocks"),
-        "pdf_path": report_state.get("pdf_path"),
-    }
+    return _build_translator_state_delta(state, report_state, summary_final)
 # Generate Unique PDF Path to avoid file locks
 import uuid
 
@@ -36276,12 +36983,14 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
             run_id = state.get("run_id")
             if run_id:
                 copy_run_reports(run_id, [pdf_path], since_epoch=None)
-                try:
-                    dest_root = os.path.join("runs", run_id, "report")
-                    os.makedirs(dest_root, exist_ok=True)
-                    shutil.copy2(pdf_path, os.path.join(dest_root, "final_report.pdf"))
-                except Exception:
-                    pass
+                registered_run_dir = get_run_dir(run_id)
+                if registered_run_dir:
+                    try:
+                        dest_root = os.path.join(registered_run_dir, "report")
+                        os.makedirs(dest_root, exist_ok=True)
+                        shutil.copy2(pdf_path, os.path.join(dest_root, "final_report.pdf"))
+                    except Exception:
+                        pass
             run_bundle_dir = state.get("run_bundle_dir")
             if run_bundle_dir:
                 try:
