@@ -204,15 +204,22 @@ export function RunDetailWorkspace({
 
   useEffect(() => {
     if (activeStep === "data_engineer") {
-      // Find the cleaned dataset path from manifest
-      const cleanedItem = manifest?.items?.find(item => item.path.endsWith("dataset_cleaned.csv") || item.path.endsWith("cleaned_full.csv"));
+      const cleanedItem = manifest?.items?.find((item) => {
+        const path = String(item.path || "").replace(/\\/g, "/").toLowerCase();
+        const type = String(item.artifact_type || "").toLowerCase();
+        return (
+          path.endsWith(".csv") &&
+          !path.includes("*") &&
+          (type === "dataset" || path.includes("/clean/") || path.includes("cleaned"))
+        );
+      });
       let p = cleanedItem?.path;
       
       let absolutePath = "";
       if (p && input.csv_path) {
          const basePath = String(input.csv_path).replace(/[/\\]?data[\\/].*?$/, "");
          const sep = String(input.csv_path).includes("\\") ? "\\" : "/";
-         absolutePath = `${basePath}${sep}runs${sep}${runId}${sep}${p.replace(/\//g, sep)}`;
+         absolutePath = `${basePath}${sep}runs${sep}${runId}${sep}work${sep}${p.replace(/[\\/]/g, sep)}`;
       }
 
       if (absolutePath && dynamicCleanedPreview.length === 0) {
