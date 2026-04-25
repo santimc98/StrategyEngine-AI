@@ -49,6 +49,46 @@ def test_id_integrity_excludes_target_columns_from_identifier_check():
     assert "identity_hate" not in (evidence.get("candidate_columns") or [])
 
 
+def test_required_model_feature_value_destruction_is_hard_rejected():
+    raw = pd.DataFrame({"flag": ["TRUE", "FALSE", "TRUE", "FALSE"]})
+    cleaned = pd.DataFrame({"flag": [None, None, None, None]})
+
+    result = _evaluate_gates_deterministic(
+        gates=[],
+        required_columns=["flag"],
+        cleaned_header=list(cleaned.columns),
+        cleaned_csv_path="data/cleaned_data.csv",
+        sample_str=cleaned.astype(object),
+        sample_infer=cleaned,
+        manifest={
+            "conversions": [
+                {
+                    "op": "to_numeric_float64",
+                    "column": "flag",
+                    "new_nulls_from_coercion": 4,
+                }
+            ]
+        },
+        raw_sample=raw,
+        column_roles={},
+        model_features=["flag"],
+        allowed_feature_sets={},
+    )
+
+    assert result["status"] == "REJECTED"
+    assert "required_model_feature_value_destruction" in result["hard_failures"]
+    assert any("flag became mostly/all null" in fix for fix in result["required_fixes"])
+    gate_entry = next(
+        gr
+        for gr in result.get("gate_results", [])
+        if normalize_gate_name(gr.get("name", "")) == "required_model_feature_value_destruction"
+    )
+    evidence = gate_entry.get("evidence", {}).get("columns", {}).get("flag", {})
+    assert evidence["new_nulls_from_coercion"] == 4
+    assert evidence["cleaned_null_frac"] == 1.0
+    assert evidence["raw_null_frac"] == 0.0
+
+
 def test_row_count_sanity_skips_when_drop_matches_label_null_listwise_pattern():
     df = pd.DataFrame(
         {

@@ -1122,6 +1122,95 @@ def _compute_null_fraction(
     return float(series.isna().sum() / total)
 
 
+def _manifest_coercion_nulls_by_column(manifest: Dict[str, Any]) -> Dict[str, int]:
+    conversions = manifest.get("conversions") if isinstance(manifest, dict) else None
+    if not isinstance(conversions, list):
+        return {}
+    out: Dict[str, int] = {}
+    for item in conversions:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or item.get("target_column") or "").strip()
+        if not column:
+            continue
+        try:
+            new_nulls = int(float(item.get("new_nulls_from_coercion") or 0))
+        except Exception:
+            new_nulls = 0
+        if new_nulls <= 0:
+            continue
+        out[column] = out.get(column, 0) + new_nulls
+    return out
+
+
+def _resolve_column_case(columns: List[str], requested: str) -> Optional[str]:
+    if requested in columns:
+        return requested
+    requested_norm = str(requested).strip().lower()
+    for column in columns:
+        if str(column).strip().lower() == requested_norm:
+            return column
+    return None
+
+
+def _detect_protected_feature_value_destruction(
+    required_columns: List[str],
+    model_features: List[str],
+    cleaned_header: List[str],
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    raw_sample: Optional[pd.DataFrame],
+    manifest: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    coercion_nulls = _manifest_coercion_nulls_by_column(manifest)
+    if not coercion_nulls:
+        return [], {"applies_if": False, "reason": "no_manifest_coercion_nulls"}
+
+    protected_ordered = _dedupe_list(list(required_columns or []) + list(model_features or []))
+    if not protected_ordered:
+        return [], {"applies_if": False, "reason": "no_required_or_model_features"}
+
+    coercion_lookup = {str(col).strip().lower(): int(count) for col, count in coercion_nulls.items()}
+    raw_columns = [str(col) for col in raw_sample.columns] if raw_sample is not None else []
+    issues: List[str] = []
+    evidence: Dict[str, Any] = {"columns": {}}
+
+    for protected_col in protected_ordered:
+        cleaned_col = _resolve_column_case(cleaned_header, protected_col)
+        if not cleaned_col:
+            continue
+        new_nulls = coercion_lookup.get(str(protected_col).strip().lower())
+        if not new_nulls:
+            continue
+        cleaned_null_frac = _compute_null_fraction(sample_infer, sample_str, cleaned_col)
+        raw_col = _resolve_column_case(raw_columns, protected_col)
+        raw_null_frac = _compute_null_fraction(raw_sample, raw_sample, raw_col) if raw_col else None
+        evidence["columns"][protected_col] = {
+            "cleaned_column": cleaned_col,
+            "raw_column": raw_col,
+            "new_nulls_from_coercion": new_nulls,
+            "cleaned_null_frac": None if cleaned_null_frac is None else round(cleaned_null_frac, 4),
+            "raw_null_frac": None if raw_null_frac is None else round(raw_null_frac, 4),
+            "protected_as_required_column": protected_col in set(required_columns or []),
+            "protected_as_model_feature": protected_col in set(model_features or []),
+        }
+        if cleaned_null_frac is None or cleaned_null_frac < 0.95:
+            continue
+        if raw_null_frac is not None and raw_null_frac > 0.20:
+            continue
+        issues.append(
+            f"{protected_col} became mostly/all null after cleaning "
+            f"(cleaned_null_frac={cleaned_null_frac:.4f}) despite manifest "
+            f"new_nulls_from_coercion={new_nulls}; preserve the original semantics "
+            "or exclude it from required/model feature obligations with justification."
+        )
+
+    if not issues:
+        evidence["applies_if"] = False
+        evidence["reason"] = "no_protected_feature_destroyed_by_coercion"
+    return issues, evidence
+
+
 def _list_str(value: Any) -> List[str]:
     def _is_compaction_marker(token: str) -> bool:
         text = str(token or "").strip()
@@ -2090,6 +2179,38 @@ def _evaluate_gates_deterministic(
                 failure_summaries,
                 warning_summaries,
             )
+
+    destruction_issues, destruction_evidence = _detect_protected_feature_value_destruction(
+        required_columns=required_columns,
+        model_features=model_features,
+        cleaned_header=cleaned_header,
+        sample_str=sample_str,
+        sample_infer=sample_infer,
+        raw_sample=raw_sample,
+        manifest=manifest,
+    )
+    if destruction_issues:
+        destruction_gate = "required_model_feature_value_destruction"
+        gate_results.append(
+            {
+                "name": destruction_gate,
+                "severity": "HARD",
+                "passed": False,
+                "issues": destruction_issues,
+                "evidence": destruction_evidence,
+            }
+        )
+        _record_gate_failure(
+            destruction_gate,
+            "HARD",
+            destruction_issues,
+            hard_failures,
+            soft_failures,
+            failed_checks,
+            required_fixes,
+            failure_summaries,
+            warning_summaries,
+        )
 
     status = "APPROVED"
     if hard_failures:
