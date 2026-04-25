@@ -5,6 +5,7 @@ from src.agents.business_translator import (
     BusinessTranslatorAgent,
     _build_final_incumbent_state,
     _build_governance_contradiction_packet,
+    _build_report_artifact_manifest,
     _build_metric_progress_summary,
     _score_report_quality,
     _sanitize_review_board_verdict_for_translator,
@@ -76,6 +77,34 @@ def test_translator_repair_call_can_use_dedicated_model_slot():
 
     assert content == "ok"
     assert captured["model"] == "openai/gpt-5.4-mini"
+
+
+def test_report_artifact_manifest_uses_authoritative_run_summary_governance(tmp_path):
+    artifact_path = tmp_path / "predictions.csv"
+    artifact_path.write_text("id,score\n1,0.8\n", encoding="utf-8")
+
+    manifest = _build_report_artifact_manifest(
+        artifact_index=[{"path": str(artifact_path), "artifact_type": "predictions"}],
+        required_outputs=[str(artifact_path)],
+        output_contract_report={"overall_status": "ok", "missing": []},
+        review_verdict="APPROVED",
+        gate_context={"failed_gates": [], "required_fixes": []},
+        run_summary={
+            "status": "NEEDS_IMPROVEMENT",
+            "run_outcome": "GO_WITH_LIMITATIONS",
+            "governance_reasons": ["qa_review=warning"],
+            "hard_failures": ["candidate_rejected"],
+        },
+        run_id="run12345",
+    )
+
+    snapshot = manifest["governance_snapshot"]
+    assert snapshot["review_verdict"] == "NEEDS_IMPROVEMENT"
+    assert snapshot["review_verdict_source"] == "run_summary.status"
+    assert snapshot["run_outcome"] == "NO_GO"
+    assert snapshot["run_outcome_source"] == "derived_from_review_verdict"
+    assert snapshot["governance_reasons"] == ["qa_review=warning"]
+    assert snapshot["hard_failures"] == ["candidate_rejected"]
 
 
 class _CaptureChatCompletions:
@@ -1031,6 +1060,11 @@ def test_translator_prompt_includes_final_incumbent_and_governance_contradiction
     assert '"governance_contradiction_packet": {' in prompt
     assert '"has_contradictions": true' in prompt
     assert '"current_incumbent_basis": "approved_baseline"' in prompt
+    packet_path = os.path.join("data", "governance_contradiction_packet.json")
+    assert os.path.getsize(packet_path) > 2
+    with open(packet_path, "r", encoding="utf-8") as f:
+        persisted_packet = json.load(f)
+    assert persisted_packet["has_contradictions"] is True
 
 
 def test_validate_report_flags_contradicted_current_state_claims():

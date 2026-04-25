@@ -512,6 +512,86 @@ def _status_badge(status: str) -> str:
     return f'<span class="status-badge {css_class}">{html.escape(label)}</span>'
 
 
+def _first_nonempty_with_source(*pairs: Tuple[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    for source, value in pairs:
+        text = str(value or "").strip()
+        if text:
+            return text, source
+    return None, None
+
+
+def _coerce_governance_outcome_for_verdict(
+    review_verdict: Optional[str],
+    run_outcome: Optional[str],
+    run_outcome_source: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    status = str(review_verdict or "").strip().upper()
+    outcome = str(run_outcome or "").strip().upper()
+    blocking_statuses = {"NEEDS_IMPROVEMENT", "REJECTED", "FAIL", "FAILED", "ERROR", "CRASH"}
+    if status in blocking_statuses and outcome != "NO_GO":
+        return "NO_GO", "derived_from_review_verdict"
+    return run_outcome, run_outcome_source
+
+
+def _build_authoritative_governance_snapshot(
+    *,
+    review_verdict: Optional[str],
+    gate_context: Dict[str, Any],
+    run_summary: Dict[str, Any],
+    output_contract_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Create the report governance view from canonical post-board state first."""
+    summary = run_summary if isinstance(run_summary, dict) else {}
+    gate_context = gate_context if isinstance(gate_context, dict) else {}
+    output_contract_report = output_contract_report if isinstance(output_contract_report, dict) else {}
+
+    verdict, verdict_source = _first_nonempty_with_source(
+        ("run_summary.status", summary.get("status")),
+        ("run_summary.final_review_verdict", summary.get("final_review_verdict")),
+        ("translator_state.review_verdict", review_verdict),
+    )
+    run_outcome, run_outcome_source = _first_nonempty_with_source(
+        ("run_summary.run_outcome", summary.get("run_outcome")),
+        ("run_summary.authoritative_decision", summary.get("authoritative_decision")),
+    )
+    run_outcome, run_outcome_source = _coerce_governance_outcome_for_verdict(
+        verdict,
+        run_outcome,
+        run_outcome_source,
+    )
+
+    failed_gates = summary.get("failed_gates")
+    failed_gates_source = "run_summary.failed_gates"
+    if not isinstance(failed_gates, list):
+        failed_gates = gate_context.get("failed_gates", [])
+        failed_gates_source = "gate_context.failed_gates"
+    if not isinstance(failed_gates, list):
+        failed_gates = []
+
+    required_fixes = summary.get("required_fixes")
+    required_fixes_source = "run_summary.required_fixes"
+    if not isinstance(required_fixes, list):
+        required_fixes = gate_context.get("required_fixes", [])
+        required_fixes_source = "gate_context.required_fixes"
+    if not isinstance(required_fixes, list):
+        required_fixes = []
+
+    return {
+        "review_verdict": verdict,
+        "review_verdict_source": verdict_source,
+        "run_outcome": run_outcome,
+        "run_outcome_source": run_outcome_source,
+        "failed_gates": failed_gates,
+        "failed_gates_source": failed_gates_source,
+        "required_fixes": required_fixes,
+        "required_fixes_source": required_fixes_source,
+        "governance_reasons": summary.get("governance_reasons", []) if isinstance(summary.get("governance_reasons"), list) else [],
+        "hard_failures": summary.get("hard_failures", []) if isinstance(summary.get("hard_failures"), list) else [],
+        "overall_status_global": summary.get("overall_status_global"),
+        "output_contract_status": output_contract_report.get("overall_status"),
+    }
+
+
 def _build_report_artifact_manifest(
     artifact_index: List[Dict[str, Any]],
     required_outputs: List[Any],
@@ -637,17 +717,12 @@ def _build_report_artifact_manifest(
         "run_id": run_id,
         "summary": summary,
         "items": items,
-        "governance_snapshot": {
-            "review_verdict": review_verdict,
-            "run_outcome": run_summary.get("run_outcome") if isinstance(run_summary, dict) else None,
-            "failed_gates": (
-                run_summary.get("failed_gates", [])
-                if isinstance(run_summary, dict) and isinstance(run_summary.get("failed_gates"), list)
-                else (gate_context.get("failed_gates", []) if isinstance(gate_context, dict) else [])
-            ),
-            "required_fixes": gate_context.get("required_fixes", []) if isinstance(gate_context, dict) else [],
-            "output_contract_status": output_contract_report.get("overall_status"),
-        },
+        "governance_snapshot": _build_authoritative_governance_snapshot(
+            review_verdict=review_verdict,
+            gate_context=gate_context,
+            run_summary=run_summary,
+            output_contract_report=output_contract_report,
+        ),
     }
     return manifest
 
@@ -696,9 +771,15 @@ def _build_artifact_compliance_table_html(
         context_failed = gate_context.get("failed_gates", [])
         if isinstance(context_failed, list):
             failed_gates = [str(g) for g in context_failed if g]
+    governance_snapshot = manifest.get("governance_snapshot", {}) if isinstance(manifest, dict) else {}
+    authoritative_review_verdict, _ = _first_nonempty_with_source(
+        ("manifest.governance_snapshot.review_verdict", governance_snapshot.get("review_verdict") if isinstance(governance_snapshot, dict) else None),
+        ("run_summary.status", run_summary.get("status") if isinstance(run_summary, dict) else None),
+        ("translator_state.review_verdict", review_verdict),
+    )
     rows: List[List[Any]] = [
         ["Output Contract Status", _status_badge(overall_status)],
-        ["Review Verdict", html.escape(str(review_verdict or "UNKNOWN"))],
+        ["Review Verdict", html.escape(str(authoritative_review_verdict or "UNKNOWN"))],
         ["Required Artifacts", str(summary.get("required_total", 0))],
         ["Required Missing", str(summary.get("required_missing", 0))],
         ["Failed Gates", html.escape(", ".join([str(g) for g in failed_gates[:6]]) or "none")],
@@ -3093,6 +3174,35 @@ def _validate_report(
     }
 
 
+def _merge_structured_layout_findings(
+    validation: Dict[str, Any],
+    structured_payload_issues: Optional[List[str]],
+) -> Dict[str, Any]:
+    merged = dict(validation if isinstance(validation, dict) else {})
+    issues = [
+        str(item).strip()
+        for item in (structured_payload_issues or [])
+        if str(item).strip()
+    ]
+    merged["structured_layout_issues"] = issues
+    if not issues:
+        return merged
+
+    structure_issues = list(merged.get("structure_issues", []) or [])
+    for issue in issues:
+        token = f"structured_layout:{issue}"
+        if token not in structure_issues:
+            structure_issues.append(token)
+    merged["structure_issues"] = structure_issues
+
+    critical_issues = list(merged.get("critical_issues", []) or [])
+    if "structured_layout_invalid" not in critical_issues:
+        critical_issues.append("structured_layout_invalid")
+    merged["critical_issues"] = critical_issues
+    merged["has_critical"] = True
+    return merged
+
+
 def _score_report_quality(validation: Dict[str, Any]) -> int:
     score = 100
     score -= 8 * len(validation.get("structure_issues", []))
@@ -3253,7 +3363,7 @@ def _materialize_structured_report(
     evidence_paths: List[str],
     target_language_code: str,
 ) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]], List[str]]:
-    structured_payload = _extract_first_json_object(content)
+    structured_payload = _extract_structured_report_payload(content)
     if structured_payload is None:
         return None, None, None, ["payload_parse_failed"]
 
@@ -3296,43 +3406,39 @@ def _materialize_structured_report(
     return content_markdown, blocks_out, structured_payload, []
 
 
-def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Extract the first valid JSON object from *text*.
+def _strip_json_fences(raw: str) -> str:
+    cleaned = re.sub(r"```json\s*", "", str(raw or ""), flags=re.IGNORECASE)
+    cleaned = re.sub(r"```", "", cleaned)
+    return cleaned.strip()
 
-    Uses **string-aware** brace matching (respects quoted strings and
-    escape sequences) so braces inside string values are ignored.
 
-    If no complete JSON object is found (e.g. the LLM truncated mid-
-    output), attempts a *truncation repair*: finds the longest ``{…``
-    prefix, closes any open arrays / objects, and re-parses.
-    """
-    if not text:
-        return None
-    raw = str(text).strip()
-
-    # ── Fast path: entire text is valid JSON ──
+def _try_parse_json_dict(candidate: str) -> Optional[Dict[str, Any]]:
     try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else None
+        parsed = json.loads(candidate)
     except Exception:
-        pass
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
-    # ── Strip markdown fences (```json … ```) wrapping ──
-    cleaned = re.sub(r"```json\s*", "", raw, flags=re.IGNORECASE)
-    cleaned = re.sub(r"```", "", cleaned).strip()
-    if cleaned != raw:
-        try:
-            parsed = json.loads(cleaned)
-            return parsed if isinstance(parsed, dict) else None
-        except Exception:
-            pass
 
-    # ── String-aware brace scan (handles braces inside quoted values) ──
+def _iter_json_object_candidates(text: str) -> List[Dict[str, Any]]:
+    raw = _strip_json_fences(str(text or ""))
+    if not raw:
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    parsed_full = _try_parse_json_dict(raw)
+    if parsed_full is not None:
+        key = json.dumps(parsed_full, sort_keys=True, ensure_ascii=False)
+        seen.add(key)
+        candidates.append(parsed_full)
+
     n = len(raw)
     for scan_start in range(n):
         if raw[scan_start] != "{":
             continue
-        depth = 0
+        stack: List[str] = []
         in_str = False
         escape = False
         for pos in range(scan_start, n):
@@ -3348,23 +3454,187 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
             if ch == '"':
                 in_str = True
             elif ch == "{":
-                depth += 1
+                stack.append("o")
+            elif ch == "[":
+                stack.append("a")
             elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = raw[scan_start:pos + 1]
-                    try:
-                        parsed = json.loads(candidate)
-                        if isinstance(parsed, dict):
-                            return parsed
-                    except Exception:
-                        break  # this opening brace failed; try next
-        # If we exhausted the string without closing → try truncation repair
-        if depth > 0:
-            result = _repair_truncated_json(raw[scan_start:])
-            if result is not None:
-                return result
-            break  # only try repair on the first plausible object
+                if not stack or stack[-1] != "o":
+                    break
+                stack.pop()
+                if not stack:
+                    parsed = _try_parse_json_dict(raw[scan_start:pos + 1])
+                    if parsed is not None:
+                        key = json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+                        if key not in seen:
+                            seen.add(key)
+                            candidates.append(parsed)
+                    break
+            elif ch == "]":
+                if not stack or stack[-1] != "a":
+                    break
+                stack.pop()
+    return candidates
+
+
+_SUPPORTED_STRUCTURED_BLOCK_TYPES = {"heading", "paragraph", "bullet_list", "numbered_list", "artifact"}
+
+
+def _score_structured_report_payload_candidate(payload: Optional[Dict[str, Any]]) -> int:
+    if not isinstance(payload, dict):
+        return -1
+    blocks = payload.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        return -1
+    dict_blocks = [block for block in blocks if isinstance(block, dict)]
+    if not dict_blocks:
+        return -1
+
+    valid_block_count = 0
+    heading_count = 0
+    artifact_count = 0
+    for block in dict_blocks:
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type in _SUPPORTED_STRUCTURED_BLOCK_TYPES:
+            valid_block_count += 1
+        if block_type == "heading":
+            heading_count += 1
+        if block_type == "artifact":
+            artifact_count += 1
+
+    if valid_block_count == 0:
+        return -1
+
+    evidence_items = payload.get("evidence")
+    evidence_count = len(evidence_items) if isinstance(evidence_items, list) else 0
+    has_title = 1 if str(payload.get("title") or "").strip() else 0
+    return 1000 + valid_block_count * 10 + heading_count * 3 + artifact_count * 2 + evidence_count + has_title
+
+
+def _looks_like_structured_block(payload: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    block_type = str(payload.get("type") or "").strip().lower()
+    if block_type not in _SUPPORTED_STRUCTURED_BLOCK_TYPES:
+        return False
+    if block_type in {"heading", "paragraph"}:
+        return bool(str(payload.get("text") or "").strip())
+    if block_type in {"bullet_list", "numbered_list"}:
+        return bool(_coerce_block_items(payload.get("items")))
+    if block_type == "artifact":
+        return bool(str(payload.get("artifact_key") or "").strip())
+    return False
+
+
+def _looks_like_evidence_item(payload: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return bool(str(payload.get("claim") or "").strip()) and bool(str(payload.get("source") or "").strip())
+
+
+def _extract_json_string_field(text: str, field_name: str) -> str:
+    if not text or not field_name:
+        return ""
+    pattern = re.compile(
+        rf'"{re.escape(field_name)}"\s*:\s*"((?:\\.|[^"\\])*)"',
+        flags=re.DOTALL,
+    )
+    match = pattern.search(_strip_json_fences(str(text)))
+    if not match:
+        return ""
+    raw_value = match.group(1)
+    try:
+        return str(json.loads(f'"{raw_value}"')).strip()
+    except Exception:
+        return sanitize_text(raw_value).strip()
+
+
+def _reconstruct_structured_report_payload(text: str) -> Optional[Dict[str, Any]]:
+    candidates = _iter_json_object_candidates(text)
+    if not candidates:
+        return None
+
+    block_candidates: List[Dict[str, Any]] = []
+    evidence_items: List[Dict[str, Any]] = []
+    seen_blocks: set[str] = set()
+    seen_evidence: set[str] = set()
+
+    for candidate in candidates:
+        if _looks_like_structured_block(candidate):
+            key = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
+            if key not in seen_blocks:
+                seen_blocks.add(key)
+                block_candidates.append(candidate)
+            continue
+        if _looks_like_evidence_item(candidate):
+            key = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
+            if key not in seen_evidence:
+                seen_evidence.add(key)
+                evidence_items.append(candidate)
+
+    if len(block_candidates) < 4:
+        return None
+
+    payload: Dict[str, Any] = {"blocks": block_candidates}
+    title = _extract_json_string_field(text, "title")
+    if title:
+        payload["title"] = title
+    if evidence_items:
+        payload["evidence"] = evidence_items[:24]
+    return payload
+
+
+def _extract_structured_report_payload(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+
+    direct = _extract_first_json_object(text)
+    best_payload = direct if _score_structured_report_payload_candidate(direct) > 0 else None
+    best_score = _score_structured_report_payload_candidate(best_payload)
+
+    for candidate in _iter_json_object_candidates(text):
+        score = _score_structured_report_payload_candidate(candidate)
+        if score > best_score:
+            best_payload = candidate
+            best_score = score
+
+    reconstructed = _reconstruct_structured_report_payload(text)
+    reconstructed_score = _score_structured_report_payload_candidate(reconstructed)
+    if reconstructed_score > best_score:
+        best_payload = reconstructed
+        best_score = reconstructed_score
+
+    if best_payload is not None:
+        return best_payload
+
+    return direct if isinstance(direct, dict) else None
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the first valid JSON object from *text*.
+
+    Uses string-aware stack scanning across objects and arrays so nested
+    arrays do not cause premature object termination.
+
+    If no complete JSON object is found (e.g. the LLM truncated mid-
+    output), attempts a truncation repair by closing the longest
+    plausible ``{...`` prefix.
+    """
+    if not text:
+        return None
+    raw = _strip_json_fences(str(text))
+
+    candidates = _iter_json_object_candidates(raw)
+    if candidates:
+        return candidates[0]
+
+    n = len(raw)
+    for scan_start in range(n):
+        if raw[scan_start] != "{":
+            continue
+        result = _repair_truncated_json(raw[scan_start:])
+        if result is not None:
+            return result
+        break
     return None
 
 
@@ -3449,8 +3719,9 @@ def _rescue_markdown_from_raw_json(raw_text: str) -> Optional[str]:
     if not raw_text:
         return None
 
-    # Try to parse via _extract_first_json_object first (it does truncation repair)
-    payload = _extract_first_json_object(raw_text)
+    # Try the structured extractor first so malformed root payloads can be
+    # reconstructed from valid block fragments.
+    payload = _extract_structured_report_payload(raw_text)
     if payload and isinstance(payload.get("blocks"), list) and payload["blocks"]:
         lines: list = []
         title = str(payload.get("title") or "").strip()
@@ -4811,10 +5082,6 @@ class BusinessTranslatorAgent:
                 json.dump(run_causal_impact_summary or {}, f_causal, indent=2, ensure_ascii=False)
             with open("data/final_incumbent_state.json", "w", encoding="utf-8") as f_incumbent:
                 json.dump(final_incumbent_state or {}, f_incumbent, indent=2, ensure_ascii=False)
-            with open("data/governance_contradiction_packet.json", "w", encoding="utf-8") as f_contradictions:
-                json.dump(governance_contradiction_packet or {}, f_contradictions, indent=2, ensure_ascii=False)
-            with open("data/stale_or_rejected_history.json", "w", encoding="utf-8") as f_history:
-                json.dump(stale_or_rejected_history or {}, f_history, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
@@ -4888,6 +5155,14 @@ class BusinessTranslatorAgent:
             governance_contradiction_packet=governance_contradiction_packet,
             decision_discrepancy=decision_discrepancy,
         )
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/governance_contradiction_packet.json", "w", encoding="utf-8") as f_contradictions:
+                json.dump(governance_contradiction_packet or {}, f_contradictions, indent=2, ensure_ascii=False)
+            with open("data/stale_or_rejected_history.json", "w", encoding="utf-8") as f_history:
+                json.dump(stale_or_rejected_history or {}, f_history, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
         # Build a compact, normalized QA signal block. QA warnings/soft
         # failures represent material caveats the executive report must not
@@ -5643,6 +5918,10 @@ $execution_results
                     decision_discrepancy=decision_discrepancy,
                     governance_contradiction_packet=governance_contradiction_packet,
                 )
+                validation = _merge_structured_layout_findings(
+                    validation,
+                    structured_payload_issues if structured_layout_enabled else [],
+                )
                 best_score = _score_report_quality(validation)
                 best_content = content
                 best_validation = validation
@@ -5725,6 +6004,10 @@ $execution_results
                             expected_language=target_language_code,
                             decision_discrepancy=decision_discrepancy,
                             governance_contradiction_packet=governance_contradiction_packet,
+                        )
+                        repair_validation = _merge_structured_layout_findings(
+                            repair_validation,
+                            structured_payload_issues if structured_layout_enabled else [],
                         )
                         repair_score = _score_report_quality(repair_validation)
                         repair_history.append({

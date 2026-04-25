@@ -162,6 +162,93 @@ def test_run_summary_prefers_state_metric_snapshot_over_stale_metrics_file(tmp_p
     assert metric_improvement.get("final_metric_artifact") == 0.330705410118
 
 
+def test_run_summary_prefers_authoritative_loop_final_over_stale_board_finalization(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"missing": []}, f)
+    with open("data/review_board_verdict.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "status": "NEEDS_IMPROVEMENT",
+                "final_review_verdict": "NEEDS_IMPROVEMENT",
+                "metric_round_finalization": {
+                    "metric_name": "roc_auc",
+                    "kept": "baseline",
+                    "baseline_metric": 0.81,
+                    "candidate_metric": 0.84,
+                    "final_metric": 0.81,
+                },
+            },
+            f,
+        )
+
+    state = {
+        "review_verdict": "NEEDS_IMPROVEMENT",
+        "last_successful_review_verdict": "APPROVED",
+        "metrics_report": {
+            "primary_metric_name": "roc_auc",
+            "primary_metric_value": 0.91,
+        },
+        "metric_loop_state": {
+            "schema_version": "v1",
+            "target": {"name": "roc_auc"},
+            "round": {
+                "round_id": 2,
+                "baseline": {"metric_name": "roc_auc", "metric_value": 0.81},
+            },
+            "candidate": {"metric_name": "roc_auc", "metric_value": 0.84},
+            "incumbent": {
+                "label": "incumbent",
+                "metric_name": "roc_auc",
+                "metric_value": 0.91,
+                "review_verdict": "APPROVED",
+            },
+            "final": {
+                "label": "best_attempt",
+                "metric_name": "roc_auc",
+                "metric_value": 0.91,
+                "review_verdict": "APPROVED",
+            },
+            "selection": {
+                "selected_label": "best_attempt",
+                "selected_metric": 0.91,
+                "reason": "best_attempt_promoted_after_degraded_execution",
+            },
+        },
+    }
+
+    summary = build_run_summary(state)
+
+    metric_improvement = summary.get("metric_improvement") or {}
+    assert summary.get("status") == "APPROVED"
+    assert metric_improvement.get("kept") == "best_attempt"
+    assert metric_improvement.get("final_metric_reported") == 0.91
+    assert metric_improvement.get("final_metric_artifact") == 0.91
+
+
+def test_run_summary_needs_improvement_without_approved_incumbent_is_no_go(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump({"overall_status": "ok", "missing": []}, f)
+    with open("data/review_board_verdict.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "status": "NEEDS_IMPROVEMENT",
+                "final_review_verdict": "NEEDS_IMPROVEMENT",
+                "failed_areas": ["qa_gates"],
+            },
+            f,
+        )
+
+    summary = build_run_summary({"review_verdict": "NEEDS_IMPROVEMENT"})
+
+    assert summary["status"] == "NEEDS_IMPROVEMENT"
+    assert summary["run_outcome"] == "NO_GO"
+    assert "authoritative_status=NEEDS_IMPROVEMENT" in summary["governance_reasons"]
+
+
 def test_run_summary_does_not_emit_duplicate_model_performance_metric_paths(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)

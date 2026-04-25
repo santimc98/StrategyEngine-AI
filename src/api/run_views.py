@@ -69,6 +69,83 @@ def _fmt(value: Any) -> str:
     return (text[:120] + "...") if len(text) > 120 else text
 
 
+def _first_nonempty_text(*values: Any) -> Optional[str]:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _first_nonempty_with_source(*pairs: tuple[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    for source, value in pairs:
+        text = str(value or "").strip()
+        if text:
+            return text, source
+    return None, None
+
+
+def _coerce_governance_outcome_for_verdict(
+    review_verdict: Optional[str],
+    run_outcome: Optional[str],
+    run_outcome_source: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    status = str(review_verdict or "").strip().upper()
+    outcome = str(run_outcome or "").strip().upper()
+    blocking_statuses = {"NEEDS_IMPROVEMENT", "REJECTED", "FAIL", "FAILED", "ERROR", "CRASH"}
+    if status in blocking_statuses and outcome != "NO_GO":
+        return "NO_GO", "derived_from_review_verdict"
+    return run_outcome, run_outcome_source
+
+
+def _reconcile_governance_snapshot(
+    artifact_snapshot: Dict[str, Any],
+    run_summary: Dict[str, Any],
+    final_state: Dict[str, Any],
+    final_incumbent_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Expose a governance snapshot where post-board run_summary is canonical."""
+    snapshot = dict(artifact_snapshot) if isinstance(artifact_snapshot, dict) else {}
+    summary = run_summary if isinstance(run_summary, dict) else {}
+    final_state = final_state if isinstance(final_state, dict) else {}
+    final_incumbent_state = final_incumbent_state if isinstance(final_incumbent_state, dict) else {}
+
+    status, status_source = _first_nonempty_with_source(
+        ("run_summary.status", summary.get("status")),
+        ("run_summary.final_review_verdict", summary.get("final_review_verdict")),
+        ("manifest.governance_snapshot.review_verdict", snapshot.get("review_verdict")),
+        ("worker_final_state.review_verdict", final_state.get("review_verdict")),
+        ("worker_final_state.last_successful_review_verdict", final_state.get("last_successful_review_verdict")),
+    )
+    run_outcome, run_outcome_source = _first_nonempty_with_source(
+        ("run_summary.run_outcome", summary.get("run_outcome")),
+        ("run_summary.authoritative_decision", summary.get("authoritative_decision")),
+        ("manifest.governance_snapshot.run_outcome", snapshot.get("run_outcome")),
+        ("final_incumbent_state.run_outcome", final_incumbent_state.get("run_outcome")),
+        ("final_incumbent_state.authoritative_decision", final_incumbent_state.get("authoritative_decision")),
+        ("worker_final_state.run_outcome", final_state.get("run_outcome")),
+    )
+    run_outcome, run_outcome_source = _coerce_governance_outcome_for_verdict(
+        status,
+        run_outcome,
+        run_outcome_source,
+    )
+
+    reconciled = dict(snapshot)
+    reconciled["review_verdict"] = status
+    reconciled["review_verdict_source"] = status_source
+    reconciled["run_outcome"] = run_outcome
+    reconciled["run_outcome_source"] = run_outcome_source
+    for key in ("failed_gates", "governance_reasons", "hard_failures", "required_fixes"):
+        summary_value = summary.get(key)
+        if isinstance(summary_value, list):
+            reconciled[key] = summary_value
+            reconciled[f"{key}_source"] = f"run_summary.{key}"
+    if summary.get("overall_status_global") is not None:
+        reconciled["overall_status_global"] = summary.get("overall_status_global")
+    return reconciled
+
+
 # ---------------------------------------------------------------------------
 # Agent label lookup for events
 # ---------------------------------------------------------------------------
@@ -711,19 +788,47 @@ def get_run_report_payload(run_id: str) -> Dict[str, Any]:
                 blocks = [b for b in payload["blocks"] if isinstance(b, dict)]
 
     artifact_manifest = get_artifact_manifest(run_id)
+    governance_snapshot = (
+        artifact_manifest.get("governance_snapshot")
+        if isinstance(artifact_manifest.get("governance_snapshot"), dict)
+        else {}
+    )
+    final_incumbent_state = _load_json_safe(_run_data_dir(run_id) / "final_incumbent_state.json") or {}
     visual_tables = get_report_visual_tables(run_id)
     pdf_path = _resolve_pdf_path(run_id)
 
+    governance_snapshot = _reconcile_governance_snapshot(
+        governance_snapshot,
+        run_summary,
+        final_state,
+        final_incumbent_state,
+    )
+
+    status = _first_nonempty_text(
+        governance_snapshot.get("review_verdict"),
+        run_summary.get("status"),
+        final_state.get("review_verdict"),
+        final_state.get("last_successful_review_verdict"),
+    )
+    run_outcome = _first_nonempty_text(
+        governance_snapshot.get("run_outcome"),
+        run_summary.get("run_outcome"),
+        final_incumbent_state.get("run_outcome"),
+        final_incumbent_state.get("authoritative_decision"),
+        final_state.get("run_outcome"),
+    )
+
     return {
         "run_id": run_id,
-        "status": run_summary.get("status") or final_state.get("review_verdict"),
-        "run_outcome": run_summary.get("run_outcome"),
+        "status": status,
+        "run_outcome": run_outcome,
         "markdown": markdown,
         "blocks": blocks,
         "pdf_available": pdf_path is not None,
         "pdf_url": f"/runs/{run_id}/report/pdf" if pdf_path is not None else None,
         "plots": list_report_plots(run_id),
         "artifact_manifest_summary": (artifact_manifest.get("summary") or {}),
+        "governance_snapshot": governance_snapshot,
         "run_summary": run_summary,
         "visual_tables": visual_tables,
     }

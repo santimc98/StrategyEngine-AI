@@ -814,6 +814,8 @@ Step 1 - Name the artifact. Resolve applies_to_artifact to a concrete entry in t
 
 Step 2 - Simulate the verifier's point of view. Ask: "Given only this artifact and the evidence_source I named, can evaluated_by produce a definitive pass/fail?" If the evidence is not observable in that artifact, the binding is wrong.
 
+Step 2b - Numeric/composite gate binding. If a HARD/ SOFT QA gate depends on more than one numeric metric from the same JSON artifact, encode it as params.metric_checks. Each metric_check must include metric, operator, and either threshold or threshold_param. Example: {"metric": "eligibility_drift_entity_pct", "operator": "<=", "threshold_param": "max_entity_drift_pct"}. Do not rely on prose-only evidence_source for multi-metric gates.
+
 Step 3 - Trivial-failure check. For every gate whose params contain forbidden_columns, required_columns, or allowed_columns, compare that column set with the required_columns and optional_passthrough_columns declared on applies_to_artifact. If a forbidden column is required or passthrough on the same artifact, the gate fails by construction. Relocate the gate, rephrase it as a manifest invariant, or materialize a separate artifact.
 
 Step 4 - Feature-matrix materialization. If any gate mentions feature matrix, model input, or training features, choose exactly one valid topology:
@@ -3190,7 +3192,11 @@ def _normalize_qa_gate_spec(item: Any) -> Dict[str, Any] | None:
         params = item.get("params")
         if not isinstance(params, dict):
             params = {}
-        for param_key in ("metric", "check", "rule", "threshold", "target", "min", "max", "operator", "direction", "condition"):
+        for param_key in (
+            "metric", "check", "rule", "threshold", "target", "min", "max",
+            "min_value", "max_value", "operator", "direction", "condition",
+            "field", "metric_checks",
+        ):
             if param_key in item and param_key not in params:
                 params[param_key] = item.get(param_key)
         gate_spec: Dict[str, Any] = {"name": str(name), "severity": severity, "params": params}
@@ -3247,7 +3253,11 @@ def _normalize_cleaning_gate_spec(item: Any) -> Dict[str, Any] | None:
         params = item.get("params")
         if not isinstance(params, dict):
             params = {}
-        for param_key in ("metric", "check", "rule", "threshold", "target", "min", "max", "operator", "direction", "condition"):
+        for param_key in (
+            "metric", "check", "rule", "threshold", "target", "min", "max",
+            "min_value", "max_value", "operator", "direction", "condition",
+            "field", "metric_checks",
+        ):
             if param_key in item and param_key not in params:
                 params[param_key] = item.get(param_key)
         gate_spec: Dict[str, Any] = {"name": str(name), "severity": severity, "params": params}
@@ -5815,8 +5825,8 @@ def _normalize_dtype_target(
 
     if role == "time_columns":
         return "datetime64[ns]"
-    if role == "identifiers":
-        return "object"
+    if role in {"identifiers", "identifier", "id", "ids", "keys", "primary_key"} or "identifier" in role:
+        return "string"
     if "datetime" in dtype or "date" in dtype or "time" in dtype:
         return "datetime64[ns]"
     if "bool" in dtype:
@@ -5934,6 +5944,10 @@ def _infer_column_dtype_targets(
             "role": role_hint or "unknown",
             "source": "data_profile",
         }
+        role_norm = str(role_hint or "").strip().lower()
+        if role_norm in {"identifiers", "identifier", "id", "ids", "keys", "primary_key"} or "identifier" in role_norm:
+            dtype_targets[col]["semantic_dtype"] = "identifier"
+            dtype_targets[col]["preserve_lexical_representation"] = True
 
     selectors_raw = clean_cfg.get("required_feature_selectors")
     selectors = [item for item in selectors_raw if isinstance(item, dict)] if isinstance(selectors_raw, list) else []

@@ -238,6 +238,210 @@ class TestBuildOutputContractReport:
         assert report["overall_status"] == "ok"
         assert report["artifact_requirements_report"]["status"] == "ok"
 
+    def test_hard_numeric_qa_gate_failure_marks_output_contract_error(self, tmp_path):
+        """Artifact-backed HARD numeric gates are contract compliance, not advisory text."""
+        metrics_dir = tmp_path / "artifacts" / "ml"
+        metrics_dir.mkdir(parents=True)
+        (metrics_dir / "latency_benchmark.json").write_text(
+            '{"ms_per_1000_debtors": 135.54}',
+            encoding="utf-8",
+        )
+
+        contract = {
+            "required_outputs": ["artifacts/ml/latency_benchmark.json"],
+            "ml_engineer": {
+                "required_outputs": [
+                    {
+                        "path": "artifacts/ml/latency_benchmark.json",
+                        "intent": "latency_benchmark",
+                    }
+                ],
+                "qa_gates": [
+                    {
+                        "name": "inference_latency_within_spec",
+                        "severity": "HARD",
+                        "applies_to_artifact": "artifacts/ml/latency_benchmark.json",
+                        "evidence_source": "artifacts/ml/latency_benchmark.json.ms_per_1000_debtors",
+                        "params": {
+                            "metric": "ms_per_1000_debtors",
+                            "min_value": 10,
+                            "max_value": 30,
+                        },
+                    }
+                ],
+            },
+            "artifact_requirements": {
+                "required_files": [{"path": "artifacts/ml/latency_benchmark.json"}],
+            },
+        }
+
+        original_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            report = build_output_contract_report(contract, work_dir=".")
+        finally:
+            os.chdir(original_cwd)
+
+        assert report["overall_status"] == "error"
+        failures = report["qa_gate_results"]["failures"]
+        assert failures[0]["name"] == "inference_latency_within_spec"
+        assert failures[0]["value"] == 135.54
+
+    def test_hard_numeric_qa_gate_pass_keeps_output_contract_ok(self, tmp_path):
+        metrics_dir = tmp_path / "artifacts" / "ml"
+        metrics_dir.mkdir(parents=True)
+        (metrics_dir / "latency_benchmark.json").write_text(
+            '{"ms_per_1000_debtors": 20.0}',
+            encoding="utf-8",
+        )
+        contract = {
+            "required_outputs": ["artifacts/ml/latency_benchmark.json"],
+            "ml_engineer": {
+                "qa_gates": [
+                    {
+                        "name": "inference_latency_within_spec",
+                        "severity": "HARD",
+                        "applies_to_artifact": "artifacts/ml/latency_benchmark.json",
+                        "params": {
+                            "metric": "ms_per_1000_debtors",
+                            "min_value": 10,
+                            "max_value": 30,
+                        },
+                    }
+                ],
+            },
+            "artifact_requirements": {
+                "required_files": [{"path": "artifacts/ml/latency_benchmark.json"}],
+            },
+        }
+
+        original_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            report = build_output_contract_report(contract, work_dir=".")
+        finally:
+            os.chdir(original_cwd)
+
+        assert report["overall_status"] == "ok"
+        assert report["qa_gate_results"]["checked"][0]["passed"] is True
+
+    def test_composite_numeric_qa_gate_uses_metric_checks(self, tmp_path):
+        metrics_dir = tmp_path / "artifacts" / "ml"
+        metrics_dir.mkdir(parents=True)
+        (metrics_dir / "validation_metrics.json").write_text(
+            json.dumps(
+                {
+                    "eligibility_drift_entity_pct": 0.02,
+                    "eligibility_drift_ventas_pct": 0.12,
+                    "eligibility_drift_saldo_pct": 0.03,
+                }
+            ),
+            encoding="utf-8",
+        )
+        contract = {
+            "required_outputs": ["artifacts/ml/validation_metrics.json"],
+            "ml_engineer": {
+                "qa_gates": [
+                    {
+                        "name": "eligibility_drift_within_tolerance",
+                        "severity": "HARD",
+                        "applies_to_artifact": "artifacts/ml/validation_metrics.json",
+                        "params": {
+                            "max_entity_drift_pct": 0.10,
+                            "max_ventas_drift_pct": 0.10,
+                            "max_saldo_drift_pct": 0.10,
+                            "metric_checks": [
+                                {
+                                    "metric": "eligibility_drift_entity_pct",
+                                    "operator": "<=",
+                                    "threshold_param": "max_entity_drift_pct",
+                                },
+                                {
+                                    "metric": "eligibility_drift_ventas_pct",
+                                    "operator": "<=",
+                                    "threshold_param": "max_ventas_drift_pct",
+                                },
+                                {
+                                    "metric": "eligibility_drift_saldo_pct",
+                                    "operator": "<=",
+                                    "threshold_param": "max_saldo_drift_pct",
+                                },
+                            ],
+                        },
+                    }
+                ]
+            },
+            "artifact_requirements": {
+                "required_files": [{"path": "artifacts/ml/validation_metrics.json"}],
+            },
+        }
+
+        original_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            report = build_output_contract_report(contract, work_dir=".")
+        finally:
+            os.chdir(original_cwd)
+
+        checked = report["qa_gate_results"]["checked"]
+        failures = report["qa_gate_results"]["failures"]
+        assert len(checked) == 3
+        assert report["overall_status"] == "error"
+        assert failures[0]["metric"] == "eligibility_drift_ventas_pct"
+        assert failures[0]["threshold_param"] == "max_ventas_drift_pct"
+
+    def test_composite_numeric_qa_gate_infers_legacy_threshold_params(self, tmp_path):
+        metrics_dir = tmp_path / "artifacts" / "ml"
+        metrics_dir.mkdir(parents=True)
+        (metrics_dir / "validation_metrics.json").write_text(
+            json.dumps(
+                {
+                    "eligibility_drift_entity_pct": 0.02,
+                    "eligibility_drift_ventas_pct": 0.03,
+                    "eligibility_drift_saldo_pct": 0.04,
+                }
+            ),
+            encoding="utf-8",
+        )
+        contract = {
+            "required_outputs": ["artifacts/ml/validation_metrics.json"],
+            "ml_engineer": {
+                "qa_gates": [
+                    {
+                        "name": "eligibility_drift_within_tolerance",
+                        "severity": "HARD",
+                        "applies_to_artifact": "artifacts/ml/validation_metrics.json",
+                        "evidence_source": (
+                            "validation_metrics.json.eligibility_drift_entity_pct, "
+                            "eligibility_drift_ventas_pct, eligibility_drift_saldo_pct for confirmation month"
+                        ),
+                        "params": {
+                            "max_entity_drift_pct": 0.10,
+                            "max_ventas_drift_pct": 0.10,
+                            "max_saldo_drift_pct": 0.10,
+                        },
+                    }
+                ]
+            },
+            "artifact_requirements": {
+                "required_files": [{"path": "artifacts/ml/validation_metrics.json"}],
+            },
+        }
+
+        original_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            report = build_output_contract_report(contract, work_dir=".")
+        finally:
+            os.chdir(original_cwd)
+
+        assert report["overall_status"] == "ok"
+        assert {item["metric"] for item in report["qa_gate_results"]["checked"]} == {
+            "eligibility_drift_entity_pct",
+            "eligibility_drift_ventas_pct",
+            "eligibility_drift_saldo_pct",
+        }
+
     def test_overall_status_error_missing_file(self, tmp_path):
         """Missing required file -> overall_status=error."""
         data_dir = tmp_path / "data"

@@ -9,11 +9,13 @@ from src.agents.execution_planner import (
     _repair_common_json_damage,
     _build_semantic_guard_validation,
     _infer_strategy_audit_only_columns,
+    _infer_column_dtype_targets,
     _reconcile_compiled_task_semantics,
     _reconcile_compiled_feature_surfaces,
     _reconcile_semantic_core_with_dataset_semantics,
     ExecutionPlannerAgent,
     _apply_planner_structural_support,
+    _normalize_qa_gate_spec,
     parse_derive_from_expression,
 )
 from src.utils.contract_validator import validate_contract_minimal_readonly
@@ -24,6 +26,28 @@ def test_parse_derive_from_expression_simple():
     parsed = parse_derive_from_expression("CurrentPhase == 'Contract'")
     assert parsed.get("column") == "CurrentPhase"
     assert parsed.get("positive_values") == ["Contract"]
+
+
+def test_qa_gate_normalizer_preserves_composite_metric_checks():
+    gate = _normalize_qa_gate_spec(
+        {
+            "name": "eligibility_drift_within_tolerance",
+            "severity": "HARD",
+            "applies_to_artifact": "artifacts/ml/validation_metrics.json",
+            "metric_checks": [
+                {
+                    "metric": "eligibility_drift_entity_pct",
+                    "operator": "<=",
+                    "threshold_param": "max_entity_drift_pct",
+                }
+            ],
+            "params": {"max_entity_drift_pct": 0.1},
+        }
+    )
+
+    assert gate is not None
+    assert gate["params"]["metric_checks"][0]["metric"] == "eligibility_drift_entity_pct"
+    assert gate["applies_to_artifact"] == "artifacts/ml/validation_metrics.json"
 
 
 def test_canonical_columns_exclude_derived_targets_and_segments():
@@ -55,6 +79,28 @@ def test_canonical_columns_exclude_derived_targets_and_segments():
     spec_canonical = evaluation_spec.get("canonical_columns") or []
     assert "is_success" not in spec_canonical
     assert "cluster_id" not in spec_canonical
+
+
+def test_identifier_dtype_targets_preserve_lexical_representation():
+    dtype_targets = _infer_column_dtype_targets(
+        canonical_columns=["EntityId", "CorporationId", "balance"],
+        column_roles={"identifiers": ["EntityId", "CorporationId"], "pre_decision": ["balance"]},
+        data_profile={
+            "dtypes": {
+                "EntityId": "float64",
+                "CorporationId": "float64",
+                "balance": "float64",
+            },
+            "missingness": {"EntityId": 0.0, "CorporationId": 0.0, "balance": 0.0},
+        },
+        clean_dataset_cfg={"required_columns": ["EntityId", "CorporationId", "balance"]},
+        column_inventory=["EntityId", "CorporationId", "balance"],
+    )
+
+    assert dtype_targets["EntityId"]["target_dtype"] == "string"
+    assert dtype_targets["CorporationId"]["target_dtype"] == "string"
+    assert dtype_targets["EntityId"]["semantic_dtype"] == "identifier"
+    assert dtype_targets["balance"]["target_dtype"] == "float64"
 
 
 def test_invalid_llm_contract_is_not_replaced_by_deterministic_scaffold(monkeypatch):

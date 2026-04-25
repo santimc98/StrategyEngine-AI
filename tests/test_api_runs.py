@@ -248,6 +248,63 @@ def test_report_endpoint_returns_curated_payload(client, monkeypatch, tmp_path):
     assert payload["plots"][0]["referenced_in_report"] is True
 
 
+def test_report_endpoint_prefers_canonical_run_summary_over_stale_manifest_snapshot(client, monkeypatch, tmp_path):
+    runs_dir = tmp_path / "runs"
+    run_dir = runs_dir / "canon1234"
+    work_data = run_dir / "work" / "data"
+    report_dir = run_dir / "report"
+    work_data.mkdir(parents=True)
+    report_dir.mkdir(parents=True)
+
+    _patch_run_paths(monkeypatch, runs_dir)
+
+    (run_dir / "worker_final_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "canon1234",
+                "review_verdict": "NEEDS_IMPROVEMENT",
+                "final_report": "# Reporte\n\nTexto",
+                "pdf_path": str(report_dir / "final_report.pdf"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (work_data / "run_summary.json").write_text(
+        json.dumps({"status": "NEEDS_IMPROVEMENT", "run_outcome": "GO_WITH_LIMITATIONS"}),
+        encoding="utf-8",
+    )
+    (work_data / "final_incumbent_state.json").write_text(
+        json.dumps({"authoritative_decision": "GO_WITH_LIMITATIONS", "run_outcome": "GO_WITH_LIMITATIONS"}),
+        encoding="utf-8",
+    )
+    (work_data / "report_artifact_manifest.json").write_text(
+        json.dumps(
+            {
+                "summary": {"required_total": 3, "required_missing": 0},
+                "governance_snapshot": {
+                    "review_verdict": "APPROVED",
+                    "run_outcome": "GO_WITH_LIMITATIONS",
+                    "failed_gates": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (report_dir / "final_report.pdf").write_bytes(b"%PDF-1.4\n")
+
+    response = client.get("/runs/canon1234/report")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "NEEDS_IMPROVEMENT"
+    assert payload["run_outcome"] == "NO_GO"
+    assert payload["run_summary"]["status"] == "NEEDS_IMPROVEMENT"
+    assert payload["governance_snapshot"]["review_verdict"] == "NEEDS_IMPROVEMENT"
+    assert payload["governance_snapshot"]["review_verdict_source"] == "run_summary.status"
+    assert payload["governance_snapshot"]["run_outcome"] == "NO_GO"
+    assert payload["governance_snapshot"]["run_outcome_source"] == "derived_from_review_verdict"
+
+
 def test_report_plots_endpoint_returns_curated_order(client, monkeypatch, tmp_path):
     runs_dir = tmp_path / "runs"
     run_dir = runs_dir / "runplots1"

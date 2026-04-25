@@ -187,6 +187,22 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
+def _normalize_review_status_token(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _is_approved_review_status(value: Any) -> bool:
+    return _normalize_review_status_token(value) in {"APPROVED", "APPROVE_WITH_WARNINGS"}
+
+
+def _metric_values_differ(left: Any, right: Any, *, tol: float = 1e-9) -> bool:
+    left_num = _coerce_float(left)
+    right_num = _coerce_float(right)
+    if left_num is None or right_num is None:
+        return False
+    return abs(float(left_num) - float(right_num)) > float(tol)
+
+
 def _extract_metric_value_by_name(metric_pool: Dict[str, float], metric_name: Any) -> Any:
     if not isinstance(metric_pool, dict):
         return None
@@ -423,16 +439,98 @@ def _build_metric_improvement_summary_from_loop_state(
     final_metric = _coerce_float(final_entry.get("metric_value"))
     if final_metric is None and isinstance(kept_entry, dict):
         final_metric = _coerce_float(kept_entry.get("metric_value"))
+    artifact_metric = _extract_metric_value_by_name(metric_pool, metric_name)
+    if artifact_metric is None:
+        authoritative_payload = (
+            final_entry.get("metrics_payload")
+            if isinstance(final_entry.get("metrics_payload"), dict)
+            else (
+                kept_entry.get("metrics_payload")
+                if isinstance(kept_entry, dict) and isinstance(kept_entry.get("metrics_payload"), dict)
+                else {}
+            )
+        )
+        artifact_metric = _extract_metric_value_by_name(
+            authoritative_payload if isinstance(authoritative_payload, dict) else {},
+            metric_name,
+        )
+    if artifact_metric is None:
+        artifact_metric = final_metric
     summary = {
         "kept": kept or None,
         "metric_name": metric_name or None,
         "baseline_metric": _coerce_float(baseline.get("metric_value")),
         "candidate_metric": _coerce_float(candidate.get("metric_value")),
         "final_metric_reported": final_metric,
-        "final_metric_artifact": _extract_metric_value_by_name(metric_pool, metric_name),
+        "final_metric_artifact": artifact_metric,
         "reason": str(controller.get("force_finalize_reason") or selection.get("reason") or "").strip(),
     }
     return summary if any(value is not None and value != "" for value in summary.values()) else {}
+
+
+def _metric_improvement_summary_conflicts(
+    loop_summary: Dict[str, Any] | None,
+    board_summary: Dict[str, Any] | None,
+) -> bool:
+    loop_obj = loop_summary if isinstance(loop_summary, dict) else {}
+    board_obj = board_summary if isinstance(board_summary, dict) else {}
+    if not loop_obj or not board_obj:
+        return False
+    for key in ("kept", "metric_name"):
+        left = str(loop_obj.get(key) or "").strip().lower()
+        right = str(board_obj.get(key) or "").strip().lower()
+        if left and right and left != right:
+            return True
+    if _metric_values_differ(
+        loop_obj.get("final_metric_reported"),
+        board_obj.get("final_metric_reported"),
+    ):
+        return True
+    return False
+
+
+def _resolve_authoritative_summary_status(
+    state: Dict[str, Any],
+    board_payload: Dict[str, Any] | None,
+    metric_loop_state: Dict[str, Any] | None,
+    loop_metric_summary: Dict[str, Any] | None,
+    board_metric_summary: Dict[str, Any] | None,
+) -> str:
+    state_obj = state if isinstance(state, dict) else {}
+    board_obj = board_payload if isinstance(board_payload, dict) else {}
+    loop_state = metric_loop_state if isinstance(metric_loop_state, dict) else {}
+    final_entry = loop_state.get("final") if isinstance(loop_state.get("final"), dict) else {}
+    selection = loop_state.get("selection") if isinstance(loop_state.get("selection"), dict) else {}
+
+    board_status = _normalize_review_status_token(
+        board_obj.get("final_review_verdict")
+        or board_obj.get("status")
+        or state_obj.get("review_verdict")
+        or state_obj.get("last_successful_review_verdict")
+        or "UNKNOWN"
+    )
+    final_review = _normalize_review_status_token(
+        final_entry.get("review_verdict")
+        or state_obj.get("last_successful_review_verdict")
+        or state_obj.get("review_verdict")
+    )
+    selected_label = str(
+        final_entry.get("label")
+        or selection.get("selected_label")
+        or ""
+    ).strip().lower()
+    loop_conflicts = _metric_improvement_summary_conflicts(loop_metric_summary, board_metric_summary)
+
+    if (
+        final_review
+        and _is_approved_review_status(final_review)
+        and (
+            loop_conflicts
+            or (selected_label in {"best_attempt", "incumbent"} and not _is_approved_review_status(board_status))
+        )
+    ):
+        return final_review
+    return board_status or "UNKNOWN"
 
 
 def build_governance_report(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -664,10 +762,11 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         and isinstance(review_board_payload.get("metric_round_finalization"), dict)
         else {}
     )
-    metric_improvement_summary: Dict[str, Any] = {}
+    loop_metric_improvement_summary = _build_metric_improvement_summary_from_loop_state(metric_loop_state, metric_pool)
+    board_metric_improvement_summary: Dict[str, Any] = {}
     if metric_round_finalization:
         metric_name = metric_round_finalization.get("metric_name")
-        metric_improvement_summary = {
+        board_metric_improvement_summary = {
             "kept": metric_round_finalization.get("kept") or state.get("ml_improvement_kept"),
             "metric_name": metric_name,
             "baseline_metric": metric_round_finalization.get("baseline_metric"),
@@ -676,8 +775,27 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
             "final_metric_artifact": _extract_metric_value_by_name(metric_pool, metric_name),
             "reason": metric_round_finalization.get("force_finalize_reason") or "",
         }
-    if not metric_improvement_summary:
-        metric_improvement_summary = _build_metric_improvement_summary_from_loop_state(metric_loop_state, metric_pool)
+    metric_improvement_summary = dict(board_metric_improvement_summary)
+    if loop_metric_improvement_summary and (
+        not metric_improvement_summary
+        or _metric_improvement_summary_conflicts(
+            loop_metric_improvement_summary,
+            board_metric_improvement_summary,
+        )
+    ):
+        metric_improvement_summary = loop_metric_improvement_summary
+
+    status = _resolve_authoritative_summary_status(
+        state,
+        _board_payload if isinstance(_board_payload, dict) else {},
+        metric_loop_state,
+        loop_metric_improvement_summary,
+        board_metric_improvement_summary,
+    )
+    if status == "NEEDS_IMPROVEMENT" and run_outcome != "NO_GO":
+        run_outcome = "NO_GO"
+        if "authoritative_status=NEEDS_IMPROVEMENT" not in reducer_reasons:
+            reducer_reasons.append("authoritative_status=NEEDS_IMPROVEMENT")
 
     return {
         "run_id": state.get("run_id"),

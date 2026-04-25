@@ -4,6 +4,8 @@ import os
 import re
 from typing import List, Dict, Any, Tuple, Optional
 
+from src.utils.metric_eval import resolve_metric_value
+
 
 def get_csv_dialect(work_dir: str = ".") -> Dict[str, Any]:
     """
@@ -113,6 +115,442 @@ def _check_paths(paths: List[str]) -> Tuple[List[str], List[str]]:
         except Exception:
             missing.append(pattern)
     return present, missing
+
+
+def _coerce_float_maybe(value: Any) -> Optional[float]:
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+def _normalize_rel_path(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _extract_json_artifact_from_evidence(value: Any) -> Tuple[str, str]:
+    text = _normalize_rel_path(value)
+    lower = text.lower()
+    marker = ".json"
+    idx = lower.find(marker)
+    if idx < 0:
+        return "", ""
+    artifact = text[: idx + len(marker)]
+    metric_path = text[idx + len(marker) :].lstrip(".:/# ")
+    return artifact, metric_path
+
+
+def _load_json_artifact(path: str, work_dir: str) -> Tuple[Dict[str, Any], str]:
+    rel = _normalize_rel_path(path)
+    if not rel:
+        return {}, ""
+    abs_path = rel if os.path.isabs(rel) else os.path.join(work_dir or ".", rel)
+    try:
+        with open(abs_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return (payload if isinstance(payload, dict) else {}), abs_path
+    except Exception:
+        return {}, abs_path
+
+
+def _collect_contract_qa_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(contract, dict):
+        return []
+    gates: List[Dict[str, Any]] = []
+
+    def _extend(value: Any) -> None:
+        if not isinstance(value, list):
+            return
+        for item in value:
+            if isinstance(item, dict) and item:
+                gates.append(item)
+
+    _extend(contract.get("qa_gates"))
+    for section_name in ("ml_engineer", "qa_reviewer", "reviewer"):
+        section = contract.get(section_name)
+        if isinstance(section, dict):
+            _extend(section.get("qa_gates"))
+            _extend(section.get("reviewer_gates"))
+    evaluation_spec = contract.get("evaluation_spec") if isinstance(contract.get("evaluation_spec"), dict) else {}
+    _extend(evaluation_spec.get("qa_gates"))
+    return gates
+
+
+def _gate_metric_name(gate: Dict[str, Any]) -> str:
+    params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+    metric = str(
+        params.get("metric")
+        or params.get("field")
+        or params.get("metric_name")
+        or gate.get("metric")
+        or gate.get("field")
+        or ""
+    ).strip()
+    if metric:
+        return metric
+    _artifact, evidence_metric = _extract_json_artifact_from_evidence(
+        gate.get("evidence_source") or params.get("evidence_source")
+    )
+    return evidence_metric
+
+
+def _gate_thresholds(gate: Dict[str, Any]) -> Dict[str, Optional[float] | str]:
+    params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+    min_value = _coerce_float_maybe(params.get("min_value"))
+    if min_value is None:
+        min_value = _coerce_float_maybe(params.get("min"))
+    max_value = _coerce_float_maybe(params.get("max_value"))
+    if max_value is None:
+        max_value = _coerce_float_maybe(params.get("max"))
+    threshold = _coerce_float_maybe(params.get("threshold"))
+    if threshold is None:
+        threshold = _coerce_float_maybe(params.get("target"))
+    operator = str(params.get("operator") or "").strip()
+    return {
+        "min_value": min_value,
+        "max_value": max_value,
+        "threshold": threshold,
+        "operator": operator,
+    }
+
+
+def _resolve_gate_artifact_and_metric(gate: Dict[str, Any]) -> Tuple[str, str]:
+    params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+    artifact = _normalize_rel_path(
+        gate.get("applies_to_artifact")
+        or params.get("artifact_path")
+        or params.get("path")
+    )
+    metric = _gate_metric_name(gate)
+    evidence_artifact, evidence_metric = _extract_json_artifact_from_evidence(
+        gate.get("evidence_source") or params.get("evidence_source")
+    )
+    if not artifact and evidence_artifact:
+        artifact = evidence_artifact
+    if not metric and evidence_metric:
+        metric = evidence_metric
+    return artifact, metric
+
+
+def _compare_numeric_gate(value: float, thresholds: Dict[str, Optional[float] | str]) -> Tuple[bool, List[str]]:
+    failures: List[str] = []
+    min_value = thresholds.get("min_value")
+    max_value = thresholds.get("max_value")
+    threshold = thresholds.get("threshold")
+    operator = str(thresholds.get("operator") or "").strip()
+    if isinstance(min_value, (int, float)) and value < float(min_value):
+        failures.append(f"value {value:.6g} is below min_value {float(min_value):.6g}")
+    if isinstance(max_value, (int, float)) and value > float(max_value):
+        failures.append(f"value {value:.6g} is above max_value {float(max_value):.6g}")
+    if isinstance(threshold, (int, float)) and operator:
+        if operator == ">" and not value > float(threshold):
+            failures.append(f"value {value:.6g} is not > {float(threshold):.6g}")
+        elif operator == ">=" and not value >= float(threshold):
+            failures.append(f"value {value:.6g} is not >= {float(threshold):.6g}")
+        elif operator == "<" and not value < float(threshold):
+            failures.append(f"value {value:.6g} is not < {float(threshold):.6g}")
+        elif operator == "<=" and not value <= float(threshold):
+            failures.append(f"value {value:.6g} is not <= {float(threshold):.6g}")
+        elif operator == "==" and not value == float(threshold):
+            failures.append(f"value {value:.6g} is not == {float(threshold):.6g}")
+    return not failures, failures
+
+
+_METRIC_THRESHOLD_STOPWORDS = {
+    "max",
+    "min",
+    "value",
+    "threshold",
+    "target",
+    "pct",
+    "percent",
+    "percentage",
+    "rate",
+    "ratio",
+    "metric",
+    "allowed",
+    "tolerance",
+    "tol",
+    "limit",
+}
+
+
+def _metric_token_set(value: Any) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", str(value or "").lower())
+        if token and token not in _METRIC_THRESHOLD_STOPWORDS
+    }
+
+
+def _extract_metric_candidates_from_evidence(value: Any) -> List[str]:
+    _artifact, metric_text = _extract_json_artifact_from_evidence(value)
+    if not metric_text:
+        return []
+    metrics: List[str] = []
+    for part in re.split(r"[,;]", metric_text):
+        match = re.match(
+            r"\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)",
+            str(part or ""),
+        )
+        if not match:
+            continue
+        metric = match.group(1).strip(". ")
+        if metric and metric.lower() not in {"for", "and", "or"} and metric not in metrics:
+            metrics.append(metric)
+    return metrics
+
+
+def _operator_from_threshold_key(key: Any) -> str:
+    token = str(key or "").strip().lower()
+    if token.startswith(("max_", "upper_", "lte_", "le_")):
+        return "<="
+    if token.startswith(("min_", "lower_", "gte_", "ge_")):
+        return ">="
+    return ""
+
+
+def _thresholds_from_check(
+    check: Dict[str, Any],
+    gate_params: Dict[str, Any],
+) -> Dict[str, Optional[float] | str]:
+    min_value = _coerce_float_maybe(check.get("min_value"))
+    if min_value is None:
+        min_value = _coerce_float_maybe(check.get("min"))
+    max_value = _coerce_float_maybe(check.get("max_value"))
+    if max_value is None:
+        max_value = _coerce_float_maybe(check.get("max"))
+    threshold = _coerce_float_maybe(check.get("threshold"))
+    if threshold is None:
+        threshold = _coerce_float_maybe(check.get("target"))
+    threshold_param = str(check.get("threshold_param") or "").strip()
+    if threshold is None and threshold_param:
+        threshold = _coerce_float_maybe(gate_params.get(threshold_param))
+    operator = str(check.get("operator") or "").strip()
+    if not operator and threshold_param:
+        operator = _operator_from_threshold_key(threshold_param)
+    return {
+        "min_value": min_value,
+        "max_value": max_value,
+        "threshold": threshold,
+        "operator": operator,
+        "threshold_param": threshold_param,
+    }
+
+
+def _matching_metric_for_threshold_param(param_key: str, metrics: List[str]) -> str:
+    param_tokens = _metric_token_set(param_key)
+    if not param_tokens:
+        return ""
+    best_metric = ""
+    best_overlap = -1
+    for metric in metrics:
+        metric_tokens = _metric_token_set(metric)
+        if not metric_tokens:
+            continue
+        overlap = len(param_tokens & metric_tokens)
+        if param_tokens.issubset(metric_tokens):
+            return metric
+        if overlap > best_overlap and overlap >= max(1, len(param_tokens) - 1):
+            best_metric = metric
+            best_overlap = overlap
+    return best_metric
+
+
+def expand_numeric_gate_checks(
+    gate: Dict[str, Any],
+    *,
+    primary_metric_name: str = "",
+) -> List[Dict[str, Any]]:
+    """Expand a QA gate into artifact-backed numeric metric checks.
+
+    Supports explicit ``params.metric_checks`` and a contract-backward-compatible
+    fallback for composite gates encoded as evidence_source plus max_/min_
+    params, e.g. max_entity_drift_pct -> eligibility_drift_entity_pct.
+    """
+    if not isinstance(gate, dict):
+        return []
+    params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+    gate_name = str(gate.get("name") or gate.get("id") or "").strip()
+    severity = str(gate.get("severity") or "HARD").strip().upper()
+    if severity not in {"HARD", "SOFT"}:
+        severity = "HARD"
+    base_artifact, evidence_metric = _resolve_gate_artifact_and_metric(gate)
+    evidence_source = gate.get("evidence_source") or params.get("evidence_source")
+
+    checks: List[Dict[str, Any]] = []
+
+    def _append_check(metric: str, thresholds: Dict[str, Any], artifact: str | None = None) -> None:
+        metric = str(metric or "").strip()
+        artifact_path = _normalize_rel_path(artifact or base_artifact)
+        if not metric or not artifact_path or not artifact_path.lower().endswith(".json"):
+            return
+        has_threshold = any(
+            isinstance(thresholds.get(key), (int, float))
+            for key in ("min_value", "max_value", "threshold")
+        )
+        if not has_threshold:
+            return
+        item = {
+            "name": gate_name or metric,
+            "severity": severity,
+            "artifact_path": artifact_path,
+            "metric": metric,
+            "min_value": thresholds.get("min_value"),
+            "max_value": thresholds.get("max_value"),
+            "threshold": thresholds.get("threshold"),
+            "operator": thresholds.get("operator"),
+            "threshold_param": thresholds.get("threshold_param"),
+            "evidence_source": evidence_source,
+        }
+        key = (
+            item["name"],
+            item["artifact_path"],
+            item["metric"],
+            item.get("operator"),
+            item.get("threshold"),
+            item.get("min_value"),
+            item.get("max_value"),
+        )
+        existing_keys = {
+            (
+                existing.get("name"),
+                existing.get("artifact_path"),
+                existing.get("metric"),
+                existing.get("operator"),
+                existing.get("threshold"),
+                existing.get("min_value"),
+                existing.get("max_value"),
+            )
+            for existing in checks
+        }
+        if key not in existing_keys:
+            checks.append(item)
+
+    raw_metric_checks = params.get("metric_checks")
+    if not isinstance(raw_metric_checks, list):
+        raw_metric_checks = gate.get("metric_checks")
+    if isinstance(raw_metric_checks, list):
+        for raw_check in raw_metric_checks:
+            if not isinstance(raw_check, dict):
+                continue
+            metric = str(
+                raw_check.get("metric")
+                or raw_check.get("field")
+                or raw_check.get("metric_name")
+                or ""
+            ).strip()
+            thresholds = _thresholds_from_check(raw_check, params)
+            artifact = raw_check.get("artifact_path") or raw_check.get("applies_to_artifact")
+            _append_check(metric, thresholds, str(artifact or ""))
+
+    thresholds = _gate_thresholds(gate)
+    metric = _gate_metric_name(gate) or evidence_metric or primary_metric_name
+    _append_check(metric, thresholds)
+
+    evidence_metrics = _extract_metric_candidates_from_evidence(evidence_source)
+    if evidence_metrics:
+        for key, value in params.items():
+            key_text = str(key or "").strip()
+            if key_text in {
+                "min",
+                "max",
+                "min_value",
+                "max_value",
+                "threshold",
+                "target",
+                "metric",
+                "field",
+                "metric_name",
+            }:
+                continue
+            threshold_value = _coerce_float_maybe(value)
+            if threshold_value is None:
+                continue
+            operator = _operator_from_threshold_key(key_text)
+            if not operator:
+                continue
+            matched_metric = _matching_metric_for_threshold_param(key_text, evidence_metrics)
+            if not matched_metric:
+                continue
+            _append_check(
+                matched_metric,
+                {
+                    "min_value": None,
+                    "max_value": None,
+                    "threshold": float(threshold_value),
+                    "operator": operator,
+                    "threshold_param": key_text,
+                },
+            )
+    return checks
+
+
+def evaluate_numeric_qa_gates(contract: Dict[str, Any], work_dir: str = ".") -> Dict[str, Any]:
+    """Evaluate artifact-backed numeric QA gates against produced JSON artifacts."""
+    checked: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    for gate in _collect_contract_qa_gates(contract if isinstance(contract, dict) else {}):
+        if not isinstance(gate, dict):
+            continue
+        for check_index, check in enumerate(expand_numeric_gate_checks(gate)):
+            artifact = str(check.get("artifact_path") or "").strip()
+            metric = str(check.get("metric") or "").strip()
+            severity = str(check.get("severity") or "HARD").strip().upper()
+            payload, abs_path = _load_json_artifact(artifact, work_dir)
+            resolved = resolve_metric_value(payload, metric) if payload else {}
+            value = _coerce_float_maybe(resolved.get("value") if isinstance(resolved, dict) else None)
+            item = {
+                "name": str(check.get("name") or metric).strip() or metric,
+                "severity": severity,
+                "artifact_path": artifact,
+                "metric": metric,
+                "check_index": check_index,
+                "value": value,
+                "min_value": check.get("min_value"),
+                "max_value": check.get("max_value"),
+                "threshold": check.get("threshold"),
+                "operator": check.get("operator"),
+                "threshold_param": check.get("threshold_param"),
+                "matched_key": resolved.get("matched_key") if isinstance(resolved, dict) else None,
+                "evidence_source": check.get("evidence_source"),
+                "abs_path": abs_path,
+            }
+            if value is None:
+                item["status"] = "missing_evidence"
+                item["passed"] = False
+                item["detail"] = f"Could not resolve numeric metric '{metric}' from {artifact}."
+            else:
+                passed, reasons = _compare_numeric_gate(float(value), check)
+                item["status"] = "pass" if passed else "fail"
+                item["passed"] = bool(passed)
+                item["detail"] = "; ".join(reasons) if reasons else "numeric gate satisfied"
+            checked.append(item)
+            if item.get("passed") is False:
+                if severity == "HARD":
+                    failures.append(item)
+                else:
+                    warnings.append(item)
+    return {
+        "checked": checked,
+        "failures": failures,
+        "warnings": warnings,
+        "summary": (
+            f"Numeric QA gates checked: {len(checked)}; "
+            f"hard_failures={len(failures)}; warnings={len(warnings)}"
+        ),
+    }
 
 
 def check_required_outputs(required_outputs: List[Any]) -> Dict[str, object]:
@@ -818,7 +1256,12 @@ def build_output_contract_report(
     artifact_req = get_artifact_requirements(contract) if isinstance(contract, dict) else {}
     artifact_report = check_artifact_requirements(artifact_req, work_dir=work_dir, contract=contract)
 
-    # 3) Build unified report
+    # 3) Evaluate artifact-backed numeric QA gates. These gates are contract
+    # compliance, not advisory reviewer opinion: if a HARD numeric gate fails
+    # against a produced artifact, the output contract is not satisfied.
+    qa_gate_report = evaluate_numeric_qa_gates(contract if isinstance(contract, dict) else {}, work_dir=work_dir)
+
+    # 4) Build unified report
     report: Dict[str, Any] = {
         # Backward compatible keys
         "present": required_outputs_report.get("present", []),
@@ -827,20 +1270,35 @@ def build_output_contract_report(
         "summary": required_outputs_report.get("summary", ""),
         # New keys
         "artifact_requirements_report": artifact_report,
+        "qa_gate_results": qa_gate_report,
     }
 
-    # 4) Derive overall_status
+    # 5) Derive overall_status
     # Error if: artifact_report has error OR missing files in required outputs
-    if artifact_report.get("status") == "error" or report["missing"]:
+    # OR artifact-backed HARD numeric gates fail.
+    if artifact_report.get("status") == "error" or report["missing"] or qa_gate_report.get("failures"):
         overall_status = "error"
-    elif artifact_report.get("status") == "warning":
+    elif artifact_report.get("status") == "warning" or qa_gate_report.get("warnings"):
         overall_status = "warning"
     else:
         overall_status = "ok"
 
     report["overall_status"] = overall_status
+    if qa_gate_report.get("failures"):
+        report["qa_gate_failures"] = qa_gate_report.get("failures") or []
+        report["hard_failures"] = [
+            str(item.get("name") or item.get("metric") or "qa_gate_failure")
+            for item in (qa_gate_report.get("failures") or [])
+            if isinstance(item, dict)
+        ]
+    if qa_gate_report.get("warnings"):
+        report["qa_gate_warnings"] = qa_gate_report.get("warnings") or []
+    if qa_gate_report.get("checked"):
+        report["summary"] = (
+            f"{report.get('summary') or ''} {qa_gate_report.get('summary') or ''}"
+        ).strip()
 
-    # 5) Include reason if provided
+    # 6) Include reason if provided
     if reason:
         report["reason"] = reason
 
