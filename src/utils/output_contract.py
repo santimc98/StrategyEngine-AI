@@ -96,24 +96,49 @@ def _split_deliverables(deliverables: List[Any]) -> Tuple[List[str], List[str]]:
     return required, optional
 
 
-def _check_paths(paths: List[str]) -> Tuple[List[str], List[str]]:
+def _resolve_under_work_dir(path: str, work_dir: str = ".") -> str:
+    if os.path.isabs(path):
+        return path
+    return os.path.join(work_dir or ".", path)
+
+
+def _display_path_for_report(resolved_path: str, original_path: str, work_dir: str = ".") -> str:
+    if os.path.isabs(original_path):
+        return original_path
+    try:
+        work_abs = os.path.abspath(work_dir or ".")
+        resolved_abs = os.path.abspath(resolved_path)
+        common = os.path.commonpath([work_abs, resolved_abs])
+        if common == work_abs:
+            return os.path.relpath(resolved_abs, work_abs).replace("\\", "/")
+    except Exception:
+        pass
+    return original_path.replace("\\", "/")
+
+
+def _check_paths(paths: List[str], work_dir: str = ".") -> Tuple[List[str], List[str]]:
     present: List[str] = []
     missing: List[str] = []
     for pattern in paths or []:
+        original = str(pattern)
+        resolved_pattern = _resolve_under_work_dir(original, work_dir)
         try:
-            if any(char in pattern for char in ["*", "?", "["]):
-                matches = glob.glob(pattern)
+            if any(char in original for char in ["*", "?", "["]):
+                matches = glob.glob(resolved_pattern)
                 if matches:
-                    present.extend(matches)
+                    present.extend(
+                        _display_path_for_report(match, original, work_dir)
+                        for match in matches
+                    )
                 else:
-                    missing.append(pattern)
+                    missing.append(original)
             else:
-                if os.path.exists(pattern):
-                    present.append(pattern)
+                if os.path.exists(resolved_pattern):
+                    present.append(_display_path_for_report(resolved_pattern, original, work_dir))
                 else:
-                    missing.append(pattern)
+                    missing.append(original)
         except Exception:
-            missing.append(pattern)
+            missing.append(original)
     return present, missing
 
 
@@ -553,7 +578,7 @@ def evaluate_numeric_qa_gates(contract: Dict[str, Any], work_dir: str = ".") -> 
     }
 
 
-def check_required_outputs(required_outputs: List[Any]) -> Dict[str, object]:
+def check_required_outputs(required_outputs: List[Any], work_dir: str = ".") -> Dict[str, object]:
     """
     Best-effort validation of required outputs.
     Supports glob patterns (e.g., static/plots/*.png).
@@ -561,8 +586,8 @@ def check_required_outputs(required_outputs: List[Any]) -> Dict[str, object]:
     Never raises.
     """
     required, optional = _split_deliverables(required_outputs or [])
-    present_required, missing_required = _check_paths(required)
-    present_optional, missing_optional = _check_paths(optional)
+    present_required, missing_required = _check_paths(required, work_dir=work_dir)
+    present_optional, missing_optional = _check_paths(optional, work_dir=work_dir)
     present = present_required + present_optional
     summary = (
         f"Present: {len(present)}; Missing required: {len(missing_required)}; "
@@ -1250,7 +1275,7 @@ def build_output_contract_report(
 
     # 1) Check required outputs presence (backward compatible)
     required_outputs = get_required_outputs(contract) if isinstance(contract, dict) else []
-    required_outputs_report = check_required_outputs(required_outputs)
+    required_outputs_report = check_required_outputs(required_outputs, work_dir=work_dir)
 
     # 2) Check artifact requirements with schema validation
     artifact_req = get_artifact_requirements(contract) if isinstance(contract, dict) else {}

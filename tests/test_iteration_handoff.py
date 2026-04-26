@@ -248,6 +248,59 @@ def test_iteration_handoff_builds_repair_ground_truth_for_runtime_api_misuse():
     )
 
 
+def test_iteration_handoff_prefers_generated_script_frame_over_library_traceback():
+    code_lines = ["# filler"] * 520
+    code_lines[509] = "        drift[col] = {'p01': float(s.quantile(0.01))}"
+    generated_code = "\n".join(code_lines) + "\n"
+    runtime_output = (
+        "Traceback (most recent call last)\n"
+        "  File \"C:\\tmp\\run\\ml_script.py\", line 510, in main\n"
+        "    drift[col] = {'p01': float(s.quantile(0.01))}\n"
+        "  File \"C:\\Users\\santi\\Projects\\Hackathon_Gemini_Agents\\.venv\\Lib\\site-packages\\pandas\\core\\series.py\", line 2901, in quantile\n"
+        "    result = df.quantile(q=q, interpolation=interpolation, numeric_only=False)\n"
+        "  File \"C:\\Users\\santi\\Projects\\Hackathon_Gemini_Agents\\.venv\\Lib\\site-packages\\numpy\\lib\\_function_base_impl.py\", line 4876, in _quantile\n"
+        "    result = _lerp(previous, next, gamma, out=out)\n"
+        "TypeError: numpy boolean subtract, the `-` operator, is not supported\n"
+    )
+
+    handoff = _build_iteration_handoff(
+        state={
+            "iteration_count": 4,
+            "execution_contract": {"required_outputs": ["artifacts/ml/evaluation_report.json"]},
+            "generated_code": generated_code,
+            "execution_output": runtime_output,
+            "last_runtime_error_tail": runtime_output,
+        },
+        status="NEEDS_IMPROVEMENT",
+        gate_context={
+            "failed_gates": ["runtime_failure"],
+            "required_fixes": ["Fix quantile profiling on boolean-like features."],
+            "feedback": "Runtime failed inside pandas/numpy quantile.",
+        },
+        oc_report={"present": [], "missing": ["artifacts/ml/evaluation_report.json"]},
+        review_result={},
+        qa_result={},
+        evaluation_spec={"primary_metric": "quadratic_weighted_kappa"},
+    )
+
+    repair_ground_truth = handoff["repair_ground_truth"]
+    assert any(
+        fact.get("fact") == "failing_line_number" and fact.get("value") == 510
+        for fact in repair_ground_truth["verified_facts"]
+    )
+    assert any(
+        fact.get("fact") == "failing_file_path" and "ml_script.py" in str(fact.get("value") or "")
+        for fact in repair_ground_truth["verified_facts"]
+    )
+    assert any(
+        "s.quantile" in str(fact.get("value") or "")
+        for fact in repair_ground_truth["verified_facts"]
+        if fact.get("fact") == "failing_line_code"
+    )
+    assert "failing_block_near_line:510" in handoff["repair_scope"]["editable_targets"]
+    assert "failing_block_near_line:2901" not in handoff["repair_scope"]["editable_targets"]
+
+
 def test_prepare_runtime_fix_attaches_authoritative_repair_ground_truth_for_ml_runtime_retry(
     monkeypatch,
 ):

@@ -238,6 +238,50 @@ class TestBuildOutputContractReport:
         assert report["overall_status"] == "ok"
         assert report["artifact_requirements_report"]["status"] == "ok"
 
+    def test_required_outputs_resolve_against_work_dir_not_cwd(self, tmp_path):
+        """Required output checks must not depend on the process cwd."""
+        work_dir = tmp_path / "run_work"
+        metrics_dir = work_dir / "artifacts" / "ml"
+        metrics_dir.mkdir(parents=True)
+        (metrics_dir / "evaluation_report.json").write_text(
+            '{"quadratic_weighted_kappa": 0.8}',
+            encoding="utf-8",
+        )
+
+        outside_cwd = tmp_path / "outside"
+        outside_cwd.mkdir()
+        contract = {
+            "required_outputs": ["artifacts/ml/evaluation_report.json"],
+            "artifact_requirements": {
+                "required_files": [{"path": "artifacts/ml/evaluation_report.json"}],
+            },
+            "ml_engineer": {
+                "qa_gates": [
+                    {
+                        "name": "qwk_threshold",
+                        "severity": "HARD",
+                        "applies_to_artifact": "artifacts/ml/evaluation_report.json",
+                        "params": {
+                            "metric": "quadratic_weighted_kappa",
+                            "min_value": 0.75,
+                        },
+                    }
+                ],
+            },
+        }
+
+        original_cwd = os.getcwd()
+        os.chdir(str(outside_cwd))
+        try:
+            report = build_output_contract_report(contract, work_dir=str(work_dir))
+        finally:
+            os.chdir(original_cwd)
+
+        assert report["missing"] == []
+        assert report["present"] == ["artifacts/ml/evaluation_report.json"]
+        assert report["overall_status"] == "ok"
+        assert report["qa_gate_results"]["checked"][0]["passed"] is True
+
     def test_hard_numeric_qa_gate_failure_marks_output_contract_error(self, tmp_path):
         """Artifact-backed HARD numeric gates are contract compliance, not advisory text."""
         metrics_dir = tmp_path / "artifacts" / "ml"

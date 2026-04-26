@@ -734,6 +734,220 @@ class MLEngineerAgent:
 
         return "\n".join(lines)
 
+    def _iter_ml_contract_gates(
+        self,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+    ) -> List[Dict[str, Any]]:
+        """Collect ML/reviewer gates from contract and view without assuming schema location."""
+        sources: List[Any] = []
+        contract = execution_contract if isinstance(execution_contract, dict) else {}
+        view = ml_view if isinstance(ml_view, dict) else {}
+        for container in (contract, view):
+            sources.append(container.get("qa_gates"))
+            sources.append(container.get("reviewer_gates"))
+            ml_section = container.get("ml_engineer")
+            if isinstance(ml_section, dict):
+                sources.append(ml_section.get("qa_gates"))
+                sources.append(ml_section.get("reviewer_gates"))
+
+        gates: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for source in sources:
+            if not isinstance(source, list):
+                continue
+            for item in source:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                artifact = str(item.get("applies_to_artifact") or item.get("artifact_path") or "").strip()
+                evidence = str(item.get("evidence_source") or "").strip()
+                key = (name.lower(), artifact.lower(), evidence.lower())
+                if not name or key in seen:
+                    continue
+                seen.add(key)
+                gates.append(item)
+        return gates
+
+    def _summarize_gate_params_for_execution_pack(self, params: Any) -> Dict[str, Any]:
+        if not isinstance(params, dict):
+            return {}
+        summary: Dict[str, Any] = {}
+        metric_checks = params.get("metric_checks")
+        if isinstance(metric_checks, list) and metric_checks:
+            checks = []
+            for check in metric_checks[:12]:
+                if not isinstance(check, dict):
+                    continue
+                checks.append(
+                    {
+                        "metric": check.get("metric"),
+                        "operator": check.get("operator"),
+                        "threshold": check.get("threshold"),
+                    }
+                )
+            if checks:
+                summary["metric_checks"] = checks
+                summary["required_metric_keys"] = [
+                    str(check.get("metric"))
+                    for check in checks
+                    if str(check.get("metric") or "").strip()
+                ]
+        for key in (
+            "required_columns",
+            "forbidden_columns",
+            "forbidden_input_columns",
+            "allowed_columns",
+            "riim10_pred_value_range",
+            "valid_levels",
+        ):
+            value = params.get(key)
+            if isinstance(value, list) and value:
+                summary[key] = value[:40]
+            elif value not in (None, "", [], {}):
+                summary[key] = value
+        for key in ("metric", "operator", "threshold", "min_value", "max_value"):
+            value = params.get(key)
+            if value not in (None, "", [], {}):
+                summary[key] = value
+        if not summary:
+            for key, value in list(params.items())[:8]:
+                if value not in (None, "", [], {}):
+                    summary[str(key)] = value
+        return summary
+
+    def _build_gate_implementation_obligation(self, gate: Dict[str, Any]) -> str:
+        artifact = str(gate.get("applies_to_artifact") or gate.get("artifact_path") or "").strip()
+        params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+        checks = params.get("metric_checks") if isinstance(params, dict) else None
+        if isinstance(checks, list) and checks:
+            keys = [
+                str(check.get("metric") or "").strip()
+                for check in checks
+                if isinstance(check, dict) and str(check.get("metric") or "").strip()
+            ]
+            if keys:
+                return (
+                    "Compute and emit these exact metric key(s) in the declared artifact: "
+                    + ", ".join(keys[:12])
+                    + (f" ({artifact})." if artifact else ".")
+                )
+        required_columns = params.get("required_columns") if isinstance(params, dict) else None
+        if isinstance(required_columns, list) and required_columns:
+            return (
+                "Emit an artifact with these exact required column(s): "
+                + ", ".join(str(col) for col in required_columns[:16])
+                + (f" ({artifact})." if artifact else ".")
+            )
+        forbidden = (
+            (params.get("forbidden_columns") or params.get("forbidden_input_columns"))
+            if isinstance(params, dict)
+            else None
+        )
+        if isinstance(forbidden, list) and forbidden:
+            return (
+                "Prove these column(s) are excluded from the relevant model/scoring inputs: "
+                + ", ".join(str(col) for col in forbidden[:16])
+                + "."
+            )
+        return "Materialize explicit evidence in the declared artifact/source so QA can verify this gate."
+
+    def _build_ml_contract_gate_execution_pack(
+        self,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+        deliverables: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Build a compact, non-dataset-specific execution checklist for ML gates.
+        This is context for LLM reasoning, not a deterministic override.
+        """
+        contract = execution_contract if isinstance(execution_contract, dict) else {}
+        view = ml_view if isinstance(ml_view, dict) else {}
+        deliverables = deliverables if isinstance(deliverables, list) else []
+
+        output_rows: List[Dict[str, Any]] = []
+        seen_outputs: set[str] = set()
+        for item in deliverables:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            if not path or path.lower() in seen_outputs:
+                continue
+            seen_outputs.add(path.lower())
+            output_rows.append(
+                {
+                    "path": path,
+                    "intent": item.get("intent"),
+                    "kind": item.get("kind"),
+                    "required": bool(item.get("required", True)),
+                }
+            )
+        for source in (view.get("required_outputs"), contract.get("required_outputs")):
+            if not isinstance(source, list):
+                continue
+            for item in source:
+                path = str(item.get("path") if isinstance(item, dict) else item or "").strip()
+                if not path or path.lower() in seen_outputs:
+                    continue
+                seen_outputs.add(path.lower())
+                output_rows.append(
+                    {
+                        "path": path,
+                        "intent": item.get("intent") if isinstance(item, dict) else None,
+                        "kind": item.get("kind") if isinstance(item, dict) else None,
+                        "required": bool(item.get("required", True)) if isinstance(item, dict) else True,
+                    }
+                )
+
+        gates = self._iter_ml_contract_gates(contract, view)
+        gate_rows: List[Dict[str, Any]] = []
+        for gate in gates:
+            params = gate.get("params") if isinstance(gate.get("params"), dict) else {}
+            severity = str(gate.get("severity") or "").strip().upper() or "UNSPECIFIED"
+            row = {
+                "name": gate.get("name"),
+                "severity": severity,
+                "applies_to_artifact": gate.get("applies_to_artifact") or gate.get("artifact_path"),
+                "evaluated_by": gate.get("evaluated_by"),
+                "evidence_source": gate.get("evidence_source"),
+                "phase_reasoning": gate.get("phase_reasoning"),
+                "params": self._summarize_gate_params_for_execution_pack(params),
+                "implementation_obligation": self._build_gate_implementation_obligation(gate),
+            }
+            gate_rows.append(row)
+
+        gate_rows = sorted(
+            gate_rows,
+            key=lambda item: (
+                0 if str(item.get("severity") or "").upper() == "HARD" else 1,
+                str(item.get("applies_to_artifact") or ""),
+                str(item.get("name") or ""),
+            ),
+        )
+        hard_gate_count = sum(1 for item in gate_rows if str(item.get("severity") or "").upper() == "HARD")
+        return {
+            "purpose": (
+                "Turn the ML contract into executable artifact evidence. "
+                "For each HARD gate, the script must compute the required value(s), "
+                "write them under the exact key/column names, and place them in the declared artifact."
+            ),
+            "required_outputs": output_rows[:24],
+            "gate_summary": {
+                "total_gates": len(gate_rows),
+                "hard_gates": hard_gate_count,
+                "soft_gates": max(0, len(gate_rows) - hard_gate_count),
+            },
+            "gates": gate_rows[:32],
+            "execution_rules": [
+                "Do not rely on narrative comments to satisfy a gate; emit machine-readable evidence.",
+                "Metric/check names are output contract keys. Preserve exact spelling from metric_checks.",
+                "If a gate applies to a JSON artifact, write the checked key(s) into that JSON artifact.",
+                "If a gate applies to a CSV artifact, emit the checked column(s) in that CSV artifact.",
+                "If a gate is not testable, emit the contract-declared status/limitation key when the gate permits it.",
+            ],
+        }
+
     def _resolve_allowed_columns_for_prompt(self, contract: Dict[str, Any] | None) -> List[str]:
         """Build prompt-safe column universe from executable input columns first, then canonical/derived."""
         if not isinstance(contract, dict):
@@ -2597,6 +2811,7 @@ class MLEngineerAgent:
         - Strategy Hypothesis: $hypothesis
         - Strategy Techniques (compact): $strategy_techniques_compact
         - Required Outputs: $deliverables_json
+        - ML Contract Gate Execution Pack (authoritative): $ml_contract_gate_execution_pack
         - Cleaned ML Fact Packet (compact observed facts): $cleaned_ml_fact_packet_json
         - Optimization Authoritative State: $optimization_authoritative_state
         - Treat that state as the single execution truth for targets, features, split rules, metrics, and output schema.
@@ -2838,7 +3053,7 @@ class MLEngineerAgent:
         *,
         ml_view: Dict[str, Any] | None = None,
         execution_contract: Dict[str, Any] | None = None,
-        max_chars: int = 50000,
+        max_chars: int = 90000,
     ) -> tuple[str, Dict[str, Any], Dict[str, Any]]:
         kwargs = dict(render_kwargs or {})
         prompt = self._build_system_prompt(
@@ -2848,7 +3063,12 @@ class MLEngineerAgent:
             execution_contract=execution_contract,
         )
         if len(prompt) <= max_chars:
-            return prompt, kwargs, {"prompt_chars": len(prompt), "budget_applied": False}
+            return prompt, kwargs, {
+                "prompt_chars": len(prompt),
+                "budget_chars": max_chars,
+                "budget_applied": False,
+                "budget_exceeded": False,
+            }
 
         shrink_plan = [
             ("data_audit_context", 4000),
@@ -2876,9 +3096,33 @@ class MLEngineerAgent:
                 execution_contract=execution_contract,
             )
             if len(prompt) <= max_chars:
-                return prompt, kwargs, {"prompt_chars": len(prompt), "budget_applied": True}
+                return prompt, kwargs, {
+                    "prompt_chars": len(prompt),
+                    "budget_chars": max_chars,
+                    "budget_applied": True,
+                    "budget_exceeded": False,
+                }
 
-        return prompt, kwargs, {"prompt_chars": len(prompt), "budget_applied": True}
+        return prompt, kwargs, {
+            "prompt_chars": len(prompt),
+            "budget_chars": max_chars,
+            "budget_applied": True,
+            "budget_exceeded": len(prompt) > max_chars,
+        }
+
+    def _resolve_prompt_budget_chars(self, *, optimization_round_hint: bool = False) -> int:
+        env_name = (
+            "ML_ENGINEER_OPTIMIZATION_PROMPT_BUDGET_CHARS"
+            if optimization_round_hint
+            else "ML_ENGINEER_PROMPT_BUDGET_CHARS"
+        )
+        raw = os.getenv(env_name) or os.getenv("ML_ENGINEER_PROMPT_BUDGET_CHARS")
+        default = 70000 if optimization_round_hint else 90000
+        try:
+            value = int(str(raw).strip()) if raw not in (None, "") else default
+        except Exception:
+            value = default
+        return max(50000, min(value, 180000))
 
     def _truncate_code_for_patch(self, code: str, max_len: int = 12000) -> str:
         return self._truncate_prompt_text(code or "", max_len=max_len, head_len=7000, tail_len=4000)
@@ -4555,7 +4799,7 @@ class MLEngineerAgent:
         - REPAIR MODE: when runtime/reviewer feedback exists, patch root cause first, preserve working blocks, and return a full script (not a diff).
 
         SOURCE OF TRUTH AND PRECEDENCE
-        1) ML_VIEW_CONTEXT + EXECUTION_CONTRACT_CONTEXT (authoritative policies and gates)
+        1) ML_CONTRACT_GATE_EXECUTION_PACK + ML_VIEW_CONTEXT + EXECUTION_CONTRACT_CONTEXT (authoritative outputs, gates, policies)
         2) CLEANED_ML_FACT_PACKET (authoritative observed post-clean facts from the ML-ready CSV)
         3) ITERATION_HANDOFF / reviewer feedback (for repair priorities when present)
         4) CLEANED_DATA_SUMMARY_MIN, DATA_SAMPLE_CONTEXT, and SIGNAL_SUMMARY (advisory detail)
@@ -4610,6 +4854,9 @@ class MLEngineerAgent:
         - Before training/inference, build and print a CONTRACT_EXECUTION_MAP summarizing:
           target columns, required input columns, training rows policy, train filter,
           primary metric, required outputs, allowed feature sets, and required plot IDs.
+        - Build a GATE_EVIDENCE_MAP from ML_CONTRACT_GATE_EXECUTION_PACK before writing code:
+          for every HARD gate, identify exact artifact path, metric key/column name,
+          formula/source rows, threshold/operator, and serializer location.
         - If any critical element is missing or contradictory, raise ValueError with a clear explanation.
 
         PREFLIGHT VALIDATION (before fit)
@@ -4698,6 +4945,9 @@ class MLEngineerAgent:
         DATA PARTITIONING CONTEXT
         $data_partitioning_context
 
+        ML_CONTRACT_GATE_EXECUTION_PACK (AUTHORITATIVE, DO NOT OMIT)
+        $ml_contract_gate_execution_pack
+
         AUTHORITATIVE CONTEXT
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title ($analysis_type)
@@ -4774,6 +5024,17 @@ class MLEngineerAgent:
             max_chars=4500,
             max_str_len=400,
             max_list_items=80,
+        )
+        ml_contract_gate_execution_pack = self._build_ml_contract_gate_execution_pack(
+            execution_contract_input,
+            ml_view,
+            deliverables,
+        )
+        ml_contract_gate_execution_pack_json = self._serialize_json_for_prompt(
+            ml_contract_gate_execution_pack,
+            max_chars=14000,
+            max_str_len=700,
+            max_list_items=160,
         )
 
         artifact_schema_block = self._render_artifact_schema_block(
@@ -5216,6 +5477,7 @@ class MLEngineerAgent:
                 )
             ),
             deliverables_json=deliverables_json,
+            ml_contract_gate_execution_pack=ml_contract_gate_execution_pack_json,
             canonical_columns=self._serialize_json_for_prompt(
                 canonical_columns_source,
                 max_chars=5000,
@@ -5269,26 +5531,36 @@ class MLEngineerAgent:
             )
             prompt_budget_meta = {
                 "prompt_chars": len(system_prompt),
+                "budget_chars": self._resolve_prompt_budget_chars(optimization_round_hint=True),
                 "budget_applied": False,
+                "budget_exceeded": False,
                 "mode": "optimization_editor",
             }
         else:
+            prompt_budget_chars = self._resolve_prompt_budget_chars(
+                optimization_round_hint=optimization_round_hint
+            )
             system_prompt, render_kwargs, prompt_budget_meta = self._build_system_prompt_with_budget(
                 SYSTEM_PROMPT_TEMPLATE,
                 render_kwargs,
                 ml_view=ml_view,
                 execution_contract=execution_contract_input,
+                max_chars=prompt_budget_chars,
             )
         if isinstance(prompt_budget_meta, dict):
             prompt_chars = int(prompt_budget_meta.get("prompt_chars") or 0)
+            budget_chars = int(prompt_budget_meta.get("budget_chars") or 0) or self._resolve_prompt_budget_chars(
+                optimization_round_hint=optimization_round_hint
+            )
             budget_applied = bool(prompt_budget_meta.get("budget_applied"))
             print(
                 "ML_PROMPT_BUDGET: "
                 + json.dumps(
                     {
                         "prompt_chars": prompt_chars,
-                        "budget_chars": 50000,
+                        "budget_chars": budget_chars,
                         "budget_applied": budget_applied,
+                        "budget_exceeded": bool(prompt_budget_meta.get("budget_exceeded")),
                         "mode": prompt_budget_meta.get("mode") or "default",
                     }
                 )
@@ -5302,8 +5574,10 @@ class MLEngineerAgent:
 
         Requirements:
         - Implement contract-first execution map and preflight gates.
+        - Implement GATE_EVIDENCE_MAP from ML_CONTRACT_GATE_EXECUTION_PACK before training/benchmarking.
         - Apply training/validation/evaluation exactly from contract + ML view.
         - Produce required outputs at exact contract paths.
+        - For every HARD gate, emit the exact machine-readable metric key or CSV column requested by the contract.
         - Include alignment evidence artifact when required.
         - In this first BUILD pass, implement the smallest contract-valid modeling pipeline justified by ML_VIEW, ML_PLAN, and observed data compatibility.
         - Do not add speculative model families or complex feature engineering unless strategy/plan context explicitly requires them.

@@ -215,6 +215,7 @@ def test_generate_code_prompt_includes_cleaned_ml_fact_packet(monkeypatch):
     _assert_contains_all(
         prompt,
         "Cleaned ML Fact Packet",
+        "ML_CONTRACT_GATE_EXECUTION_PACK",
         "expected_scoring_row_count",
         "temporal_holdout_with_cv",
         "pr_auc",
@@ -223,3 +224,122 @@ def test_generate_code_prompt_includes_cleaned_ml_fact_packet(monkeypatch):
         "derive expected",
         "scoring/test counts from the authoritative row filter",
     )
+
+
+def test_ml_contract_gate_execution_pack_maps_hard_gate_to_exact_artifact_keys():
+    agent = MLEngineerAgent.__new__(MLEngineerAgent)
+    contract = {
+        "required_outputs": [
+            {
+                "intent": "evaluation_report",
+                "kind": "metrics",
+                "path": "artifacts/ml/evaluation_report.json",
+                "required": True,
+            }
+        ],
+        "ml_engineer": {
+            "qa_gates": [
+                {
+                    "name": "portfolio_weighted_aggregation_gate",
+                    "severity": "HARD",
+                    "applies_to_artifact": "artifacts/ml/evaluation_report.json",
+                    "evaluated_by": "qa_reviewer",
+                    "evidence_source": "evaluation_report.portfolio_aggregation",
+                    "phase_reasoning": "Corporation-level weighted risk must be verifiable.",
+                    "params": {
+                        "metric_checks": [
+                            {
+                                "metric": "share_corporations_abs_weighted_mean_deviation_le_1",
+                                "operator": ">=",
+                                "threshold": 0.85,
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+    }
+
+    pack = agent._build_ml_contract_gate_execution_pack(contract, {}, [])
+
+    assert pack["gate_summary"]["hard_gates"] == 1
+    assert pack["required_outputs"][0]["path"] == "artifacts/ml/evaluation_report.json"
+    gate = pack["gates"][0]
+    assert gate["name"] == "portfolio_weighted_aggregation_gate"
+    assert gate["applies_to_artifact"] == "artifacts/ml/evaluation_report.json"
+    assert gate["params"]["required_metric_keys"] == [
+        "share_corporations_abs_weighted_mean_deviation_le_1"
+    ]
+    assert "exact metric key" in gate["implementation_obligation"]
+
+
+def test_generate_code_prompt_includes_non_truncable_ml_contract_gate_pack(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-openrouter")
+    monkeypatch.setenv("ML_ENGINEER_PROMPT_BUDGET_CHARS", "90000")
+    monkeypatch.setattr("src.agents.ml_engineer.OpenAI", _FakeOpenAI)
+
+    def _fake_call_chat_with_fallback(client, messages, models, call_kwargs=None, logger=None, context_tag=None):
+        return {"dummy": True}, models[0]
+
+    monkeypatch.setattr("src.agents.ml_engineer.call_chat_with_fallback", _fake_call_chat_with_fallback)
+    monkeypatch.setattr(
+        "src.agents.ml_engineer.extract_response_text",
+        lambda response: "import json\nprint('ok')\n",
+    )
+
+    contract = {
+        "required_outputs": [
+            {
+                "intent": "evaluation_report",
+                "kind": "metrics",
+                "path": "artifacts/ml/evaluation_report.json",
+                "required": True,
+            }
+        ],
+        "ml_engineer": {
+            "qa_gates": [
+                {
+                    "name": "individual_ordinal_performance_gates",
+                    "severity": "HARD",
+                    "applies_to_artifact": "artifacts/ml/evaluation_report.json",
+                    "evaluated_by": "qa_reviewer",
+                    "evidence_source": "evaluation_report.individual_ordinal",
+                    "params": {
+                        "metric_checks": [
+                            {"metric": "accuracy_exact", "operator": ">=", "threshold": 0.65},
+                            {"metric": "accuracy_within_1", "operator": ">=", "threshold": 0.85},
+                            {"metric": "quadratic_weighted_kappa", "operator": ">=", "threshold": 0.75},
+                        ]
+                    },
+                }
+            ]
+        },
+    }
+    agent = MLEngineerAgent()
+    _ = agent.generate_code(
+        strategy={"title": "RIIM Strategy", "analysis_type": "predictive", "required_columns": []},
+        data_path="data/cleaned_data.csv",
+        execution_contract=contract,
+        ml_view={},
+        cleaned_data_summary_min={"row_count": 100, "column_count": 5},
+    )
+
+    prompt = str(agent.last_prompt or "")
+    _assert_contains_all(
+        prompt,
+        "ML_CONTRACT_GATE_EXECUTION_PACK",
+        "GATE_EVIDENCE_MAP",
+        "individual_ordinal_performance_gates",
+        "artifacts/ml/evaluation_report.json",
+        "accuracy_exact",
+        "accuracy_within_1",
+        "quadratic_weighted_kappa",
+        "For every HARD gate",
+    )
+
+
+def test_ml_engineer_prompt_budget_default_is_above_legacy_50k(monkeypatch):
+    monkeypatch.delenv("ML_ENGINEER_PROMPT_BUDGET_CHARS", raising=False)
+    agent = MLEngineerAgent.__new__(MLEngineerAgent)
+
+    assert agent._resolve_prompt_budget_chars() == 90000
