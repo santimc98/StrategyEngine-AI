@@ -689,6 +689,16 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         contract=contract,
         integrity_report=integrity,
     )
+    output_threshold_gaps = []
+    try:
+        from src.utils.governance_reducer import classify_output_contract_performance_thresholds
+
+        output_threshold_gaps = (
+            classify_output_contract_performance_thresholds(output_contract).get("performance_threshold_gaps")
+            or []
+        )
+    except Exception:
+        output_threshold_gaps = []
 
     # Merge hard_failures and reasons from reducer
     reducer_hard_failures = governance_verdict.get("hard_failures", [])
@@ -824,4 +834,5 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         "hard_failures": reducer_hard_failures,
         "governance_reasons": reducer_reasons,
         "metric_improvement": metric_improvement_summary,
+        "performance_threshold_gaps": output_threshold_gaps,
     }

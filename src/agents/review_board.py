@@ -46,12 +46,20 @@ class ReviewBoardAgent:
             "If REVIEW_STACK_CONTEXT contains deterministic_facts, treat those facts as canonical for\n"
             "numeric values, metric thresholds, and artifact completeness.\n"
             "If reviewer text conflicts with deterministic_facts, explicitly flag it in failed_areas and required_actions.\n\n"
+            "Metric-threshold policy:\n"
+            "- If deterministic_facts.output_contract.performance_thresholds_are_optimization_targets is true,\n"
+            "  the artifact exists and the numeric value was measured, but it missed a target threshold.\n"
+            "- Do NOT reject or request compliance repair for those evidence-backed performance gaps alone.\n"
+            "- Return APPROVE_WITH_WARNINGS for an otherwise executable, honest baseline so the metric improvement\n"
+            "  loop can attempt to close the gap; list the gaps as optimization targets, not blockers.\n"
+            "- Still reject missing artifacts, missing metric evidence, schema issues, leakage, runtime failures,\n"
+            "  fabricated metrics, or any non-performance hard failure.\n\n"
             "=== EVIDENCE RULE ===\n"
             f"{SENIOR_EVIDENCE_RULE}\n\n"
             "Decision policy:\n"
-            "1) If unresolved hard failures exist (runtime hard blockers, QA hard failures, deterministic blockers), return REJECTED.\n"
+            "1) If unresolved hard failures exist (runtime hard blockers, non-performance QA hard failures, deterministic blockers), return REJECTED.\n"
             "2) If hard blockers are absent but contract/spec fixes are required, return NEEDS_IMPROVEMENT.\n"
-            "3) If only advisory/optimization items remain, return APPROVE_WITH_WARNINGS.\n"
+            "3) If only advisory/optimization items remain, including metric thresholds below target, return APPROVE_WITH_WARNINGS.\n"
             "4) If all critical areas pass, return APPROVED.\n"
             "5) Use progress_tracker when available: if performance regressed and blockers remain unresolved, avoid optimistic approval.\n"
             "6) Use iteration_history when available to detect progress trends, plateaus, or regressions across iterations.\n"
@@ -112,6 +120,11 @@ class ReviewBoardAgent:
         evaluator = context.get("result_evaluator") if isinstance(context.get("result_evaluator"), dict) else {}
         runtime = context.get("runtime") if isinstance(context.get("runtime"), dict) else {}
         progress = context.get("progress_tracker") if isinstance(context.get("progress_tracker"), dict) else {}
+        perf_policy = context.get("performance_threshold_policy") if isinstance(context.get("performance_threshold_policy"), dict) else {}
+        performance_gaps = perf_policy.get("gaps") if isinstance(perf_policy.get("gaps"), list) else []
+        only_performance_threshold_gaps = bool(
+            performance_gaps and perf_policy.get("blocking_for_baseline_approval") is False
+        )
 
         statuses = [
             str(qa.get("status", "")).upper(),
@@ -141,8 +154,10 @@ class ReviewBoardAgent:
             if len(required_actions) >= 20:
                 break
 
-        if hard_failures:
+        if hard_failures and not only_performance_threshold_gaps:
             status = "REJECTED" if runtime.get("runtime_fix_terminal") else "NEEDS_IMPROVEMENT"
+        elif hard_failures and only_performance_threshold_gaps:
+            status = "APPROVE_WITH_WARNINGS"
         elif "NEEDS_IMPROVEMENT" in statuses or "REJECTED" in statuses:
             status = "NEEDS_IMPROVEMENT"
         elif "APPROVE_WITH_WARNINGS" in statuses:
@@ -151,8 +166,10 @@ class ReviewBoardAgent:
             status = "APPROVED"
 
         failed_areas: List[str] = []
-        if hard_failures:
+        if hard_failures and not only_performance_threshold_gaps:
             failed_areas.append("qa_gates")
+        elif only_performance_threshold_gaps:
+            failed_areas.append("metric_threshold_gaps")
         if status_conflict:
             failed_areas.append("cross_reviewer_conflict")
         if status in {"NEEDS_IMPROVEMENT", "REJECTED"} and "results_quality" not in failed_areas:
@@ -163,6 +180,17 @@ class ReviewBoardAgent:
 
         if status in {"NEEDS_IMPROVEMENT", "REJECTED"} and not required_actions:
             required_actions.append("Apply reviewer-required fixes and rerun.")
+        if only_performance_threshold_gaps:
+            required_actions = [
+                action
+                for action in required_actions
+                if "threshold" not in str(action).lower()
+                and "metric" not in str(action).lower()
+                and "qa" not in str(action).lower()
+            ]
+            required_actions.append(
+                "Treat measured metric-threshold misses as optimization targets for the metric improvement loop."
+            )
         if isinstance(progress, dict) and progress.get("available") and progress.get("improved") is False:
             action = (
                 "Investigate regression in primary metric and keep previous successful artifacts/logic stable while patching blockers."

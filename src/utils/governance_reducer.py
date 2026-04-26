@@ -14,6 +14,7 @@ RULES:
 - Else → "GO"
 """
 
+import math
 from typing import Any, Dict, List, Set
 
 
@@ -55,6 +56,156 @@ def _dedupe_reasons(reasons: List[str]) -> List[str]:
 
 def _normalize_gate_name(name: Any) -> str:
     return str(name or "").strip().lower()
+
+
+_PERFORMANCE_ARTIFACT_TOKENS = {
+    "metric",
+    "metrics",
+    "evaluation",
+    "eval",
+    "validation",
+    "performance",
+    "benchmark",
+    "portfolio",
+    "inference",
+    "cv_",
+    "model",
+    "scorecard",
+}
+
+_PERFORMANCE_METRIC_TOKENS = {
+    "accuracy",
+    "auc",
+    "roc",
+    "pr_auc",
+    "f1",
+    "precision",
+    "recall",
+    "qwk",
+    "kappa",
+    "mae",
+    "mape",
+    "rmse",
+    "r2",
+    "lift",
+    "gini",
+    "log_loss",
+    "brier",
+    "ndcg",
+    "map",
+    "mrr",
+    "latency",
+    "throughput",
+    "coverage",
+    "portfolio",
+    "calibration",
+}
+
+_NON_PERFORMANCE_METRIC_TOKENS = {
+    "row_count",
+    "rows",
+    "missing",
+    "null",
+    "nan",
+    "schema",
+    "column",
+    "columns",
+    "leakage",
+    "forbidden",
+    "required",
+    "artifact",
+    "runtime",
+    "security",
+    "integrity",
+}
+
+
+def _coerce_float_maybe(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            if math.isfinite(float(value)):
+                return float(value)
+        except Exception:
+            return None
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        parsed = float(text)
+        if math.isfinite(parsed):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def is_performance_threshold_failure(failure: Any) -> bool:
+    """Return True only for evidence-backed numeric target misses.
+
+    These are not runtime/compliance defects: the artifact exists and contains a
+    real metric value, but that value has not reached a business/model target
+    yet. Missing evidence, schema issues, data quality gates, and integrity
+    gates remain blocking elsewhere.
+    """
+    if not isinstance(failure, dict):
+        return False
+    if failure.get("passed") is not False:
+        return False
+    if str(failure.get("status") or "").strip().lower() == "missing_evidence":
+        return False
+    if _coerce_float_maybe(failure.get("value")) is None:
+        return False
+    threshold_keys = ("min_value", "max_value", "threshold")
+    if not any(_coerce_float_maybe(failure.get(key)) is not None for key in threshold_keys):
+        return False
+
+    metric = str(failure.get("metric") or failure.get("name") or "").strip().lower()
+    artifact = str(failure.get("artifact_path") or failure.get("evidence_source") or "").strip().lower()
+    detail = str(failure.get("detail") or "").strip().lower()
+    semantic_haystack = f"{metric} {detail}"
+    if any(token in semantic_haystack for token in _NON_PERFORMANCE_METRIC_TOKENS):
+        return False
+    metric_like = any(token in metric for token in _PERFORMANCE_METRIC_TOKENS)
+    artifact_like = any(token in artifact for token in _PERFORMANCE_ARTIFACT_TOKENS)
+    if not metric_like and not artifact_like:
+        return False
+    if artifact and ".json" not in artifact:
+        return False
+    return True
+
+
+def classify_output_contract_performance_thresholds(
+    output_contract_report: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Split output-contract QA failures into blocking vs optimization targets."""
+    report = output_contract_report if isinstance(output_contract_report, dict) else {}
+    qa_results = report.get("qa_gate_results") if isinstance(report.get("qa_gate_results"), dict) else {}
+    raw_failures = qa_results.get("failures") if isinstance(qa_results.get("failures"), list) else report.get("qa_gate_failures")
+    failures = [item for item in (raw_failures or []) if item]
+    performance_gaps = [item for item in failures if is_performance_threshold_failure(item)]
+    blocking_failures = [item for item in failures if item not in performance_gaps]
+
+    artifact_report = report.get("artifact_requirements_report")
+    artifact_status = (
+        str(artifact_report.get("status") or "").strip().lower()
+        if isinstance(artifact_report, dict)
+        else ""
+    )
+    missing = [str(item) for item in (report.get("missing") or []) if str(item).strip()]
+    only_performance_threshold_failures = bool(
+        failures
+        and performance_gaps
+        and not blocking_failures
+        and not missing
+        and artifact_status != "error"
+    )
+    return {
+        "performance_threshold_gaps": performance_gaps,
+        "blocking_qa_gate_failures": blocking_failures,
+        "only_performance_threshold_failures": only_performance_threshold_failures,
+    }
 
 
 def _extract_hard_gate_names(contract: Dict[str, Any]) -> Set[str]:
@@ -178,11 +329,16 @@ def compute_governance_verdict(
     # =========================================================================
 
     # A1: Check overall_status from output_contract_report
+    performance_thresholds = classify_output_contract_performance_thresholds(output_contract_report)
     oc_overall_status = _normalize_status(output_contract_report.get("overall_status")).lower()
     if oc_overall_status == "error":
-        overall_status = "error"
-        reasons.append("output_contract_report.overall_status=error")
-        hard_failures.append("output_contract_compliance_error")
+        if performance_thresholds.get("only_performance_threshold_failures"):
+            overall_status = "warning"
+            reasons.append("output_contract.performance_threshold_gaps")
+        else:
+            overall_status = "error"
+            reasons.append("output_contract_report.overall_status=error")
+            hard_failures.append("output_contract_compliance_error")
     elif oc_overall_status == "warning" and overall_status != "error":
         overall_status = "warning"
         reasons.append("output_contract_report.overall_status=warning")

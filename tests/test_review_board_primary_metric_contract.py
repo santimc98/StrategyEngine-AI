@@ -1,3 +1,5 @@
+import json
+
 from src.graph import graph as graph_mod
 import pytest
 from src.utils.metric_eval import resolve_metric_value
@@ -318,3 +320,69 @@ def test_build_primary_metric_state_keeps_contract_mean_metric_when_payload_prim
     assert metric_state.get("target_metric_name") == "mean_multi_horizon_log_loss"
     assert metric_state.get("primary_metric_name") == "mean_multi_horizon_log_loss"
     assert metric_state.get("primary_metric_value") == pytest.approx(0.330705410118, abs=1e-12)
+
+
+def test_declared_metrics_payload_prefers_contract_ml_evaluation_over_clean_drift(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "artifacts" / "clean").mkdir(parents=True)
+    (tmp_path / "artifacts" / "ml").mkdir(parents=True)
+    (tmp_path / "artifacts" / "clean" / "feature_drift_baseline.json").write_text(
+        json.dumps(
+            {
+                "model_performance": {
+                    "row_count": 596802,
+                    "feature_count": 44,
+                    "mean": 10512.8,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "artifacts" / "ml" / "evaluation_report.json").write_text(
+        json.dumps({"holdout": {"quadratic_weighted_kappa": 0.7770295727962795}}),
+        encoding="utf-8",
+    )
+    contract = {
+        "validation_requirements": {"primary_metric": "quadratic_weighted_kappa"},
+        "required_outputs": [
+            "artifacts/clean/feature_drift_baseline.json",
+            "artifacts/ml/evaluation_report.json",
+        ],
+    }
+
+    payload, path = graph_mod._load_declared_artifact_payload(
+        contract,
+        {},
+        "metrics.json",
+        kind="metrics",
+    )
+
+    assert path == "artifacts/ml/evaluation_report.json"
+    assert payload["holdout"]["quadratic_weighted_kappa"] == pytest.approx(0.7770295727962795)
+
+
+def test_primary_metric_rejects_physically_impossible_qwk_and_uses_valid_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state = {
+        "primary_metric_state": {
+            "primary_metric_name": "quadratic_weighted_kappa",
+            "primary_metric_value": 34.76319999608677,
+            "primary_metric_source": "artifact:artifacts/ml/inference_benchmark.json",
+        },
+        "execution_contract": {
+            "validation_requirements": {
+                "primary_metric": "quadratic_weighted_kappa",
+            }
+        },
+    }
+    metrics_report = {
+        "source": "artifact:artifacts/ml/evaluation_report.json",
+        "holdout": {
+            "quadratic_weighted_kappa": 0.7770295727962795,
+        },
+    }
+
+    primary = graph_mod._extract_primary_metric_for_board(state, metrics_report)
+
+    assert primary.get("value") == pytest.approx(0.7770295727962795)
+    assert primary.get("source") == "artifact:artifacts/ml/evaluation_report.json"

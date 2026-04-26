@@ -2,6 +2,7 @@ import json
 import os
 
 from src.utils.governance import build_run_summary
+from src.utils.governance_reducer import compute_governance_verdict, derive_run_outcome
 
 
 def test_run_summary_outcome_with_limitations(tmp_path, monkeypatch):
@@ -54,6 +55,45 @@ def test_run_summary_integrity_warning_does_not_force_no_go(tmp_path, monkeypatc
     assert summary.get("integrity_critical_count") == 0
     assert "integrity_critical" not in summary.get("failed_gates", [])
     assert summary.get("run_outcome") in {"GO", "GO_WITH_LIMITATIONS"}
+
+
+def test_metric_threshold_failures_are_go_with_limitations_not_no_go(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    threshold_failure = {
+        "name": "accuracy_exact_minimum",
+        "severity": "HARD",
+        "artifact_path": "artifacts/ml/evaluation_report.json",
+        "metric": "accuracy_exact",
+        "value": 0.559,
+        "min_value": 0.65,
+        "status": "fail",
+        "passed": False,
+        "detail": "value 0.559 is below min_value 0.65",
+    }
+    output_contract = {
+        "overall_status": "error",
+        "missing": [],
+        "artifact_requirements_report": {"status": "ok"},
+        "qa_gate_results": {"failures": [threshold_failure], "warnings": [], "checked": [threshold_failure]},
+    }
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump(output_contract, f)
+    with open("data/metrics.json", "w", encoding="utf-8") as f:
+        json.dump({"accuracy_exact": 0.559}, f)
+
+    verdict = compute_governance_verdict(
+        output_contract_report=output_contract,
+        state={"review_verdict": "APPROVE_WITH_WARNINGS"},
+        contract={},
+    )
+    assert verdict["overall_status"] == "warning"
+    assert "output_contract_compliance_error" not in verdict["hard_failures"]
+    assert derive_run_outcome(verdict) == "GO_WITH_LIMITATIONS"
+
+    summary = build_run_summary({"review_verdict": "APPROVE_WITH_WARNINGS"})
+    assert summary["run_outcome"] == "GO_WITH_LIMITATIONS"
+    assert summary["performance_threshold_gaps"] == [threshold_failure]
 
 
 def test_run_summary_reports_all_contract_views(tmp_path, monkeypatch):

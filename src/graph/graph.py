@@ -191,6 +191,7 @@ from src.utils.experiment_tracker import (
 from src.utils.error_hints import append_repair_hints
 from src.utils.contract_first_gates import apply_contract_first_gate_policy
 from src.utils.governance import write_governance_report, build_run_summary
+from src.utils.governance_reducer import classify_output_contract_performance_thresholds
 from src.utils.data_adequacy import (
     build_data_adequacy_report,
     write_data_adequacy_report,
@@ -736,6 +737,94 @@ def _metrics_report_has_values(report: Dict[str, Any] | None) -> bool:
     return bool(_extract_metric_like_numbers(report, max_items=80))
 
 
+def _metric_value_within_physical_domain(metric_name: Any, value: Any) -> bool:
+    num = _coerce_float(value)
+    if num is None:
+        return False
+    name = str(metric_name or "").strip()
+    key = _normalize_metric_key(name)
+    canonical = _metric_canonical_name(name)
+    bounded_zero_one = {
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "roc_auc",
+        "pr_auc",
+        "ndcg",
+        "map",
+        "mrr",
+    }
+    bounded_minus_one_one = {
+        "gini",
+        "spearman",
+        "kendall",
+    }
+    if (
+        canonical in bounded_zero_one
+        or any(token in key for token in ("accuracy", "precision", "recall", "f1score"))
+        or ("auc" in key)
+    ):
+        return 0.0 <= float(num) <= 1.0
+    if (
+        canonical in bounded_minus_one_one
+        or "kappa" in key
+        or "quadraticweightedkappa" in key
+        or "cohenkappa" in key
+    ):
+        return -1.0 <= float(num) <= 1.0
+    if canonical == "r2" or key in {"r2", "rsquared", "coefficientofdetermination"}:
+        return float(num) <= 1.0
+    return True
+
+
+def _metric_artifact_priority(path: Any, metric_name: Any = "") -> int:
+    text = normalize_artifact_path(path).lower()
+    metric_key = _normalize_metric_key(str(metric_name or ""))
+    if not text:
+        return 999
+    is_production_metric = any(
+        token in metric_key
+        for token in (
+            "latency",
+            "throughput",
+            "memory",
+            "modelsize",
+            "serializedmodelsize",
+            "p95",
+            "batch",
+        )
+    )
+    is_portfolio_metric = any(
+        token in metric_key
+        for token in (
+            "portfolio",
+            "corporation",
+            "eligibility",
+            "saldovivo",
+            "ventas",
+            "deviation",
+        )
+    )
+    if "evaluation_report" in text or "eval_report" in text:
+        return 0 if not is_production_metric and not is_portfolio_metric else 12
+    if "evaluation" in text and ("report" in text or "summary" in text or "/artifacts/" in text):
+        return 3
+    if "cv_metrics" in text or "model_metrics" in text or text.endswith("metrics.json"):
+        return 3
+    if "portfolio_aggregation" in text:
+        return 0 if is_portfolio_metric else 18
+    if "inference_benchmark" in text:
+        return 0 if is_production_metric else 45
+    if "/artifacts/ml/" in text or text.startswith("artifacts/ml/"):
+        return 20
+    if "feature_drift_baseline" in text:
+        return 95
+    if "/artifacts/clean/" in text or text.startswith("artifacts/clean/"):
+        return 90
+    return 50
+
+
 def _metric_key_looks_metric_like(name: str) -> bool:
     key = _normalize_metric_key(name)
     if not key:
@@ -924,6 +1013,8 @@ def _resolve_output_contract_report_for_facts(state: Dict[str, Any]) -> Dict[str
 def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     candidates: List[tuple[Dict[str, Any], str]] = []
     metric_round_active = bool(state.get("ml_improvement_round_active"))
+    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
+    contract_metric = _resolve_contract_primary_metric_name(state if isinstance(state, dict) else {}, contract) or ""
     state_metrics = state.get("metrics_report")
     state_metrics_snapshot = state.get("metrics_artifact_snapshot")
     snapshot_is_fresh = _metrics_snapshot_matches_active_attempt(state, state_metrics_snapshot)
@@ -1005,6 +1096,14 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
             elif isinstance(entry, str):
                 _add_path(entry)
 
+    for path in _resolve_required_outputs(contract, state):
+        _add_path(path)
+
+    artifact_paths = sorted(
+        artifact_paths,
+        key=lambda item: (_metric_artifact_priority(item, contract_metric), artifact_paths.index(item)),
+    )
+
     for path in artifact_paths:
         if not _is_metrics_like_path(path):
             continue
@@ -1030,9 +1129,13 @@ def _resolve_metrics_report_for_facts(state: Dict[str, Any]) -> Dict[str, Any]:
         for path in oc_report.get("present", []) or []:
             _add_path(path)
 
-    contract = state.get("execution_contract") if isinstance(state.get("execution_contract"), dict) else {}
     for path in _resolve_required_outputs(contract, state):
         _add_path(path)
+
+    artifact_paths = sorted(
+        artifact_paths,
+        key=lambda item: (_metric_artifact_priority(item, contract_metric), artifact_paths.index(item)),
+    )
 
     for path in artifact_paths:
         if not _is_metrics_like_path(path):
@@ -1405,9 +1508,11 @@ def _load_declared_artifact_payload(
     artifact_name: str,
     *,
     kind: str | None = None,
+    metric_name: str | None = None,
 ) -> Tuple[Dict[str, Any], str | None]:
     contract = contract if isinstance(contract, dict) else {}
     state = state if isinstance(state, dict) else {}
+    metric_name = str(metric_name or _resolve_contract_primary_metric_name(state, contract) or "").strip()
     path = _resolve_declared_artifact_path_from_contract_or_state(
         contract,
         state,
@@ -1415,7 +1520,7 @@ def _load_declared_artifact_payload(
         kind=kind,
     )
     payload = _load_json_safe(path) if path else {}
-    if kind == "metrics" and (not isinstance(payload, dict) or not payload):
+    if kind == "metrics":
         metric_candidates: List[str] = []
 
         def _add_metric_candidate(candidate_path: Any) -> None:
@@ -1457,9 +1562,23 @@ def _load_declared_artifact_payload(
                 if isinstance(item, dict):
                     _add_metric_candidate(item.get("path"))
 
+        metric_candidates = sorted(
+            metric_candidates,
+            key=lambda item: (_metric_artifact_priority(item, metric_name), metric_candidates.index(item)),
+        )
         for candidate_path in metric_candidates:
             candidate_payload = _load_json_safe(candidate_path)
             if isinstance(candidate_payload, dict) and candidate_payload:
+                if metric_name:
+                    resolved = _resolve_metric_payload(
+                        candidate_payload,
+                        metric_name,
+                        source_hint=candidate_path,
+                    )
+                    if not resolved:
+                        continue
+                elif not _metrics_report_has_values(_normalize_metrics_report_payload(candidate_payload)):
+                    continue
                 payload = candidate_payload
                 path = candidate_path
                 break
@@ -1469,6 +1588,8 @@ def _load_declared_artifact_payload(
 def _load_metric_snapshot_payload(
     snapshot_dir: Any,
     artifact_paths: List[str] | None,
+    *,
+    metric_name: str | None = None,
 ) -> Tuple[Dict[str, Any], str | None]:
     snapshot_root = str(snapshot_dir or "").strip()
     if not snapshot_root:
@@ -1478,12 +1599,23 @@ def _load_metric_snapshot_payload(
         normalized = normalize_artifact_path(item)
         if normalized and normalized not in candidates:
             candidates.append(normalized)
+    candidates = sorted(
+        candidates,
+        key=lambda item: (_metric_artifact_priority(item, metric_name or ""), candidates.index(item)),
+    )
     for rel_path in candidates:
         candidate_path = Path(snapshot_root) / Path(rel_path)
         if not candidate_path.exists():
             continue
         payload = _load_json_safe(str(candidate_path))
         if isinstance(payload, dict) and payload:
+            metric_text = str(metric_name or "").strip()
+            if metric_text and not _resolve_metric_payload(
+                payload,
+                metric_text,
+                source_hint=normalize_artifact_path(rel_path),
+            ):
+                continue
             return payload, normalize_artifact_path(rel_path)
     return {}, None
 
@@ -2073,11 +2205,19 @@ def _derive_metric_loop_state_from_legacy(
     if not _has_metric_loop_legacy_evidence(state):
         return {}
     metric_state = _load_primary_metric_state(state)
+    metric_name = str(
+        metric_state.get("primary_metric_name")
+        or metric_state.get("target_metric_name")
+        or state.get("ml_improvement_primary_metric_name")
+        or _resolve_contract_primary_metric_name(state, contract)
+        or ""
+    ).strip()
     current_metrics_payload, metric_path = _load_declared_artifact_payload(
         contract,
         state,
         "metrics.json",
         kind="metrics",
+        metric_name=metric_name,
     )
     round_baseline_metrics = (
         state.get("ml_improvement_round_baseline_metrics")
@@ -2099,6 +2239,7 @@ def _derive_metric_loop_state_from_legacy(
         baseline_metrics, _ = _load_metric_snapshot_payload(
             snapshot_dir,
             ([metric_path] if metric_path else []) + list(output_paths),
+            metric_name=metric_name,
         )
     round_id = int(
         state.get("ml_improvement_current_round_id")
@@ -2422,13 +2563,16 @@ def _resolve_metric_payload(
         or metric_name
         or ""
     ).strip()
+    resolved_value = float(resolved.get("value"))
+    if not _metric_value_within_physical_domain(metric_name or resolved_name, resolved_value):
+        return {}
     return {
         "name": resolved_name or metric_name,
         "canonical_name": str(
             resolved.get("canonical_name")
             or _metric_canonical_name(resolved_name or metric_name)
         ),
-        "value": float(resolved.get("value")),
+        "value": resolved_value,
         "matched_key": matched_key,
         "score": int(resolved.get("score", 0) or 0),
         "source": source,
@@ -2519,6 +2663,11 @@ def _build_primary_metric_state(
                 }
 
     if not isinstance(primary, dict) or not _is_number(primary.get("value")):
+        return {}
+    if not _metric_value_within_physical_domain(
+        primary.get("name") or target_name,
+        primary.get("value"),
+    ):
         return {}
 
     baseline = None
@@ -2659,7 +2808,7 @@ def _extract_primary_metric_for_board(
             or (contract_canonical_name and contract_canonical_name in {primary_canonical_name, target_canonical_name})
         ):
             value = _coerce_float(metric_state.get("primary_metric_value"))
-            if value is not None:
+            if value is not None and _metric_value_within_physical_domain(contract_metric or primary_name, value):
                 return {
                     "name": contract_metric or primary_name,
                     "canonical_name": contract_canonical_name or primary_canonical_name,
@@ -2674,18 +2823,23 @@ def _extract_primary_metric_for_board(
         not contract_metric
         or _metric_name_matches(str(contract_metric), str(snapshot.get("primary_metric_name") or ""))
     ):
-        return {
-            "name": snapshot.get("primary_metric_name") or contract_metric,
-            "canonical_name": str(
-                snapshot.get("primary_metric_canonical_name")
-                or snapshot.get("canonical_name")
-                or _metric_canonical_name(snapshot.get("primary_metric_name") or contract_metric)
-            ),
-            "value": snapshot.get("primary_metric_value"),
-            "baseline_value": snapshot.get("baseline_value"),
-            "matched_key": snapshot.get("primary_metric_path") or snapshot.get("matched_key"),
-            "source": str(snapshot.get("primary_metric_source") or snapshot.get("source") or "primary_metric_snapshot"),
-        }
+        snapshot_value = _coerce_float(snapshot.get("primary_metric_value"))
+        if snapshot_value is not None and _metric_value_within_physical_domain(
+            snapshot.get("primary_metric_name") or contract_metric,
+            snapshot_value,
+        ):
+            return {
+                "name": snapshot.get("primary_metric_name") or contract_metric,
+                "canonical_name": str(
+                    snapshot.get("primary_metric_canonical_name")
+                    or snapshot.get("canonical_name")
+                    or _metric_canonical_name(snapshot.get("primary_metric_name") or contract_metric)
+                ),
+                "value": snapshot_value,
+                "baseline_value": snapshot.get("baseline_value"),
+                "matched_key": snapshot.get("primary_metric_path") or snapshot.get("matched_key"),
+                "source": str(snapshot.get("primary_metric_source") or snapshot.get("source") or "primary_metric_snapshot"),
+            }
 
     weights_path = _resolve_declared_artifact_path_from_state(
         state,
@@ -2721,6 +2875,8 @@ def _extract_primary_metric_for_board(
             value = _coerce_float(cand.get("value"))
             if value is None:
                 continue
+            if not _metric_value_within_physical_domain(cand_name or contract_metric, value):
+                continue
             return {
                 "name": cand_name or contract_metric,
                 "canonical_name": _metric_canonical_name(cand_name or contract_metric),
@@ -2741,6 +2897,13 @@ def _extract_primary_metric_for_board(
             if isinstance(raw_metrics, dict):
                 direct_value = _extract_primary_metric(raw_metrics, contract_metric)
         if direct_value is not None:
+            if not _metric_value_within_physical_domain(contract_metric, direct_value):
+                return {
+                    "name": contract_metric,
+                    "canonical_name": contract_canonical_name,
+                    "value": None,
+                    "source": "contract.primary_metric_invalid_physical_domain",
+                }
             return {
                 "name": contract_metric,
                 "canonical_name": contract_canonical_name,
@@ -2765,6 +2928,8 @@ def _extract_primary_metric_for_board(
     if isinstance(primary, dict):
         value = _coerce_float(primary.get("value"))
         if value is not None:
+            if not _metric_value_within_physical_domain(primary.get("name"), value):
+                return {"name": primary.get("name"), "value": None, "source": "metric.invalid_physical_domain"}
             return {
                 "name": primary.get("name"),
                 "value": float(value),
@@ -2777,6 +2942,8 @@ def _extract_primary_metric_for_board(
         if isinstance(val, dict):
             val = val.get("mean")
         if isinstance(val, (int, float)):
+            if not _metric_value_within_physical_domain(key, val):
+                continue
             return {
                 "name": key,
                 "value": float(val),
@@ -2797,6 +2964,7 @@ def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(alignment_check, dict):
         alignment_check = {}
     oc_report = _resolve_output_contract_report_for_facts(state if isinstance(state, dict) else {})
+    threshold_gap_classification = classify_output_contract_performance_thresholds(oc_report)
     artifact_issues = _extract_contract_artifact_issues(oc_report)
     visual_reqs = (
         contract.get("artifact_requirements", {}).get("visual_requirements")
@@ -2861,12 +3029,22 @@ def _build_review_board_facts(state: Dict[str, Any]) -> Dict[str, Any]:
         "alignment": _summarize_alignment_requirements(alignment_check),
         "output_contract": {
             "overall_status": str(oc_report.get("overall_status") or "").lower() if isinstance(oc_report, dict) else "",
+            "governance_status": (
+                "warning"
+                if threshold_gap_classification.get("only_performance_threshold_failures")
+                else (str(oc_report.get("overall_status") or "").lower() if isinstance(oc_report, dict) else "")
+            ),
             "missing_required_artifacts": artifact_issues.get("missing_paths", []),
             "schema_issues": artifact_issues.get("schema_issues", []),
             "qa_gate_failures": (
                 (oc_report.get("qa_gate_results") or {}).get("failures")
                 if isinstance(oc_report.get("qa_gate_results"), dict)
                 else []
+            ),
+            "blocking_qa_gate_failures": threshold_gap_classification.get("blocking_qa_gate_failures", []),
+            "performance_threshold_gaps": threshold_gap_classification.get("performance_threshold_gaps", []),
+            "performance_thresholds_are_optimization_targets": bool(
+                threshold_gap_classification.get("only_performance_threshold_failures")
             ),
             "qa_gate_warnings": (
                 (oc_report.get("qa_gate_results") or {}).get("warnings")
@@ -2899,10 +3077,14 @@ def _build_code_review_diagnostics(
 ) -> Dict[str, Any]:
     oc_report = output_contract_report if isinstance(output_contract_report, dict) else {}
     missing_outputs = [str(path) for path in (oc_report.get("missing") or []) if path]
+    threshold_gap_classification = classify_output_contract_performance_thresholds(oc_report)
     blockers: List[str] = []
     if runtime_failure_detected:
         blockers.append("runtime_failure")
-    if str(oc_report.get("overall_status") or "").lower() == "error":
+    if (
+        str(oc_report.get("overall_status") or "").lower() == "error"
+        and not threshold_gap_classification.get("only_performance_threshold_failures")
+    ):
         blockers.append("output_contract_error")
     if missing_outputs:
         blockers.append("contract_required_artifacts_missing")
@@ -2911,6 +3093,7 @@ def _build_code_review_diagnostics(
         "runtime_fix_terminal": bool(runtime_terminal),
         "execution_output_tail": str(execution_output or "")[-1200:],
         "output_contract_overall_status": str(oc_report.get("overall_status") or "").lower(),
+        "performance_threshold_gaps": threshold_gap_classification.get("performance_threshold_gaps", []),
         "output_contract_missing": missing_outputs,
         "artifact_index": artifact_index if isinstance(artifact_index, list) else [],
         "hard_blockers": blockers,
@@ -3782,15 +3965,18 @@ def _persist_output_contract_report(
         }
     else:
         # Build comprehensive report using the unified helper
+        work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
         report = build_output_contract_report(
             contract=contract,
-            work_dir=".",  # Current working directory
+            work_dir=work_dir_abs,
             reason=reason,
         )
     
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        dump_json(path, report)
+        work_dir_abs = _resolve_work_dir_abs(state if isinstance(state, dict) else None)
+        report_path = path if os.path.isabs(path) else _abs_in_work(work_dir_abs, path)
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        dump_json(report_path, report)
     except Exception:
         pass
     return report
@@ -8053,6 +8239,39 @@ def _looks_blocking_retry_signal(text: Any) -> bool:
             return True
     return False
 
+
+def _looks_performance_threshold_signal(text: Any) -> bool:
+    value = str(text or "").strip().lower()
+    if not value:
+        return False
+    tokens = [
+        "metric",
+        "threshold",
+        "benchmark",
+        "kpi",
+        "performance",
+        "optimization",
+        "quality",
+        "results_quality",
+        "metric_gap",
+        "qa_gates",
+        "accuracy",
+        "auc",
+        "roc",
+        "qwk",
+        "kappa",
+        "f1",
+        "precision",
+        "recall",
+        "portfolio",
+        "lift",
+        "coverage",
+        "calibration",
+        "latency",
+    ]
+    return any(token in value for token in tokens)
+
+
 def _is_blocking_retry_reason(
     state: Dict[str, Any] | None,
     gate_context: Dict[str, Any] | None = None,
@@ -8078,13 +8297,22 @@ def _is_blocking_retry_reason(
     if last_iter_type == "compliance" or gate_iter_type == "compliance":
         return True
 
-    hard_failures = [str(x) for x in (gate_context.get("hard_failures") or state.get("hard_failures") or []) if x]
-    if hard_failures:
-        return True
-
     oc_report = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
+    threshold_gap_classification = classify_output_contract_performance_thresholds(oc_report)
+    only_performance_threshold_failures = bool(
+        threshold_gap_classification.get("only_performance_threshold_failures")
+    )
+    hard_failures = [str(x) for x in (gate_context.get("hard_failures") or state.get("hard_failures") or []) if x]
+    if hard_failures and not (
+        only_performance_threshold_failures
+        and all(_looks_performance_threshold_signal(item) for item in hard_failures)
+    ):
+        return True
     if isinstance(oc_report, dict):
-        if str(oc_report.get("overall_status") or "").strip().lower() == "error":
+        if (
+            str(oc_report.get("overall_status") or "").strip().lower() == "error"
+            and not only_performance_threshold_failures
+        ):
             return True
         missing = [str(x) for x in (oc_report.get("missing") or []) if x]
         if missing:
@@ -8110,6 +8338,14 @@ def _is_blocking_retry_reason(
         value = gate_context.get(key)
         if value:
             signals.append(str(value))
+
+    if only_performance_threshold_failures:
+        blocking_non_performance_signals = [
+            signal
+            for signal in signals
+            if _looks_blocking_retry_signal(signal) and not _looks_performance_threshold_signal(signal)
+        ]
+        return bool(blocking_non_performance_signals)
 
     return any(_looks_blocking_retry_signal(signal) for signal in signals)
 
@@ -10658,7 +10894,11 @@ def _promote_candidate_attempt_as_best_attempt(
     if deterministic_blockers:
         return {}
     oc_report = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
-    if str(oc_report.get("overall_status") or "").strip().lower() == "error":
+    threshold_gap_classification = classify_output_contract_performance_thresholds(oc_report)
+    if (
+        str(oc_report.get("overall_status") or "").strip().lower() == "error"
+        and not threshold_gap_classification.get("only_performance_threshold_failures")
+    ):
         return {}
     if state.get("last_attempt_valid") is False:
         return {}
@@ -10744,7 +10984,11 @@ def _should_restore_best_attempt(
 
     oc_report = state.get("output_contract_report")
     if isinstance(oc_report, dict):
-        if str(oc_report.get("overall_status") or "").strip().lower() == "error":
+        threshold_gap_classification = classify_output_contract_performance_thresholds(oc_report)
+        if (
+            str(oc_report.get("overall_status") or "").strip().lower() == "error"
+            and not threshold_gap_classification.get("only_performance_threshold_failures")
+        ):
             return True
         missing = oc_report.get("missing")
         if isinstance(missing, list) and any(str(item).strip() for item in missing):
@@ -13895,14 +14139,92 @@ def _resolve_authoritative_runtime_text(
     return best
 
 
-def _extract_runtime_traceback_line_number(text: Any) -> int | None:
-    matches = re.findall(r'File\s+"[^"]+",\s+line\s+(\d+)', str(text or ""))
-    if not matches:
+def _extract_runtime_traceback_frames(text: Any) -> List[Dict[str, Any]]:
+    frames: List[Dict[str, Any]] = []
+    for match in re.finditer(
+        r'File\s+"([^"]+)",\s+line\s+(\d+)(?:,\s+in\s+([^\n]+))?',
+        str(text or ""),
+    ):
+        try:
+            line_number = int(match.group(2))
+        except Exception:
+            continue
+        frames.append(
+            {
+                "file": str(match.group(1) or ""),
+                "line": line_number,
+                "function": str(match.group(3) or "").strip(),
+            }
+        )
+    return frames
+
+
+def _is_generated_script_traceback_file(path: Any) -> bool:
+    normalized = str(path or "").replace("\\", "/").lower()
+    basename = normalized.rsplit("/", 1)[-1]
+    if basename in {
+        "script.py",
+        "ml_script.py",
+        "cleaning_script.py",
+        "data_engineer_script.py",
+        "main.py",
+    }:
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "/sandbox/local_runner/",
+            "/sandbox/heavy_runner/",
+            "/tmp/run/",
+        )
+    )
+
+
+def _is_library_traceback_file(path: Any) -> bool:
+    normalized = str(path or "").replace("\\", "/").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "/site-packages/",
+            "/dist-packages/",
+            "/lib/python",
+            "/python",
+            "/.venv/",
+            "/venv/",
+        )
+    )
+
+
+def _select_runtime_traceback_frame(text: Any, code: Any | None = None) -> Dict[str, Any] | None:
+    frames = _extract_runtime_traceback_frames(text)
+    if not frames:
         return None
-    try:
-        return int(matches[-1])
-    except Exception:
+    max_line = len(str(code or "").splitlines()) if code is not None else None
+
+    def _line_in_code(frame: Dict[str, Any]) -> bool:
+        if not isinstance(max_line, int) or max_line <= 0:
+            return True
+        line = frame.get("line")
+        return isinstance(line, int) and 1 <= line <= max_line
+
+    for frame in reversed(frames):
+        if _is_generated_script_traceback_file(frame.get("file")) and _line_in_code(frame):
+            return frame
+    for frame in reversed(frames):
+        if not _is_library_traceback_file(frame.get("file")) and _line_in_code(frame):
+            return frame
+    for frame in reversed(frames):
+        if _line_in_code(frame):
+            return frame
+    return frames[-1]
+
+
+def _extract_runtime_traceback_line_number(text: Any, code: Any | None = None) -> int | None:
+    frame = _select_runtime_traceback_frame(text, code=code)
+    if not isinstance(frame, dict):
         return None
+    line = frame.get("line")
+    return line if isinstance(line, int) and line > 0 else None
 
 
 def _get_code_line_at(code: Any, line_number: int | None) -> str:
@@ -14118,7 +14440,7 @@ def _resolve_probe_object_from_expression(
 
 
 def _build_candidate_call_site_facts(runtime_output: Any, code: Any) -> List[Dict[str, Any]]:
-    line_number = _extract_runtime_traceback_line_number(runtime_output)
+    line_number = _extract_runtime_traceback_line_number(runtime_output, code=code)
     if not isinstance(line_number, int) or line_number <= 0:
         return []
     call_expressions = _collect_call_expressions_for_line(code, line_number)
@@ -14769,12 +15091,17 @@ def _build_repair_ground_truth(
     repair_focus = str(retry_context.get("repair_focus") or "").strip().lower()
     specific_error = str(retry_context.get("specific_error") or "").strip()
     exception_type, exception_message = _extract_runtime_exception_signature(runtime_text)
-    line_number = _extract_runtime_traceback_line_number(runtime_text)
     generated_code = (
         state.get("generated_code")
         or state.get("last_generated_code")
         or state.get("last_successful_generated_code")
         or ""
+    )
+    traceback_frame = _select_runtime_traceback_frame(runtime_text, code=generated_code)
+    line_number = (
+        traceback_frame.get("line")
+        if isinstance(traceback_frame, dict) and isinstance(traceback_frame.get("line"), int)
+        else None
     )
     failing_line = _get_code_line_at(generated_code, line_number)
     keyword_match = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", runtime_text, re.IGNORECASE)
@@ -14814,6 +15141,14 @@ def _build_repair_ground_truth(
         verified_facts.append({"fact": "exception_message", "value": exception_message[:280], "source": "runtime_traceback"})
     if isinstance(line_number, int) and line_number > 0:
         verified_facts.append({"fact": "failing_line_number", "value": line_number, "source": "runtime_traceback"})
+    if isinstance(traceback_frame, dict) and str(traceback_frame.get("file") or "").strip():
+        verified_facts.append(
+            {
+                "fact": "failing_file_path",
+                "value": str(traceback_frame.get("file") or "").strip()[:280],
+                "source": "runtime_traceback",
+            }
+        )
     if failing_line:
         verified_facts.append({"fact": "failing_line_code", "value": failing_line[:280], "source": "generated_code"})
     if missing_outputs:
@@ -30507,13 +30842,27 @@ def _collect_board_deterministic_blockers(board_context: Dict[str, Any]) -> List
         if isinstance(deterministic_facts.get("output_contract"), dict)
         else {}
     )
-    if str(output_contract.get("overall_status") or "").strip().lower() == "error":
+    threshold_gap_classification = classify_output_contract_performance_thresholds(output_contract)
+    only_performance_threshold_failures = bool(
+        output_contract.get("performance_thresholds_are_optimization_targets")
+        or threshold_gap_classification.get("only_performance_threshold_failures")
+    )
+    if (
+        str(output_contract.get("overall_status") or "").strip().lower() == "error"
+        and not only_performance_threshold_failures
+    ):
         _add("output_contract_error")
     for path in output_contract.get("missing_required_artifacts") or []:
         _add(f"missing_required_artifact:{path}")
     for issue in output_contract.get("schema_issues") or []:
         _add(f"output_schema_issue:{issue}")
     for failure in output_contract.get("qa_gate_failures") or []:
+        if only_performance_threshold_failures and failure in (
+            output_contract.get("performance_threshold_gaps")
+            or threshold_gap_classification.get("performance_threshold_gaps")
+            or []
+        ):
+            continue
         if isinstance(failure, dict):
             gate_name = failure.get("name") or failure.get("gate_name") or failure.get("metric")
             detail = failure.get("detail") or failure.get("status") or ""
@@ -30538,6 +30887,23 @@ def _collect_board_deterministic_blockers(board_context: Dict[str, Any]) -> List
         and str(metric_ctx.get("review_mode") or "").strip().lower()
         in {"hybrid_guarded", "advisor_only"}
     )
+    perf_policy = (
+        board_context.get("performance_threshold_policy")
+        if isinstance(board_context.get("performance_threshold_policy"), dict)
+        else {}
+    )
+    performance_policy_active = bool(
+        perf_policy.get("gaps") and perf_policy.get("blocking_for_baseline_approval") is False
+    )
+
+    def _packet_has_non_performance_blocker(packet: Dict[str, Any]) -> bool:
+        for hard in packet.get("hard_failures") or []:
+            if not _looks_performance_threshold_signal(hard):
+                return True
+        for gate in packet.get("failed_gates") or []:
+            if _looks_blocking_retry_signal(gate) and not _looks_performance_threshold_signal(gate):
+                return True
+        return False
 
     for key in ("result_evaluator", "reviewer", "qa_reviewer"):
         if advisory_review_active and key in ("reviewer", "qa_reviewer"):
@@ -30548,11 +30914,20 @@ def _collect_board_deterministic_blockers(board_context: Dict[str, Any]) -> List
         if key != "result_evaluator":
             status_blockers.add("NEEDS_IMPROVEMENT")
         if status in status_blockers:
-            _add(f"{key}_status:{status}")
+            if not (
+                performance_policy_active
+                and status == "NEEDS_IMPROVEMENT"
+                and not _packet_has_non_performance_blocker(packet)
+            ):
+                _add(f"{key}_status:{status}")
         for hard in packet.get("hard_failures") or []:
+            if performance_policy_active and _looks_performance_threshold_signal(hard):
+                continue
             _add(f"{key}_hard_failure:{hard}")
         for gate in packet.get("failed_gates") or []:
-            if _looks_blocking_retry_signal(gate):
+            if _looks_blocking_retry_signal(gate) and not (
+                performance_policy_active and _looks_performance_threshold_signal(gate)
+            ):
                 _add(f"{key}_failed_gate:{gate}")
     return blockers
 
@@ -30585,8 +30960,19 @@ def _board_needs_improvement_conflicts_with_current_success(
         if isinstance(deterministic_facts.get("output_contract"), dict)
         else {}
     )
+    threshold_gap_classification = classify_output_contract_performance_thresholds(output_contract)
+    output_contract_status = str(output_contract.get("overall_status") or "").strip().lower()
+    output_contract_effective_status = str(output_contract.get("governance_status") or "").strip().lower()
+    if (
+        output_contract_status == "error"
+        and bool(
+            output_contract.get("performance_thresholds_are_optimization_targets")
+            or threshold_gap_classification.get("only_performance_threshold_failures")
+        )
+    ):
+        output_contract_effective_status = "warning"
     output_contract_ok = (
-        str(output_contract.get("overall_status") or "").strip().lower() == "ok"
+        output_contract_effective_status in {"ok", "warning"}
         and not [str(x) for x in (output_contract.get("missing_required_artifacts") or []) if str(x).strip()]
         and not [str(x) for x in (output_contract.get("schema_issues") or []) if str(x).strip()]
     )
@@ -30656,6 +31042,27 @@ def run_review_board(state: AgentState) -> AgentState:
     if not isinstance(deterministic_facts, dict) or not deterministic_facts:
         deterministic_facts = _build_review_board_facts(state if isinstance(state, dict) else {})
     board_context["deterministic_facts"] = deterministic_facts
+    output_contract_facts = (
+        deterministic_facts.get("output_contract")
+        if isinstance(deterministic_facts.get("output_contract"), dict)
+        else {}
+    )
+    threshold_gap_classification = classify_output_contract_performance_thresholds(output_contract_facts)
+    performance_threshold_gaps = (
+        output_contract_facts.get("performance_threshold_gaps")
+        if isinstance(output_contract_facts.get("performance_threshold_gaps"), list)
+        else threshold_gap_classification.get("performance_threshold_gaps", [])
+    )
+    if performance_threshold_gaps:
+        board_context["performance_threshold_policy"] = {
+            "classification": "optimization_target",
+            "blocking_for_baseline_approval": False,
+            "instruction": (
+                "Evidence-backed metric threshold misses are not baseline compliance blockers. "
+                "Approve executable/honest baselines with warnings so the metric improvement loop can try to close these gaps."
+            ),
+            "gaps": performance_threshold_gaps,
+        }
     board_context["progress_tracker"] = _build_review_progress_tracker(state if isinstance(state, dict) else {})
     board_context["review_verdict_before_board"] = state.get("review_verdict")
     board_context["review_feedback_before_board"] = state.get("review_feedback")
@@ -30760,10 +31167,30 @@ def run_review_board(state: AgentState) -> AgentState:
     gate_context = dict(state.get("last_gate_context") or {})
     current_failed = [str(g) for g in (gate_context.get("failed_gates") or []) if g]
     current_required = [str(g) for g in (gate_context.get("required_fixes") or []) if g]
+    performance_gap_names = {
+        str(item.get("name") or item.get("metric") or "").strip().lower()
+        for item in performance_threshold_gaps
+        if isinstance(item, dict) and str(item.get("name") or item.get("metric") or "").strip()
+    }
+
+    def _is_nonblocking_performance_area(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        if not text or not performance_threshold_gaps:
+            return False
+        if text in performance_gap_names:
+            return True
+        if any(name and name in text for name in performance_gap_names):
+            return True
+        return _looks_performance_threshold_signal(text)
+
     for area in failed_areas:
+        if _is_nonblocking_performance_area(area):
+            continue
         if area not in current_failed:
             current_failed.append(area)
     for action in required_actions:
+        if _is_nonblocking_performance_area(action):
+            continue
         if action not in current_required:
             current_required.append(action)
     if current_failed:
@@ -30777,6 +31204,9 @@ def run_review_board(state: AgentState) -> AgentState:
         "required_actions": required_actions,
         "confidence": confidence,
     }
+    if performance_threshold_gaps:
+        gate_context["performance_threshold_gaps"] = performance_threshold_gaps
+        gate_context["performance_threshold_policy"] = "optimization_target_not_baseline_blocker"
     board_feedback_record = _set_latest_feedback_record(
         state,
         agent="ml_engineer",
@@ -30981,6 +31411,10 @@ def run_review_board(state: AgentState) -> AgentState:
         "summary": board_summary,
         "failed_areas": failed_areas,
         "deterministic_blockers": deterministic_blockers,
+        "performance_threshold_gaps": performance_threshold_gaps,
+        "performance_threshold_policy": (
+            "optimization_target_not_baseline_blocker" if performance_threshold_gaps else ""
+        ),
         "required_actions": required_actions,
         "confidence": confidence,
         "evidence": evidence,
@@ -31030,6 +31464,7 @@ def run_review_board(state: AgentState) -> AgentState:
         "feedback_history": history,
         "last_gate_context": gate_context,
         "iteration_handoff": iteration_handoff,
+        "performance_threshold_gaps": performance_threshold_gaps,
     }
     approved_candidate_update = _promote_candidate_attempt_as_best_attempt(
         state if isinstance(state, dict) else {},
@@ -31557,7 +31992,28 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     )
     quality_evidence: List[Dict[str, Any]] = []
     if isinstance(repair_ground_truth, dict):
-        for fact in repair_ground_truth.get("verified_facts") or []:
+        causal_fact_priority = {
+            "unexpected_keyword_argument": 0,
+            "unexpected_keyword_callable_mismatch": 1,
+            "missing_attribute": 2,
+            "missing_required_argument": 3,
+            "failing_line_number": 4,
+            "failing_line_code": 5,
+            "exception_type": 6,
+            "exception_message": 7,
+            "failing_file_path": 8,
+        }
+        verified_facts_for_evidence = [
+            fact for fact in (repair_ground_truth.get("verified_facts") or []) if isinstance(fact, dict)
+        ]
+        verified_facts_for_evidence = sorted(
+            enumerate(verified_facts_for_evidence),
+            key=lambda item: (
+                causal_fact_priority.get(str(item[1].get("fact") or ""), 50),
+                item[0],
+            ),
+        )
+        for _, fact in verified_facts_for_evidence:
             if not isinstance(fact, dict):
                 continue
             quality_evidence.append(
@@ -33740,6 +34196,7 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
             state if isinstance(state, dict) else {},
             "metrics.json",
             kind="metrics",
+            metric_name=metric_name,
         )
 
     baseline_value = _extract_primary_metric(baseline_metrics, metric_name)
@@ -34689,6 +35146,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
             state if isinstance(state, dict) else {},
             "metrics.json",
             kind="metrics",
+            metric_name=metric_name,
         )
         current_metrics_snapshot = _build_metrics_artifact_snapshot(
             state=state if isinstance(state, dict) else {},
@@ -34719,6 +35177,7 @@ def _finalize_metric_improvement_round(state: Dict[str, Any], contract: Dict[str
         baseline_metrics_payload, _ = _load_metric_snapshot_payload(
             snapshot_dir,
             ([metrics_path] if metrics_path else []) + list(output_paths),
+            metric_name=metric_name,
         )
     if not baseline_metrics_payload and baseline_value is not None:
         baseline_metrics_payload = {

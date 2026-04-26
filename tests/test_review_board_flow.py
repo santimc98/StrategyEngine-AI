@@ -727,6 +727,94 @@ def test_collect_board_deterministic_blockers_ignores_advisory_consistency_signa
     assert blockers == []
 
 
+def test_collect_board_deterministic_blockers_treats_metric_thresholds_as_targets() -> None:
+    threshold_failure = {
+        "name": "accuracy_exact_minimum",
+        "severity": "HARD",
+        "artifact_path": "artifacts/ml/evaluation_report.json",
+        "metric": "accuracy_exact",
+        "value": 0.559,
+        "min_value": 0.65,
+        "status": "fail",
+        "passed": False,
+        "detail": "value 0.559 is below min_value 0.65",
+    }
+    board_context = {
+        "runtime": {"status": "OK", "runtime_fix_terminal": False, "sandbox_failed": False},
+        "performance_threshold_policy": {
+            "classification": "optimization_target",
+            "blocking_for_baseline_approval": False,
+            "gaps": [threshold_failure],
+        },
+        "deterministic_facts": {
+            "output_contract": {
+                "overall_status": "error",
+                "governance_status": "warning",
+                "missing_required_artifacts": [],
+                "schema_issues": [],
+                "qa_gate_failures": [threshold_failure],
+                "performance_threshold_gaps": [threshold_failure],
+                "performance_thresholds_are_optimization_targets": True,
+            }
+        },
+        "reviewer": {"status": "APPROVED", "failed_gates": [], "hard_failures": []},
+        "qa_reviewer": {
+            "status": "NEEDS_IMPROVEMENT",
+            "failed_gates": ["qa_gates"],
+            "hard_failures": ["accuracy_exact_minimum"],
+        },
+        "result_evaluator": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": [], "hard_failures": []},
+    }
+
+    assert graph_mod._collect_board_deterministic_blockers(board_context) == []
+
+
+def test_run_review_board_metric_threshold_gap_approves_for_optimization(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardNeedsImprovement())
+    threshold_failure = {
+        "name": "accuracy_exact_minimum",
+        "severity": "HARD",
+        "artifact_path": "artifacts/ml/evaluation_report.json",
+        "metric": "accuracy_exact",
+        "value": 0.559,
+        "min_value": 0.65,
+        "status": "fail",
+        "passed": False,
+        "detail": "value 0.559 is below min_value 0.65",
+    }
+    state = {
+        "iteration_count": 0,
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "review_feedback": "Metric threshold below target.",
+        "feedback_history": [],
+        "execution_output": "OK",
+        "last_gate_context": {"failed_gates": [], "required_fixes": [], "hard_failures": []},
+        "output_contract_report": {
+            "overall_status": "error",
+            "missing": [],
+            "artifact_requirements_report": {"status": "ok"},
+            "qa_gate_results": {"failures": [threshold_failure], "warnings": [], "checked": [threshold_failure]},
+        },
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False, "sandbox_failed": False},
+            "result_evaluator": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": [], "hard_failures": []},
+            "reviewer": {"status": "APPROVED", "failed_gates": [], "hard_failures": []},
+            "qa_reviewer": {"status": "APPROVED", "failed_gates": [], "hard_failures": []},
+            "results_advisor": {"status": "APPROVE_WITH_WARNINGS"},
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+
+    assert result["review_verdict"] == "APPROVE_WITH_WARNINGS"
+    assert result["performance_threshold_gaps"] == [threshold_failure]
+    assert result["last_gate_context"]["performance_threshold_policy"] == "optimization_target_not_baseline_blocker"
+    assert "qa_gates" not in result["last_gate_context"].get("failed_gates", [])
+    assert result["review_board_verdict"]["performance_threshold_gaps"] == [threshold_failure]
+
+
 def test_run_review_board_downgrades_stale_needs_improvement_when_current_facts_are_clean(
     tmp_path,
     monkeypatch,
