@@ -67,8 +67,17 @@ class FailureExplainerAgent:
         code_snippet = self._truncate(code, 6000)
         error_snippet = self._truncate(error_details, 4000)
         context_snippet = self._truncate(str(ctx), 2000)
+        deterministic_hint = self._deterministic_runtime_hint(code, error_details)
+        hint_section = (
+            "\n\nSYSTEM_DETECTED_RUNTIME_FACTS:\n"
+            + deterministic_hint
+            + "\n"
+            if deterministic_hint
+            else ""
+        )
         prompt = (
             prompt_prefix
+            + hint_section
             + "\n\nCODE:\n"
             + code_snippet
             + "\n\nERROR:\n"
@@ -139,6 +148,9 @@ class FailureExplainerAgent:
     def _fallback(self, error_details: str) -> str:
         if not error_details:
             return ""
+        deterministic_hint = self._deterministic_runtime_hint("", error_details)
+        if deterministic_hint:
+            return deterministic_hint
         return f"Automated diagnosis unavailable. Raw error summary: {error_details[:500]}"
 
     @staticmethod
@@ -150,3 +162,22 @@ class FailureExplainerAgent:
         head = text[: limit // 2]
         tail = text[-(limit // 2) :]
         return f"{head}\n...[truncated]...\n{tail}"
+
+    @staticmethod
+    def _deterministic_runtime_hint(code: str, error_details: str) -> str:
+        haystack = f"{error_details}\n{code}".lower()
+        if "quantile" in haystack and "numpy boolean subtract" in haystack:
+            return (
+                "WHERE: Numeric summary / feature drift quantile computation.\n"
+                "WHY: pandas/numpy attempted quantile interpolation on boolean or non-numeric values; "
+                "an empty-series guard alone is insufficient.\n"
+                "FIX: before quantile, coerce to numeric, drop NaN, and either exclude bool columns from numeric "
+                "quantiles or cast bool values to int; only call quantile on non-empty numeric Series."
+            )
+        if "quantile" in haystack and any(token in haystack for token in ("empty", "all-nan", "all nan", "no valid")):
+            return (
+                "WHERE: Numeric summary / feature drift quantile computation.\n"
+                "WHY: quantile was called after coercion left no valid numeric observations.\n"
+                "FIX: guard the post-coercion non-null Series and emit null summary statistics when it is empty."
+            )
+        return ""
