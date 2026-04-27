@@ -93,6 +93,9 @@ def _safe_load_json_candidates(*paths: Optional[str]):
 def _load_authoritative_metrics_payload() -> Dict[str, Any]:
     for candidate in (
         "artifacts/ml/cv_metrics.json",
+        "artifacts/ml/evaluation_report.json",
+        "artifacts/ml/validation_metrics.json",
+        "data/evaluation_metrics.json",
         "data/metrics.json",
     ):
         payload = _safe_load_json(candidate)
@@ -2647,6 +2650,440 @@ def _select_confirmed_evidence_paths(
             break
     return deduped
 
+def _json_pointer(path_parts: List[Any]) -> str:
+    if not path_parts:
+        return ""
+    return "/" + "/".join(str(part).replace("~", "~0").replace("/", "~1") for part in path_parts)
+
+
+def _source_ref(path: str, pointer: str = "") -> str:
+    clean_path = _normalize_path(path)
+    clean_pointer = str(pointer or "").strip()
+    return f"{clean_path}#{clean_pointer}" if clean_pointer else clean_path
+
+
+def _format_fact_value(value: Any) -> str:
+    numeric = _coerce_float(value)
+    if numeric is not None:
+        return f"{numeric:.6g}"
+    text = str(value or "").strip()
+    return text[:180]
+
+
+def _add_ledger_fact(
+    ledger: List[Dict[str, Any]],
+    *,
+    fact_id: str,
+    claim: str,
+    source_path: str,
+    json_pointer: str = "",
+    value: Any = None,
+    artifact_type: str = "json",
+    business_relevance: str = "supporting evidence",
+    risk_level: str = "medium",
+) -> None:
+    clean_claim = sanitize_text(str(claim or "")).strip()
+    clean_source = _normalize_path(source_path)
+    if not clean_claim or not clean_source:
+        return
+    if any(item.get("fact_id") == fact_id for item in ledger):
+        return
+    ledger.append(
+        {
+            "fact_id": fact_id,
+            "claim": clean_claim[:420],
+            "source": _source_ref(clean_source, json_pointer),
+            "source_path": clean_source,
+            "json_pointer": json_pointer,
+            "value": value,
+            "artifact_type": artifact_type,
+            "business_relevance": business_relevance,
+            "risk_level": risk_level,
+        }
+    )
+
+
+def _flatten_numeric_leaf_facts(
+    payload: Any,
+    *,
+    source_path: str,
+    prefix: List[Any] | None = None,
+    max_facts: int = 20,
+) -> List[Dict[str, Any]]:
+    facts: List[Dict[str, Any]] = []
+    prefix = list(prefix or [])
+    if len(facts) >= max_facts:
+        return facts
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if len(facts) >= max_facts:
+                break
+            child_path = prefix + [key]
+            if isinstance(value, (dict, list)):
+                facts.extend(
+                    _flatten_numeric_leaf_facts(
+                        value,
+                        source_path=source_path,
+                        prefix=child_path,
+                        max_facts=max_facts - len(facts),
+                    )
+                )
+            elif _coerce_float(value) is not None:
+                metric_name = ".".join(str(part) for part in child_path)
+                pointer = _json_pointer(child_path)
+                facts.append(
+                    {
+                        "metric": metric_name,
+                        "value": _coerce_float(value),
+                        "source": _source_ref(source_path, pointer),
+                        "source_path": source_path,
+                        "json_pointer": pointer,
+                    }
+                )
+    elif isinstance(payload, list):
+        for idx, value in enumerate(payload[:50]):
+            if len(facts) >= max_facts:
+                break
+            child_path = prefix + [idx]
+            if isinstance(value, (dict, list)):
+                facts.extend(
+                    _flatten_numeric_leaf_facts(
+                        value,
+                        source_path=source_path,
+                        prefix=child_path,
+                        max_facts=max_facts - len(facts),
+                    )
+                )
+            elif _coerce_float(value) is not None:
+                metric_name = ".".join(str(part) for part in child_path)
+                pointer = _json_pointer(child_path)
+                facts.append(
+                    {
+                        "metric": metric_name,
+                        "value": _coerce_float(value),
+                        "source": _source_ref(source_path, pointer),
+                        "source_path": source_path,
+                        "json_pointer": pointer,
+                    }
+                )
+    return facts[:max_facts]
+
+
+def _build_translator_evidence_ledger(
+    *,
+    run_summary: Dict[str, Any],
+    review_board_verdict: Dict[str, Any],
+    output_contract_report: Dict[str, Any],
+    metrics_payload: Dict[str, Any],
+    data_adequacy_report: Dict[str, Any],
+    manifest: Dict[str, Any],
+    plot_summaries: Optional[List[Dict[str, Any]]],
+    final_incumbent_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    ledger: List[Dict[str, Any]] = []
+
+    if isinstance(run_summary, dict) and run_summary:
+        if run_summary.get("run_outcome"):
+            _add_ledger_fact(
+                ledger,
+                fact_id="run_outcome",
+                claim=f"Authoritative run outcome is {run_summary.get('run_outcome')}.",
+                source_path="data/run_summary.json",
+                json_pointer="/run_outcome",
+                value=run_summary.get("run_outcome"),
+                artifact_type="governance",
+                business_relevance="executive decision",
+                risk_level="high",
+            )
+        if run_summary.get("overall_status_global"):
+            _add_ledger_fact(
+                ledger,
+                fact_id="overall_status_global",
+                claim=f"Global governance status is {run_summary.get('overall_status_global')}.",
+                source_path="data/run_summary.json",
+                json_pointer="/overall_status_global",
+                value=run_summary.get("overall_status_global"),
+                artifact_type="governance",
+                business_relevance="governance status",
+                risk_level="high",
+            )
+
+    if isinstance(review_board_verdict, dict) and review_board_verdict:
+        verdict = review_board_verdict.get("final_review_verdict") or review_board_verdict.get("status")
+        if verdict:
+            _add_ledger_fact(
+                ledger,
+                fact_id="review_board_verdict",
+                claim=f"Review board verdict is {verdict}.",
+                source_path="data/review_board_verdict.json",
+                json_pointer="/final_review_verdict",
+                value=verdict,
+                artifact_type="governance",
+                business_relevance="review decision",
+                risk_level="high",
+            )
+        gaps = review_board_verdict.get("performance_threshold_gaps")
+        if isinstance(gaps, list):
+            for idx, gap in enumerate(gaps[:12]):
+                if not isinstance(gap, dict):
+                    continue
+                metric = gap.get("metric") or gap.get("matched_key") or gap.get("name")
+                value = gap.get("value")
+                operator = gap.get("operator") or ""
+                threshold = gap.get("threshold")
+                status = gap.get("status") or ("pass" if gap.get("passed") else "fail")
+                _add_ledger_fact(
+                    ledger,
+                    fact_id=f"threshold_gap_{idx + 1}",
+                    claim=(
+                        f"Gate {gap.get('name') or 'unnamed'} measured {metric}="
+                        f"{_format_fact_value(value)} against {operator} {_format_fact_value(threshold)} "
+                        f"and status is {status}."
+                    ),
+                    source_path="data/review_board_verdict.json",
+                    json_pointer=f"/performance_threshold_gaps/{idx}",
+                    value=value,
+                    artifact_type="gate_result",
+                    business_relevance="contract threshold",
+                    risk_level="high" if str(status).lower() == "fail" else "medium",
+                )
+
+    if isinstance(output_contract_report, dict) and output_contract_report:
+        missing = output_contract_report.get("missing") if isinstance(output_contract_report.get("missing"), list) else []
+        _add_ledger_fact(
+            ledger,
+            fact_id="required_artifacts_missing_count",
+            claim=f"Output contract missing required artifact count is {len(missing)}.",
+            source_path="data/output_contract_report.json",
+            json_pointer="/missing",
+            value=len(missing),
+            artifact_type="contract_report",
+            business_relevance="deliverability",
+            risk_level="high" if missing else "medium",
+        )
+        checked = ((output_contract_report.get("qa_gate_results") or {}).get("checked") or [])
+        if isinstance(checked, list):
+            for idx, gate in enumerate(checked[:18]):
+                if not isinstance(gate, dict):
+                    continue
+                metric = gate.get("metric") or gate.get("matched_key") or gate.get("name")
+                value = gate.get("value")
+                operator = gate.get("operator") or ""
+                threshold = gate.get("threshold")
+                status = gate.get("status") or ("pass" if gate.get("passed") else "fail")
+                _add_ledger_fact(
+                    ledger,
+                    fact_id=f"contract_gate_{idx + 1}",
+                    claim=(
+                        f"Output contract gate {gate.get('name') or 'unnamed'} checked {metric}="
+                        f"{_format_fact_value(value)} against {operator} {_format_fact_value(threshold)} "
+                        f"with status {status}."
+                    ),
+                    source_path="data/output_contract_report.json",
+                    json_pointer=f"/qa_gate_results/checked/{idx}",
+                    value=value,
+                    artifact_type="contract_gate",
+                    business_relevance="contract compliance",
+                    risk_level="high" if str(status).lower() == "fail" else "medium",
+                )
+
+    metric_sources = [
+        ("artifacts/ml/evaluation_report.json", _safe_load_json("artifacts/ml/evaluation_report.json") or {}),
+        ("artifacts/ml/validation_metrics.json", _safe_load_json("artifacts/ml/validation_metrics.json") or {}),
+        ("data/metrics.json", _safe_load_json("data/metrics.json") or {}),
+    ]
+    if isinstance(metrics_payload, dict) and metrics_payload:
+        metric_sources.insert(0, ("authoritative_metrics_payload", metrics_payload))
+    seen_metric_sources: set[str] = set()
+    fact_counter = 1
+    for source_path, payload in metric_sources:
+        key = source_path if source_path != "authoritative_metrics_payload" else json.dumps(payload, sort_keys=True, default=str)[:80]
+        if key in seen_metric_sources or not isinstance(payload, dict) or not payload:
+            continue
+        seen_metric_sources.add(key)
+        ledger_source = "artifacts/ml/evaluation_report.json" if source_path == "authoritative_metrics_payload" else source_path
+        for fact in _flatten_numeric_leaf_facts(payload, source_path=ledger_source, max_facts=28):
+            metric = fact.get("metric")
+            value = fact.get("value")
+            if not metric:
+                continue
+            _add_ledger_fact(
+                ledger,
+                fact_id=f"metric_{fact_counter}",
+                claim=f"Metric {metric} is {_format_fact_value(value)}.",
+                source_path=fact.get("source_path") or ledger_source,
+                json_pointer=fact.get("json_pointer") or "",
+                value=value,
+                artifact_type="metric",
+                business_relevance="model performance",
+                risk_level="medium",
+            )
+            fact_counter += 1
+            if fact_counter > 36:
+                break
+        if fact_counter > 36:
+            break
+
+    if isinstance(data_adequacy_report, dict) and data_adequacy_report:
+        status = data_adequacy_report.get("status")
+        if status:
+            _add_ledger_fact(
+                ledger,
+                fact_id="data_adequacy_status",
+                claim=f"Data adequacy status is {status}.",
+                source_path="data/data_adequacy_report.json",
+                json_pointer="/status",
+                value=status,
+                artifact_type="data_quality",
+                business_relevance="data readiness",
+                risk_level="high" if str(status).lower() in {"insufficient_signal", "data_limited"} else "medium",
+            )
+        reasons = data_adequacy_report.get("reasons")
+        if isinstance(reasons, list) and reasons:
+            _add_ledger_fact(
+                ledger,
+                fact_id="data_adequacy_reasons",
+                claim=f"Data adequacy reasons include: {', '.join(str(x) for x in reasons[:5])}.",
+                source_path="data/data_adequacy_report.json",
+                json_pointer="/reasons",
+                value=reasons[:5],
+                artifact_type="data_quality",
+                business_relevance="data readiness caveats",
+                risk_level="high",
+            )
+
+    if isinstance(manifest, dict):
+        summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+        if summary:
+            _add_ledger_fact(
+                ledger,
+                fact_id="artifact_manifest_summary",
+                claim=(
+                    f"Artifact manifest reports {summary.get('required_present')} of "
+                    f"{summary.get('required_total')} required artifacts present and "
+                    f"{summary.get('required_missing')} required artifacts missing."
+                ),
+                source_path="data/report_artifact_manifest.json",
+                json_pointer="/summary",
+                value=summary,
+                artifact_type="artifact_manifest",
+                business_relevance="artifact traceability",
+                risk_level="high" if summary.get("required_missing") else "medium",
+            )
+
+    if isinstance(final_incumbent_state, dict):
+        deliverability = final_incumbent_state.get("deliverability") if isinstance(final_incumbent_state.get("deliverability"), dict) else {}
+        if deliverability:
+            _add_ledger_fact(
+                ledger,
+                fact_id="final_deliverability",
+                claim=f"Final deliverability state is {deliverability}.",
+                source_path="data/final_incumbent_state.json",
+                json_pointer="/deliverability",
+                value=deliverability,
+                artifact_type="final_state",
+                business_relevance="deployment readiness",
+                risk_level="high",
+            )
+
+    if isinstance(plot_summaries, list):
+        for idx, plot in enumerate(plot_summaries[:8]):
+            if not isinstance(plot, dict):
+                continue
+            filename = plot.get("filename") or plot.get("path")
+            facts = plot.get("key_facts") or plot.get("facts")
+            if not filename or not facts:
+                continue
+            facts_text = "; ".join(str(x) for x in facts[:4]) if isinstance(facts, list) else str(facts)
+            _add_ledger_fact(
+                ledger,
+                fact_id=f"plot_{idx + 1}",
+                claim=f"Plot {filename} summarizes: {facts_text}.",
+                source_path=f"static/plots/{os.path.basename(str(filename))}",
+                value=facts_text,
+                artifact_type="plot",
+                business_relevance="visual evidence",
+                risk_level="medium",
+            )
+
+    return {
+        "schema_version": "translator_evidence_ledger.v1",
+        "facts": ledger[:80],
+        "usage_policy": {
+            "claim_sources": "Use fact_id/source pairs from this ledger for substantive report claims.",
+            "unsupported_claim_handling": "If no ledger fact supports a claim, downgrade it to cautious inference or remove it.",
+        },
+    }
+
+
+def _ledger_facts(evidence_ledger: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(evidence_ledger, dict):
+        return []
+    facts = evidence_ledger.get("facts")
+    return facts if isinstance(facts, list) else []
+
+
+def _source_in_evidence_ledger(source: str, evidence_ledger: Optional[Dict[str, Any]]) -> bool:
+    normalized = str(source or "").strip()
+    if not normalized:
+        return False
+    normalized_fact_id = re.sub(r"(?i)^fact_id\s*:\s*", "", normalized).strip()
+    for fact in _ledger_facts(evidence_ledger):
+        if not isinstance(fact, dict):
+            continue
+        if normalized == str(fact.get("source") or "").strip():
+            return True
+        if normalized_fact_id == str(fact.get("fact_id") or "").strip():
+            return True
+    return False
+
+
+def _claim_match_tokens(text: Any) -> set[str]:
+    tokens = {
+        token
+        for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", str(text or "").lower())
+        if token not in {"the", "and", "con", "para", "que", "los", "las", "una", "del", "por", "from", "with"}
+    }
+    return tokens
+
+
+def _claim_numbers(text: Any) -> set[str]:
+    numbers: set[str] = set()
+    for raw in re.findall(r"-?\d+(?:[\.,]\d+)?", str(text or "")):
+        try:
+            val = float(raw.replace(",", "."))
+        except Exception:
+            numbers.add(raw)
+            continue
+        numbers.add(f"{val:.4g}")
+    return numbers
+
+
+def _best_ledger_source_for_claim(claim: str, evidence_ledger: Optional[Dict[str, Any]]) -> str:
+    claim_text = str(claim or "").strip()
+    if not claim_text:
+        return ""
+    claim_tokens = _claim_match_tokens(claim_text)
+    claim_nums = _claim_numbers(claim_text)
+    best_score = 0.0
+    best_source = ""
+    for fact in _ledger_facts(evidence_ledger):
+        if not isinstance(fact, dict):
+            continue
+        fact_text = f"{fact.get('claim') or ''} {fact.get('source') or ''} {fact.get('fact_id') or ''}"
+        fact_tokens = _claim_match_tokens(fact_text)
+        fact_nums = _claim_numbers(f"{fact_text} {fact.get('value')}")
+        token_overlap = len(claim_tokens & fact_tokens)
+        number_overlap = len(claim_nums & fact_nums)
+        score = token_overlap + 3.0 * number_overlap
+        if claim_nums and not number_overlap:
+            score -= 2.0
+        if score > best_score:
+            best_score = score
+            best_source = str(fact.get("source") or "").strip()
+    return best_source if best_score >= 3.0 else ""
+
+
 def _is_valid_evidence_source(source: str) -> bool:
     if not source:
         return False
@@ -2656,6 +3093,8 @@ def _is_valid_evidence_source(source: str) -> bool:
     lower = normalized.lower()
     if lower == "missing":
         return False
+    if lower.startswith("fact_id:"):
+        return True
     if lower.startswith("script:"):
         return True
     if "/" in normalized or "\\" in normalized:
@@ -2723,6 +3162,7 @@ def _canonical_evidence_section(
     llm_items: Optional[List[Dict[str, str]]] = None,
     *,
     target_language_code: str = "es",
+    evidence_ledger: Optional[Dict[str, Any]] = None,
 ) -> str:
     validated_llm_items: List[Dict[str, str]] = []
     placeholder = _report_language_pack(target_language_code).get(
@@ -2736,8 +3176,14 @@ def _canonical_evidence_section(
         source = _sanitize_evidence_value(item.get("source", ""))
         if not claim:
             continue
-        if not _is_valid_evidence_source(source):
-            source = "missing"
+        if _source_in_evidence_ledger(source, evidence_ledger):
+            normalized_fact_id = re.sub(r"(?i)^fact_id\s*:\s*", "", source).strip()
+            for fact in _ledger_facts(evidence_ledger):
+                if normalized_fact_id in {str(fact.get("fact_id") or "").strip(), str(fact.get("source") or "").strip()}:
+                    source = _sanitize_evidence_value(fact.get("source") or source)
+                    break
+        elif not _is_valid_evidence_source(source):
+            source = _best_ledger_source_for_claim(claim, evidence_ledger) or "missing"
         validated_llm_items.append({"claim": claim, "source": source})
 
     if validated_llm_items:
@@ -2775,7 +3221,13 @@ def _canonical_evidence_section(
     return "\n".join(evidence_lines + ["", "**Artifacts:**", ""] + path_lines)
 
 
-def _ensure_evidence_section(report: str, evidence_paths: List[str], *, target_language_code: str = "es") -> str:
+def _ensure_evidence_section(
+    report: str,
+    evidence_paths: List[str],
+    *,
+    target_language_code: str = "es",
+    evidence_ledger: Optional[Dict[str, Any]] = None,
+) -> str:
     if not report:
         return report
     report = sanitize_text(report)
@@ -2784,6 +3236,7 @@ def _ensure_evidence_section(report: str, evidence_paths: List[str], *, target_l
         evidence_paths,
         llm_items=llm_items,
         target_language_code=target_language_code,
+        evidence_ledger=evidence_ledger,
     )
 
     header_match = re.search(r"(?im)^\s*##\s+(evidencia usada|evidence used)\s*$", report)
@@ -3099,6 +3552,7 @@ def _validate_report(
     expected_language: str,
     decision_discrepancy: Optional[Dict[str, Any]] = None,
     governance_contradiction_packet: Optional[Dict[str, Any]] = None,
+    evidence_ledger: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     structure_issues = _validate_report_structure(content, expected_language=expected_language)
     decision_in_report = _extract_report_decision(content)
@@ -3124,7 +3578,11 @@ def _validate_report(
         source = str(item.get("source") or "").strip().lower()
         if not claim:
             continue
-        if source == "missing" and not _is_placeholder_evidence_claim(claim):
+        if (
+            source == "missing"
+            and not _is_placeholder_evidence_claim(claim)
+            and not _best_ledger_source_for_claim(claim, evidence_ledger)
+        ):
             unsupported_evidence_claims.append(claim)
 
     allowed_plots = {str(path).replace("\\", "/") for path in (plots or [])}
@@ -3222,6 +3680,7 @@ def _build_repair_prompt(
     expected_decision: str,
     evidence_paths: List[str],
     target_language_code: str,
+    evidence_ledger: Optional[Dict[str, Any]] = None,
 ) -> str:
     issues = (
         validation.get("critical_issues", [])
@@ -3230,6 +3689,7 @@ def _build_repair_prompt(
     )
     issues_text = "\n".join(f"- {issue}" for issue in issues) or "- unknown_issue"
     evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths[:8]) or "- missing"
+    evidence_ledger_text = json.dumps(evidence_ledger or {}, ensure_ascii=False, indent=2)[:18000]
     language_pack = _report_language_pack(target_language_code)
     placeholder = language_pack.get("uncertainty_placeholder", "No verificable con artifacts actuales")
     return render_prompt(
@@ -3251,8 +3711,13 @@ def _build_repair_prompt(
         - Only use source "missing" for explicit uncertainty placeholders such as "$placeholder".
         - Ensure sections exist: $executive_decision_heading, $risks_heading, $evidence_heading.
         - Keep "$evidence_section_heading" with evidence:{claim,source} and artifact bullets.
+        - Ground every substantive claim in the Evidence Ledger below. Prefer exact "source" values from ledger facts.
+        - If a useful claim has no ledger support, rewrite it as cautious inference or remove it.
         - Use these artifact paths when citing evidence:
         $evidence_paths
+
+        Evidence Ledger:
+        $evidence_ledger
 
         Original report:
         ---
@@ -3263,6 +3728,7 @@ def _build_repair_prompt(
         decision=expected_decision,
         issues=issues_text,
         evidence_paths=evidence_paths_text,
+        evidence_ledger=evidence_ledger_text,
         report=report or "(empty)",
         placeholder=placeholder,
         executive_decision_heading=language_pack.get("executive_decision"),
@@ -3280,6 +3746,7 @@ def _build_structured_repair_prompt(
     evidence_paths: List[str],
     target_language_code: str,
     artifact_registry_prompt_json: str,
+    evidence_ledger: Optional[Dict[str, Any]] = None,
 ) -> str:
     issues = (
         validation.get("critical_issues", [])
@@ -3288,6 +3755,7 @@ def _build_structured_repair_prompt(
     )
     issues_text = "\n".join(f"- {issue}" for issue in issues) or "- unknown_issue"
     evidence_paths_text = "\n".join(f"- {path}" for path in evidence_paths[:8]) or "- missing"
+    evidence_ledger_text = json.dumps(evidence_ledger or {}, ensure_ascii=False, indent=2)[:18000]
     placeholder = _report_language_pack(target_language_code).get(
         "uncertainty_placeholder",
         "No verificable con artifacts actuales",
@@ -3311,6 +3779,8 @@ def _build_structured_repair_prompt(
         - Use assertive language only for supported facts.
         - If you mention timelines, thresholds, gates, rollout policies, or remediation windows that are not explicit in the artifacts, frame them as recommendations or scenarios, not as established facts.
         - Use only artifact_key values that exist in the artifact registry below.
+        - Ground every substantive claim in the Evidence Ledger below. Prefer exact ledger "source" values.
+        - If a claim cannot be grounded in a ledger fact, downgrade it to cautious inference or remove it.
         - Do not emit a separate evidence heading block. Use the "evidence" array only.
         - If a claim is uncertain, express that uncertainty in the narrative and use the placeholder "$placeholder" only inside the evidence array when needed.
         - Charts and tables are optional. Use them only if they materially improve clarity or trust.
@@ -3320,6 +3790,9 @@ def _build_structured_repair_prompt(
 
         Available evidence paths:
         $evidence_paths
+
+        Evidence Ledger:
+        $evidence_ledger
 
         Required schema:
         {
@@ -3351,6 +3824,7 @@ def _build_structured_repair_prompt(
         issues=issues_text,
         artifact_registry=artifact_registry_prompt_json or "[]",
         evidence_paths=evidence_paths_text,
+        evidence_ledger=evidence_ledger_text,
         placeholder=placeholder,
         report=report or "(empty)",
     )
@@ -3362,6 +3836,7 @@ def _materialize_structured_report(
     artifact_registry: Dict[str, Dict[str, Any]],
     evidence_paths: List[str],
     target_language_code: str,
+    evidence_ledger: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]], List[str]]:
     structured_payload = _extract_structured_report_payload(content)
     if structured_payload is None:
@@ -3386,6 +3861,7 @@ def _materialize_structured_report(
         evidence_paths=evidence_paths,
         llm_evidence_items=llm_evidence_items,
         target_language_code=target_language_code,
+        evidence_ledger=evidence_ledger,
     )
     evidence_markdown = (
         f"{_evidence_section_heading(target_language_code)}\n\n"
@@ -3393,6 +3869,7 @@ def _materialize_structured_report(
             evidence_paths,
             llm_items=llm_evidence_items,
             target_language_code=target_language_code,
+            evidence_ledger=evidence_ledger,
         )
     )
     blocks_out = list(hydrated_blocks)
@@ -4142,6 +4619,7 @@ def _render_report_blocks_to_markdown(
     evidence_paths: List[str],
     llm_evidence_items: Optional[List[Dict[str, str]]] = None,
     target_language_code: str = "es",
+    evidence_ledger: Optional[Dict[str, Any]] = None,
 ) -> str:
     parts: List[str] = []
     has_h1 = any(
@@ -4206,6 +4684,7 @@ def _render_report_blocks_to_markdown(
                 evidence_paths,
                 llm_items=llm_evidence_items,
                 target_language_code=target_language_code,
+                evidence_ledger=evidence_ledger,
             )
         )
     return _normalize_evidence_sources("\n\n".join(part for part in parts if str(part or "").strip()).strip() + "\n")
@@ -5035,6 +5514,17 @@ class BusinessTranslatorAgent:
             artifact_available_fn=_artifact_available,
             max_items=8,
         )
+        evidence_ledger = _build_translator_evidence_ledger(
+            run_summary=run_summary if isinstance(run_summary, dict) else {},
+            review_board_verdict=sanitized_review_board_verdict if isinstance(sanitized_review_board_verdict, dict) else {},
+            output_contract_report=output_contract_report if isinstance(output_contract_report, dict) else {},
+            metrics_payload=metrics_payload if isinstance(metrics_payload, dict) else {},
+            data_adequacy_report=data_adequacy_report if isinstance(data_adequacy_report, dict) else {},
+            manifest=manifest if isinstance(manifest, dict) else {},
+            plot_summaries=plot_summaries if isinstance(plot_summaries, list) else None,
+            final_incumbent_state=final_incumbent_state if isinstance(final_incumbent_state, dict) else {},
+        )
+        evidence_ledger_prompt_json = json.dumps(evidence_ledger, ensure_ascii=False, indent=2)[:24000]
         artifact_inventory_table_html = _build_artifact_inventory_table_html(manifest)
         artifact_compliance_table_html = _build_artifact_compliance_table_html(
             manifest,
@@ -5082,6 +5572,8 @@ class BusinessTranslatorAgent:
                 json.dump(run_causal_impact_summary or {}, f_causal, indent=2, ensure_ascii=False)
             with open("data/final_incumbent_state.json", "w", encoding="utf-8") as f_incumbent:
                 json.dump(final_incumbent_state or {}, f_incumbent, indent=2, ensure_ascii=False)
+            with open("data/translator_evidence_ledger.json", "w", encoding="utf-8") as f_ledger:
+                json.dump(evidence_ledger or {}, f_ledger, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
@@ -5258,6 +5750,11 @@ class BusinessTranslatorAgent:
             "ml_progress_summary": metric_progress_summary,
             "ml_engineer_change_summary": ml_engineer_change_summary,
             "run_causal_impact_summary": run_causal_impact_summary,
+            "evidence_ledger": {
+                "schema_version": evidence_ledger.get("schema_version"),
+                "facts": (evidence_ledger.get("facts") or [])[:24],
+                "usage_policy": evidence_ledger.get("usage_policy"),
+            },
         }
 
         context_appendix = {
@@ -5506,6 +6003,10 @@ what to do next.
   override the authoritative executive outcome.
 - Evidence must come from listed artifacts or explicit deterministic facts.
   If support is missing, state uncertainty explicitly instead of presenting the claim as established.
+- TRANSLATOR_EVIDENCE_LEDGER is the grounding table for substantive claims.
+  Each important claim should be traceable to one or more ledger facts. Prefer
+  exact ledger "source" values in the output evidence array. If no ledger fact
+  supports a candidate claim, write it as cautious inference or omit it.
 - Separate FINAL INCUMBENT STATE from IMPROVEMENT HISTORY.
   KPI snapshots, stability claims, and deployment recommendations must be grounded
   in the final incumbent only. Rejected challengers are exploration history, not final state.
@@ -5600,6 +6101,9 @@ RECOMMENDED ACTIONS
 === FACTS (do not alter values) ===
 $facts_block_json
 
+=== TRANSLATOR EVIDENCE LEDGER (claim grounding source of truth) ===
+$evidence_ledger_json
+
 === RUN NARRATIVE (primary context — what happened during this run) ===
 $run_narrative_section
 
@@ -5670,7 +6174,7 @@ Schema:
     }
   ],
   "evidence": [
-    {"claim": "...", "source": "artifact_path -> key"}
+    {"claim": "...", "source": "exact ledger source, e.g. artifacts/ml/evaluation_report.json#/holdout/qwk"}
   ]
 }
 
@@ -5684,6 +6188,7 @@ Rules:
 - Charts, data previews, and summary tables belong inline next to the finding they support.
 - Do NOT emit raw HTML tables or markdown image syntax inside text blocks.
 - The Evidence trail will be rendered from the "evidence" array; do not add a separate evidence heading block.
+- The "evidence" array must cite exact sources from TRANSLATOR_EVIDENCE_LEDGER for all substantive claims.
 - If the Outline Plan is non-empty, use it as a starting skeleton but adapt freely.
 - Use the report to explain how the problem was solved, partially solved,
   or blocked by engineering decisions grounded in the run context.
@@ -5729,6 +6234,7 @@ $execution_results
             "target_language_name": target_language_name,
             "target_language_code": target_language_code,
             "facts_block_json": json.dumps(facts_block, ensure_ascii=False),
+            "evidence_ledger_json": evidence_ledger_prompt_json,
             "run_narrative_section": run_narrative_section,
             "post_mortem_directive": post_mortem_directive,
             "business_objective_summary": business_objective_summary,
@@ -5869,6 +6375,7 @@ $execution_results
                     artifact_registry=artifact_registry,
                     evidence_paths=evidence_paths,
                     target_language_code=target_language_code,
+                    evidence_ledger=evidence_ledger,
                 )
                 if materialized_content is not None and materialized_blocks is not None:
                     content = materialized_content
@@ -5888,6 +6395,7 @@ $execution_results
                     content,
                     evidence_paths,
                     target_language_code=target_language_code,
+                    evidence_ledger=evidence_ledger,
                 )
             content = sanitize_text(content)
 
@@ -5917,6 +6425,7 @@ $execution_results
                     expected_language=target_language_code,
                     decision_discrepancy=decision_discrepancy,
                     governance_contradiction_packet=governance_contradiction_packet,
+                    evidence_ledger=evidence_ledger,
                 )
                 validation = _merge_structured_layout_findings(
                     validation,
@@ -5950,6 +6459,7 @@ $execution_results
                                 evidence_paths=evidence_paths,
                                 target_language_code=target_language_code,
                                 artifact_registry_prompt_json=artifact_registry_prompt_json,
+                                evidence_ledger=evidence_ledger,
                             )
                         else:
                             repair_prompt = _build_repair_prompt(
@@ -5958,6 +6468,7 @@ $execution_results
                                 expected_decision=executive_decision_label,
                                 evidence_paths=evidence_paths,
                                 target_language_code=target_language_code,
+                                evidence_ledger=evidence_ledger,
                             )
                         repaired = self._call_llm(
                             repair_prompt,
@@ -5969,6 +6480,7 @@ $execution_results
                                 artifact_registry=artifact_registry,
                                 evidence_paths=evidence_paths,
                                 target_language_code=target_language_code,
+                                evidence_ledger=evidence_ledger,
                             )
                             if repaired_content is not None and repaired_blocks is not None:
                                 repaired = repaired_content
@@ -5986,6 +6498,7 @@ $execution_results
                                     repaired,
                                     evidence_paths,
                                     target_language_code=target_language_code,
+                                    evidence_ledger=evidence_ledger,
                                 )
                         else:
                             repaired = _sanitize_report_text(repaired)
@@ -5993,6 +6506,7 @@ $execution_results
                                 repaired,
                                 evidence_paths,
                                 target_language_code=target_language_code,
+                                evidence_ledger=evidence_ledger,
                             )
                         repaired = sanitize_text(repaired)
                         repair_validation = _validate_report(
@@ -6004,6 +6518,7 @@ $execution_results
                             expected_language=target_language_code,
                             decision_discrepancy=decision_discrepancy,
                             governance_contradiction_packet=governance_contradiction_packet,
+                            evidence_ledger=evidence_ledger,
                         )
                         repair_validation = _merge_structured_layout_findings(
                             repair_validation,

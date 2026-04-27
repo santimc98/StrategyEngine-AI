@@ -6,6 +6,8 @@ from src.agents.business_translator import (
     _build_final_incumbent_state,
     _build_governance_contradiction_packet,
     _build_report_artifact_manifest,
+    _build_translator_evidence_ledger,
+    _ensure_evidence_section,
     _build_metric_progress_summary,
     _score_report_quality,
     _sanitize_review_board_verdict_for_translator,
@@ -38,6 +40,115 @@ class _SequencedModel:
                 self.text = text
 
         return _Resp(text)
+
+
+def test_translator_evidence_ledger_extracts_metric_and_gate_sources(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "artifacts" / "ml").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    with open(tmp_path / "artifacts" / "ml" / "evaluation_report.json", "w", encoding="utf-8") as f:
+        json.dump({"holdout": {"qwk": 0.7742043498751316}}, f)
+
+    ledger = _build_translator_evidence_ledger(
+        run_summary={"run_outcome": "GO_WITH_LIMITATIONS", "overall_status_global": "warning"},
+        review_board_verdict={
+            "final_review_verdict": "APPROVE_WITH_WARNINGS",
+            "performance_threshold_gaps": [
+                {
+                    "name": "individual_ordinal_performance",
+                    "metric": "holdout.accuracy_exact",
+                    "value": 0.42145044956032013,
+                    "operator": ">=",
+                    "threshold": 0.65,
+                    "status": "fail",
+                }
+            ],
+        },
+        output_contract_report={"missing": [], "qa_gate_results": {"checked": []}},
+        metrics_payload={"holdout": {"qwk": 0.7742043498751316}},
+        data_adequacy_report={"status": "ok", "reasons": []},
+        manifest={"summary": {"required_present": 14, "required_total": 14, "required_missing": 0}},
+        plot_summaries=None,
+        final_incumbent_state={},
+    )
+
+    sources = [fact["source"] for fact in ledger["facts"]]
+    assert "data/run_summary.json#/run_outcome" in sources
+    assert any(source.endswith("#/holdout/qwk") for source in sources)
+    assert any("performance_threshold_gaps/0" in source for source in sources)
+
+
+def test_evidence_section_auto_grounds_missing_claim_from_ledger():
+    ledger = {
+        "facts": [
+            {
+                "fact_id": "metric_1",
+                "claim": "Metric holdout.qwk is 0.774204.",
+                "source": "artifacts/ml/evaluation_report.json#/holdout/qwk",
+                "value": 0.774204,
+            }
+        ]
+    }
+    report = """# Reporte
+
+## Decisión Ejecutiva
+
+GO_WITH_LIMITATIONS.
+
+## Riesgos
+
+El resumen de holdout reporta qwk=0.7742.
+
+## Evidencia usada
+
+evidence:
+{claim: "El resumen de holdout reporta qwk=0.7742.", source: "missing"}
+"""
+
+    normalized = _ensure_evidence_section(
+        report,
+        ["artifacts/ml/evaluation_report.json"],
+        evidence_ledger=ledger,
+    )
+
+    assert 'source: "artifacts/ml/evaluation_report.json#/holdout/qwk"' in normalized
+
+
+def test_validate_report_allows_missing_claim_when_ledger_can_ground_it():
+    report = """## Decisión Ejecutiva
+
+GO_WITH_LIMITATIONS
+
+## Riesgos
+
+El resumen de holdout reporta qwk=0.7742.
+
+## Evidencia usada
+
+evidence:
+{claim: "El resumen de holdout reporta qwk=0.7742.", source: "missing"}
+"""
+
+    validation = _validate_report(
+        content=report,
+        expected_decision="GO_WITH_LIMITATIONS",
+        facts_context=[],
+        metrics_payload={},
+        plots=[],
+        expected_language="es",
+        evidence_ledger={
+            "facts": [
+                {
+                    "fact_id": "metric_1",
+                    "claim": "Metric holdout.qwk is 0.774204.",
+                    "source": "artifacts/ml/evaluation_report.json#/holdout/qwk",
+                    "value": 0.774204,
+                }
+            ]
+        },
+    )
+
+    assert "unsupported_evidence_claims" not in validation["critical_issues"]
 
 
 class _CaptureCompletions:
