@@ -61,6 +61,19 @@ _METRIC_CANONICAL_ALIASES: Dict[str, Tuple[str, ...]] = {
         "nll",
     ),
     "accuracy": ("accuracy", "acc"),
+    "quadratic_weighted_kappa": (
+        "quadratic_weighted_kappa",
+        "quadratic weighted kappa",
+        "quadratic_kappa",
+        "quadratic kappa",
+        "weighted_kappa",
+        "weighted kappa",
+        "cohen_kappa",
+        "cohens_kappa",
+        "cohen's kappa",
+        "qwk",
+        "kappa",
+    ),
     "f1": ("f1", "f1_score", "f1-score"),
     "precision": ("precision", "ppv"),
     "recall": ("recall", "tpr", "sensitivity"),
@@ -190,6 +203,16 @@ def canonicalize_metric_name(metric_name: str) -> str:
         return "mrr"
     if "gini" in norm:
         return "gini"
+    if norm in {
+        "qwk",
+        "kappa",
+        "weightedkappa",
+        "quadraticweightedkappa",
+        "quadratickappa",
+        "cohenkappa",
+        "cohenskappa",
+    }:
+        return "quadratic_weighted_kappa"
     if "accuracy" in norm or norm.endswith("acc"):
         return "accuracy"
     if re.fullmatch(r"f1(score)?", norm):

@@ -1,8 +1,10 @@
 import json
 
 from src.utils.metric_eval import (
+    canonicalize_metric_name,
     canonicalize_metrics_report_file,
     normalize_metrics_report_payload,
+    resolve_metric_value,
 )
 
 
@@ -78,3 +80,20 @@ def test_normalize_metrics_report_payload_resolves_ordering_violation_reduction(
     assert normalized["higher_is_better"] is True
     assert normalized["model_performance"]["primary_metric_value"] == 3.0
     assert normalized["model_performance"]["higher_is_better"] is True
+
+
+def test_resolve_metric_value_maps_quadratic_weighted_kappa_to_qwk_artifact_key() -> None:
+    payload = {
+        "holdout": {
+            "qwk": 0.7742043498751316,
+            "accuracy_exact": 0.42145044956032013,
+        },
+        "primary_metric_name": "two_month_pct_variation",
+        "primary_metric_value": 0.020596674246555292,
+    }
+
+    resolved = resolve_metric_value(payload, "quadratic_weighted_kappa")
+
+    assert canonicalize_metric_name("weighted kappa") == "quadratic_weighted_kappa"
+    assert resolved["value"] == 0.7742043498751316
+    assert resolved["matched_key"] == "holdout.qwk"

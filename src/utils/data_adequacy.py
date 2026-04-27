@@ -34,6 +34,11 @@ def _safe_load_json(path: str) -> Dict[str, Any]:
 def _load_metrics_report() -> Dict[str, Any]:
     """Load metrics from the first available canonical metrics artifact path."""
     candidates = [
+        "artifacts/ml/cv_metrics.json",
+        "artifacts/ml/metrics.json",
+        "artifacts/ml/evaluation_metrics.json",
+        "artifacts/ml/evaluation_report.json",
+        "artifacts/ml/evaluation_summary.json",
         "data/metrics.json",
         "reports/evaluation_metrics.json",
         "data/evaluation_metrics.json",
@@ -173,6 +178,19 @@ def _resolve_cleaned_data_path(state: Dict[str, Any], contract: Dict[str, Any]) 
             if not isinstance(path, str):
                 continue
             norm = path.replace("\\", "/").strip()
+            lower = norm.lower()
+            if lower.endswith(".csv") and "/clean" in lower:
+                candidates.append(norm)
+
+    output_report = _safe_load_json("data/output_contract_report.json")
+    for key in ("present", "checked", "required_outputs"):
+        values = output_report.get(key) if isinstance(output_report, dict) else None
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            norm = value.replace("\\", "/").strip()
             lower = norm.lower()
             if lower.endswith(".csv") and "/clean" in lower:
                 candidates.append(norm)

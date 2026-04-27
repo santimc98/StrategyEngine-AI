@@ -368,6 +368,46 @@ def test_run_summary_uses_metric_loop_state_to_clear_stale_pipeline_abort_and_bu
     assert metric_improvement.get("final_metric_reported") == 0.033403701215064016
 
 
+def test_run_summary_clears_stale_abort_and_clean_missing_when_final_evidence_exists(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "overall_status": "ok",
+                "missing": [],
+                "present": ["artifacts/clean/dataset_prepared.csv", "artifacts/ml/evaluation_report.json"],
+            },
+            f,
+        )
+    with open("data/data_adequacy_report.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "status": "insufficient_signal",
+                "reasons": ["cleaned_data_missing", "pipeline_aborted_before_metrics"],
+                "recommendations": ["legacy"],
+            },
+            f,
+        )
+    with open("data/metrics.json", "w", encoding="utf-8") as f:
+        json.dump({"holdout": {"qwk": 0.7742043498751316}}, f)
+
+    summary = build_run_summary(
+        {
+            "review_verdict": "APPROVE_WITH_WARNINGS",
+            "execution_contract": {
+                "evaluation_spec": {"primary_metric": "quadratic_weighted_kappa"},
+            },
+        }
+    )
+
+    adequacy = summary.get("data_adequacy") or {}
+    assert adequacy.get("status") == "ok"
+    assert adequacy.get("reasons") == []
+
+
 def test_run_summary_prefers_clean_state_output_contract_over_stale_persisted_report(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)

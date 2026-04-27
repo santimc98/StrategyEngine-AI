@@ -27,6 +27,7 @@ from src.utils.paths import PROJECT_ROOT
 os.chdir(PROJECT_ROOT)
 
 from src.utils.api_keys_store import apply_keys_to_env
+from src.utils.governance_reducer import classify_output_contract_performance_thresholds
 from src.utils.run_status import (
     append_log,
     is_run_abort_requested,
@@ -81,6 +82,22 @@ def _read_run_json(run_id: str, rel_path: str) -> dict:
         return {}
 
 
+def _output_contract_has_blocking_error(output_contract: dict) -> bool:
+    if not isinstance(output_contract, dict):
+        return False
+    if any(str(item).strip() for item in (output_contract.get("missing") or [])):
+        return True
+    if str(output_contract.get("overall_status") or "").strip().lower() != "error":
+        return False
+    try:
+        threshold_classification = classify_output_contract_performance_thresholds(output_contract)
+        if threshold_classification.get("only_performance_threshold_failures"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def _has_execution_failure(final_state: dict, run_id: str | None = None) -> bool:
     if not isinstance(final_state, dict):
         return False
@@ -90,19 +107,21 @@ def _has_execution_failure(final_state: dict, run_id: str | None = None) -> bool
     error_message = str(final_state.get("error_message") or "")
     if preview.lower().startswith("error:") or error_message.strip():
         return True
-    output_contract = final_state.get("output_contract_report")
-    if not isinstance(output_contract, dict) and run_id:
-        output_contract = _read_run_json(run_id, os.path.join("work", "data", "output_contract_report.json"))
-    if isinstance(output_contract, dict):
-        if str(output_contract.get("overall_status") or "").strip().lower() == "error":
-            return True
-        if any(str(item).strip() for item in (output_contract.get("missing") or [])):
-            return True
+    run_summary = {}
     if run_id:
         run_summary = _read_run_json(run_id, os.path.join("work", "data", "run_summary.json"))
         if str(run_summary.get("run_outcome") or "").strip().upper() == "NO_GO":
             return True
         if str(run_summary.get("overall_status_global") or "").strip().lower() == "error":
+            return True
+    output_contract = final_state.get("output_contract_report")
+    if not isinstance(output_contract, dict) and run_id:
+        output_contract = _read_run_json(run_id, os.path.join("work", "data", "output_contract_report.json"))
+    if isinstance(output_contract, dict):
+        summary_outcome = str(run_summary.get("run_outcome") or "").strip().upper()
+        summary_global = str(run_summary.get("overall_status_global") or "").strip().lower()
+        summary_allows_completion = summary_outcome in {"GO", "GO_WITH_LIMITATIONS"} and summary_global != "error"
+        if _output_contract_has_blocking_error(output_contract) and not summary_allows_completion:
             return True
     execution_output = str(final_state.get("execution_output", "") or "")
     failure_markers = [

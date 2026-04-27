@@ -8,7 +8,10 @@ from src.utils.governance_reducer import (
     compute_governance_verdict,
     derive_run_outcome,
 )
-from src.utils.metric_eval import normalize_metrics_report_payload
+from src.utils.metric_eval import (
+    canonicalize_metric_name,
+    normalize_metrics_report_payload,
+)
 
 
 def _safe_load_json(path: str) -> Dict[str, Any]:
@@ -207,9 +210,11 @@ def _extract_metric_value_by_name(metric_pool: Dict[str, float], metric_name: An
     if not isinstance(metric_pool, dict):
         return None
     target = _normalize_metric_token(metric_name)
+    target_canonical = canonicalize_metric_name(str(metric_name or ""))
     if not target:
         return None
     exact_key = None
+    canonical_key = None
     fuzzy_key = None
     for key in metric_pool.keys():
         normalized = _normalize_metric_token(key)
@@ -218,9 +223,11 @@ def _extract_metric_value_by_name(metric_pool: Dict[str, float], metric_name: An
         if normalized == target:
             exact_key = key
             break
+        if target_canonical and canonicalize_metric_name(str(key or "")) == target_canonical:
+            canonical_key = canonical_key or key
         if target in normalized and fuzzy_key is None:
             fuzzy_key = key
-    selected = exact_key or fuzzy_key
+    selected = exact_key or canonical_key or fuzzy_key
     if selected is None:
         return None
     return metric_pool.get(selected)
@@ -395,14 +402,23 @@ def _metric_loop_has_activity(loop_state: Dict[str, Any] | None) -> bool:
 def _normalize_data_adequacy_for_metric_loop(
     adequacy_summary: Dict[str, Any],
     loop_state: Dict[str, Any] | None,
+    metric_pool: Dict[str, float] | None = None,
+    output_contract: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     summary = dict(adequacy_summary) if isinstance(adequacy_summary, dict) else {}
-    if not summary or not _metric_loop_has_activity(loop_state):
+    metrics_available = bool(metric_pool)
+    if not summary or (not _metric_loop_has_activity(loop_state) and not metrics_available):
         return summary
     reasons = [str(item) for item in (summary.get("reasons") or []) if str(item).strip()]
-    summary["reasons"] = [
-        item for item in reasons if str(item).split(":", 1)[0] != "pipeline_aborted_before_metrics"
-    ]
+    removable = {"pipeline_aborted_before_metrics"} if metrics_available else set()
+    clean_artifact_present = False
+    if isinstance(output_contract, dict):
+        present = [str(item).replace("\\", "/").lower() for item in (output_contract.get("present") or []) if item]
+        missing = [str(item).strip() for item in (output_contract.get("missing") or []) if str(item).strip()]
+        clean_artifact_present = not missing and any(path.endswith(".csv") and "/clean" in path for path in present)
+    if clean_artifact_present:
+        removable.add("cleaned_data_missing")
+    summary["reasons"] = [item for item in reasons if str(item).split(":", 1)[0] not in removable]
     if not summary["reasons"] and summary.get("status") in {"data_limited", "insufficient_signal"}:
         summary["status"] = "ok"
         summary["recommendations"] = []
@@ -669,7 +685,12 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     metric_pool.update(_flatten_metrics(metrics_report))
     metric_pool = _merge_explicit_primary_metric(metric_pool, metrics_report)
     metric_pool.update(_flatten_metrics(weights_report))
-    adequacy_summary = _normalize_data_adequacy_for_metric_loop(adequacy_summary, metric_loop_state)
+    adequacy_summary = _normalize_data_adequacy_for_metric_loop(
+        adequacy_summary,
+        metric_loop_state,
+        metric_pool=metric_pool,
+        output_contract=output_contract,
+    )
     baseline_vs_model = _extract_baseline_vs_model(metric_pool)
     thresholds = {
         "auc": float(os.getenv("CEILING_DELTA_AUC", "0.02")),
