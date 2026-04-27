@@ -209,6 +209,55 @@ class TestComputeGovernanceVerdict:
         )
         assert verdict["overall_status"] == "error"
 
+    def test_threshold_gap_qa_rejection_is_warning_not_hard_failure(self):
+        """Measured metric-threshold misses should not make the final governance NO_GO."""
+        threshold_failure = {
+            "name": "eligibility_preservation_by_corporation",
+            "severity": "HARD",
+            "artifact_path": "artifacts/ml/evaluation_report.json",
+            "metric": "eligibility_debtor_count_dev_max_pct",
+            "value": 0.25,
+            "threshold": 0.1,
+            "operator": "<=",
+            "status": "fail",
+            "passed": False,
+        }
+        verdict = compute_governance_verdict(
+            output_contract_report={
+                "overall_status": "error",
+                "missing": [],
+                "artifact_requirements_report": {"status": "ok"},
+                "qa_gate_results": {"failures": [threshold_failure], "warnings": []},
+            },
+            state={
+                "review_verdict": "APPROVE_WITH_WARNINGS",
+                "review_board_verdict": {
+                    "performance_threshold_policy": "optimization_target_not_baseline_blocker",
+                    "performance_threshold_gaps": [threshold_failure],
+                },
+                "last_gate_context": {
+                    "status": "APPROVE_WITH_WARNINGS",
+                    "failed_gates": ["eligibility_preservation_by_corporation"],
+                    "hard_failures": ["eligibility_preservation_by_corporation"],
+                },
+                "qa_last_result": {
+                    "status": "REJECTED",
+                    "failed_gates": ["eligibility_preservation_by_corporation"],
+                    "hard_failures": ["eligibility_preservation_by_corporation"],
+                },
+            },
+            contract={
+                "qa_gates": [
+                    {"name": "eligibility_preservation_by_corporation", "severity": "HARD"}
+                ]
+            },
+            integrity_report={"issues": []},
+        )
+
+        assert verdict["overall_status"] == "warning"
+        assert "eligibility_preservation_by_corporation" not in verdict["hard_failures"]
+        assert not any(str(item).startswith("hard_gate_failed") for item in verdict["hard_failures"])
+
 
 class TestDeriveRunOutcome:
     """Tests for derive_run_outcome function."""

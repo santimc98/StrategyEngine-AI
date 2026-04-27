@@ -15,6 +15,7 @@ RULES:
 """
 
 import math
+import re
 from typing import Any, Dict, List, Set
 
 
@@ -56,6 +57,112 @@ def _dedupe_reasons(reasons: List[str]) -> List[str]:
 
 def _normalize_gate_name(name: Any) -> str:
     return str(name or "").strip().lower()
+
+
+def _normalize_gap_ref(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    # Drop common source prefixes while keeping the actual gate/metric token.
+    for prefix in (
+        "qa_reviewer_hard_failure:",
+        "qa_reviewer_failed_gate:",
+        "reviewer_hard_failure:",
+        "result_evaluator_hard_failure:",
+        "hard_gate_failed:",
+        "gate_context.hard_failure=",
+        "state.hard_failure=",
+    ):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    if ":" in text:
+        parts = [part for part in text.split(":") if part]
+        if parts:
+            text = parts[-1]
+    return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+
+
+def performance_threshold_gap_keys(gaps: Any) -> Set[str]:
+    """Return exact gate/metric identifiers for evidence-backed threshold gaps."""
+    keys: Set[str] = set()
+    if not isinstance(gaps, list):
+        return keys
+    for gap in gaps:
+        if isinstance(gap, dict):
+            fields = (
+                "name",
+                "gate_name",
+                "gate",
+                "id",
+                "metric",
+                "matched_key",
+                "threshold_param",
+            )
+            for field in fields:
+                token = _normalize_gap_ref(gap.get(field))
+                if token:
+                    keys.add(token)
+            params = gap.get("params") if isinstance(gap.get("params"), dict) else {}
+            checks = params.get("metric_checks") if isinstance(params.get("metric_checks"), list) else []
+            for check in checks:
+                if isinstance(check, dict):
+                    token = _normalize_gap_ref(check.get("metric"))
+                    if token:
+                        keys.add(token)
+        else:
+            token = _normalize_gap_ref(gap)
+            if token:
+                keys.add(token)
+    return keys
+
+
+def is_performance_threshold_gap_reference(value: Any, gaps: Any) -> bool:
+    """True when a reviewer/QA failure token maps to a measured threshold gap."""
+    keys = performance_threshold_gap_keys(gaps)
+    if not keys:
+        return False
+    if isinstance(value, dict):
+        if value in gaps:
+            return True
+        candidates = [
+            value.get("name"),
+            value.get("gate_name"),
+            value.get("gate"),
+            value.get("id"),
+            value.get("metric"),
+            value.get("matched_key"),
+        ]
+        return any(_normalize_gap_ref(item) in keys for item in candidates if item)
+    token = _normalize_gap_ref(value)
+    if token in keys:
+        return True
+    text = str(value or "").strip().lower()
+    text_tokens = {
+        _normalize_gap_ref(part)
+        for part in re.split(r"[:;,|\\s]+", text)
+        if _normalize_gap_ref(part)
+    }
+    return bool(text_tokens & keys)
+
+
+def packet_contains_only_performance_threshold_failures(packet: Any, gaps: Any) -> bool:
+    """Return true when a rejected packet only names measured threshold gaps."""
+    if not isinstance(packet, dict):
+        return False
+    gap_keys = performance_threshold_gap_keys(gaps)
+    if not gap_keys:
+        return False
+    hard = [item for item in _safe_list(packet.get("hard_failures")) if str(item).strip()]
+    failed = [item for item in _safe_list(packet.get("failed_gates")) if str(item).strip()]
+    explicit = hard or [
+        item
+        for item in failed
+        if _normalize_gap_ref(item) not in {"qa_gates", "qa", "qa_reviewer", "results_quality"}
+    ]
+    if not explicit:
+        return False
+    return all(is_performance_threshold_gap_reference(item, gaps) for item in explicit)
 
 
 _PERFORMANCE_ARTIFACT_TOKENS = {
@@ -330,6 +437,15 @@ def compute_governance_verdict(
 
     # A1: Check overall_status from output_contract_report
     performance_thresholds = classify_output_contract_performance_thresholds(output_contract_report)
+    performance_gaps = performance_thresholds.get("performance_threshold_gaps") or []
+    performance_threshold_policy_active = bool(
+        performance_thresholds.get("only_performance_threshold_failures")
+        or (
+            isinstance(state.get("review_board_verdict"), dict)
+            and state.get("review_board_verdict", {}).get("performance_threshold_policy")
+            == "optimization_target_not_baseline_blocker"
+        )
+    )
     oc_overall_status = _normalize_status(output_contract_report.get("overall_status")).lower()
     if oc_overall_status == "error":
         if performance_thresholds.get("only_performance_threshold_failures"):
@@ -398,6 +514,8 @@ def compute_governance_verdict(
         # B4: Collect hard_failures from gate_context (if present)
         gc_hard_failures = _safe_list(gate_context.get("hard_failures"))
         for hf in gc_hard_failures:
+            if performance_threshold_policy_active and is_performance_threshold_gap_reference(hf, performance_gaps):
+                continue
             if hf and str(hf) not in hard_failures:
                 hard_failures.append(str(hf))
                 overall_status = "error"
@@ -424,6 +542,8 @@ def compute_governance_verdict(
     # C1: Accumulated hard_failures from state (if present)
     state_hard_failures = _safe_list(state.get("hard_failures"))
     for hf in state_hard_failures:
+        if performance_threshold_policy_active and is_performance_threshold_gap_reference(hf, performance_gaps):
+            continue
         if hf and str(hf) not in hard_failures:
             hard_failures.append(str(hf))
             overall_status = "error"
@@ -438,7 +558,18 @@ def compute_governance_verdict(
                 source = key.replace("_last_result", "")
                 reasons.append(f"{source}.status=REJECTED")
                 result_hard_failures = _safe_list(result.get("hard_failures"))
+                if (
+                    source == "qa"
+                    and performance_threshold_policy_active
+                    and packet_contains_only_performance_threshold_failures(result, performance_gaps)
+                ):
+                    if overall_status == "ok":
+                        overall_status = "warning"
+                    reasons.append(f"{source}.status=REJECTED_threshold_targets_only")
+                    continue
                 for hf in result_hard_failures:
+                    if performance_threshold_policy_active and is_performance_threshold_gap_reference(hf, performance_gaps):
+                        continue
                     if hf and str(hf) not in hard_failures:
                         hard_failures.append(str(hf))
                         overall_status = "error"
@@ -476,6 +607,10 @@ def compute_governance_verdict(
                 hard_gate_names=hard_gate_names,
                 segmentation_required=segmentation_required,
                 decisioning_required=decisioning_required,
+            )
+            and not (
+                performance_threshold_policy_active
+                and is_performance_threshold_gap_reference(gate, performance_gaps)
             )
         ]
         if hard_failed:

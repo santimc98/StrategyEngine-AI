@@ -191,7 +191,11 @@ from src.utils.experiment_tracker import (
 from src.utils.error_hints import append_repair_hints
 from src.utils.contract_first_gates import apply_contract_first_gate_policy
 from src.utils.governance import write_governance_report, build_run_summary
-from src.utils.governance_reducer import classify_output_contract_performance_thresholds
+from src.utils.governance_reducer import (
+    classify_output_contract_performance_thresholds,
+    is_performance_threshold_gap_reference,
+    packet_contains_only_performance_threshold_failures,
+)
 from src.utils.data_adequacy import (
     build_data_adequacy_report,
     write_data_adequacy_report,
@@ -8292,20 +8296,25 @@ def _is_blocking_retry_reason(
     if _has_runtime_failure_marker(f"{state.get('execution_output', '')}\n{state.get('error_message', '')}"):
         return True
 
-    last_iter_type = str(state.get("last_iteration_type") or "").strip().lower()
-    gate_iter_type = str(gate_context.get("iteration_type") or "").strip().lower()
-    if last_iter_type == "compliance" or gate_iter_type == "compliance":
-        return True
-
     oc_report = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
     threshold_gap_classification = classify_output_contract_performance_thresholds(oc_report)
+    performance_threshold_gaps = threshold_gap_classification.get("performance_threshold_gaps", [])
     only_performance_threshold_failures = bool(
         threshold_gap_classification.get("only_performance_threshold_failures")
+        or gate_context.get("performance_threshold_policy") == "optimization_target_not_baseline_blocker"
     )
+    last_iter_type = str(state.get("last_iteration_type") or "").strip().lower()
+    gate_iter_type = str(gate_context.get("iteration_type") or "").strip().lower()
+    if (last_iter_type == "compliance" or gate_iter_type == "compliance") and not only_performance_threshold_failures:
+        return True
     hard_failures = [str(x) for x in (gate_context.get("hard_failures") or state.get("hard_failures") or []) if x]
     if hard_failures and not (
         only_performance_threshold_failures
-        and all(_looks_performance_threshold_signal(item) for item in hard_failures)
+        and all(
+            is_performance_threshold_gap_reference(item, performance_threshold_gaps)
+            or _looks_performance_threshold_signal(item)
+            for item in hard_failures
+        )
     ):
         return True
     if isinstance(oc_report, dict):
@@ -8343,7 +8352,11 @@ def _is_blocking_retry_reason(
         blocking_non_performance_signals = [
             signal
             for signal in signals
-            if _looks_blocking_retry_signal(signal) and not _looks_performance_threshold_signal(signal)
+            if _looks_blocking_retry_signal(signal)
+            and not (
+                is_performance_threshold_gap_reference(signal, performance_threshold_gaps)
+                or _looks_performance_threshold_signal(signal)
+            )
         ]
         return bool(blocking_non_performance_signals)
 
@@ -30793,6 +30806,40 @@ def _sanitize_board_failed_areas(
     qa_findings = _packet_has_explicit_findings(board_context.get("qa_reviewer"))
     reviewer_findings = _packet_has_explicit_findings(board_context.get("reviewer"))
     results_findings = _packet_has_explicit_findings(board_context.get("results_advisor"))
+    perf_policy = (
+        board_context.get("performance_threshold_policy")
+        if isinstance(board_context.get("performance_threshold_policy"), dict)
+        else {}
+    )
+    deterministic_facts = (
+        board_context.get("deterministic_facts")
+        if isinstance(board_context.get("deterministic_facts"), dict)
+        else {}
+    )
+    output_contract = (
+        deterministic_facts.get("output_contract")
+        if isinstance(deterministic_facts.get("output_contract"), dict)
+        else {}
+    )
+    performance_gaps = (
+        perf_policy.get("gaps")
+        if isinstance(perf_policy.get("gaps"), list)
+        else output_contract.get("performance_threshold_gaps")
+    )
+    performance_policy_active = bool(
+        performance_gaps
+        and (
+            perf_policy.get("blocking_for_baseline_approval") is False
+            or output_contract.get("performance_thresholds_are_optimization_targets") is True
+        )
+    )
+    qa_only_threshold_gaps = bool(
+        performance_policy_active
+        and packet_contains_only_performance_threshold_failures(
+            board_context.get("qa_reviewer"),
+            performance_gaps,
+        )
+    )
 
     qa_aliases = {"qa_gates", "qa", "qa_reviewer"}
     reviewer_aliases = {"reviewer_alignment", "reviewer_gates", "reviewer", "code_alignment"}
@@ -30802,6 +30849,16 @@ def _sanitize_board_failed_areas(
     dropped: List[str] = []
     for area in [str(x) for x in failed_areas if x]:
         key = area.strip().lower()
+        if performance_policy_active:
+            if is_performance_threshold_gap_reference(area, performance_gaps):
+                dropped.append(area)
+                continue
+            if key in {"metric_threshold_gaps", "performance_threshold_gaps", "results_quality"}:
+                dropped.append(area)
+                continue
+            if key in qa_aliases and qa_only_threshold_gaps:
+                dropped.append(area)
+                continue
         if key in qa_aliases and qa_findings is False:
             dropped.append(area)
             continue
@@ -30895,13 +30952,29 @@ def _collect_board_deterministic_blockers(board_context: Dict[str, Any]) -> List
     performance_policy_active = bool(
         perf_policy.get("gaps") and perf_policy.get("blocking_for_baseline_approval") is False
     )
+    performance_gaps = (
+        perf_policy.get("gaps")
+        if isinstance(perf_policy.get("gaps"), list)
+        else output_contract.get("performance_threshold_gaps")
+    )
 
     def _packet_has_non_performance_blocker(packet: Dict[str, Any]) -> bool:
         for hard in packet.get("hard_failures") or []:
-            if not _looks_performance_threshold_signal(hard):
+            if not (
+                is_performance_threshold_gap_reference(hard, performance_gaps)
+                or _looks_performance_threshold_signal(hard)
+            ):
                 return True
         for gate in packet.get("failed_gates") or []:
-            if _looks_blocking_retry_signal(gate) and not _looks_performance_threshold_signal(gate):
+            gate_key = str(gate or "").strip().lower()
+            if gate_key in {"qa_gates", "qa", "qa_reviewer"}:
+                if packet_contains_only_performance_threshold_failures(packet, performance_gaps):
+                    continue
+                return True
+            if _looks_blocking_retry_signal(gate) and not (
+                is_performance_threshold_gap_reference(gate, performance_gaps)
+                or _looks_performance_threshold_signal(gate)
+            ):
                 return True
         return False
 
@@ -30916,17 +30989,31 @@ def _collect_board_deterministic_blockers(board_context: Dict[str, Any]) -> List
         if status in status_blockers:
             if not (
                 performance_policy_active
-                and status == "NEEDS_IMPROVEMENT"
+                and status in {"NEEDS_IMPROVEMENT", "REJECTED"}
                 and not _packet_has_non_performance_blocker(packet)
             ):
                 _add(f"{key}_status:{status}")
         for hard in packet.get("hard_failures") or []:
-            if performance_policy_active and _looks_performance_threshold_signal(hard):
+            if performance_policy_active and (
+                is_performance_threshold_gap_reference(hard, performance_gaps)
+                or _looks_performance_threshold_signal(hard)
+            ):
                 continue
             _add(f"{key}_hard_failure:{hard}")
         for gate in packet.get("failed_gates") or []:
+            gate_key = str(gate or "").strip().lower()
+            is_generic_qa_gate = gate_key in {"qa_gates", "qa", "qa_reviewer"}
+            is_threshold_gate = (
+                is_performance_threshold_gap_reference(gate, performance_gaps)
+                or (not is_generic_qa_gate and _looks_performance_threshold_signal(gate))
+                or (
+                    is_generic_qa_gate
+                    and packet_contains_only_performance_threshold_failures(packet, performance_gaps)
+                )
+            )
             if _looks_blocking_retry_signal(gate) and not (
-                performance_policy_active and _looks_performance_threshold_signal(gate)
+                performance_policy_active
+                and is_threshold_gate
             ):
                 _add(f"{key}_failed_gate:{gate}")
     return blockers
@@ -30982,10 +31069,18 @@ def _board_needs_improvement_conflicts_with_current_success(
     result_packet = board_context.get("result_evaluator") if isinstance(board_context.get("result_evaluator"), dict) else {}
     reviewer_packet = board_context.get("reviewer") if isinstance(board_context.get("reviewer"), dict) else {}
     qa_packet = board_context.get("qa_reviewer") if isinstance(board_context.get("qa_reviewer"), dict) else {}
+    performance_gaps = output_contract.get("performance_threshold_gaps") or threshold_gap_classification.get("performance_threshold_gaps") or []
+    qa_effectively_approved = _is_approved_review_status(qa_packet.get("status")) or (
+        bool(
+            output_contract.get("performance_thresholds_are_optimization_targets")
+            or threshold_gap_classification.get("only_performance_threshold_failures")
+        )
+        and packet_contains_only_performance_threshold_failures(qa_packet, performance_gaps)
+    )
     return (
         _is_approved_review_status(result_packet.get("status"))
         and _is_approved_review_status(reviewer_packet.get("status"))
-        and _is_approved_review_status(qa_packet.get("status"))
+        and qa_effectively_approved
     )
 
 
@@ -31093,6 +31188,44 @@ def run_review_board(state: AgentState) -> AgentState:
     evidence = verdict.get("evidence") if isinstance(verdict.get("evidence"), list) else []
     confidence = str(verdict.get("confidence") or "medium").lower()
     deterministic_blockers = _collect_board_deterministic_blockers(board_context)
+    performance_policy_active = bool(
+        performance_threshold_gaps
+        and (
+            (board_context.get("performance_threshold_policy") or {}).get("blocking_for_baseline_approval") is False
+            if isinstance(board_context.get("performance_threshold_policy"), dict)
+            else True
+        )
+    )
+
+    def _is_nonblocking_performance_area(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        if not text or not performance_policy_active:
+            return False
+        if is_performance_threshold_gap_reference(value, performance_threshold_gaps):
+            return True
+        if text in {"qa_gates", "qa", "qa_reviewer"}:
+            return packet_contains_only_performance_threshold_failures(
+                board_context.get("qa_reviewer"),
+                performance_threshold_gaps,
+            )
+        if text in {"results_quality", "metric_threshold_gaps", "performance_threshold_gaps"}:
+            return packet_contains_only_performance_threshold_failures(
+                board_context.get("qa_reviewer"),
+                performance_threshold_gaps,
+            )
+        return _looks_performance_threshold_signal(text)
+
+    if performance_policy_active:
+        failed_areas = [
+            area
+            for area in failed_areas
+            if not _is_nonblocking_performance_area(area)
+        ]
+        required_actions = [
+            action
+            for action in required_actions
+            if not _is_nonblocking_performance_area(action)
+        ]
     critical_failed_areas = [area for area in failed_areas if _looks_blocking_retry_signal(area)]
     runtime_terminal = bool(runtime_block.get("runtime_fix_terminal"))
     if runtime_terminal and critical_failed_areas:
@@ -31167,22 +31300,6 @@ def run_review_board(state: AgentState) -> AgentState:
     gate_context = dict(state.get("last_gate_context") or {})
     current_failed = [str(g) for g in (gate_context.get("failed_gates") or []) if g]
     current_required = [str(g) for g in (gate_context.get("required_fixes") or []) if g]
-    performance_gap_names = {
-        str(item.get("name") or item.get("metric") or "").strip().lower()
-        for item in performance_threshold_gaps
-        if isinstance(item, dict) and str(item.get("name") or item.get("metric") or "").strip()
-    }
-
-    def _is_nonblocking_performance_area(value: Any) -> bool:
-        text = str(value or "").strip().lower()
-        if not text or not performance_threshold_gaps:
-            return False
-        if text in performance_gap_names:
-            return True
-        if any(name and name in text for name in performance_gap_names):
-            return True
-        return _looks_performance_threshold_signal(text)
-
     for area in failed_areas:
         if _is_nonblocking_performance_area(area):
             continue
@@ -31197,6 +31314,17 @@ def run_review_board(state: AgentState) -> AgentState:
         gate_context["failed_gates"] = current_failed
     if current_required:
         gate_context["required_fixes"] = current_required
+    if performance_policy_active:
+        existing_hard = [str(x) for x in (gate_context.get("hard_failures") or []) if str(x).strip()]
+        filtered_hard = [
+            item
+            for item in existing_hard
+            if not _is_nonblocking_performance_area(item)
+        ]
+        if filtered_hard:
+            gate_context["hard_failures"] = filtered_hard
+        else:
+            gate_context["hard_failures"] = []
     gate_context["review_board"] = {
         "status": board_status,
         "summary": board_summary,
@@ -32503,10 +32631,38 @@ def _resolve_metric_round_augmentation_requested(
 def _has_real_baseline_reviewer_approval(state: Dict[str, Any]) -> bool:
     if not isinstance(state, dict):
         return False
-    reviewer_status, qa_status, _source = _resolve_baseline_reviewer_status_pair(state)
+    reviewer_status, qa_status, source = _resolve_baseline_reviewer_status_pair(state)
     if not reviewer_status or not qa_status:
         return False
-    return _is_approved_review_status(reviewer_status) and _is_approved_review_status(qa_status)
+    if not _is_approved_review_status(reviewer_status):
+        return False
+    if _is_approved_review_status(qa_status):
+        return True
+    review_stack = state.get("ml_review_stack") if isinstance(state.get("ml_review_stack"), dict) else {}
+    qa_packet = (
+        review_stack.get("qa_reviewer")
+        if source == "state.ml_review_stack" and isinstance(review_stack.get("qa_reviewer"), dict)
+        else state.get("qa_last_result")
+    )
+    if not isinstance(qa_packet, dict):
+        return False
+    board_payload = state.get("review_board_verdict") if isinstance(state.get("review_board_verdict"), dict) else {}
+    gaps = board_payload.get("performance_threshold_gaps")
+    if not isinstance(gaps, list) or not gaps:
+        output_contract = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
+        gaps = classify_output_contract_performance_thresholds(output_contract).get("performance_threshold_gaps") or []
+    policy = str(board_payload.get("performance_threshold_policy") or "").strip()
+    policy_active = bool(gaps and policy == "optimization_target_not_baseline_blocker")
+    if not policy_active:
+        output_contract = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
+        policy_active = bool(
+            gaps
+            and classify_output_contract_performance_thresholds(output_contract).get("only_performance_threshold_failures")
+        )
+    return bool(
+        policy_active
+        and packet_contains_only_performance_threshold_failures(qa_packet, gaps)
+    )
 
 
 def _metric_improvement_skip_reason(state: Dict[str, Any], contract: Dict[str, Any]) -> str | None:
@@ -33907,6 +34063,75 @@ def _build_incumbent_brief(
     return brief
 
 
+def _build_threshold_optimization_context(
+    state: Dict[str, Any] | None,
+    baseline_metrics: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Expose measured threshold gaps as optimization targets for the metric loop."""
+    state = state if isinstance(state, dict) else {}
+    baseline_metrics = baseline_metrics if isinstance(baseline_metrics, dict) else {}
+    output_contract = state.get("output_contract_report") if isinstance(state.get("output_contract_report"), dict) else {}
+    threshold_classification = classify_output_contract_performance_thresholds(output_contract)
+    gaps = threshold_classification.get("performance_threshold_gaps") or []
+    board_payload = state.get("review_board_verdict") if isinstance(state.get("review_board_verdict"), dict) else {}
+    if not gaps and isinstance(board_payload.get("performance_threshold_gaps"), list):
+        gaps = board_payload.get("performance_threshold_gaps") or []
+    targets: List[Dict[str, Any]] = []
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        metric = str(gap.get("metric") or gap.get("matched_key") or gap.get("name") or "").strip()
+        value = gap.get("value")
+        operator = str(gap.get("operator") or "").strip()
+        threshold = gap.get("threshold")
+        if threshold is None:
+            threshold = gap.get("min_value")
+        if threshold is None:
+            threshold = gap.get("max_value")
+        numeric_value = _coerce_float(value)
+        numeric_threshold = _coerce_float(threshold)
+        direction = ""
+        gap_abs = None
+        if numeric_value is not None and numeric_threshold is not None:
+            if operator in {">=", ">"}:
+                direction = "increase"
+                gap_abs = max(0.0, float(numeric_threshold) - float(numeric_value))
+            elif operator in {"<=", "<"}:
+                direction = "decrease"
+                gap_abs = max(0.0, float(numeric_value) - float(numeric_threshold))
+        targets.append(
+            {
+                "gate": str(gap.get("name") or gap.get("gate_name") or "").strip(),
+                "metric": metric,
+                "current_value": value,
+                "target_value": threshold,
+                "operator": operator,
+                "gap_abs": gap_abs,
+                "direction": direction or "close_gap",
+                "artifact_path": str(gap.get("artifact_path") or gap.get("abs_path") or "").strip(),
+                "evidence_source": str(gap.get("evidence_source") or "").strip(),
+                "detail": str(gap.get("detail") or "").strip()[:240],
+            }
+        )
+    if not targets:
+        return {}
+    compact_baseline: Dict[str, Any] = {}
+    for key, value in baseline_metrics.items():
+        if len(compact_baseline) >= 30:
+            break
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            compact_baseline[str(key)] = value
+    return {
+        "policy": "performance_threshold_gaps_are_optimization_targets",
+        "instruction": (
+            "Use these measured gaps to choose hypotheses. They are not baseline compliance blockers; "
+            "they define what the metric improvement loop should try to improve."
+        ),
+        "targets": targets,
+        "baseline_metrics_compact": compact_baseline,
+    }
+
+
 def _resolve_metric_round_previous_code(state: Dict[str, Any]) -> str | None:
     if not isinstance(state, dict) or not bool(state.get("ml_improvement_round_active")):
         return None
@@ -34458,6 +34683,9 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
     advisor_context["phase"] = "baseline_review"
     advisor_context["candidate_metrics"] = baseline_metrics
     advisor_context["active_gates_context"] = _collect_active_gate_names(contract, phase="metric_round")
+    threshold_optimization_context = _build_threshold_optimization_context(state, baseline_metrics)
+    if threshold_optimization_context:
+        advisor_context["threshold_optimization_context"] = threshold_optimization_context
 
     critique_packet = results_advisor.generate_critique_packet(advisor_context)
     critique_meta = (
@@ -34504,6 +34732,8 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
                 "primary_metric": metric_name,
                 "models_used": (baseline_metrics or {}).get("models_used", []),
             }
+            if threshold_optimization_context:
+                analyst_context["threshold_optimization_context"] = threshold_optimization_context
             optimization_blueprint = analyst.analyze_baseline(analyst_context)
             if isinstance(optimization_blueprint, dict) and optimization_blueprint:
                 state["optimization_blueprint"] = optimization_blueprint
@@ -34820,6 +35050,8 @@ def _bootstrap_metric_improvement_round(state: Dict[str, Any], contract: Dict[st
         "round_history_recent": compress_long_lists((round_history or [])[-4:])[0],
         "metric_loop_state": metric_loop_state,
     }
+    if threshold_optimization_context:
+        optimization_context["threshold_optimization_context"] = threshold_optimization_context
     history_policy_line = (
         "METRIC_IMPROVEMENT_POLICY: phase="
         + str(hybrid_policy_meta.get("phase") or "explore")

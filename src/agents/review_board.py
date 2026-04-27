@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 from src.utils.reviewer_llm import init_reviewer_llm
 from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 from src.utils.openrouter_reasoning import create_chat_completion_with_reasoning
+from src.utils.governance_reducer import packet_contains_only_performance_threshold_failures
 
 
 class ReviewBoardAgent:
@@ -123,7 +124,12 @@ class ReviewBoardAgent:
         perf_policy = context.get("performance_threshold_policy") if isinstance(context.get("performance_threshold_policy"), dict) else {}
         performance_gaps = perf_policy.get("gaps") if isinstance(perf_policy.get("gaps"), list) else []
         only_performance_threshold_gaps = bool(
-            performance_gaps and perf_policy.get("blocking_for_baseline_approval") is False
+            performance_gaps
+            and perf_policy.get("blocking_for_baseline_approval") is False
+            and (
+                packet_contains_only_performance_threshold_failures(qa, performance_gaps)
+                or not (qa.get("hard_failures") or qa.get("failed_gates"))
+            )
         )
 
         statuses = [

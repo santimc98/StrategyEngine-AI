@@ -769,6 +769,67 @@ def test_collect_board_deterministic_blockers_treats_metric_thresholds_as_target
     assert graph_mod._collect_board_deterministic_blockers(board_context) == []
 
 
+def test_collect_board_deterministic_blockers_maps_named_threshold_gates_from_qa_rejection() -> None:
+    threshold_failures = [
+        {
+            "name": "eligibility_preservation_by_corporation",
+            "severity": "HARD",
+            "artifact_path": "artifacts/ml/evaluation_report.json",
+            "metric": "eligibility_debtor_count_dev_max_pct",
+            "value": 0.25,
+            "threshold": 0.1,
+            "operator": "<=",
+            "status": "fail",
+            "passed": False,
+        },
+        {
+            "name": "temporal_stability_on_eligible_pairs",
+            "severity": "HARD",
+            "artifact_path": "artifacts/ml/evaluation_report.json",
+            "metric": "max_variation_pct_in_eligible_pairs",
+            "value": 0.31,
+            "threshold": 0.05,
+            "operator": "<=",
+            "status": "fail",
+            "passed": False,
+        },
+    ]
+    board_context = {
+        "runtime": {"status": "OK", "runtime_fix_terminal": False, "sandbox_failed": False},
+        "performance_threshold_policy": {
+            "classification": "optimization_target",
+            "blocking_for_baseline_approval": False,
+            "gaps": threshold_failures,
+        },
+        "deterministic_facts": {
+            "output_contract": {
+                "overall_status": "error",
+                "governance_status": "warning",
+                "missing_required_artifacts": [],
+                "schema_issues": [],
+                "qa_gate_failures": threshold_failures,
+                "performance_threshold_gaps": threshold_failures,
+                "performance_thresholds_are_optimization_targets": True,
+            }
+        },
+        "reviewer": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": [], "hard_failures": []},
+        "qa_reviewer": {
+            "status": "REJECTED",
+            "failed_gates": [
+                "eligibility_preservation_by_corporation",
+                "temporal_stability_on_eligible_pairs",
+            ],
+            "hard_failures": [
+                "eligibility_preservation_by_corporation",
+                "temporal_stability_on_eligible_pairs",
+            ],
+        },
+        "result_evaluator": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": [], "hard_failures": []},
+    }
+
+    assert graph_mod._collect_board_deterministic_blockers(board_context) == []
+
+
 def test_run_review_board_metric_threshold_gap_approves_for_optimization(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     os.makedirs("data", exist_ok=True)
@@ -813,6 +874,62 @@ def test_run_review_board_metric_threshold_gap_approves_for_optimization(tmp_pat
     assert result["last_gate_context"]["performance_threshold_policy"] == "optimization_target_not_baseline_blocker"
     assert "qa_gates" not in result["last_gate_context"].get("failed_gates", [])
     assert result["review_board_verdict"]["performance_threshold_gaps"] == [threshold_failure]
+
+
+def test_run_review_board_qa_rejected_threshold_gates_start_metric_loop_eligible(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
+    monkeypatch.setattr(graph_mod, "review_board", _StubBoardNeedsImprovement())
+    threshold_failure = {
+        "name": "eligibility_preservation_by_corporation",
+        "severity": "HARD",
+        "artifact_path": "artifacts/ml/evaluation_report.json",
+        "metric": "eligibility_debtor_count_dev_max_pct",
+        "value": 0.25,
+        "threshold": 0.1,
+        "operator": "<=",
+        "status": "fail",
+        "passed": False,
+    }
+    state = {
+        "iteration_count": 0,
+        "review_verdict": "APPROVE_WITH_WARNINGS",
+        "review_feedback": "Threshold below target.",
+        "feedback_history": [],
+        "execution_output": "OK",
+        "last_gate_context": {"failed_gates": [], "required_fixes": [], "hard_failures": []},
+        "output_contract_report": {
+            "overall_status": "error",
+            "missing": [],
+            "artifact_requirements_report": {"status": "ok"},
+            "qa_gate_results": {"failures": [threshold_failure], "warnings": [], "checked": [threshold_failure]},
+        },
+        "ml_review_stack": {
+            "runtime": {"status": "OK", "runtime_fix_terminal": False, "sandbox_failed": False},
+            "result_evaluator": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": [], "hard_failures": []},
+            "reviewer": {"status": "APPROVE_WITH_WARNINGS", "failed_gates": [], "hard_failures": []},
+            "qa_reviewer": {
+                "status": "REJECTED",
+                "failed_gates": ["eligibility_preservation_by_corporation"],
+                "hard_failures": ["eligibility_preservation_by_corporation"],
+            },
+            "results_advisor": {"status": "APPROVE_WITH_WARNINGS"},
+        },
+    }
+
+    result = graph_mod.run_review_board(state)
+
+    assert result["review_verdict"] == "APPROVE_WITH_WARNINGS"
+    assert result["last_gate_context"].get("hard_failures") == []
+    assert "qa_gates" not in result["last_gate_context"].get("failed_gates", [])
+    assert graph_mod._metric_improvement_skip_reason(
+        {
+            **state,
+            **result,
+            "execution_contract": {"iteration_policy": {"metric_improvement_rounds": 1}},
+        },
+        {"iteration_policy": {"metric_improvement_rounds": 1}},
+    ) is None
 
 
 def test_run_review_board_downgrades_stale_needs_improvement_when_current_facts_are_clean(
